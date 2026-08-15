@@ -1,0 +1,168 @@
+{
+  "SchemaVersion": 1,
+  "Scenario": {
+    "Seed": 7314550603573657853,
+    "NodeCount": 3,
+    "JobCount": 32,
+    "WorkloadDuration": "01:00:00",
+    "DrainAllowance": "06:00:00",
+    "CrashProbabilityPerPoll": 0,
+    "HeartbeatLossProbability": 0,
+    "HandlerFailureProbability": 0.1897523967549205,
+    "MaxExecutionDuration": "00:01:30",
+    "MaxClockSkew": "00:00:02",
+    "MaxCrashDowntime": "00:05:00",
+    "PollInterval": "00:00:01",
+    "HeartbeatInterval": "00:00:20",
+    "LeaseDuration": "00:01:00",
+    "MaxAttempts": 3,
+    "Backoff": "00:00:30",
+    "ConcurrencyLimit": null,
+    "ConcurrencyLimits": {},
+    "PoolSize": 2147483647,
+    "HintDeliveryProbability": 0,
+    "MaxHintLatency": "00:00:00.2500000",
+    "StoreFaultProbability": 0.11945050461450592,
+    "OperatorActionCount": 0,
+    "IsolationCount": 0,
+    "PermanentLossProbability": 0,
+    "AckLossProbability": 0,
+    "UnroutableProbability": 0.09386375414207579,
+    "TopologyQueues": 0,
+    "ForceWeightedDispatch": false,
+    "StartTime": "2026-01-01T00:00:00+00:00",
+    "Schedules": [],
+    "Sabotage": false,
+    "SabotageSlotDoubleRelease": false,
+    "SabotagePoolSize": false,
+    "SabotageOutcomeFence": false,
+    "SabotageMigrationSweep": false,
+    "SabotagePausedClaim": false,
+    "SabotageCancelProvenance": false,
+    "SabotageLegalTransition": false,
+    "SabotageExecuteLiveness": false,
+    "SabotageAuditCompleteness": false,
+    "SabotageServedSet": false,
+    "SabotageInlineUnroutableReport": false
+  },
+  "FaultMap": [
+    {
+      "Axis": "store",
+      "Id": "-1:Enqueue",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "-1:Enqueue",
+      "Ordinal": 5,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "-1:Enqueue",
+      "Ordinal": 6,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "0:ReportOutcome",
+      "Ordinal": 1,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "-1:Enqueue",
+      "Ordinal": 10,
+      "Fault": true
+    },
+    {
+      "Axis": "handler",
+      "Id": "fafbc7de-6d87-572f-982e-1448e491cd36:1",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "handler",
+      "Id": "fafbc7de-6d87-572f-982e-1448e491cd36:2",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "-1:Enqueue",
+      "Ordinal": 16,
+      "Fault": true
+    },
+    {
+      "Axis": "handler",
+      "Id": "1303a7b8-33be-ad8f-047c-d174a203d539:1",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "unroutable",
+      "Id": "92f23b74-f91d-41b3-a29f-0f01369f72de",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "-1:Enqueue",
+      "Ordinal": 25,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "-1:Enqueue",
+      "Ordinal": 28,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "-1:Enqueue",
+      "Ordinal": 30,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "0:ReportOutcome",
+      "Ordinal": 18,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "0:ReportOutcome",
+      "Ordinal": 20,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "0:ReportOutcome",
+      "Ordinal": 22,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "0:ReportOutcome",
+      "Ordinal": 32,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "0:ReportOutcome",
+      "Ordinal": 35,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "0:ReportOutcome",
+      "Ordinal": 36,
+      "Fault": true
+    }
+  ],
+  "Failure": {
+    "Message": "[seed 7314550603573657853] invariant ExecuteLiveness violated at virtual 2026-01-01T01:00:00.1756066\u002B00:00 after 11414 steps: liveness: job 92f23b74-f91d-41b3-a29f-0f01369f72de reached DeadLettered but never executed",
+    "InvariantId": "ExecuteLiveness"
+  }
+}

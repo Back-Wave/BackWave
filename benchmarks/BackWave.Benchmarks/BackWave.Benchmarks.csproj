@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The Benchmark Harness (ADR 0027): a macro, end-to-end throughput measurement that drives the
+       real Shell pump against a real Storage Adapter under wall-clock time. It is deliberately
+       non-deterministic (real clock, I/O, threads) and measures performance, never correctness, so it
+       lives under benchmarks/ — NOT tests/ — and is never run by `dotnet test` or gated on a PR.
+       Mirrors how tests/BackWave.Vopr fences the VOPR console runner away from the unit battery. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <!-- Not a test project: keep it out of `dotnet test` discovery and any coverage run. -->
+    <IsTestProject>false</IsTestProject>
+    <!-- Hangfire.PostgreSql pulls in Dapper transitively, whose analyzer flags DELETE-without-WHERE (DAP223).
+         The store-reset paths wipe whole benchmark tables by design between runs, so the rule is silenced here. -->
+    <NoWarn>$(NoWarn);DAP223</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+    <PackageReference Include="Npgsql" Version="9.0.3" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.1.1" />
+    <!-- The Hangfire competitor (bench-0140): its own server + storage behind the IBenchmarkTarget seam,
+         so the measurement code around it is provably identical to BackWave's. SQL Server is first-party
+         (the flagship comparison); Hangfire.PostgreSql is the community adapter (footnoted in the doc). -->
+    <PackageReference Include="Hangfire.Core" Version="1.8.23" />
+    <PackageReference Include="Hangfire.SqlServer" Version="1.8.23" />
+    <PackageReference Include="Hangfire.PostgreSql" Version="1.21.1" />
+    <!-- Hangfire serializes with Newtonsoft.Json (reflection-JSON, the competitor's path); its transitive
+         pin (11.0.1) carries a known advisory that NU1903-as-error rejects, so float it to a patched line. -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\BackWave\BackWave.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Hosting\BackWave.Hosting.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Postgres\BackWave.Postgres.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.SqlServer\BackWave.SqlServer.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.SourceGenerators\BackWave.SourceGenerators.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="BackWave.Benchmarks.Tests" />
+  </ItemGroup>
+
+</Project>

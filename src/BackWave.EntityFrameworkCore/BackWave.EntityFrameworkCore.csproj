@@ -1,0 +1,39 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>EF Core integration for BackWave: Transactional Enqueue inside the ambient unit of work.</Description>
+    <PackageTags>$(PackageTags);entity-framework;efcore;ef-core;transactional</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="BackWave.EntityFrameworkCore.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BackWave\BackWave.csproj" />
+  </ItemGroup>
+
+  <!-- EF Core is framework-coupled: reference the major that matches each TFM so a net8 consumer isn't
+       force-dragged onto the EF Core 10 runtime graph. The adapter uses only long-stable Relational APIs. -->
+  <!-- 8.0.10 is the security floor: earlier 8.0.x drags in the vulnerable Microsoft.Extensions.Caching.Memory
+       (CVE-2024-43483); EF Core first carries the patched Caching.Memory in the 8.0.10 servicing wave. The
+       9.x/10.x lines were never affected, so they floor at .0. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="8.0.10" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net9.0'">
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.0" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.0" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>$(ShipTfms)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

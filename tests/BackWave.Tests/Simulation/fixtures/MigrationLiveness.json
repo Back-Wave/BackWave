@@ -1,0 +1,92 @@
+{
+  "SchemaVersion": 1,
+  "Scenario": {
+    "Seed": 3580938247943024235,
+    "NodeCount": 3,
+    "JobCount": 55,
+    "WorkloadDuration": "01:00:00",
+    "DrainAllowance": "06:00:00",
+    "CrashProbabilityPerPoll": 0,
+    "HeartbeatLossProbability": 0,
+    "HandlerFailureProbability": 0,
+    "MaxExecutionDuration": "00:01:30",
+    "MaxClockSkew": "00:00:02",
+    "MaxCrashDowntime": "00:05:00",
+    "PollInterval": "00:00:01",
+    "HeartbeatInterval": "00:00:20",
+    "LeaseDuration": "00:01:00",
+    "MaxAttempts": 3,
+    "Backoff": "00:00:30",
+    "ConcurrencyLimit": null,
+    "ConcurrencyLimits": {},
+    "PoolSize": 2147483647,
+    "HintDeliveryProbability": 0,
+    "MaxHintLatency": "00:00:00.2500000",
+    "StoreFaultProbability": 0.0947853784239851,
+    "OperatorActionCount": 0,
+    "IsolationCount": 7,
+    "PermanentLossProbability": 0,
+    "AckLossProbability": 0.03139866890385747,
+    "UnroutableProbability": 0,
+    "TopologyQueues": 0,
+    "ForceWeightedDispatch": false,
+    "StartTime": "2026-01-01T00:00:00+00:00",
+    "Schedules": [],
+    "Sabotage": false,
+    "SabotageSlotDoubleRelease": false,
+    "SabotagePoolSize": false,
+    "SabotageOutcomeFence": false,
+    "SabotageMigrationSweep": false,
+    "SabotageMigrationFaultGrace": false,
+    "SabotagePausedClaim": false,
+    "SabotageCancelProvenance": false,
+    "SabotageLegalTransition": false,
+    "SabotageExecuteLiveness": false,
+    "SabotageAuditCompleteness": false,
+    "SabotageServedSet": false,
+    "SabotageInlineUnroutableReport": false,
+    "SabotageDeferredUnroutableReport": false
+  },
+  "FaultMap": [
+    {
+      "Axis": "store",
+      "Id": "-1:Enqueue",
+      "Ordinal": 14,
+      "Fault": true
+    },
+    {
+      "Axis": "isolation",
+      "Id": "2:2026-01-01T00:19:04.2329255\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "isolation",
+      "Id": "0:2026-01-01T00:19:06.4598237\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "1:ExpireLeases",
+      "Ordinal": 1207,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "1:ExpireLeases",
+      "Ordinal": 1208,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "1:ExpireLeases",
+      "Ordinal": 1209,
+      "Fault": true
+    }
+  ],
+  "Failure": {
+    "Message": "[seed 3580938247943024235] invariant MigrationLiveness violated at virtual 2026-01-01T00:20:07.8420460\u002B00:00 after 3960 steps: migration-liveness: job 43c731e8-6068-5fd2-697a-748c7cc1896d still Leased by isolated node-0 5.2s past Lease expiry (bound 5.0s)",
+    "InvariantId": "MigrationLiveness"
+  }
+}

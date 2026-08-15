@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>$(ShipTfms)</TargetFrameworks>
+    <Description>BackWave Pro: a Model Context Protocol (MCP) server over your BackWave jobs — AI agents monitor queues and jobs and (opt-in) act on them through tools mounted in your own ASP.NET Core host. Free to use under $1M annual revenue; a license is required above that.</Description>
+    <PackageTags>$(PackageTags);mcp;model-context-protocol;ai;agents;llm;pro</PackageTags>
+    <IsAotCompatible>true</IsAotCompatible>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Pro ships under the commercial EULA; the free packages default to LICENSE.md. Require explicit
+         license acceptance at install for the commercial terms (the free packages leave it off). -->
+    <PackageLicenseFile>LICENSE-PRO.md</PackageLicenseFile>
+    <PackageRequireLicenseAcceptance>true</PackageRequireLicenseAcceptance>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The official MCP SDK's ASP.NET Core transport (streamable HTTP). 1.4.x is the GA line; the
+         tool layer is kept decoupled from transport specifics so the eventual 2.0 move touches only
+         the hosting seam. -->
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="1.4.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BackWave.Hosting\BackWave.Hosting.csproj" />
+    <ProjectReference Include="..\BackWave.Pro\BackWave.Pro.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="BackWave.Pro.Mcp.Tests" />
+  </ItemGroup>
+
+</Project>

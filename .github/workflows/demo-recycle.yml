@@ -1,0 +1,20 @@
+name: Recycle demo
+
+# The demo's reset: restart the Fly app every hour. Booting re-seeds a fresh SQLite file from scratch
+# (see DemoSeed), so anything a visitor wrecks self-heals within the hour while the generator keeps the
+# workload flowing. This is the whole reset mechanism — there is no in-process wipe/reseed for v1.
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+jobs:
+  recycle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Restart the demo app
+        run: flyctl apps restart backwave-demo
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

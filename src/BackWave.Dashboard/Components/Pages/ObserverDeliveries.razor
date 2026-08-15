@@ -1,0 +1,177 @@
+@* Observers: Transition-Observer delivery health (ADR 0017, §5.13). For each registered
+   Observer: its durable delivery cursor (how far the at-least-once cursor has advanced) and its
+   dead-lettered deliveries — surfaced like dead-lettered jobs, but they are NOT jobs, so they get
+   their own small health surface. METADATA ONLY: never payload, never Failure Detail. Each
+   dead-lettered delivery links through to the Job detail page, where the existing
+   ViewSensitiveData gate continues to govern sensitive content — this surface opens no new path
+   past it. Observers are run config (not stored rows), so the set arrives via the dashboard
+   options; the cursor and dead-letters arrive via the Monitor API. *@
+<DashboardLayout BasePath="@BasePath" Title="Observers" Active="observers" ContentOnly="@ContentOnly" Live="@Live">
+    <div class="screen" data-screen-label="Observers">
+        <header class="screen__head">
+            <div>
+                <h1 style="font:var(--type-display);letter-spacing:var(--tracking-tight);">Observers</h1>
+            </div>
+        </header>
+
+        @if (Observers.Count == 0)
+        {
+            <div class="bw-card">
+                <p class="ptable__empty">
+                    No Transition Observers are registered. Register observers (run config, ADR 0017)
+                    and their delivery health appears here.
+                </p>
+            </div>
+        }
+        else
+        {
+            var behind = Observers.Count(o => o.Lag.Pending > 0);
+            var degraded = Observers.Count(o => o.DeadLetters.Count > 0);
+            var deadLettered = Observers.Sum(o => o.DeadLetters.Count);
+            <div class="stats-row">
+                <div class="bw-card stat-card">
+                    <div class="bw-card__aside">Observers</div>
+                    <div style="font:var(--type-display);">@Observers.Count</div>
+                    <div style="color:var(--text-secondary);">@(Observers.Count - behind) caught up · @behind behind</div>
+                </div>
+                <div class="bw-card stat-card">
+                    <div class="bw-card__aside">Pending deliveries</div>
+                    <div style="font:var(--type-display);">@Observers.Sum(o => o.Lag.Pending)</div>
+                    <div style="color:var(--text-secondary);">matching transitions not yet delivered</div>
+                </div>
+                <div class="bw-card stat-card">
+                    <div class="bw-card__aside">Dead-lettered</div>
+                    <div style="font:var(--type-display);color:@(deadLettered > 0 ? "var(--pen-red)" : "inherit");">@deadLettered</div>
+                    <div style="color:var(--text-secondary);">across @degraded observer@(degraded == 1 ? "" : "s")</div>
+                </div>
+            </div>
+            @foreach (var observer in Observers)
+            {
+                @ObserverCard(observer)
+            }
+        }
+    </div>
+</DashboardLayout>
+
+@code {
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+
+    /// <summary>One health record per registered Observer: its id, durable cursor, and dead-letters.</summary>
+    [Parameter, EditorRequired] public IReadOnlyList<ObserverHealth> Observers { get; set; } = [];
+
+    /// <summary>Render only the live region (SSE fragment) rather than the full document.</summary>
+    [Parameter] public bool ContentOnly { get; set; }
+
+    /// <summary>Wrap in the #bw-live region and inline the SSE client.</summary>
+    [Parameter] public bool Live { get; set; }
+
+    /// <summary>
+    /// One registered Observer's delivery health, assembled for display (issue 0082). <see cref="Lag"/>
+    /// carries its durable cursor plus how far it trails the transitions it watches;
+    /// <see cref="DeadLetters"/> are its dead-lettered deliveries, metadata only.
+    /// </summary>
+    public sealed record ObserverHealth(
+        string Id, string Subscription, ObserverLag Lag, IReadOnlyList<ObserverDeadLetterRecord> DeadLetters);
+
+    private RenderFragment ObserverCard(ObserverHealth observer) =>@<div class="bw-card">
+        <div class="bw-card__header">
+            <span class="bw-card__title mono">@observer.Id</span>
+            @{
+                var (tone, status) = observer.DeadLetters.Count > 0
+                    ? ("red", $"{observer.DeadLetters.Count} dead-lettered")
+                    : observer.Lag.Pending > 0
+                        ? ("amber", $"{observer.Lag.Pending} behind")
+                        : ("green", "delivering cleanly");
+            }
+            <span class="bw-badge bw-badge--@tone"><span class="bw-badge__dot"></span>@status</span>
+        </div>
+        <p style="color:var(--text-secondary);">
+            Watches <span class="mono">@observer.Subscription</span>. The delivery cursor is the durable
+            log position up to and including which every matching transition has been delivered or
+            dead-lettered — at-least-once, leaderless. Delivery metadata only; never payload or Failure
+            Detail.
+        </p>
+        <table class="ptable ptable--plain">
+            <tbody>
+                <tr>
+                    <th>Delivery cursor</th>
+                    <td class="mono">
+                        @(observer.Lag.Cursor < 0
+                            ? "— (nothing delivered yet)"
+                            : observer.Lag.Cursor.ToString())
+                    </td>
+                </tr>
+                <tr>
+                    <th>Pending deliveries</th>
+                    <td>
+                        @if (observer.Lag.Pending == 0)
+                        {
+                            <span style="color:var(--pen-green);">Caught up</span>
+                        }
+                        else
+                        {
+                            <span class="mono">@observer.Lag.Pending</span>
+                            <span> matching transition@(observer.Lag.Pending == 1 ? "" : "s") not yet delivered</span>
+                            @if (observer.Lag.OldestPendingAt is { } oldest)
+                            {
+                                <span style="color:var(--text-secondary);"> · oldest from <span class="mono">@DashboardGlossary.Instant(oldest)</span></span>
+                            }
+                        }
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+
+        <div class="bw-card__header" style="margin-top:16px;">
+            <span class="bw-card__title">Dead-lettered deliveries</span>
+            <span class="bw-card__aside">@observer.DeadLetters.Count shown</span>
+        </div>
+        <p style="color:var(--text-secondary);">
+            A delivery that exhausted its ceiling — recorded loudly, never silently dropped, and the
+            cursor advanced past it so one poison row never blocks later notifications forever. Each
+            links to the Job it points at, where the <strong>ViewSensitiveData</strong> Permission
+            governs any sensitive content. This surface shows delivery metadata only.
+        </p>
+        @if (observer.DeadLetters.Count == 0)
+        {
+            <p class="ptable__empty">No dead-lettered deliveries for this Observer.</p>
+        }
+        else
+        {
+            <div class="ptable-scroll">
+            <table class="ptable">
+                <thead>
+                    <tr>
+                        <th class="num">Log position</th>
+                        <th>Job</th>
+                        <th>Transition</th>
+                        <th class="num">Job Attempt</th>
+                        <th class="num">Delivery attempts</th>
+                        <th class="nowrap">Dead-lettered at</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var record in observer.DeadLetters)
+                    {
+                        <tr>
+                            <td class="num" data-label="Log position">@record.Position</td>
+                            <td data-label="Job">
+                                <a class="mono" href="@($"{BasePath}/jobs/{record.JobId}")">@(record.JobId.ToString()[..8])…</a>
+                            </td>
+                            <td data-label="Transition">
+                                <span class="bw-badge bw-badge--@DashboardGlossary.Tone(record.State)">
+                                    <span class="bw-badge__dot"></span>@DashboardGlossary.StateName(record.State)
+                                </span>
+                                <span class="mono" style="margin-left:6px;">#@record.Ordinal</span>
+                            </td>
+                            <td class="num" data-label="Job Attempt">@record.Attempt</td>
+                            <td class="num" data-label="Delivery attempts">@record.DeliveryAttempts</td>
+                            <td class="mono nowrap" data-label="Dead-lettered at">@DashboardGlossary.Instant(record.DeadLetteredAt)</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+            </div>
+        }
+    </div>;
+}

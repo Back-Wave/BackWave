@@ -1,0 +1,78 @@
+@namespace BackWave.Pro.Dashboard
+@* Workflows list (a BackWave Pro surface): every Workflow ordered by creation time, each with its
+   derived status badge (Running / Succeeded / Failed / Cancelled) and member count. The status is
+   always a PROJECTION of member states, never stored — so a Workflow can legitimately reopen
+   Succeeded→Running when live work is appended. Follow a Workflow to its graph view. Read through the
+   Pro Monitor surface; rendered inside the free dashboard's shell via the extension seam. *@
+<DashboardLayout BasePath="@BasePath" Title="Workflows" Active="workflows" ContentOnly="@ContentOnly" Live="@Live">
+    <div class="screen" data-screen-label="Workflows">
+        <header class="screen__head">
+            <div>
+                <h1 style="font:var(--type-display);letter-spacing:var(--tracking-tight);">Workflows</h1>
+            </div>
+        </header>
+
+        <div class="bw-card">
+            @if (Items.Count == 0)
+            {
+                <p class="ptable__empty">No Workflows enqueued.</p>
+            }
+            else
+            {
+                <div class="ptable-scroll">
+                <table class="ptable">
+                    <thead>
+                        <tr>
+                            <th>Workflow</th>
+                            <th>Name</th>
+                            <th>Status</th>
+                            <th class="num">Members</th>
+                            <th>Created</th>
+                            <th>Restarted from</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var workflow in Items)
+                        {
+                            <tr>
+                                <td data-label="Workflow">
+                                    <a class="mono" href="@($"{BasePath}/workflows/{workflow.WorkflowId}")">@(workflow.WorkflowId.ToString()[..8])…</a>
+                                </td>
+                                <td data-label="Name">@(workflow.Name ?? "—")</td>
+                                <td data-label="Status">
+                                    <span class="bw-badge bw-badge--@DashboardGlossary.WorkflowStatusTone(workflow.Status)">
+                                        <span class="bw-badge__dot"></span>@DashboardGlossary.WorkflowStatusName(workflow.Status)
+                                    </span>
+                                </td>
+                                <td class="num" data-label="Members">@workflow.MemberCount</td>
+                                <td class="mono nowrap" data-label="Created">@DashboardGlossary.Instant(workflow.CreatedAt)</td>
+                                <td data-label="Restarted from">
+                                    @if (workflow.RestartedFrom is { } from)
+                                    {
+                                        <a class="mono" href="@($"{BasePath}/workflows/{from}")">@(from.ToString()[..8])…</a>
+                                    }
+                                    else
+                                    {
+                                        <span>—</span>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                </div>
+            }
+        </div>
+    </div>
+</DashboardLayout>
+
+@code {
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+    [Parameter, EditorRequired] public IReadOnlyList<WorkflowSnapshot> Items { get; set; } = [];
+
+    /// <summary>Render only the live region (SSE fragment) rather than the full document.</summary>
+    [Parameter] public bool ContentOnly { get; set; }
+
+    /// <summary>Wrap in the #bw-live region and inline the SSE client.</summary>
+    [Parameter] public bool Live { get; set; }
+}

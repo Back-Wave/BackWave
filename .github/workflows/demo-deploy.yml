@@ -1,0 +1,36 @@
+name: Deploy demo
+
+# Builds and deploys the live demo (samples/BackWave.Demo) to Fly.io (demo.backwave.app) on every
+# push to main that touches the demo or the library it references. Auth is a Fly deploy token stored
+# as the FLY_API_TOKEN repository secret. The image is built by Fly from samples/BackWave.Demo/Dockerfile
+# with the repo root as the build context (see fly.toml).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "samples/BackWave.Demo/**"
+      - "src/**"
+      - "Directory.Build.*"
+      - ".github/workflows/demo-deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: demo-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history so MinVer can resolve the version from tags during the image build.
+          fetch-depth: 0
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy to Fly
+        # --ha=false keeps the demo a SINGLE machine: it's one shared world (River-style), so a second
+        # HA machine would split visitors across divergent SQLite state. See fly.toml.
+        run: flyctl deploy --config samples/BackWave.Demo/fly.toml --remote-only --ha=false
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

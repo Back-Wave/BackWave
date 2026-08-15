@@ -1,0 +1,23 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\BackWave\BackWave.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The low-level pump stays internal; BackWave's own test suites drive it directly. -->
+    <InternalsVisibleTo Include="BackWave.Tests" />
+    <InternalsVisibleTo Include="BackWave.Testing.Tests" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <Description>Deterministic testing harness for BackWave: the In-Memory Store plus Virtual Time behind one API. Enqueue real jobs, advance the clock, and assert through the Monitor.</Description>
+    <PackageTags>$(PackageTags);testing;unit-testing;virtual-time;fakes</PackageTags>
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>$(ShipTfms)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+</Project>

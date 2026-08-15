@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Torture Suite — non-deterministic concurrency discovery against live Storage Adapters. Internal infrastructure, never shipped, never a PR gate.</Description>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The in-place upgrade harness (issue 0202) is driven both by the `upgrade` console verb and by a
+         thin xUnit entry that runs the contract in the PR battery; that test project reaches the harness
+         types through this grant. Nothing else is exposed. -->
+    <InternalsVisibleTo Include="BackWave.Upgrade.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\BackWave\BackWave.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Postgres\BackWave.Postgres.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.SqlServer\BackWave.SqlServer.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Sqlite\BackWave.Sqlite.csproj" />
+  </ItemGroup>
+
+</Project>

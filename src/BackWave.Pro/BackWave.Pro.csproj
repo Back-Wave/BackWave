@@ -1,0 +1,73 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>$(ShipTfms)</TargetFrameworks>
+    <!-- Match the Microsoft.Extensions.* Abstractions major to the target framework so a net8 consumer
+         isn't force-upgraded to the .NET 10 Extensions graph. -->
+    <ExtensionsVersion Condition="'$(TargetFramework)' == 'net8.0'">8.0.0</ExtensionsVersion>
+    <ExtensionsVersion Condition="'$(TargetFramework)' == 'net9.0'">9.0.0</ExtensionsVersion>
+    <ExtensionsVersion Condition="'$(TargetFramework)' == 'net10.0'">10.0.0</ExtensionsVersion>
+    <Description>BackWave Pro: revenue-gated add-on features (Workflows). Free to use under $1M annual revenue; a license is required above that.</Description>
+    <PackageTags>$(PackageTags);workflows;orchestration;fan-out;pro</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Pro ships under the commercial EULA; the free packages default to LICENSE.md. Require explicit
+         license acceptance at install for the commercial terms (the free packages leave it off). -->
+    <PackageLicenseFile>LICENSE-PRO.md</PackageLicenseFile>
+    <PackageRequireLicenseAcceptance>true</PackageRequireLicenseAcceptance>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The relocated Workflow orchestration attaches to the free client/operator via extension
+         methods that reach their internal store/registry/clock, so Pro must see BackWave internals. -->
+    <InternalsVisibleTo Include="BackWave.Pro.Tests" />
+    <InternalsVisibleTo Include="BackWave.Pro.Dashboard.Tests" />
+    <InternalsVisibleTo Include="BackWave.Pro.Mcp.Tests" />
+    <InternalsVisibleTo Include="BackWave.Pro.LicenseTool" />
+  </ItemGroup>
+
+  <!-- Release gate: never ship the package with a license verification key whose PRIVATE half is
+       publicly known. The concrete risk is the historical DEVELOPMENT key: its private half was once
+       committed to the repo, so a build embedding it could verify a self-signed license as Valid. The
+       test suite now generates an ephemeral in-memory keypair per run (nothing is committed), so this
+       gate no longer reads a .pem file — it pins the known-compromised dev public key inline and fails
+       `dotnet pack` if EmbeddedVerificationKey.cs ever contains it. Runs before Pack (the ship action);
+       a normal build/test is unaffected. The compare is whitespace-insensitive: strip all whitespace
+       from the source, then look for the pinned base64 body. Override for an intentional dev/internal
+       pack with -p:AllowDevSigningKey=true. -->
+  <Target Name="GuardAgainstDevLicenseKey" BeforeTargets="Pack">
+    <PropertyGroup>
+      <!-- The SPKI base64 body (PEM markers and whitespace already stripped) of the historical
+           development verification key, whose matching private half was once committed to the repo.
+           Pinned here so the gate survives the removal of the committed keypair. -->
+      <_DevKeyBase64>MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9v2lQrGCPSKbFJnuALznTGSMBJnbpYgzl3RI9QGV7Flp2LurCmrrLL07UruebWpG2Kmb8v62RGA1aesPl5+c7Q==</_DevKeyBase64>
+      <_EmbeddedKeyPath>$(MSBuildThisFileDirectory)Licensing/EmbeddedVerificationKey.cs</_EmbeddedKeyPath>
+      <_EmbeddedKeyCs Condition="Exists('$(_EmbeddedKeyPath)')">$([System.IO.File]::ReadAllText('$(_EmbeddedKeyPath)'))</_EmbeddedKeyCs>
+      <!-- Strip ALL whitespace (regex \s covers CR/LF/tab/space on any platform) so the compare is
+           insensitive to how the PEM is wrapped in the source. -->
+      <_EmbeddedKeyNoWhitespace>$([System.Text.RegularExpressions.Regex]::Replace('$(_EmbeddedKeyCs)', '\s', ''))</_EmbeddedKeyNoWhitespace>
+    </PropertyGroup>
+    <Error
+      Condition="'$(AllowDevSigningKey)' != 'true' AND '$(_EmbeddedKeyCs)' != '' AND $(_EmbeddedKeyNoWhitespace.Contains('$(_DevKeyBase64)'))"
+      Text="BackWave.Pro is being packed with the historical DEVELOPMENT license verification key, whose private half was committed to the repo — any license it signs would verify as Valid. Replace EmbeddedVerificationKey.cs with a production keypair (keep the private half a release secret) before publishing. To pack with the dev key on purpose, set -p:AllowDevSigningKey=true." />
+  </Target>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="$(ExtensionsVersion)" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="$(ExtensionsVersion)" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="$(ExtensionsVersion)" />
+  </ItemGroup>
+
+  <!-- System.Buffers.Text.Base64Url is in-box on net9+; on net8 this backport supplies it with the
+       same strict (canonical, rejects non-zero trailing bits) semantics the license codec relies on.
+       9.0.14 is the security floor: 9.0.0–9.0.13 have an out-of-bounds read decoding malformed Base64Url
+       (CVE-2026-26127) — the exact codec the license check runs — patched at 9.0.14. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
+    <PackageReference Include="Microsoft.Bcl.Memory" Version="9.0.14" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BackWave\BackWave.csproj" />
+  </ItemGroup>
+
+</Project>

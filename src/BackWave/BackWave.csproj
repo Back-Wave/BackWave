@@ -1,0 +1,77 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Multi-targeted: clear the inherited single TargetFramework so the $(ShipTfms) cross-target build runs. -->
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>$(ShipTfms)</TargetFrameworks>
+    <!-- Match the Microsoft.Extensions.Logging.Abstractions major to the target framework so a net8
+         consumer isn't force-upgraded to the .NET 10 Extensions graph. -->
+    <ExtensionsVersion Condition="'$(TargetFramework)' == 'net8.0'">8.0.0</ExtensionsVersion>
+    <ExtensionsVersion Condition="'$(TargetFramework)' == 'net9.0'">9.0.0</ExtensionsVersion>
+    <ExtensionsVersion Condition="'$(TargetFramework)' == 'net10.0'">10.0.0</ExtensionsVersion>
+    <Description>Deterministic background job system for .NET: Core, Storage Contract, In-Memory Store.</Description>
+    <PackageTags>$(PackageTags);in-memory;deterministic;source-generator</PackageTags>
+    <IsAotCompatible>true</IsAotCompatible>
+    <!-- Ships the .xml with the package AND turns missing/mismatched docs (CS1591/1572/1573)
+         into build errors under the repo-wide TreatWarningsAsErrors — the documentation gate. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The sans-IO engine (Driver, Observer dispatch core), the routing/resolution plumbing,
+         and the internal scheduling helpers are internal: public only so the Shells, adapters,
+         and test/sim suites can drive them. They are not consumer or adapter-author API. -->
+    <InternalsVisibleTo Include="BackWave.Hosting" />
+    <!-- BackWave Pro reaches the client/operator internals (store, registry, clock, registration
+         lookup) through which its relocated Workflow extension methods drive the free Core. -->
+    <InternalsVisibleTo Include="BackWave.Pro" />
+    <InternalsVisibleTo Include="BackWave.Postgres" />
+    <InternalsVisibleTo Include="BackWave.SqlServer" />
+    <InternalsVisibleTo Include="BackWave.Sqlite" />
+    <InternalsVisibleTo Include="BackWave.EntityFrameworkCore" />
+    <InternalsVisibleTo Include="BackWave.Testing" />
+    <InternalsVisibleTo Include="BackWave.Dashboard" />
+    <InternalsVisibleTo Include="BackWave.Tests" />
+    <InternalsVisibleTo Include="BackWave.Hosting.Tests" />
+    <InternalsVisibleTo Include="BackWave.Conformance" />
+    <InternalsVisibleTo Include="BackWave.Simulation" />
+    <InternalsVisibleTo Include="BackWave.Vopr" />
+  </ItemGroup>
+
+  <!-- The optional ILoggerFactory the Core takes for the logs pillar: the [LoggerMessage] catalog and
+       job-context scopes bind to these abstractions only. Trim/AOT-safe (abstractions, no reflection),
+       so BackWave stays AOT-trim-safe. A null factory yields a NullLogger, so this reference costs a
+       consumer nothing at runtime unless they wire a real ILoggerFactory. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="$(ExtensionsVersion)" />
+  </ItemGroup>
+
+  <!-- The source generator ships bundled inside this package (analyzers/dotnet/cs) rather than as its
+       own package: its generated code (registry, serialization, [Job] sugar) binds to BackWave runtime
+       APIs, so the two must never version-skew. ReferenceOutputAssembly=false keeps the netstandard2.0
+       generator out of the runtime graph — it only feeds the compiler. -->
+  <ItemGroup>
+    <ProjectReference Include="..\BackWave.SourceGenerators\BackWave.SourceGenerators.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+    <!-- The BW0007 code fix ships in the same analyzer path as the generator. It is a design-time-only
+         component (references Workspaces, which csc must never load for generation), so it is a split
+         assembly kept out of the runtime graph exactly like the generator above. -->
+    <ProjectReference Include="..\BackWave.SourceGenerators.CodeFixes\BackWave.SourceGenerators.CodeFixes.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <!-- Pack the built generator dll into the analyzer path (TFM-agnostic, one copy per package). The
+       generator is a ProjectReference built before this project, so its netstandard2.0 output is on
+       disk by pack time. This references that path directly rather than filtering @(Analyzer), which is
+       only populated by ResolveProjectReferences in the per-TFM inner builds — under multi-targeting,
+       pack runs at the outer build where that target does not exist. -->
+  <Target Name="PackSourceGeneratorAsAnalyzer" BeforeTargets="_GetPackageFiles">
+    <ItemGroup>
+      <None Include="$(MSBuildThisFileDirectory)..\BackWave.SourceGenerators\bin\$(Configuration)\netstandard2.0\BackWave.SourceGenerators.dll"
+            Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
+      <None Include="$(MSBuildThisFileDirectory)..\BackWave.SourceGenerators.CodeFixes\bin\$(Configuration)\netstandard2.0\BackWave.SourceGenerators.CodeFixes.dll"
+            Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
+    </ItemGroup>
+  </Target>
+
+</Project>

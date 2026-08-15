@@ -1,0 +1,90 @@
+@* The shared shell: brand, sidebar nav, topbar, content frame. Renders the full HTML
+   document; the design system is inlined into <head> (zero static assets). Server-rendered —
+   the source design's theme toggle and bell are JS-only and so are intentionally absent. The
+   one script the dashboard ships is the live EventSource client, emitted only on live views
+   (@Live), which swaps #bw-live with SSE fragments. ContentOnly renders just that region. *@
+@if (ContentOnly)
+{
+    @* SSE fragment: the #bw-live inner markup only — no document, no chrome, no script. *@
+    @ChildContent
+}
+else
+{
+    <html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>@Title · BackWave</title>
+        @FaviconLink
+        @((MarkupString)$"<style>{DesignSystem.Css}</style>")
+        @* Apply the saved theme before first paint to avoid a flash of the wrong palette. *@
+        @((MarkupString)ThemeBootScript)
+    </head>
+    <body class="paper-grain">
+        <div class="shell">
+            <aside class="shell__side">
+                <div class="shell__brand" style="display:flex;align-items:center;gap:8px;">@Logo<b>backwave</b></div>
+                <nav class="bw-sidenav">
+                    @* One merged, ordered list: the built-in entries in order, with each extension
+                       entry slotted right after the built-in named by its After anchor (or appended
+                       when unanchored). With no extension installed this is byte-identical to the
+                       built-in sidebar. Each entry carries its own icon markup. *@
+                    @foreach (var item in MergedNav())
+                    {
+                        var active = item.Key == Active;
+                        <a class="bw-sidenav__item @(active ? "bw-sidenav__item--active" : "")"
+                           href="@(BasePath + item.Href)" aria-current="@(active ? "page" : null)">
+                            @item.IconMarkup<span>@item.Label</span>
+                        </a>
+                    }
+                </nav>
+                <div class="shell__user">
+                    <span class="bw-avatar" style="width:30px;height:30px;">BW</span>
+                    <div>
+                        <span style="font:var(--type-label);display:block;">BackWave</span>
+                        <span class="annotation">monitor</span>
+                    </div>
+                </div>
+            </aside>
+
+            <div class="shell__main">
+                <div class="shell__topbar">
+                    <span class="annotation">backwave console</span>
+                    <button type="button" id="bw-theme-toggle" class="bw-btn bw-btn--ghost bw-btn--icon bw-btn--sm"
+                            aria-label="Toggle dark mode" title="Toggle theme">
+                        @* moon shows in light mode (click to go dark); sun shows in dark mode *@
+                        <svg class="bw-theme-toggle__moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 14.0784C20.3003 14.7189 18.9301 15.0821 17.4751 15.0821C12.7491 15.0821 8.91792 11.2509 8.91792 6.52485C8.91792 5.06986 9.28105 3.69968 9.92163 2.5C5.66765 3.49698 2.5 7.31513 2.5 11.8731C2.5 17.1899 6.8101 21.5 12.1269 21.5C16.6849 21.5 20.503 18.3324 21.5 14.0784Z"/></svg>
+                        <svg class="bw-theme-toggle__sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 12C17 14.7614 14.7614 17 12 17C9.23858 17 7 14.7614 7 12C7 9.23858 9.23858 7 12 7C14.7614 7 17 9.23858 17 12Z"/><path d="M12 2V3.5M12 20.5V22M19.0710 4.92896L18.0104 5.98962M5.98962 18.0104L4.92896 19.0710M22 12H20.5M3.5 12H2M19.0710 19.0710L18.0104 18.0104M5.98962 5.98962L4.92896 4.92896" stroke-width="2"/></svg>
+                    </button>
+                </div>
+                <main class="shell__content">
+                    @* Extension banners (zero when no extension package is installed). Rendered
+                       above the page and outside #bw-live so they are not swapped by live updates;
+                       presentation-only chrome. *@
+                    @foreach (var banner in ExtensionBanners())
+                    {
+                        @((MarkupString)banner)
+                    }
+                    @if (Live)
+                    {
+                        @* The region the SSE client swaps in place; its inner markup is exactly
+                           what a ContentOnly render emits, so updates drop in 1:1. *@
+                        <div id="bw-live">@ChildContent</div>
+                    }
+                    else
+                    {
+                        @ChildContent
+                    }
+                </main>
+            </div>
+        </div>
+        @((MarkupString)ThemeToggleScript)
+        @((MarkupString)CopyScript)
+        @((MarkupString)TagSuggestScript)
+        @if (Live)
+        {
+            @((MarkupString)LiveScript)
+        }
+    </body>
+    </html>
+}

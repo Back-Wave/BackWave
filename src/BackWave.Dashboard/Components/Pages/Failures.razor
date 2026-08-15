@@ -1,0 +1,79 @@
+@* Failures: Dead-Lettered and Quarantined as distinct categories (invariant I5, never
+   collapsed) — ran-and-kept-failing vs could-not-be-routed/decoded. Two tabs so a long
+   Dead-Lettered list never buries the Quarantined one; the active tab rides the URL
+   (?tab=quarantine) so it survives each live SSE tick. Via the Monitor API. *@
+<DashboardLayout BasePath="@BasePath" Title="Failures" Active="failures" ContentOnly="@ContentOnly" Live="@Live">
+    <div class="screen" data-screen-label="Failures">
+        <header class="screen__head">
+            <div>
+                <h1 style="font:var(--type-display);letter-spacing:var(--tracking-tight);">Failures</h1>
+            </div>
+        </header>
+
+        <div class="bw-tabs">
+            @Tab(JobState.DeadLettered, "Dead-Lettered", $"{BasePath}/failures", DeadLettered.Count)
+            @Tab(JobState.Quarantined, "Quarantined", $"{BasePath}/failures?tab=quarantine", Quarantined.Count)
+        </div>
+
+        @if (ShowQuarantined)
+        {
+            @Section(JobState.Quarantined, "Quarantined", Quarantined)
+        }
+        else
+        {
+            @Section(JobState.DeadLettered, "Dead-Lettered", DeadLettered)
+        }
+    </div>
+</DashboardLayout>
+
+@code {
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+    [Parameter, EditorRequired] public IReadOnlyList<JobSnapshot> DeadLettered { get; set; } = [];
+    [Parameter, EditorRequired] public IReadOnlyList<JobSnapshot> Quarantined { get; set; } = [];
+    [Parameter, EditorRequired] public int PageSize { get; set; }
+    [Parameter, EditorRequired] public DashboardActions Actions { get; set; } = DashboardActions.None;
+
+    /// <summary>Which category tab is open — "quarantine" shows Quarantined, anything else (the default)
+    /// shows Dead-Lettered. Carried in the URL so it survives every live SSE re-render.</summary>
+    [Parameter] public string ActiveTab { get; set; } = "";
+
+    /// <summary>Render only the live region (SSE fragment) rather than the full document.</summary>
+    [Parameter] public bool ContentOnly { get; set; }
+
+    /// <summary>Wrap in the #bw-live region and inline the SSE client.</summary>
+    [Parameter] public bool Live { get; set; }
+
+    private bool ShowQuarantined => string.Equals(ActiveTab, "quarantine", StringComparison.OrdinalIgnoreCase);
+
+    // Requeue: a Dead-Lettered/Quarantined job back to Scheduled (Attempt reset). Rendered
+    // only where AuthorizeRequeue passed.
+    private RenderFragment<JobSnapshot>? RequeueAction => Actions.CanRequeue
+        ? job =>@<ActionForm Action="@($"{BasePath}/jobs/{job.JobId}/requeue")" Label="Requeue" Actions="Actions" />
+        : null;
+
+    // A tag pill on a failed job deep-links to the Jobs list filtered to this terminal state AND the
+    // clicked Tag — "show me every Dead-Lettered job carrying this Label".
+    private Func<JobTag, string> TagHref(JobState state)
+        => tag =>$"{BasePath}/jobs?state={state}&{TagFilterUrl.ToQueryPart(tag)}";
+
+    // A count-capped label: the loader caps each list at PageSize, so a full list means "at least this
+    // many" — shown as "50+" rather than an exact count that would under-report.
+    private string TabCount(int count) => count >= PageSize ? $"{PageSize}+" : count.ToString();
+
+    private RenderFragment Tab(JobState state, string label, string href, int count) =>@<a
+        class="bw-tab @(ShowQuarantined == (state == JobState.Quarantined) ? "bw-tab--active" : "")" href="@href">
+        @label<span class="bw-tab__count">@TabCount(count)</span>
+        @if (ShowQuarantined == (state == JobState.Quarantined))
+        {
+            <span class="bw-tab__ink"></span>
+        }
+    </a>;
+
+    private RenderFragment Section(JobState state, string title, IReadOnlyList<JobSnapshot> jobs) =>@<div class="bw-card">
+        <JobTable BasePath="@BasePath" Jobs="jobs" EmptyText="@($"No {title} jobs.")" RowAction="@RequeueAction" TagHref="@TagHref(state)" />
+        @if (jobs.Count >= PageSize)
+        {
+            <p><a class="mono" href="@($"{BasePath}/jobs?state={state}")">Search all @title jobs →</a></p>
+        }
+    </div>;
+}

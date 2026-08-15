@@ -1,0 +1,78 @@
+@* Executing now (ADR 0009, issue 0054): the jobs with a live Lease right now, surfaced
+   from the read model. Leases are DB-authoritative, so this reflects work across every node.
+   Owner + expiry come from JobSnapshot; the countdown is the time left on the heartbeat-
+   renewed Lease at page render. Via the Monitor API. *@
+<DashboardLayout BasePath="@BasePath" Title="Executing now" Active="executing" ContentOnly="@ContentOnly" Live="@Live">
+    <div class="screen" data-screen-label="Executing now">
+        <header class="screen__head">
+            <div>
+                <h1 style="font:var(--type-display);letter-spacing:var(--tracking-tight);">Executing now</h1>
+            </div>
+        </header>
+
+        <div class="bw-card">
+            @if (Jobs.Count == 0)
+            {
+                <p class="ptable__empty">Nothing is executing right now. Leased jobs appear here while a worker holds them.</p>
+            }
+            else
+            {
+                <div class="ptable-scroll">
+                <table class="ptable">
+                    <thead>
+                        <tr>
+                            <th>Job</th>
+                            <th>Wire Name</th>
+                            <th>Queue</th>
+                            <th class="num">Attempt</th>
+                            <th>Lease owner</th>
+                            <th>Lease expires</th>
+                            <th>Countdown</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var job in Jobs)
+                        {
+                            <tr>
+                                <td data-label="Job"><a class="mono" href="@($"{BasePath}/jobs/{job.JobId}")">@(job.JobId.ToString()[..8])…</a></td>
+                                <td data-label="Wire Name">@job.WireName</td>
+                                <td class="mono" data-label="Queue">@job.Queue</td>
+                                <td class="num" data-label="Attempt">@job.Attempt</td>
+                                <td class="mono" data-label="Lease owner">@(job.LeaseOwner ?? "—")</td>
+                                <td class="mono nowrap" data-label="Lease expires">@(job.LeaseExpiry is { } expiry ? DashboardGlossary.Instant(expiry) : "—")</td>
+                                <td class="mono nowrap" data-label="Countdown">@Countdown(job.LeaseExpiry)</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                </div>
+            }
+        </div>
+    </div>
+</DashboardLayout>
+
+@code {
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+    [Parameter, EditorRequired] public IReadOnlyList<JobSnapshot> Jobs { get; set; } = [];
+
+    /// <summary>The render instant the countdown is measured against (passed in so the view stays pure).</summary>
+    [Parameter, EditorRequired] public DateTimeOffset Now { get; set; }
+
+    /// <summary>Render only the live region (SSE fragment) rather than the full document.</summary>
+    [Parameter] public bool ContentOnly { get; set; }
+
+    /// <summary>Wrap in the #bw-live region and inline the SSE client.</summary>
+    [Parameter] public bool Live { get; set; }
+
+    private string Countdown(DateTimeOffset? expiry)
+    {
+        if (expiry is not { } e)
+        {
+            return "—";
+        }
+        var remaining = e - Now;
+        return remaining <= TimeSpan.Zero
+            ? "expired"
+            : $"{(int)remaining.TotalMinutes}m {remaining.Seconds:D2}s";
+    }
+}

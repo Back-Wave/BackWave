@@ -1,0 +1,110 @@
+{
+  "SchemaVersion": 1,
+  "Scenario": {
+    "Seed": 104,
+    "NodeCount": 3,
+    "JobCount": 59,
+    "WorkloadDuration": "01:00:00",
+    "DrainAllowance": "06:00:00",
+    "CrashProbabilityPerPoll": 0,
+    "HeartbeatLossProbability": 0,
+    "HandlerFailureProbability": 0,
+    "MaxExecutionDuration": "00:01:30",
+    "MaxClockSkew": "00:00:02",
+    "MaxCrashDowntime": "00:05:00",
+    "PollInterval": "00:00:01",
+    "HeartbeatInterval": "00:00:20",
+    "LeaseDuration": "00:01:00",
+    "MaxAttempts": 3,
+    "Backoff": "00:00:30",
+    "ConcurrencyLimit": null,
+    "ConcurrencyLimits": {},
+    "PoolSize": 2147483647,
+    "HintDeliveryProbability": 0,
+    "MaxHintLatency": "00:00:00.2500000",
+    "StoreFaultProbability": 0.11851651726989076,
+    "OperatorActionCount": 0,
+    "IsolationCount": 0,
+    "PermanentLossProbability": 0,
+    "AckLossProbability": 0,
+    "UnroutableProbability": 0.054848119299858805,
+    "TopologyQueues": 0,
+    "ForceWeightedDispatch": false,
+    "StartTime": "2026-01-01T00:00:00+00:00",
+    "Schedules": [],
+    "Observers": [],
+    "Sabotage": false,
+    "SabotageSlotDoubleRelease": false,
+    "SabotagePoolSize": false,
+    "SabotageOutcomeFence": false,
+    "SabotageBatchFence": false,
+    "SabotageMigrationSweep": false,
+    "SabotageMigrationFaultGrace": false,
+    "SabotagePausedClaim": false,
+    "SabotageCancelProvenance": false,
+    "SabotageLegalTransition": false,
+    "SabotageExecuteLiveness": false,
+    "SabotageAuditCompleteness": false,
+    "SabotageServedSet": false,
+    "SabotageInlineUnroutableReport": false,
+    "SabotageDeferredUnroutableReport": false,
+    "RadioactiveMode": false
+  },
+  "FaultMap": [
+    {
+      "Axis": "store",
+      "Id": "2:ExpireLeases",
+      "Ordinal": 700,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "2:ExpireLeases",
+      "Ordinal": 701,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "2:ExpireLeases",
+      "Ordinal": 702,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "2:ExpireLeases",
+      "Ordinal": 705,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "2:ExpireLeases",
+      "Ordinal": 735,
+      "Fault": true
+    },
+    {
+      "Axis": "unroutable",
+      "Id": "6d766214-8d69-42f2-38aa-30592c25c1dd",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "-1:Enqueue",
+      "Ordinal": 33,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "2:Claim",
+      "Ordinal": 772,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "2:ReportOutcome",
+      "Ordinal": 24,
+      "Fault": true
+    }
+  ],
+  "Failure": null
+}

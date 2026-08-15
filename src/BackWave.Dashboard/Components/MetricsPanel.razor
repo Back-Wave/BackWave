@@ -1,0 +1,206 @@
+@* Live in-process metrics panel (ADR 0032): per-second throughput sparklines plus Top Endpoints
+   and Faulting Endpoints, all fed by a bounded MeterListener ring buffer inside this dashboard
+   process. The data is PER-NODE and EPHEMERAL — it reflects only the node hosting this dashboard and
+   resets when the process restarts — so the header says so plainly. It refreshes on the same SSE tick
+   the rest of the Overview uses. When no collector is registered (AddBackWaveDashboardMetrics was not
+   called, or the static-SSR test path) Snapshot is null and we render an honest empty state, never a
+   fabricated series. *@
+<div class="bw-card">
+    <div class="bw-card__header">
+        <span class="bw-card__title">Throughput</span>
+        <span class="bw-card__aside">per-node · live · resets on restart</span>
+    </div>
+
+    @if (Snapshot is null)
+    {
+        <p class="bw-metrics__empty">
+            Live throughput is off. Call <code class="mono">AddBackWaveDashboardMetrics()</code> on the
+            host that runs your BackWave workers to light up per-second enqueued / processed / failed
+            rates and the busiest and faulting job types — a bounded, per-node, in-memory view that
+            resets on restart. For retained history and cross-node totals, use your metrics stack
+            (the same BackWave OpenTelemetry Meter already feeds it).
+        </p>
+    }
+    else
+    {
+        <div class="bw-metrics__row">
+            @Series("enqueued", Snapshot.Enqueued, Snapshot.EnqueuedPerSecond, "var(--wave-500)")
+            @Series("processed", Snapshot.Processed, Snapshot.ProcessedPerSecond, "var(--pen-green)")
+            @Series("failed", Snapshot.Failed, Snapshot.FailedPerSecond, "var(--pen-red)")
+        </div>
+        <p class="bw-metrics__note">
+            Per-second rates averaged over the last @DashboardMetricsCollector.WindowSeconds seconds,
+            observed on this node only. Rates over time and across the cluster live in your metrics
+            stack, fed by the same BackWave Meter.
+        </p>
+    }
+</div>
+
+@if (Snapshot is not null)
+{
+    <div class="dash-grid">
+        <div class="bw-card">
+            <div class="bw-card__header">
+                <span class="bw-card__title">Top endpoints</span>
+                <span class="bw-card__aside">busiest job types · per-node</span>
+            </div>
+            @if (Snapshot.TopEndpoints.Count == 0)
+            {
+                <p class="ptable__empty">No jobs processed in the last @DashboardMetricsCollector.WindowSeconds seconds.</p>
+            }
+            else
+            {
+                <div class="ptable-scroll">
+                <table class="ptable">
+                    <thead>
+                        <tr>
+                            <th>Wire Name</th><th class="num">Processed /s</th>
+                            <th class="num">p95 <span class="bw-metrics__approx">approx</span></th>
+                            <th class="num">p99 <span class="bw-metrics__approx">approx</span></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var endpoint in Snapshot.TopEndpoints)
+                        {
+                            <tr>
+                                <td class="mono" data-label="Wire Name">@endpoint.WireName</td>
+                                <td class="num" data-label="Processed /s">@Rate(endpoint.ProcessedPerSecond)</td>
+                                <td class="num" data-label="p95 approx">@Millis(endpoint.ApproxP95Ms)</td>
+                                <td class="num" data-label="p99 approx">@Millis(endpoint.ApproxP99Ms)</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                </div>
+            }
+        </div>
+
+        <div class="bw-card">
+            <div class="bw-card__header">
+                <span class="bw-card__title">Faulting endpoints</span>
+                <span class="bw-card__aside">highest fault rate · per-node</span>
+            </div>
+            @if (Snapshot.FaultingEndpoints.Count == 0)
+            {
+                <p class="ptable__empty">No failed attempts in the last @DashboardMetricsCollector.WindowSeconds seconds.</p>
+            }
+            else
+            {
+                <div class="ptable-scroll">
+                <table class="ptable">
+                    <thead>
+                        <tr>
+                            <th>Wire Name</th><th class="num">Fault rate</th><th class="num">Failed / attempts</th>
+                            <th class="num">p95 <span class="bw-metrics__approx">approx</span></th>
+                            <th class="num">p99 <span class="bw-metrics__approx">approx</span></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var endpoint in Snapshot.FaultingEndpoints)
+                        {
+                            <tr>
+                                <td class="mono" data-label="Wire Name">@endpoint.WireName</td>
+                                <td class="num" data-label="Fault rate">@Percent(endpoint.Rate)</td>
+                                <td class="num" data-label="Failed / attempts">@endpoint.Failed / @endpoint.Attempts</td>
+                                <td class="num" data-label="p95 approx">@Millis(endpoint.ApproxP95Ms)</td>
+                                <td class="num" data-label="p99 approx">@Millis(endpoint.ApproxP99Ms)</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                </div>
+            }
+        </div>
+    </div>
+}
+
+@code {
+    /// <summary>The live-metrics snapshot to render, or <see langword="null"/> when no collector is
+    /// registered (the panel then shows its empty state instead of a fabricated series).</summary>
+    [Parameter] public MetricsSnapshot? Snapshot { get; set; }
+
+    private static string Rate(double perSecond)
+        => perSecond.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture);
+
+    private static string Percent(double rate)
+        => (rate * 100).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "%";
+
+    // An approximate latency percentile in milliseconds, or an em dash when no latency was recorded for
+    // the endpoint (never a fabricated 0). Sub-10ms values keep one decimal; larger ones round to whole
+    // milliseconds since the bucket width already dwarfs the fractional part.
+    private static string Millis(double? ms)
+    {
+        if (ms is not { } value)
+        {
+            return "—";
+        }
+        var format = value < 10 ? "0.#" : "0";
+        return value.ToString(format, System.Globalization.CultureInfo.InvariantCulture) + " ms";
+    }
+
+    // One throughput stat: the current per-second rate over a server-rendered SVG sparkline of the
+    // window. No client JS — the polyline is computed here and emitted as static markup.
+    private RenderFragment Series(string label, IReadOnlyList<long> series, double perSecond, string color) => builder =>
+    {
+        var seq = 0;
+        builder.OpenElement(seq++, "div");
+        builder.AddAttribute(seq++, "class", "bw-metric");
+
+        builder.OpenElement(seq++, "div");
+        builder.AddAttribute(seq++, "class", "bw-stat");
+        builder.OpenElement(seq++, "span");
+        builder.AddAttribute(seq++, "class", "bw-stat__label");
+        builder.AddContent(seq++, label);
+        builder.CloseElement();
+        builder.OpenElement(seq++, "span");
+        builder.AddAttribute(seq++, "class", "bw-stat__value");
+        builder.AddContent(seq++, Rate(perSecond) + " /s");
+        builder.CloseElement();
+        builder.CloseElement(); // bw-stat
+
+        builder.AddMarkupContent(seq++, Sparkline(series, color));
+        builder.CloseElement(); // bw-metric
+    };
+
+    // Renders the window as a fixed-viewBox SVG polyline (with a soft area fill under it). The value
+    // axis is scaled to the window's own peak so a quiet node still shows shape; a flat/empty window
+    // draws a baseline. preserveAspectRatio=none lets the fixed 100x32 viewBox stretch to the card.
+    private static string Sparkline(IReadOnlyList<long> series, string color)
+    {
+        const int w = 100;
+        const int h = 32;
+        var n = series.Count;
+        if (n == 0)
+        {
+            return $"<svg class=\"bw-spark\" viewBox=\"0 0 {w} {h}\" preserveAspectRatio=\"none\" aria-hidden=\"true\"></svg>";
+        }
+
+        long peak = 0;
+        for (var i = 0; i < n; i++)
+        {
+            if (series[i] > peak) peak = series[i];
+        }
+        var denom = peak == 0 ? 1d : peak;
+
+        var pts = new System.Text.StringBuilder(n * 12);
+        for (var i = 0; i < n; i++)
+        {
+            var x = n == 1 ? 0d : (double)i / (n - 1) * w;
+            var y = h - series[i] / denom * (h - 2) - 1; // 1px padding top/bottom
+            if (i > 0) pts.Append(' ');
+            pts.Append(Coord(x)).Append(',').Append(Coord(y));
+        }
+        var points = pts.ToString();
+        // Close the polyline down to the baseline and back to form the fill area.
+        var area = $"{Coord(0)},{h} {points} {Coord(w)},{h}";
+
+        return
+            $"<svg class=\"bw-spark\" viewBox=\"0 0 {w} {h}\" preserveAspectRatio=\"none\" aria-hidden=\"true\">" +
+            $"<polygon class=\"bw-spark__area\" points=\"{area}\" style=\"fill:{color};\" />" +
+            $"<polyline class=\"bw-spark__line\" points=\"{points}\" style=\"stroke:{color};\" />" +
+            "</svg>";
+    }
+
+    private static string Coord(double value)
+        => value.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
+}

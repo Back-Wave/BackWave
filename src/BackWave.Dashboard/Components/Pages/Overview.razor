@@ -1,0 +1,229 @@
+@* Overview: the one real page that proves the render spine. Honest counts only — the
+   store retains terminals within their window; rates over time come from the Meter, not
+   here (so no fabricated throughput series). Point-in-time health (issue 0064): paused
+   Queues, Queues at their Concurrency Limit, and Schedule health, plus newest-first
+   Needs-attention and Executing-now previews. All data arrives via the Monitor API. *@
+<DashboardLayout BasePath="@BasePath" Title="Overview" Active="overview" ContentOnly="@ContentOnly" Live="@Live">
+    <div class="screen" data-screen-label="Overview">
+        <header class="screen__head">
+            <div>
+                <h1 style="font:var(--type-display);letter-spacing:var(--tracking-tight);">Overview</h1>
+                <p style="color:var(--text-secondary);margin-top:4px;">
+                    @Total jobs retained across @Queues.Count @(Queues.Count == 1 ? "queue" : "queues").
+                </p>
+            </div>
+        </header>
+
+        @* Stat row: a complete state rollup, lifecycle order — Scheduled → Leased → terminals. *@
+        <div class="stats-row">
+            <div class="bw-card bw-card--quiet stat-card">
+                <div class="bw-stat">
+                    <span class="bw-stat__label">scheduled</span>
+                    <span class="bw-stat__value">@Count(JobState.Scheduled)</span>
+                </div>
+            </div>
+            <div class="bw-card bw-card--quiet stat-card">
+                <div class="bw-stat">
+                    <span class="bw-stat__label">in flight · leased</span>
+                    <span class="bw-stat__value">@Count(JobState.Leased)</span>
+                </div>
+            </div>
+            <div class="bw-card bw-card--quiet stat-card">
+                <div class="bw-stat">
+                    <span class="bw-stat__label">succeeded</span>
+                    <span class="bw-stat__value">@Count(JobState.Succeeded)</span>
+                </div>
+            </div>
+            <div class="bw-card bw-card--quiet stat-card">
+                <div class="bw-stat">
+                    <span class="bw-stat__label">cancelled</span>
+                    <span class="bw-stat__value">@Count(JobState.Cancelled)</span>
+                </div>
+            </div>
+            <div class="bw-card bw-card--quiet stat-card">
+                <div class="bw-stat">
+                    <span class="bw-stat__label">dead-lettered</span>
+                    <span class="bw-stat__value">@Count(JobState.DeadLettered)</span>
+                </div>
+            </div>
+            <div class="bw-card bw-card--quiet stat-card">
+                <div class="bw-stat">
+                    <span class="bw-stat__label">quarantined</span>
+                    <span class="bw-stat__value">@Count(JobState.Quarantined)</span>
+                </div>
+            </div>
+        </div>
+
+        @* Health signals: point-in-time facts that explain why nothing is draining. *@
+        <div class="stats-row">
+            <div class="bw-card bw-card--quiet stat-card">
+                <div class="bw-stat">
+                    <span class="bw-stat__label">paused queues</span>
+                    <span class="bw-stat__value">@PausedQueues.Count</span>
+                    <span class="bw-stat__delta">
+                        @(PausedQueues.Count == 0 ? "none — all Queues claiming" : string.Join(", ", PausedQueues))
+                    </span>
+                </div>
+            </div>
+            <div class="bw-card bw-card--quiet stat-card">
+                <div class="bw-stat">
+                    <span class="bw-stat__label">queues at concurrency limit</span>
+                    <span class="bw-stat__value">@QueuesAtCap.Count</span>
+                    <span class="bw-stat__delta">
+                        @(QueuesAtCap.Count == 0 ? "none capped out" : string.Join(", ", QueuesAtCap))
+                    </span>
+                </div>
+            </div>
+            <div class="bw-card bw-card--quiet stat-card">
+                <div class="bw-stat">
+                    <span class="bw-stat__label">recurring schedules</span>
+                    <span class="bw-stat__value">@Schedules.Count</span>
+                    <span class="bw-stat__delta">
+                        @ErroredSchedules errored · @SkippedTickCount skipped ticks
+                    </span>
+                </div>
+            </div>
+        </div>
+
+        @* Queue depths: the real per-Queue table, full width so its columns have room. *@
+        <div class="bw-card">
+            <div class="bw-card__header">
+                <span class="bw-card__title">Queue depths</span>
+                <span class="bw-card__aside"><a href="@($"{BasePath}/queues")">@Queues.Count @(Queues.Count == 1 ? "queue" : "queues") →</a></span>
+            </div>
+            @if (Queues.Count == 0)
+            {
+                <p class="ptable__empty">No jobs yet. Queue depths appear as soon as something is enqueued.</p>
+            }
+            else
+            {
+                <div class="ptable-scroll">
+                <table class="ptable">
+                    <thead>
+                        <tr>
+                            <th>Queue</th>
+                            @foreach (var state in DashboardGlossary.StateOrder)
+                            {
+                                <th class="num">@DashboardGlossary.StateName(state)</th>
+                            }
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var queue in Queues)
+                        {
+                            <tr>
+                                <td data-label="Queue">
+                                    <a class="mono" href="@($"{BasePath}/jobs?queue={Uri.EscapeDataString(queue)}")">@queue</a>
+                                </td>
+                                @foreach (var state in DashboardGlossary.StateOrder)
+                                {
+                                    <td class="num" data-label="@DashboardGlossary.StateName(state)">@Cell(queue, state)</td>
+                                }
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                </div>
+            }
+        </div>
+
+        @* Previews: the most recent rows that need a human, newest-first (issue 0063).
+           Each is a full-width table — the shared JobTable has 7 columns and needs the room,
+           so stacking them keeps every column readable and aligned. *@
+        <div class="bw-card">
+            <div class="bw-card__header">
+                <span class="bw-card__title">Needs attention</span>
+                <span class="bw-card__aside"><a href="@($"{BasePath}/failures")">all failures →</a></span>
+            </div>
+            <JobTable BasePath="@BasePath" Jobs="@NeedsAttention"
+                      EmptyText="No Dead-Lettered or Quarantined jobs. Failures show up here as they happen." />
+        </div>
+
+        <div class="bw-card">
+            <div class="bw-card__header">
+                <span class="bw-card__title">Executing now</span>
+                <span class="bw-card__aside"><a href="@($"{BasePath}/executing")">all executing →</a></span>
+            </div>
+            <JobTable BasePath="@BasePath" Jobs="@Executing"
+                      EmptyText="No jobs are Leased right now. Active workers appear here while they hold a Lease." />
+        </div>
+
+        @* Live throughput + endpoint metrics: per-node, ephemeral, fed by the in-process MeterListener
+           ring buffer (ADR 0032). Renders an honest empty state when metrics are not registered. *@
+        <MetricsPanel Snapshot="@Metrics" />
+
+        @* One-line failure recap alongside the live view. *@
+        <div class="bw-card">
+            <div class="bw-card__header"><span class="bw-card__title">Failures</span></div>
+            <p>
+                <strong>@Count(JobState.DeadLettered)</strong> Dead-Lettered and
+                <strong>@Count(JobState.Quarantined)</strong> Quarantined —
+                <a href="@($"{BasePath}/failures")">inspect failures</a>.
+            </p>
+        </div>
+    </div>
+</DashboardLayout>
+
+@code {
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+    [Parameter, EditorRequired] public IReadOnlyList<QueueStateCount> Depths { get; set; } = [];
+    [Parameter, EditorRequired] public IReadOnlyList<QueueSettings> Settings { get; set; } = [];
+    [Parameter, EditorRequired] public IReadOnlyList<ScheduleStatus> Schedules { get; set; } = [];
+    [Parameter, EditorRequired] public IReadOnlyList<JobSnapshot> DeadLettered { get; set; } = [];
+    [Parameter, EditorRequired] public IReadOnlyList<JobSnapshot> Quarantined { get; set; } = [];
+    [Parameter, EditorRequired] public IReadOnlyList<JobSnapshot> Executing { get; set; } = [];
+
+    /// <summary>The live in-process throughput/endpoint snapshot, or <see langword="null"/> when the
+    /// metrics collector is not registered — the panel then renders its graceful empty state.</summary>
+    [Parameter] public MetricsSnapshot? Metrics { get; set; }
+
+    /// <summary>Rows shown in each preview table.</summary>
+    [Parameter] public int PreviewRows { get; set; } = 5;
+
+    /// <summary>Render only the live region (SSE fragment) rather than the full document.</summary>
+    [Parameter] public bool ContentOnly { get; set; }
+
+    /// <summary>Wrap in the #bw-live region and inline the SSE client.</summary>
+    [Parameter] public bool Live { get; set; }
+
+    private List<string> Queues = [];
+    private Dictionary<(string Queue, JobState State), int> ByCell = [];
+
+    // Health signals, all derived from the point-in-time Monitor reads.
+    private List<string> PausedQueues = [];
+    private List<string> QueuesAtCap = [];
+    private int ErroredSchedules;
+    private int SkippedTickCount;
+
+    // Previews: newest-first lists merged/clamped to PreviewRows.
+    private List<JobSnapshot> NeedsAttention = [];
+
+    private int Total => Depths.Sum(d => d.Count);
+    private int Count(JobState state) => Depths.Where(d => d.State == state).Sum(d => d.Count);
+    private int Cell(string queue, JobState state) => ByCell.GetValueOrDefault((queue, state));
+
+    protected override void OnParametersSet()
+    {
+        Queues = Depths.Select(d => d.Queue).Distinct().Order(StringComparer.Ordinal).ToList();
+        ByCell = Depths.ToDictionary(d => (d.Queue, d.State), d => d.Count);
+
+        // Paused: the first thing to check when a Queue stops draining.
+        PausedQueues = Settings.Where(s => s.Paused).Select(s => s.Queue).Order(StringComparer.Ordinal).ToList();
+
+        // At cap: Leased depth equals the configured Concurrency Limit — a healthy-looking bottleneck.
+        QueuesAtCap = Settings
+            .Where(s => s.ConcurrencyLimit is { } limit
+                        && Depths.Where(d => d.Queue == s.Queue && d.State == JobState.Leased).Sum(d => d.Count) == limit)
+            .Select(s => s.Queue).Order(StringComparer.Ordinal).ToList();
+
+        // Schedule health: how many are poisoned (Error set) and how many ticks they've recorded skipping.
+        ErroredSchedules = Schedules.Count(s => s.Error is not null);
+        SkippedTickCount = Schedules.Sum(s => s.SkippedTicks.Count);
+
+        // No multi-state filter exists, so merge the two failure lists and re-clamp newest-first.
+        NeedsAttention = DeadLettered.Concat(Quarantined)
+            .OrderByDescending(j => j.Sequence)
+            .Take(PreviewRows)
+            .ToList();
+    }
+}

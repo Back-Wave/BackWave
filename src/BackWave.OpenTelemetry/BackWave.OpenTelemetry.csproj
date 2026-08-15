@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>$(ShipTfms)</TargetFrameworks>
+    <Description>One-call OpenTelemetry registration for BackWave: AddBackWaveInstrumentation() wires the Core job-lifecycle traces and metrics onto a TracerProviderBuilder/MeterProviderBuilder, with per-adapter opt-in for store spans. Subscribes by source name, so it drags in neither Core nor any adapter assembly.</Description>
+    <PackageTags>$(PackageTags);opentelemetry;otel;telemetry;tracing;metrics;observability;instrumentation</PackageTags>
+    <IsAotCompatible>true</IsAotCompatible>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The OTel API only: AddSource/AddMeter live on TracerProviderBuilder/MeterProviderBuilder here,
+         not in the full SDK. Subscription is by string source name, so this package needs no
+         ProjectReference to Core or the adapters - opting into an adapter does not drag its assembly in. -->
+    <PackageReference Include="OpenTelemetry.Api" Version="1.16.0" />
+  </ItemGroup>
+
+</Project>

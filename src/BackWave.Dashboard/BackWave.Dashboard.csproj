@@ -1,0 +1,44 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BackWave\BackWave.csproj" />
+    <!-- The embedded dashboard already requires the BackWave host at runtime (it reads the
+         BackWaveMonitor that AddBackWave registers). The explicit reference lets a host opt the
+         live-metrics collector into the AddBackWave block via backwave.AddDashboardMetrics(). -->
+    <ProjectReference Include="..\BackWave.Hosting\BackWave.Hosting.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="BackWave.Dashboard.Tests" />
+    <!-- BackWave.Pro.Dashboard contributes the Workflow surface (Pro feature) through the public
+         extension seam, but reuses internal presentation helpers (the glossary, the renderer) that
+         stay deliberately internal to the free dashboard. -->
+    <InternalsVisibleTo Include="BackWave.Pro.Dashboard" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The design system is inlined into <head> at render time: zero static assets to host. -->
+    <EmbeddedResource Include="Assets\design-system.css" />
+  </ItemGroup>
+
+  <!-- Deliberately NOT marked IsAotCompatible. The package's own code is trim/AOT-clean, but its
+       pages render through Blazor's HtmlRenderer, whose component parameter/[Inject] reflection
+       (Microsoft.AspNetCore.Components) emits IL2072 trim warnings under a consumer's PublishAot that
+       we cannot remove. It renders correctly under NativeAOT (verified end to end), but we don't stamp
+       the guarantee while the framework surface warns - same honest stance as the SqlServer/Sqlite
+       adapters. Do not add IsAotCompatible here until the Blazor component runtime is trim-clean. -->
+  <PropertyGroup>
+    <Description>Read-only monitoring dashboard for BackWave: jobs, queues, failures, schedules, and observers, rendered server-side with zero static assets to host.</Description>
+    <PackageTags>$(PackageTags);dashboard;monitoring;observability;ui</PackageTags>
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>$(ShipTfms)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+</Project>

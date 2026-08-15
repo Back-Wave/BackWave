@@ -1,0 +1,76 @@
+name: Release
+
+# Publishes every shipped package to nuget.org at one lockstep version. The version comes from the
+# tag: MinVer turns an annotated tag `v1.0.0` into package version 1.0.0 (see Directory.Build.props),
+# so releasing is `git tag -a v1.0.0 -m ... && git push origin v1.0.0`. Tag a commit that already
+# passed CI on main. workflow_dispatch is a manual re-run; --skip-duplicate makes a re-push a no-op.
+#
+# Auth is NuGet Trusted Publishing (OIDC) — no long-lived API key secret. This job mints a GitHub
+# OIDC token, NuGet/login exchanges it for a 1-hour nuget.org key that matches a Trusted Publishing
+# policy configured on nuget.org (owner Back-Wave, repo BackWave, workflow file release.yml). The only
+# config on GitHub is the non-secret NUGET_USER (your nuget.org profile name).
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # mint the OIDC token NuGet exchanges for a short-lived key
+      contents: read  # checkout
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # MinVer needs full history + tags to compute the version
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore -c Release
+
+      # Pack only the shipped packages by explicit path — never the samples, benchmarks, tools, or
+      # test projects, even though they build. The source generator packs inside BackWave, not on its
+      # own. BackWave.Pro's Pack target refuses to publish with the dev license key embedded.
+      # Not --no-build: BackWave references the generator project, and pack --no-build trips
+      # NETSDK1085 on it; --no-restore keeps the pack incremental off the Build step above.
+      - name: Pack
+        run: |
+          for proj in \
+            src/BackWave/BackWave.csproj \
+            src/BackWave.Hosting/BackWave.Hosting.csproj \
+            src/BackWave.Postgres/BackWave.Postgres.csproj \
+            src/BackWave.SqlServer/BackWave.SqlServer.csproj \
+            src/BackWave.Sqlite/BackWave.Sqlite.csproj \
+            src/BackWave.EntityFrameworkCore/BackWave.EntityFrameworkCore.csproj \
+            src/BackWave.OpenTelemetry/BackWave.OpenTelemetry.csproj \
+            src/BackWave.Testing/BackWave.Testing.csproj \
+            src/BackWave.Conformance/BackWave.Conformance.csproj \
+            src/BackWave.Dashboard/BackWave.Dashboard.csproj \
+            src/BackWave.Pro/BackWave.Pro.csproj \
+            src/BackWave.Pro.Dashboard/BackWave.Pro.Dashboard.csproj \
+            src/BackWave.Pro.Mcp/BackWave.Pro.Mcp.csproj ; do
+            dotnet pack "$proj" --no-restore -c Release -o "${{ runner.temp }}/nupkgs"
+          done
+
+      # Exchange the job's OIDC token for a short-lived nuget.org API key (valid 1 hour). Done right
+      # before the push so it can't expire mid-run. `user` is your nuget.org profile name, not email.
+      - name: NuGet login (OIDC → short-lived key)
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: Push to nuget.org
+        run: >
+          dotnet nuget push "${{ runner.temp }}/nupkgs/*.nupkg"
+          --api-key ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate

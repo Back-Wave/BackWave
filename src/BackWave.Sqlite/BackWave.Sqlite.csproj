@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>$(ShipTfms)</TargetFrameworks>
+    <Description>SQLite storage adapter for BackWave, the first Embedded Adapter (single host, WAL + BEGIN IMMEDIATE whole-writer serialization, co-resident Transactional Enqueue).</Description>
+    <PackageTags>$(PackageTags);sqlite;embedded</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BackWave\BackWave.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.9" />
+    <!-- Pins the native SQLite binary forward off the 2.x line, which carries advisory
+         GHSA-2m69-gcr7-jv3q (NU1903) on its bundled SQLite. Microsoft.Data.Sqlite still
+         references SQLitePCLRaw.bundle_e_sqlite3 2.1.x transitively (true through at least
+         10.0.9), so this direct pin to 3.x is required to clear the audit error.
+         REMOVE this line once Microsoft.Data.Sqlite bumps its bundle to 3.x internally and
+         a vulnerable-package audit stays clean without it. -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Schema\*.sql" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="BackWave.Sqlite.Tests" />
+  </ItemGroup>
+
+</Project>

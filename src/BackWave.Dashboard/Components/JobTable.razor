@@ -1,0 +1,99 @@
+@* Shared jobs table: the columns and the state→tone badge mapping reused by the Jobs,
+   Failures, and Schedule-detail views. Empty state uses the design system's ptable row. *@
+@if (Jobs.Count == 0)
+{
+    <p class="ptable__empty">@EmptyText</p>
+}
+else
+{
+    <div class="ptable-scroll">
+    <table class="ptable">
+        <thead>
+            <tr>
+                <th>Job</th>
+                <th>Wire Name</th>
+                <th>Queue</th>
+                <th>State</th>
+                <th class="num">Attempt</th>
+                <th>Due Time</th>
+                <th>Terminal At</th>
+                @if (ShowTags)
+                {
+                    <th>Tags</th>
+                }
+                @if (RowAction is not null)
+                {
+                    <th>Actions</th>
+                }
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var job in Jobs)
+            {
+                <tr>
+                    <td data-label="Job">
+                        <a class="mono" href="@($"{BasePath}/jobs/{job.JobId}")">@(job.JobId.ToString()[..8])…</a>
+                    </td>
+                    <td data-label="Wire Name">@job.WireName</td>
+                    <td class="mono" data-label="Queue">@job.Queue</td>
+                    <td data-label="State">
+                        <span class="bw-badge bw-badge--@DashboardGlossary.Tone(job.State)">
+                            <span class="bw-badge__dot"></span>@DashboardGlossary.StateName(job.State)
+                        </span>
+                    </td>
+                    <td class="num" data-label="Attempt">@job.Attempt</td>
+                    <td class="mono nowrap" data-label="Due Time">@DashboardGlossary.Instant(job.DueTime)</td>
+                    <td class="mono nowrap" data-label="Terminal At">@(job.TerminalAt is { } terminalAt ? DashboardGlossary.Instant(terminalAt) : "—")</td>
+                    @if (TagHref is { } tagHref)
+                    {
+                        @* Tag pills (ADR 0022, issue 0113): an empty tag set renders NOTHING — no empty
+                           container, just a dash placeholder so the column stays aligned. Each pill is a
+                           click-to-filter link that ANDs its predicate onto the active filter. *@
+                        <td data-label="Tags">
+                            @if (job.Tags.Count == 0)
+                            {
+                                <span class="bw-tags__empty">—</span>
+                            }
+                            else
+                            {
+                                <span class="bw-tags">
+                                    @foreach (var tag in job.Tags)
+                                    {
+                                        <a class="bw-tag" href="@tagHref(tag)" title="Filter by this Tag">@DashboardGlossary.TagLabel(tag)</a>
+                                    }
+                                </span>
+                            }
+                        </td>
+                    }
+                    @if (RowAction is not null)
+                    {
+                        <td data-label="Actions">@RowAction(job)</td>
+                    }
+                </tr>
+            }
+        </tbody>
+    </table>
+    </div>
+}
+
+@code {
+    /// <summary>Path the dashboard is mounted at, for building job-detail links.</summary>
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+
+    [Parameter, EditorRequired] public IReadOnlyList<JobSnapshot> Jobs { get; set; } = [];
+
+    /// <summary>Copy shown when no jobs match — each view phrases its own empty state.</summary>
+    [Parameter] public string EmptyText { get; set; } = "No jobs match.";
+
+    /// <summary>Optional per-row Operator Action cell (e.g. Requeue, Cancel). Adds an Actions column when set.</summary>
+    [Parameter] public RenderFragment<JobSnapshot>? RowAction { get; set; }
+
+    /// <summary>
+    /// The link a tag pill points at, given the Tag the pill renders (issue 0113). Set by the
+    /// Jobs page to build a click-to-filter URL that ANDs the Tag's predicate onto the active
+    /// filter; when null the Tags column is not shown at all (views that don't filter by Tag).
+    /// </summary>
+    [Parameter] public Func<JobTag, string>? TagHref { get; set; }
+
+    private bool ShowTags => TagHref is not null;
+}

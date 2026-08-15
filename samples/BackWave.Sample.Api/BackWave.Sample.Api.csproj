@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <!-- A playground, never a shipped artifact: must never be packed or referenced by the library. -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="10.2.1" />
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="10.0.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- OpenTelemetry SDK + exporters for the reference wiring in Program.cs. The versions track the
+         OpenTelemetry.Api 1.16.0 that BackWave.OpenTelemetry pins, so the SDK the exporters bring in and
+         the API the registration package compiles against stay on the same 1.16.0 line. -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.16.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.16.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.16.0" />
+    <ProjectReference Include="..\..\src\BackWave.OpenTelemetry\BackWave.OpenTelemetry.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\BackWave\BackWave.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Pro\BackWave.Pro.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Hosting\BackWave.Hosting.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Dashboard\BackWave.Dashboard.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Pro.Dashboard\BackWave.Pro.Dashboard.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Pro.Mcp\BackWave.Pro.Mcp.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Postgres\BackWave.Postgres.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.SqlServer\BackWave.SqlServer.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Sqlite\BackWave.Sqlite.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.EntityFrameworkCore\BackWave.EntityFrameworkCore.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.SourceGenerators\BackWave.SourceGenerators.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+</Project>

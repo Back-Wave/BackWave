@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so pushes don't stack up in the queue.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Database-backed adapter tests: the long pole. Postgres + SQL Server boot in the
+  # background while restore+build run, so their startup is hidden under compile time.
+  db-tests:
+    name: DB-backed tests (Postgres + SQL Server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v5
+        with:
+          # net10 builds every shipped TFM (net8/net9 via reference packs); the net8 and net9
+          # runtimes are here so the multi-targeted test projects can also execute on those.
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/Directory.Packages.props', '**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+      - name: Start Postgres and SQL Server (detached; boot overlaps with build)
+        run: docker compose up -d postgres sqlserver
+      - name: Restore
+        run: dotnet restore
+      - name: Build
+        run: dotnet build --no-restore -c Release
+      - name: Wait for databases to be healthy
+        run: docker compose up -d --wait postgres sqlserver
+      - name: Test (database-backed adapters)
+        run: |
+          rc=0
+          for proj in \
+            tests/BackWave.Postgres.Tests \
+            tests/BackWave.SqlServer.Tests \
+            tests/BackWave.EntityFrameworkCore.Tests \
+            tests/BackWave.SchemaGate.Tests \
+            tests/BackWave.Upgrade.Tests; do
+            dotnet test "$proj" --no-build -c Release --filter "Category!=Soak" || rc=1
+          done
+          exit $rc
+
+  # Everything else: unit tests, embedded Sqlite, dashboards, source generators, and the
+  # Simulator seed battery. No external database, so no Docker on this runner.
+  unit-tests:
+    name: Unit + Sqlite + dashboard + simulator tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/Directory.Packages.props', '**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+      - name: Restore
+        run: dotnet restore
+      - name: Build
+        run: dotnet build --no-restore -c Release
+      - name: Test (includes the Simulator seed battery; soak runs nightly)
+        run: |
+          rc=0
+          for proj in \
+            tests/BackWave.Tests \
+            tests/BackWave.Sqlite.Tests \
+            tests/BackWave.Dashboard.Tests \
+            tests/BackWave.Hosting.Tests \
+            tests/BackWave.Testing.Tests \
+            tests/BackWave.SourceGenerators.Tests \
+            tests/BackWave.Pro.Tests \
+            tests/BackWave.Pro.Dashboard.Tests \
+            tests/BackWave.Pro.Mcp.Tests \
+            tests/BackWave.Benchmarks.Tests; do
+            dotnet test "$proj" --no-build -c Release --filter "Category!=Soak" || rc=1
+          done
+          exit $rc

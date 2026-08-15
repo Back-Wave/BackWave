@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Design-time code fixes for BackWave analyzer diagnostics (e.g. BW0007).</Description>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <IsRoslynComponent>true</IsRoslynComponent>
+    <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <!-- Not shipped as its own package: the BackWave package packs this dll into analyzers/dotnet/cs
+         alongside the generator so a plain `dotnet add package BackWave` gets the code fix too. -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Workspaces carries the CodeFixProvider/CodeAction surface. It is host-provided (Roslyn ships it
+         in the IDE / build host), so PrivateAssets=all keeps it out of the analyzer we pack and off the
+         generator's own dependency graph - csc never loads Workspaces for generation. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.14.0" PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>

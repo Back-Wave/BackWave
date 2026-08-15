@@ -1,0 +1,1079 @@
+/* ============================================================
+   BackWave Design System — inlined into the dashboard <head>.
+   Ported from the design doc. The @font-face webfont blocks are
+   intentionally omitted: the dashboard ships zero static assets,
+   so the genuine families fall back to the next family in each
+   stack (Hanken Grotesk -> Helvetica/Arial, Spline Sans Mono ->
+   SF Mono/Menlo). Everything else is verbatim.
+
+   Ink-on-paper system, shifted cool. Light = blue pen on cool
+   drafting paper. Dark = chalk on a deep ocean board.
+   Brand: ink navy #1B4079 - wave azure #2D72F0. The "wave" is the
+   bright moving thing - jobs in flight. Type is never hand-drawn;
+   only the linework is.
+   ============================================================ */
+
+:root {
+  /* Tell the browser which system palette to draw native chrome in
+     (scrollbars, <select> popups, autofill, native focus rings) so
+     they track our theme. Flipped to `dark` under [data-theme="dark"]. */
+  color-scheme: light;
+
+  /* --- Paper (surfaces) — cool drafting stock --- */
+  --paper-0: #F1F5FB;          /* app background — cool paper */
+  --paper-1: #E7EEF8;          /* sunken areas, wells, table stripes */
+  --paper-2: #FBFCFF;          /* raised card surface */
+  --paper-3: #FFFFFF;          /* inputs, popovers — brightest sheet */
+
+  /* --- Ink (text + strokes) — navy pen --- */
+  --ink-900: #0E2546;          /* headings, primary text */
+  --ink-700: #1B4079;          /* brand navy — strokes, emphasis, links */
+  --ink-500: #566F92;          /* secondary text, captions */
+  --ink-300: #98ABC8;          /* placeholders, disabled */
+  --ink-150: #C8D5E8;          /* faint construction lines */
+
+  /* --- Wave accent — the bright azure dot --- */
+  --wave-600: #1A56D0;         /* pressed / hover-dark */
+  --wave-500: #2D72F0;         /* primary accent — the crest */
+  --wave-300: #8BB4F7;         /* charts, secondary marks */
+  --wave-100: #DEEAFD;         /* tint fills, selected rows */
+
+  /* --- Semantic inks (muted, like colored drawing pens) --- */
+  --pen-red: #C6463A;          /* danger / failed */
+  --pen-red-tint: #F8E3DF;
+  --pen-amber: #B07C1F;        /* warning / scheduled */
+  --pen-amber-tint: #F6EBD3;
+  --pen-green: #1E9466;        /* success / succeeded */
+  --pen-green-tint: #D7F0E4;
+
+  /* --- Lines --- */
+  --line-strong: var(--ink-700);   /* component borders — the pen line */
+  --line-soft: #D2DDED;            /* hairline dividers, grid rules */
+  --line-faint: #E4EBF5;           /* table grids, ghost guides */
+
+  /* --- Semantic aliases --- */
+  --surface-app: var(--paper-0);
+  --surface-card: var(--paper-2);
+  --surface-sunken: var(--paper-1);
+  --surface-input: var(--paper-3);
+  --text-heading: var(--ink-900);
+  --text-body: var(--ink-900);
+  --text-secondary: var(--ink-500);
+  --text-muted: var(--ink-300);
+  --text-accent: var(--wave-600);
+  --text-link: var(--ink-700);
+  --text-on-accent: #F8FBFF;
+  --text-on-ink: #F4F8FF;
+  --accent: var(--wave-500);
+  --accent-hover: var(--wave-600);
+  --selection-bg: var(--wave-100);
+}
+
+/* --- Night-ops theme (chalk on a deep ocean board) --- */
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --paper-0: #0C1B30;          /* the board */
+  --paper-1: #081325;          /* sunken */
+  --paper-2: #122541;          /* raised card */
+  --paper-3: #16304F;          /* inputs, popovers */
+
+  --ink-900: #EAF1FB;          /* chalk */
+  --ink-700: #BBD2F0;          /* chalk-blue strokes */
+  --ink-500: #8AA3C6;
+  --ink-300: #5B7299;
+  --ink-150: #2C4567;
+
+  --wave-600: #5B9BFF;
+  --wave-500: #3D86FF;
+  --wave-300: #1C4FA8;
+  --wave-100: #15315A;
+
+  --pen-red: #E08A72;
+  --pen-red-tint: #3A2622;
+  --pen-amber: #D9B36A;
+  --pen-amber-tint: #392F1F;
+  --pen-green: #4FC795;
+  --pen-green-tint: #103A2C;
+
+  --line-strong: var(--ink-700);
+  --line-soft: #284568;
+  --line-faint: #1C3658;
+
+  --text-on-accent: #06122A;
+  --text-on-ink: #0C1B30;
+  --text-accent: var(--wave-500);
+  --selection-bg: #1A3E72;
+}
+
+/* ============================================================
+   BackWave — Typography tokens
+   ============================================================ */
+
+:root {
+  --font-sans: "Hanken Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "Spline Sans Mono", "SF Mono", Menlo, monospace;
+
+  /* Scale (rem) */
+  --text-2xs: 0.6875rem;   /* 11px — annotation labels (mono, uppercase) */
+  --text-xs: 0.75rem;      /* 12px — captions, badges */
+  --text-sm: 0.875rem;     /* 14px — UI default, body in dense apps */
+  --text-md: 1rem;         /* 16px — comfortable body */
+  --text-lg: 1.1875rem;    /* 19px — card titles */
+  --text-xl: 1.5rem;       /* 24px — page titles */
+  --text-2xl: 2rem;        /* 32px — section displays */
+  --text-3xl: 2.75rem;     /* 44px — big numbers, hero */
+
+  /* Weights — Hanken Grotesk */
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* Line heights */
+  --leading-tight: 1.15;   /* displays, big numbers */
+  --leading-snug: 1.35;    /* titles */
+  --leading-body: 1.55;    /* paragraphs */
+
+  /* Letterspacing */
+  --tracking-tight: -0.015em;  /* xl and up */
+  --tracking-normal: 0;
+  --tracking-label: 0.08em;    /* uppercase mono annotations */
+
+  /* Composite styles */
+  --type-display: var(--weight-bold) var(--text-2xl)/var(--leading-tight) var(--font-sans);
+  --type-title: var(--weight-semibold) var(--text-xl)/var(--leading-snug) var(--font-sans);
+  --type-card-title: var(--weight-semibold) var(--text-lg)/var(--leading-snug) var(--font-sans);
+  --type-body: var(--weight-regular) var(--text-sm)/var(--leading-body) var(--font-sans);
+  --type-label: var(--weight-medium) var(--text-sm)/1.2 var(--font-sans);
+  --type-annotation: var(--weight-medium) var(--text-2xs)/1.2 var(--font-mono);
+  --type-figure: var(--weight-medium) var(--text-3xl)/var(--leading-tight) var(--font-mono);
+}
+
+/* ============================================================
+   BackWave — Spacing, sizing & the sketch geometry
+   ============================================================ */
+
+:root {
+  /* --- Space scale (4px base) --- */
+  --space-1: 0.25rem;   /*  4px */
+  --space-2: 0.5rem;    /*  8px */
+  --space-3: 0.75rem;   /* 12px */
+  --space-4: 1rem;      /* 16px */
+  --space-5: 1.5rem;    /* 24px */
+  --space-6: 2rem;      /* 32px */
+  --space-7: 3rem;      /* 48px */
+  --space-8: 4rem;      /* 64px */
+
+  /* --- Sketch radii: each corner slightly different, like a drawn box.
+         Use these INSTEAD of uniform border-radius. --- */
+  --radius-sketch-sm: 0.4rem 0.55rem 0.45rem 0.6rem / 0.55rem 0.45rem 0.6rem 0.4rem;
+  --radius-sketch-md: 0.65rem 0.9rem 0.7rem 1rem / 0.9rem 0.7rem 1rem 0.65rem;
+  --radius-sketch-lg: 1rem 1.4rem 1.1rem 1.5rem / 1.4rem 1.1rem 1.5rem 1rem;
+  --radius-pill: 2rem 1.8rem 2rem 1.7rem / 1.8rem 2rem 1.7rem 2rem;
+  --radius-blob: 49% 51% 52% 48% / 52% 48% 51% 49%;   /* avatars, dots */
+
+  /* --- Pen weights --- */
+  --stroke-hair: 1px;       /* construction lines, dividers */
+  --stroke-pen: 1.5px;      /* the standard drawn outline */
+  --stroke-marker: 2.5px;   /* emphasis, selected states */
+
+  /* --- Control sizing --- */
+  --control-sm: 2rem;       /* 32px */
+  --control-md: 2.5rem;     /* 40px */
+  --control-lg: 3rem;       /* 48px */
+  --sidebar-w: 15.5rem;
+  --sidebar-rail-w: 3.5rem;  /* collapsed icon-rail width below ~900px viewport */
+}
+
+/* ============================================================
+   BackWave — Effects: paper grain, ink shadows, hatch fills,
+   drawn accents (underline, dividers), focus & motion.
+   ============================================================ */
+
+:root {
+  /* --- Paper grain: subtle monochrome noise, overlaid on surfaces. --- */
+  --texture-paper: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='240' height='240' filter='url(%23g)' opacity='0.55'/%3E%3C/svg%3E");
+  --texture-paper-opacity: 0.05;
+
+  /* --- Shadows: graphite, soft and close. Never glossy. --- */
+  --shadow-card: 0 1px 0 rgba(14, 37, 70, 0.06), 0 3px 10px rgba(14, 37, 70, 0.08);
+  --shadow-raised: 0 2px 0 rgba(14, 37, 70, 0.05), 0 8px 24px rgba(14, 37, 70, 0.13);
+  --shadow-popover: 0 3px 0 rgba(14, 37, 70, 0.04), 0 12px 32px rgba(14, 37, 70, 0.17);
+
+  /* --- Hatch fills: tight diagonal pen hatching (SVG tiles). --- */
+  --hatch-navy: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M-2 2 L2 -2 M-2 10 L10 -2 M6 10 L10 6' stroke='%231B4079' stroke-width='1.2' fill='none'/%3E%3C/svg%3E");
+  --hatch-wave: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M-2 2 L2 -2 M-2 10 L10 -2 M6 10 L10 6' stroke='%232D72F0' stroke-width='1.2' fill='none'/%3E%3C/svg%3E");
+  --hatch-green: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M-2 2 L2 -2 M-2 10 L10 -2 M6 10 L10 6' stroke='%231E9466' stroke-width='1.2' fill='none'/%3E%3C/svg%3E");
+  --hatch-red: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M-2 2 L2 -2 M-2 10 L10 -2 M6 10 L10 6' stroke='%23C6463A' stroke-width='1.2' fill='none'/%3E%3C/svg%3E");
+  --hatch-amber: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M-2 2 L2 -2 M-2 10 L10 -2 M6 10 L10 6' stroke='%23B07C1F' stroke-width='1.2' fill='none'/%3E%3C/svg%3E");
+  --hatch-paper: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M-2 2 L2 -2 M-2 10 L10 -2 M6 10 L10 6' stroke='%23F1F5FB' stroke-width='1.2' fill='none'/%3E%3C/svg%3E");
+  --hatch-cross: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10'%3E%3Cpath d='M-2 2 L2 -2 M-2 12 L12 -2 M8 12 L12 8 M-2 8 L8 -2 M2 12 L12 2' stroke='%231B4079' stroke-width='0.9' opacity='0.8' fill='none'/%3E%3C/svg%3E");
+
+  /* --- Drawn accents (data-URI strokes, provided in both inks) --- */
+  --stroke-underline: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='8' viewBox='0 0 160 8'%3E%3Cpath d='M3 5.5 C 40 3.2, 95 3.0, 157 4.6' fill='none' stroke='%231B4079' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E");
+  --stroke-underline-wave: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='8' viewBox='0 0 160 8'%3E%3Cpath d='M3 5.5 C 40 3.2, 95 3.0, 157 4.6' fill='none' stroke='%232D72F0' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E");
+  --stroke-rule: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='600' height='6' viewBox='0 0 600 6'%3E%3Cpath d='M2 3.4 C 120 2.2, 300 4.1, 440 2.9 S 560 3.6, 598 2.8' fill='none' stroke='%231B4079' stroke-width='1.7' stroke-linecap='round' opacity='0.7'/%3E%3C/svg%3E");
+
+  /* --- Focus: a second pen pass around the control --- */
+  --focus-ring: 0 0 0 2px var(--surface-app), 0 0 0 4px var(--wave-500);
+
+  /* --- Motion: calm. Things settle like a page laid flat. --- */
+  --ease-settle: cubic-bezier(0.25, 0.6, 0.3, 1);
+  --duration-fast: 120ms;
+  --duration-base: 200ms;
+  --duration-slow: 320ms;
+}
+
+[data-theme="dark"] {
+  --texture-paper-opacity: 0.04;
+  --hatch-navy: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M-2 2 L2 -2 M-2 10 L10 -2 M6 10 L10 6' stroke='%23BBD2F0' stroke-width='1.2' fill='none'/%3E%3C/svg%3E");
+  --hatch-wave: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M-2 2 L2 -2 M-2 10 L10 -2 M6 10 L10 6' stroke='%233D86FF' stroke-width='1.2' fill='none'/%3E%3C/svg%3E");
+  --hatch-green: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M-2 2 L2 -2 M-2 10 L10 -2 M6 10 L10 6' stroke='%234FC795' stroke-width='1.2' fill='none'/%3E%3C/svg%3E");
+  --hatch-red: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M-2 2 L2 -2 M-2 10 L10 -2 M6 10 L10 6' stroke='%23E08A72' stroke-width='1.2' fill='none'/%3E%3C/svg%3E");
+  --hatch-amber: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M-2 2 L2 -2 M-2 10 L10 -2 M6 10 L10 6' stroke='%23D9B36A' stroke-width='1.2' fill='none'/%3E%3C/svg%3E");
+  --hatch-paper: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M-2 2 L2 -2 M-2 10 L10 -2 M6 10 L10 6' stroke='%230C1B30' stroke-width='1.2' fill='none'/%3E%3C/svg%3E");
+  --hatch-cross: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10'%3E%3Cpath d='M-2 2 L2 -2 M-2 12 L12 -2 M8 12 L12 8 M-2 8 L8 -2 M2 12 L12 2' stroke='%23BBD2F0' stroke-width='0.9' opacity='0.8' fill='none'/%3E%3C/svg%3E");
+  --shadow-card: 0 1px 0 rgba(0, 0, 0, 0.2), 0 3px 10px rgba(0, 0, 0, 0.3);
+  --shadow-raised: 0 2px 0 rgba(0, 0, 0, 0.2), 0 8px 24px rgba(0, 0, 0, 0.4);
+  --shadow-popover: 0 3px 0 rgba(0, 0, 0, 0.2), 0 12px 32px rgba(0, 0, 0, 0.5);
+  --stroke-underline: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='8' viewBox='0 0 160 8'%3E%3Cpath d='M3 5.5 C 40 3.2, 95 3.0, 157 4.6' fill='none' stroke='%23BBD2F0' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E");
+  --stroke-underline-wave: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='8' viewBox='0 0 160 8'%3E%3Cpath d='M3 5.5 C 40 3.2, 95 3.0, 157 4.6' fill='none' stroke='%233D86FF' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E");
+  --stroke-rule: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='600' height='6' viewBox='0 0 600 6'%3E%3Cpath d='M2 3.4 C 120 2.2, 300 4.1, 440 2.9 S 560 3.6, 598 2.8' fill='none' stroke='%23BBD2F0' stroke-width='1.4' stroke-linecap='round' opacity='0.55'/%3E%3C/svg%3E");
+}
+
+/* ============================================================
+   BackWave — Base styles & sketch utilities
+   ============================================================ */
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--surface-app);
+  color: var(--text-body);
+  font: var(--type-body);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4 { color: var(--text-heading); margin: 0; }
+p { margin: 0; text-wrap: pretty; }
+a { color: var(--text-link); text-decoration-thickness: 1.5px; text-underline-offset: 3px; }
+::selection { background: var(--selection-bg); }
+
+/* --- Paper grain overlay. --- */
+.paper-grain { position: relative; }
+.paper-grain::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: var(--texture-paper);
+  opacity: var(--texture-paper-opacity);
+  pointer-events: none;
+  z-index: 2147483646;
+}
+.paper-grain--local::after { position: absolute; }
+
+/* --- The drawn box: pen outline + organic corners --- */
+.sketch-box {
+  background: var(--surface-card);
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: var(--radius-sketch-md);
+  box-shadow: var(--shadow-card);
+}
+.sketch-box--lg { border-radius: var(--radius-sketch-lg); }
+.sketch-box--sm { border-radius: var(--radius-sketch-sm); }
+.sketch-box--quiet { border-color: var(--line-soft); box-shadow: none; }
+
+/* --- Drawn horizontal rule --- */
+hr.sketch-rule, .sketch-rule {
+  border: none;
+  height: 6px;
+  margin: var(--space-4) 0;
+  background: var(--stroke-rule) left center / 600px 6px repeat-x;
+}
+
+/* --- Hand-drawn underline accent (for emphasized words) --- */
+.sketch-underline {
+  background: var(--stroke-underline) bottom left / 100% 8px no-repeat;
+  padding-bottom: 8px;
+}
+.sketch-underline--wave {
+  background-image: var(--stroke-underline-wave);
+}
+
+/* --- Hatch fill helpers: pen hatching as SVG tiles --- */
+.hatch-navy { background-image: var(--hatch-navy); }
+.hatch-wave { background-image: var(--hatch-wave); }
+.hatch-green { background-image: var(--hatch-green); }
+.hatch-red { background-image: var(--hatch-red); }
+.hatch-amber { background-image: var(--hatch-amber); }
+.hatch-cross { background-image: var(--hatch-cross); }
+
+/* --- Annotation label: tiny uppercase mono, like a figure label --- */
+.annotation {
+  font: var(--type-annotation);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+/* --- Focus visibility (second pen pass) --- */
+:where(button, input, select, textarea, a, [tabindex]):focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* --- Reduced motion: honour the OS "reduce motion" setting. Kills the
+       infinite graph spinner and collapses transitions/animations to a
+       hair so state changes still register without movement. --- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ============================================================
+   BackWave — Component styles. Class prefix: bw-
+   ============================================================ */
+
+/* ---------- Button ---------- */
+.bw-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  font: var(--type-label);
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: var(--radius-sketch-sm);
+  background: var(--surface-card);
+  color: var(--text-body);
+  cursor: pointer;
+  white-space: nowrap;
+  height: var(--control-md);
+  padding: 0 var(--space-4);
+  text-decoration: none;
+  transition: background-color var(--duration-fast) var(--ease-settle),
+              color var(--duration-fast) var(--ease-settle),
+              transform var(--duration-fast) var(--ease-settle),
+              box-shadow var(--duration-fast) var(--ease-settle);
+}
+.bw-btn:hover { background: var(--surface-sunken); }
+.bw-btn:active { transform: translateY(1px); }
+.bw-btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+
+.bw-btn--primary {
+  background: var(--ink-700);
+  border-color: var(--ink-700);
+  color: var(--text-on-ink);
+}
+.bw-btn--primary:hover { background: var(--ink-900); border-color: var(--ink-900); }
+
+.bw-btn--accent {
+  background: var(--wave-600);
+  border-color: var(--wave-600);
+  color: var(--text-on-accent);
+}
+.bw-btn--accent:hover { background: var(--wave-500); border-color: var(--wave-500); }
+
+.bw-btn--ghost { border-color: transparent; background: transparent; }
+.bw-btn--ghost:hover { background: var(--surface-sunken); }
+
+.bw-btn--danger {
+  border-color: var(--pen-red);
+  color: var(--pen-red);
+  background: var(--surface-card);
+}
+.bw-btn--danger:hover { background: var(--pen-red-tint); }
+
+.bw-btn--sm { height: var(--control-sm); padding: 0 var(--space-3); font-size: var(--text-xs); }
+.bw-btn--lg { height: var(--control-lg); padding: 0 var(--space-5); font-size: var(--text-md); }
+.bw-btn--icon { width: var(--control-md); padding: 0; }
+.bw-btn--icon.bw-btn--sm { width: var(--control-sm); }
+.bw-btn--icon.bw-btn--lg { width: var(--control-lg); }
+
+/* ---------- Input ---------- */
+.bw-field { display: flex; flex-direction: column; gap: var(--space-2); }
+.bw-field > label { font: var(--type-label); color: var(--text-heading); }
+.bw-field > .bw-field__hint { font-size: var(--text-xs); color: var(--text-secondary); }
+.bw-field > .bw-field__error { font-size: var(--text-xs); color: var(--pen-red); }
+
+.bw-input {
+  font: var(--type-body);
+  color: var(--text-body);
+  background: var(--surface-input);
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: var(--radius-sketch-sm);
+  height: var(--control-md);
+  padding: 0 var(--space-3);
+  width: 100%;
+  transition: box-shadow var(--duration-fast) var(--ease-settle);
+}
+.bw-input::placeholder { color: var(--text-muted); }
+.bw-input:disabled { background: var(--surface-sunken); opacity: 0.6; }
+.bw-input--error { border-color: var(--pen-red); }
+textarea.bw-input { height: auto; padding: var(--space-2) var(--space-3); resize: vertical; }
+
+/* ---------- Select ---------- */
+.bw-select { position: relative; display: inline-flex; width: 100%; }
+.bw-select > select {
+  appearance: none;
+  width: 100%;
+  font: var(--type-body);
+  color: var(--text-body);
+  background: var(--surface-input);
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: var(--radius-sketch-sm);
+  height: var(--control-md);
+  padding: 0 var(--space-6) 0 var(--space-3);
+  cursor: pointer;
+}
+.bw-select > svg {
+  position: absolute;
+  right: var(--space-3);
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  color: var(--ink-700);
+}
+
+/* ---------- Checkbox ---------- */
+.bw-check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+  font: var(--type-label);
+  color: var(--text-body);
+  white-space: nowrap;
+}
+.bw-check input { position: absolute; opacity: 0; width: 0; height: 0; }
+.bw-check__box {
+  width: 1.25rem;
+  height: 1.25rem;
+  flex: none;
+  background: var(--surface-input);
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: 0.3rem 0.45rem 0.35rem 0.5rem / 0.45rem 0.35rem 0.5rem 0.3rem;
+  display: grid;
+  place-items: center;
+  transition: background-color var(--duration-fast) var(--ease-settle);
+}
+.bw-check__box svg { color: var(--ink-700); opacity: 0; transform: scale(0.6); transition: opacity var(--duration-fast) var(--ease-settle), transform var(--duration-base) var(--ease-settle); }
+.bw-check input:checked + .bw-check__box { background: var(--wave-100); }
+.bw-check input:checked + .bw-check__box svg { opacity: 1; transform: scale(1); }
+.bw-check input:focus-visible + .bw-check__box { box-shadow: var(--focus-ring); }
+.bw-check--disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ---------- Switch ---------- */
+.bw-switch { display: inline-flex; align-items: center; gap: var(--space-2); cursor: pointer; font: var(--type-label); white-space: nowrap; }
+.bw-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.bw-switch__track {
+  width: 2.6rem;
+  height: 1.5rem;
+  flex: none;
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  position: relative;
+  transition: background-color var(--duration-base) var(--ease-settle);
+}
+.bw-switch__track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: calc(1.5rem - 7px);
+  height: calc(1.5rem - 7px);
+  background: var(--surface-card);
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: var(--radius-blob);
+  transition: left var(--duration-base) var(--ease-settle);
+}
+.bw-switch input:checked + .bw-switch__track {
+  background-color: var(--wave-100);
+  background-image: var(--hatch-wave);
+}
+.bw-switch input:checked + .bw-switch__track::after { left: calc(100% - 1.5rem + 5px); }
+.bw-switch input:focus-visible + .bw-switch__track { box-shadow: var(--focus-ring); }
+
+/* ---------- Card ---------- */
+.bw-card {
+  background: var(--surface-card);
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: var(--radius-sketch-md);
+  box-shadow: var(--shadow-card);
+  padding: var(--space-5);
+}
+.bw-card--quiet { border-color: var(--line-soft); box-shadow: none; }
+.bw-card--sunken { background: var(--surface-sunken); box-shadow: none; }
+.bw-card__header { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-4); }
+.bw-card__title { font: var(--type-card-title); color: var(--text-heading); white-space: nowrap; }
+.bw-card__aside { font: var(--type-annotation); letter-spacing: var(--tracking-label); text-transform: uppercase; color: var(--text-secondary); white-space: nowrap; }
+/* Below the ADR 0044 narrow width the header's two nowrap spans no longer fit side by side, so the
+   annotation drops under the title and left-aligns (and may wrap) instead of overflowing the card. */
+@container content (max-width: 560px) {
+  .bw-card__header { flex-direction: column; align-items: flex-start; gap: var(--space-1); }
+  .bw-card__aside { white-space: normal; }
+}
+
+/* ---------- Badge ---------- */
+.bw-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: var(--weight-medium) var(--text-xs)/1 var(--font-sans);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-pill);
+  padding: 4px 10px;
+  background: var(--surface-card);
+  color: var(--text-body);
+}
+.bw-badge__dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: var(--radius-blob);
+  background: var(--ink-500);
+}
+.bw-badge--wave { border-color: var(--wave-600); color: var(--wave-600); background: var(--wave-100); }
+.bw-badge--wave .bw-badge__dot { background: var(--wave-500); }
+.bw-badge--navy { border-color: var(--ink-700); color: var(--ink-700); }
+.bw-badge--navy .bw-badge__dot { background: var(--ink-700); }
+.bw-badge--green { border-color: var(--pen-green); color: var(--pen-green); background: var(--pen-green-tint); }
+.bw-badge--green .bw-badge__dot { background: var(--pen-green); }
+.bw-badge--red { border-color: var(--pen-red); color: var(--pen-red); background: var(--pen-red-tint); }
+.bw-badge--red .bw-badge__dot { background: var(--pen-red); }
+.bw-badge--amber { border-color: var(--pen-amber); color: var(--pen-amber); background: var(--pen-amber-tint); }
+.bw-badge--amber .bw-badge__dot { background: var(--pen-amber); }
+
+/* ---------- Tag pill (ADR 0022) ---------- */
+.bw-tags { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.bw-tags__empty { color: var(--text-secondary); }
+.bw-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: var(--weight-medium) var(--text-xs)/1 var(--font-sans);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-pill);
+  padding: 3px 9px;
+  background: var(--surface-card);
+  color: var(--text-body);
+  text-decoration: none;
+}
+.bw-tag:hover { border-color: var(--wave-600); color: var(--wave-600); background: var(--wave-100); }
+.bw-tag--active { border-color: var(--wave-600); color: var(--wave-600); background: var(--wave-100); }
+.bw-tag--disabled, .bw-tag--disabled:hover {
+  opacity: .5;
+  cursor: default;
+  border-color: var(--line-strong);
+  color: var(--text-body);
+  background: var(--surface-card);
+}
+.bw-tag__count {
+  font: var(--weight-medium) var(--text-xs)/1 var(--font-sans);
+  color: var(--text-secondary);
+  background: var(--surface-sunken);
+  border-radius: var(--radius-pill);
+  padding: 1px 6px;
+}
+
+/* ---------- Tag suggest dropdown (issue 0214) ---------- */
+.bw-suggest { position: relative; max-width: 360px; }
+.bw-suggest__menu {
+  position: absolute;
+  z-index: 20;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  padding: var(--space-3);
+  background: var(--surface-card);
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: var(--radius-sketch-sm);
+  box-shadow: var(--shadow-card);
+  max-height: 300px;
+  overflow-y: auto;
+}
+.bw-suggest__menu[hidden] { display: none; }
+/* Keyboard-highlighted option (ADR 0043): the arrow-key active descendant, styled like hover. */
+.bw-suggest__menu .bw-tag.is-active {
+  border-color: var(--wave-600);
+  color: var(--wave-600);
+  background: var(--wave-100);
+}
+.bw-suggest__note { flex-basis: 100%; font-size: var(--text-xs); color: var(--text-secondary); }
+/* Stage-two breadcrumb: the active key on its own row, click (or Esc) to back out. */
+.bw-suggest__crumb { flex-basis: 100%; display: flex; margin-bottom: 2px; }
+
+/* ---------- Avatar ---------- */
+.bw-avatar {
+  display: inline-grid;
+  place-items: center;
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: var(--radius-blob);
+  background: var(--wave-100);
+  color: var(--ink-700);
+  font: var(--weight-semibold) 0.8em/1 var(--font-sans);
+  overflow: hidden;
+  flex: none;
+}
+.bw-avatar img { width: 100%; height: 100%; object-fit: cover; }
+
+/* ---------- Stat ---------- */
+.bw-stat { display: flex; flex-direction: column; gap: var(--space-1); }
+.bw-stat__label { font: var(--type-annotation); letter-spacing: var(--tracking-label); text-transform: uppercase; color: var(--text-secondary); white-space: nowrap; }
+.bw-stat__value { font: var(--type-figure); color: var(--text-heading); }
+.bw-stat__delta { font: var(--weight-medium) var(--text-xs)/1.2 var(--font-mono); display: inline-flex; align-items: center; gap: 4px; }
+.bw-stat__delta--up { color: var(--pen-green); }
+.bw-stat__delta--down { color: var(--pen-red); }
+
+/* ---------- Tabs ---------- */
+.bw-tabs { display: flex; gap: var(--space-5); border-bottom: var(--stroke-hair) solid var(--line-soft); }
+.bw-tab {
+  appearance: none;
+  background: none;
+  border: none;
+  font: var(--type-label);
+  color: var(--text-secondary);
+  padding: var(--space-2) 2px 10px;
+  cursor: pointer;
+  position: relative;
+  margin-bottom: -1px;
+  text-decoration: none;
+}
+.bw-tab:hover { color: var(--text-heading); }
+.bw-tab--active { color: var(--text-heading); }
+.bw-tab__ink {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 8px;
+  background: var(--stroke-underline-wave) bottom left / 100% 8px no-repeat;
+}
+.bw-tab__count { font: var(--weight-medium) var(--text-2xs)/1 var(--font-mono); color: var(--text-muted); margin-left: 6px; }
+
+/* ---------- SideNav ---------- */
+.bw-sidenav { display: flex; flex-direction: column; gap: 2px; }
+.bw-sidenav__item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  font: var(--type-label);
+  color: var(--text-secondary);
+  padding: 0 var(--space-3);
+  height: var(--control-md);
+  border: var(--stroke-pen) solid transparent;
+  border-radius: var(--radius-sketch-sm);
+  white-space: nowrap;
+  cursor: pointer;
+  background: none;
+  text-align: left;
+  width: 100%;
+  text-decoration: none;
+  transition: background-color var(--duration-fast) var(--ease-settle), color var(--duration-fast) var(--ease-settle);
+}
+.bw-sidenav__item:hover { background: var(--surface-sunken); color: var(--text-heading); }
+.bw-sidenav__item--active {
+  background: var(--wave-100);
+  border-color: var(--line-strong);
+  color: var(--text-heading);
+}
+.bw-sidenav__item svg { color: var(--ink-700); flex: none; }
+.bw-sidenav__spacer { font: var(--type-annotation); letter-spacing: var(--tracking-label); text-transform: uppercase; color: var(--text-muted); padding: var(--space-4) var(--space-3) var(--space-1); }
+
+/* ---------- Progress ---------- */
+.bw-progress {
+  height: 1rem;
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  overflow: hidden;
+}
+.bw-progress__fill {
+  height: 100%;
+  background-color: var(--wave-100);
+  background-image: var(--hatch-wave);
+  border-right: var(--stroke-pen) solid var(--line-strong);
+  transition: width var(--duration-slow) var(--ease-settle);
+}
+.bw-progress--green .bw-progress__fill { background-color: var(--pen-green-tint); background-image: var(--hatch-green); }
+.bw-progress--red .bw-progress__fill { background-color: var(--pen-red-tint); background-image: var(--hatch-red); }
+.bw-progress--amber .bw-progress__fill { background-color: var(--pen-amber-tint); background-image: var(--hatch-amber); }
+.bw-progress--navy .bw-progress__fill { background-color: var(--paper-1); background-image: var(--hatch-navy); }
+
+/* ---- Console shell layout ---- */
+html, body { height: 100%; }
+.shell { display: flex; min-height: 100vh; }
+.shell__side {
+  width: var(--sidebar-w);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-3);
+  border-right: var(--stroke-pen) solid var(--line-strong);
+  background: var(--surface-app);
+  position: sticky;
+  top: 0;
+  height: 100vh;
+}
+.shell__brand { display: flex; align-items: center; gap: 10px; padding: var(--space-1) var(--space-3); }
+.shell__brand b { font: var(--weight-bold) 1.25rem/1 var(--font-sans); color: var(--ink-700); letter-spacing: var(--tracking-tight); }
+.shell__user { margin-top: auto; display: flex; align-items: center; gap: 10px; padding: var(--space-3); border-top: var(--stroke-hair) solid var(--line-soft); }
+.shell__user > div { flex: 1; }
+.shell__main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.shell__topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: var(--space-2) var(--space-6);
+  border-bottom: var(--stroke-hair) solid var(--line-soft);
+}
+.shell__content {
+  padding: var(--space-6);
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto;
+  /* The content frame is a query container: table card-flips and grid collapses key off its
+     own width (not the viewport), so they respond to the real space a table has regardless of
+     the sidebar's icon-rail state. Named so nested containers can't accidentally match. */
+  container: content / inline-size;
+}
+
+/* Sidebar collapses to an icon-only rail below tablet width. The sidebar is shell chrome that
+   lives OUTSIDE the .shell__content container, so this is a genuine viewport query — container
+   queries can't reach it. It stays a visible, tappable rail — never a drawer (phone nav is out
+   of scope). Labels hide, the brand shrinks to its mark, and everything centers on its icon. */
+@media (max-width: 900px) {
+  .shell__side {
+    width: var(--sidebar-rail-w);
+    padding-left: var(--space-2);
+    padding-right: var(--space-2);
+    align-items: center;
+  }
+  .bw-sidenav { align-self: stretch; }
+  .bw-sidenav__item { justify-content: center; gap: 0; padding: 0; }
+  .bw-sidenav__item span { display: none; }
+  .bw-sidenav__spacer { font-size: 0; padding: var(--space-2) 0; }
+  .shell__brand { justify-content: center; padding-left: 0; padding-right: 0; gap: 0; }
+  .shell__brand b { display: none; }
+  .shell__user { justify-content: center; padding-left: 0; padding-right: 0; }
+  .shell__user > div { display: none; }
+}
+
+/* ---- Theme toggle (sun/moon icon swap) ---- */
+.bw-theme-toggle__sun { display: none; }
+.bw-theme-toggle__moon { display: inline-flex; }
+[data-theme="dark"] .bw-theme-toggle__sun { display: inline-flex; }
+[data-theme="dark"] .bw-theme-toggle__moon { display: none; }
+
+/* ---- Screen scaffolding ---- */
+.screen { display: flex; flex-direction: column; gap: var(--space-5); }
+.screen__head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4); }
+.stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); }
+.stat-card { padding: var(--space-4); }
+.dash-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); align-items: stretch; }
+@container content (max-width: 720px) {
+  .stats-row, .dash-grid { grid-template-columns: 1fr; }
+}
+.risk-list { display: flex; flex-direction: column; gap: var(--space-4); }
+.risk-row { display: flex; flex-direction: column; gap: var(--space-2); }
+.risk-row__top { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+.activity { display: flex; flex-direction: column; gap: var(--space-3); }
+.activity__row { display: flex; align-items: center; gap: var(--space-3); }
+
+/* ---- Jobs table ---- */
+.search-wrap { position: relative; display: flex; align-items: center; }
+.search-wrap svg { position: absolute; left: 10px; color: var(--ink-500); pointer-events: none; }
+.search-wrap .bw-input { padding-left: 32px; width: 220px; }
+/* Wide tables scroll horizontally inside their card rather than clipping or wrapping cells. */
+.ptable-scroll { overflow-x: auto; }
+.ptable { width: 100%; border-collapse: collapse; }
+.ptable td.nowrap, .ptable th.nowrap { white-space: nowrap; }
+.ptable__cron-raw { color: var(--text-muted); font: var(--type-annotation); margin-top: 2px; }
+.ptable th {
+  font: var(--type-annotation);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  text-align: left;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: var(--stroke-pen) solid var(--line-strong);
+}
+.ptable td { padding: var(--space-3) var(--space-4); border-bottom: var(--stroke-hair) solid var(--line-faint); vertical-align: middle; }
+.ptable tbody tr { transition: background-color var(--duration-fast) var(--ease-settle); }
+.ptable tbody tr:hover { background: var(--surface-sunken); }
+.ptable tbody tr:last-child td { border-bottom: none; }
+.ptable__empty { text-align: center; color: var(--text-secondary); padding: var(--space-6) !important; }
+.avatar-stack { display: inline-flex; }
+.avatar-stack .bw-avatar:not(:first-child) { margin-left: -8px; }
+
+/* ---- Narrow-width card transform (ADR 0044) ----
+   Below ~560px of the content container's width, every data-grid .ptable restyles into a stack
+   of bordered cards: each <tr> is a card, each <td> a `label: value` line whose muted label comes
+   from its data-label attribute. The leftmost cell is the row's primary identity across all five
+   grids, so it is promoted to a header (larger, no label prefix). Property tables opt out with
+   .ptable--plain and keep rendering as a normal table (their narrow treatment is separate). */
+@container content (max-width: 560px) {
+  .ptable:not(.ptable--plain) thead { display: none; }
+  .ptable:not(.ptable--plain),
+  .ptable:not(.ptable--plain) tbody,
+  .ptable:not(.ptable--plain) tr,
+  .ptable:not(.ptable--plain) td { display: block; width: auto; }
+  .ptable:not(.ptable--plain) tbody tr {
+    border: var(--stroke-pen) solid var(--line-strong);
+    border-radius: var(--radius-sketch-sm);
+    padding: var(--space-3);
+    margin-bottom: var(--space-3);
+    background: var(--surface-card);
+  }
+  .ptable:not(.ptable--plain) tbody tr:hover { background: var(--surface-card); }
+  .ptable:not(.ptable--plain) tbody tr:last-child { margin-bottom: 0; }
+  .ptable:not(.ptable--plain) td {
+    padding: var(--space-2) 0;
+    border-bottom: var(--stroke-hair) solid var(--line-faint);
+    text-align: left;
+    white-space: normal;
+  }
+  .ptable:not(.ptable--plain) td:last-child { border-bottom: none; }
+  .ptable:not(.ptable--plain) td::before {
+    content: attr(data-label);
+    display: block;
+    font: var(--type-annotation);
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    margin-bottom: 2px;
+  }
+  /* First cell = the row's primary identity: promoted to a card header, no label prefix. */
+  .ptable:not(.ptable--plain) td:first-child {
+    font: var(--weight-semibold) var(--text-md)/1.3 var(--font-sans);
+    padding-top: 0;
+  }
+  .ptable:not(.ptable--plain) td:first-child::before { display: none; }
+  /* Numeric cells right-align in table mode; in card mode they read left like every value. */
+  .ptable:not(.ptable--plain) td.num { text-align: left; }
+}
+
+/* ---- Property-table narrow stack (ADR 0044, .ptable--plain) ----
+   The 2-column property lists (th = row label, td = value) opt out of the card transform, but at
+   the same narrow container width they stack the label above its value — a lighter treatment so a
+   long mono JobId or timestamp is not squeezed side-by-side. No card chrome, no data-label: the
+   label is the row's own <th>, not a column header. */
+@container content (max-width: 560px) {
+  .ptable--plain tr { display: block; }
+  .ptable--plain tr + tr { border-top: var(--stroke-hair) solid var(--line-faint); }
+  .ptable--plain th,
+  .ptable--plain td {
+    display: block;
+    padding-left: 0;
+    padding-right: 0;
+    border-bottom: none;
+    text-align: left;
+  }
+  .ptable--plain th { padding-bottom: 0; }
+  /* Let a long unbroken value (JobId, timestamp) wrap rather than overflow its row. */
+  .ptable--plain td { padding-top: 2px; overflow-wrap: anywhere; }
+}
+
+/* ---- Settings ---- */
+.settings-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: var(--space-4); align-items: start; }
+.form-stack { display: flex; flex-direction: column; gap: var(--space-4); }
+/* Fields keep their natural width and pack left; the row wraps onto extra lines instead of
+   shrinking/clipping when it runs out of room. Below the ADR 0044 card-flip width they stack
+   full-width — off the content container, like the tables, so it keys on real space. */
+.form-row { display: flex; flex-wrap: wrap; gap: var(--space-4); }
+@container content (max-width: 560px) {
+  .form-row { flex-direction: column; align-items: stretch; }
+}
+
+/* ---- Numeric table cells (right-aligned mono figures) ---- */
+.ptable td.num, .num { text-align: right; font-family: var(--font-mono); }
+code, .mono { font-family: var(--font-mono); }
+
+/* ---- JSON payload highlighting (best-effort, server-rendered spans) ---- */
+.bw-json { white-space: pre; overflow-x: auto; margin: 0; }
+.bw-json__key  { color: var(--ink-700); }
+.bw-json__str  { color: var(--pen-green); }
+.bw-json__num  { color: var(--wave-600); }
+.bw-json__bool { color: var(--pen-amber); }
+.bw-json__null { color: var(--text-muted); }
+.bw-json__punc { color: var(--text-muted); }
+
+/* ---- Copyable code block (payload, etc.): a copy button floated over a <pre> ---- */
+.bw-codeblock { position: relative; }
+.bw-codeblock > pre { padding-right: calc(var(--control-sm) + var(--space-3)); }
+.bw-copy {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-sm);
+  height: var(--control-sm);
+  padding: 0;
+  border: var(--stroke-pen) solid var(--line-soft);
+  border-radius: var(--radius-sketch-sm);
+  background: var(--surface-card);
+  color: var(--text-secondary);
+  cursor: pointer;
+  opacity: 0.6;
+  transition: opacity var(--duration-fast) var(--ease-settle),
+              color var(--duration-fast) var(--ease-settle),
+              border-color var(--duration-fast) var(--ease-settle),
+              background-color var(--duration-fast) var(--ease-settle);
+}
+.bw-copy:hover { opacity: 1; background: var(--surface-sunken); color: var(--text-body); }
+.bw-copy:active { transform: translateY(1px); }
+.bw-copy__check { display: none; }
+.bw-copy.is-copied { opacity: 1; color: var(--pen-green); border-color: var(--pen-green); }
+.bw-copy.is-copied .bw-copy__copy { display: none; }
+.bw-copy.is-copied .bw-copy__check { display: inline; }
+
+/* ---- Code fence: a framed code block with a header chrome bar (label + copy) ---- */
+.bw-fence {
+  border: var(--stroke-pen) solid var(--line-soft);
+  border-radius: var(--radius-sketch-sm);
+  background: var(--surface-sunken);
+  overflow: hidden;
+}
+.bw-fence__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-input);
+  border-bottom: var(--stroke-hair) solid var(--line-soft);
+}
+.bw-fence__lang {
+  font: var(--weight-medium) var(--text-2xs)/1.2 var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+/* Inside the bar the copy button sits in flow, not floated over the <pre>. */
+.bw-fence__bar .bw-copy { position: static; opacity: 1; }
+.bw-fence__body { padding: var(--space-3); }
+.bw-fence__body > pre { margin: 0; padding: 0; }
+
+/* ---- Workflow graph (ADR 0023): a pan/zoom DAG canvas with a minimap ---- */
+.bw-graph { position: relative; }
+.bw-graph__pane {
+  position: relative;
+  width: 100%;
+  height: 460px;
+  max-height: min(460px, 70vh);   /* cap to viewport so a tall DAG stays on-screen */
+  overflow: auto;                 /* no-JS fallback: native scroll */
+  border: var(--stroke-hair) solid var(--line-soft);
+  border-radius: var(--radius-sketch-sm);
+  background:
+    radial-gradient(var(--line-faint) 1px, transparent 1px) 0 0 / 22px 22px,
+    var(--surface-sunken);
+  touch-action: none;
+}
+.bw-graph.is-interactive .bw-graph__pane { overflow: hidden; cursor: grab; }
+.bw-graph.is-interactive .bw-graph__pane:active { cursor: grabbing; }
+.bw-graph__canvas { position: relative; transform-origin: 0 0; }
+.bw-graph__edges { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
+.bw-graph__edge { fill: none; stroke: var(--line-strong); stroke-width: 1.5; opacity: 0.5; }
+.bw-graph__edge.is-pending { stroke-dasharray: 5 5; opacity: 0.38; }
+
+/* node */
+.bw-gnode {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 0 var(--space-3);
+  background: var(--surface-card);
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: var(--radius-sketch-sm);
+  box-shadow: var(--shadow-card);
+  box-sizing: border-box;
+  overflow: hidden;
+}
+.bw-gnode__hit { position: absolute; inset: 0; z-index: 1; }
+.bw-gnode.is-selected {
+  border-color: var(--wave-500);
+  box-shadow: 0 0 0 2px var(--wave-100), var(--shadow-raised);
+}
+.bw-gnode__icon { flex: none; display: inline-flex; color: var(--ink-500); }
+.bw-gnode__text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.bw-gnode__name { font: var(--weight-semibold) var(--text-md)/1.2 var(--font-sans); color: var(--text-heading); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bw-gnode__meta { font: var(--weight-medium) var(--text-xs)/1.2 var(--font-mono); color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bw-gnode__open {
+  position: absolute; top: 6px; right: 6px; z-index: 2;
+  display: inline-flex; color: var(--text-muted);
+  opacity: 0; transition: opacity var(--duration-fast) var(--ease-settle);
+}
+.bw-gnode:hover .bw-gnode__open { opacity: 1; }
+.bw-gnode__open:hover { color: var(--wave-600); }
+.bw-gnode--green { border-left-width: 3px; border-left-color: var(--pen-green); }
+.bw-gnode--green .bw-gnode__icon { color: var(--pen-green); }
+.bw-gnode--red { border-left-width: 3px; border-left-color: var(--pen-red); }
+.bw-gnode--red .bw-gnode__icon { color: var(--pen-red); }
+.bw-gnode--amber { border-left-width: 3px; border-left-color: var(--pen-amber); }
+.bw-gnode--amber .bw-gnode__icon { color: var(--pen-amber); }
+.bw-gnode--wave { border-left-width: 3px; border-left-color: var(--wave-500); }
+.bw-gnode--wave .bw-gnode__icon { color: var(--wave-500); }
+.bw-gnode--navy { border-left-width: 3px; border-left-color: var(--ink-500); }
+.bw-gnode--navy .bw-gnode__icon { color: var(--ink-500); }
+.bw-gnode__spin { animation: bw-graph-spin 1.1s linear infinite; transform-origin: center; }
+@keyframes bw-graph-spin { to { transform: rotate(360deg); } }
+
+/* zoom controls */
+.bw-graph__controls {
+  position: absolute; left: var(--space-3); bottom: var(--space-3); z-index: 4;
+  display: none; flex-direction: column; gap: 4px;
+}
+.bw-graph.is-interactive .bw-graph__controls { display: flex; }
+.bw-graph__controls button {
+  width: var(--control-sm); height: var(--control-sm);
+  display: inline-flex; align-items: center; justify-content: center;
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: var(--radius-sketch-sm);
+  background: var(--surface-card); color: var(--text-body);
+  cursor: pointer; font: var(--weight-semibold) var(--text-md)/1 var(--font-sans);
+}
+.bw-graph__controls button:hover { background: var(--surface-sunken); }
+
+/* minimap */
+.bw-graph__minimap {
+  position: absolute; right: var(--space-3); bottom: var(--space-3); z-index: 4;
+  width: 168px; height: 108px;
+  display: none;
+  border: var(--stroke-pen) solid var(--line-strong);
+  border-radius: var(--radius-sketch-sm);
+  background: var(--surface-card);
+  overflow: hidden; cursor: pointer;
+}
+.bw-graph.is-interactive .bw-graph__minimap { display: block; }
+.bw-graph__minimap svg { width: 100%; height: 100%; display: block; }
+.bw-graph__minimap-node { opacity: 0.85; fill: var(--ink-300); }
+.bw-graph__minimap-node.is-green { fill: var(--pen-green); }
+.bw-graph__minimap-node.is-red { fill: var(--pen-red); }
+.bw-graph__minimap-node.is-amber { fill: var(--pen-amber); }
+.bw-graph__minimap-node.is-wave { fill: var(--wave-500); }
+.bw-graph__minimap-node.is-navy { fill: var(--ink-500); }
+.bw-graph__minimap-view { fill: var(--wave-500); fill-opacity: 0.12; stroke: var(--wave-500); stroke-width: 6; }
+
+/* ── live metrics panel (ADR 0032) ──────────────────────────────────────────── */
+.bw-metrics__empty { color: var(--text-secondary); margin: 0; }
+.bw-metrics__note { color: var(--text-secondary); font: var(--type-annotation); margin: var(--space-3) 0 0; }
+.bw-metrics__approx { color: var(--text-secondary); font: var(--type-annotation); font-weight: 400; text-transform: uppercase; letter-spacing: var(--tracking-label); }
+.bw-metrics__row { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); }
+@container content (max-width: 720px) { .bw-metrics__row { grid-template-columns: 1fr; } }
+.bw-metric {
+  display: flex; flex-direction: column; gap: var(--space-2);
+  padding: var(--space-3);
+  border: var(--stroke-hair) solid var(--line-soft);
+  border-radius: var(--radius-sketch-sm);
+  background: var(--surface-sunken);
+}
+.bw-spark { width: 100%; height: 40px; display: block; }
+.bw-spark__area { fill-opacity: 0.12; stroke: none; }
+.bw-spark__line { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; stroke-linejoin: round; stroke-linecap: round; }

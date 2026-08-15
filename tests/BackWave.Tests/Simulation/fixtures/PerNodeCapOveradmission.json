@@ -1,0 +1,344 @@
+{
+  "SchemaVersion": 1,
+  "Scenario": {
+    "Seed": 13020077931337472759,
+    "NodeCount": 3,
+    "JobCount": 51,
+    "WorkloadDuration": "01:00:00",
+    "DrainAllowance": "06:00:00",
+    "CrashProbabilityPerPoll": 0,
+    "HeartbeatLossProbability": 0,
+    "HandlerFailureProbability": 0,
+    "MaxExecutionDuration": "00:00:40",
+    "MaxClockSkew": "00:00:02",
+    "MaxCrashDowntime": "00:05:00",
+    "PollInterval": "00:00:01",
+    "HeartbeatInterval": "00:00:20",
+    "LeaseDuration": "00:01:00",
+    "MaxAttempts": 3,
+    "Backoff": "00:00:30",
+    "ConcurrencyLimit": null,
+    "ConcurrencyLimits": {},
+    "PoolSize": 4,
+    "HintDeliveryProbability": 0,
+    "MaxHintLatency": "00:00:00.2500000",
+    "StoreFaultProbability": 0,
+    "OperatorActionCount": 30,
+    "IsolationCount": 0,
+    "PermanentLossProbability": 0,
+    "AckLossProbability": 0,
+    "UnroutableProbability": 0,
+    "TopologyQueues": 0,
+    "ForceWeightedDispatch": false,
+    "StartTime": "2026-01-01T00:00:00+00:00",
+    "Schedules": [],
+    "Observers": [],
+    "Sabotage": false,
+    "SabotageSlotDoubleRelease": false,
+    "SabotagePoolSize": false,
+    "SabotageOutcomeFence": false,
+    "SabotageBatchFence": false,
+    "SabotageMigrationSweep": false,
+    "SabotageMigrationFaultGrace": false,
+    "SabotagePausedClaim": false,
+    "SabotageCancelProvenance": false,
+    "SabotageLegalTransition": false,
+    "SabotageExecuteLiveness": false,
+    "SabotageAuditCompleteness": false,
+    "SabotageServedSet": false,
+    "SabotageInlineUnroutableReport": false,
+    "SabotageDeferredUnroutableReport": false,
+    "RadioactiveMode": false
+  },
+  "FaultMap": [
+    {
+      "Axis": "handler",
+      "Id": "ec16c1b0-270e-c68c-e24a-b54c2a5fe321:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:07:32.1562546+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:07:46.6025234+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:07:51.6373876+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:08:50.6459398+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "handler",
+      "Id": "5a86a7f3-3cbd-6c93-c814-8814161afe71:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "f5fbc2de-9842-d1d1-257b-be09d974ca77:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "bf8e1d69-b442-296d-eddf-49450fa75ed6:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "310c7840-8e10-b6c7-fddd-936f1944d4bb:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "37480ba2-5d72-5ae8-d5bf-dacdaf0a7506:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "ed114acd-6e7c-4bfe-db6e-eb0de62db768:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "2c44735a-1a7a-068b-af28-e438102b7c59:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "bbc815e0-a2fd-ef78-74d8-f34fb243d895:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "09c180bd-6b8a-9c97-d800-f0882d7b1218:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "f1ed76bc-050d-3cd9-61be-dcf471577b97:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "e0c7643f-943b-0071-588a-6cb56a752ac3:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "1be31bae-fd5f-5428-cd5e-897df32ed096:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "cc90359f-660b-6e98-c7d8-1587e2100324:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:12:41.1550664+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "handler",
+      "Id": "4ba3459f-e84e-8355-79ae-0621ff70b35a:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:12:45.1474398+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:13:34.4917247+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:14:09.1434311+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:16:20.8644175+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:17:51.6806829+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:18:54.4505597+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:19:30.3478412+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:26:15.2728569+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:29:02.5447787+00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "handler",
+      "Id": "7bec36d0-e91a-6237-8ebc-7faae2559695:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "ecc360f3-d7b6-70c7-2099-140fec039d77:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "6662b1da-448c-e074-8636-e586e7a24a7f:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "c2f2cc11-0cc2-c07d-07b0-644516fbe178:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "ee05fc25-5433-d97e-0c36-4b1f2a46332f:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "7269bc2a-adf6-ba22-60ab-3c0851a6de8e:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "db9225a4-3538-dc34-67c3-262707d56ac4:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "4ae98f0e-fea0-a547-b5df-46cddd4ce6d4:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "2d37a440-e3e0-9419-29bd-fb4c42c1aa04:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "7641a2a5-6417-6ce8-922d-be237e88a869:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "32eb8be2-34f8-f2da-80e4-ccc536db3fa5:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "2fbe4f2f-95b1-5744-33fc-3c2a015ce6cd:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "ddba7ac2-cd12-6f75-54bb-0279b2c77ab2:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "57c7a054-de9c-31ef-bbd0-fd4a0cc82423:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "aeac2b75-e295-2bb1-1d4b-3f2a8314dba5:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "c4857e38-bdb4-7233-62a2-90fd25035e2b:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "cda143e8-4610-e5cf-0bf5-4632eab01bd9:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "af6f238b-fa6a-7b7d-1d10-b6c2710e85b2:1",
+      "Ordinal": 0,
+      "Fault": false
+    },
+    {
+      "Axis": "handler",
+      "Id": "091ab7a0-fcd5-ed35-8105-13813439bc1d:1",
+      "Ordinal": 0,
+      "Fault": false
+    }
+  ],
+  "Failure": null
+}

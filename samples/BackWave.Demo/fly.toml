@@ -1,0 +1,33 @@
+# Fly.io config for the live demo at demo.backwave.app. Deploy from the REPO ROOT so the build context
+# includes the referenced src/* projects:
+#
+#   flyctl deploy --config samples/BackWave.Demo/fly.toml
+#
+# One-time setup (not committed):
+#   flyctl apps create backwave-demo
+#   flyctl certs add demo.backwave.app                       # then add the CNAME on the DNS side
+#   flyctl secrets set BackWave__ProLicense=<key>            # clears the unlicensed-Pro notice
+#
+# The hourly reset is a scheduled `flyctl apps restart` — see .github/workflows/demo-recycle.yml.
+
+app = "backwave-demo"
+primary_region = "iad"
+
+[build]
+  # Resolved relative to THIS fly.toml's directory (samples/BackWave.Demo/), not the repo root.
+  # The build context is still the repo root — it's the working directory `flyctl deploy` runs from.
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # A single shared instance (River-style): every visitor sees and mutates the same world. Keep one
+  # machine always up so the seeded state and the recurring generator are live between visits.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "512mb"

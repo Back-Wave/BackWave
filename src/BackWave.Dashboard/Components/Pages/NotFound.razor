@@ -1,0 +1,19 @@
+@* 404: no such page or job. Rendered through the shell so even misses stay on-brand. ContentOnly
+   lets a live view that lost its resource mid-stream swap just this region into #bw-live. *@
+<DashboardLayout BasePath="@BasePath" Title="Not found" Active="" ContentOnly="@ContentOnly">
+    <div class="screen" data-screen-label="Not found">
+        <header class="screen__head">
+            <div>
+                <h1 style="font:var(--type-display);letter-spacing:var(--tracking-tight);">Not found</h1>
+                <p style="color:var(--text-secondary);margin-top:4px;">No such page or job.</p>
+            </div>
+        </header>
+    </div>
+</DashboardLayout>
+
+@code {
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+
+    /// <summary>Render only the live region (SSE fragment) rather than the full document.</summary>
+    [Parameter] public bool ContentOnly { get; set; }
+}

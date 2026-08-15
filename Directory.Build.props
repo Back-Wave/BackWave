@@ -1,0 +1,77 @@
+<Project>
+
+  <PropertyGroup>
+    <!-- Default TFM for non-shipped projects (tests, samples, tooling). Shipped packages override
+         this by setting TargetFrameworks to $(ShipTfms) and clearing TargetFramework — see below. -->
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- The frameworks every shipped package targets. net10 is current; net8 (LTS) and net9 broaden
+         reach to apps not yet on net10. Kept here as the single source of truth so a future bump edits
+         one line. TimeProvider and Enumerable.Order() are native on all three; only System.Threading.Lock
+         (net9+) needs a guard on net8. -->
+    <ShipTfms>net8.0;net9.0;net10.0</ShipTfms>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AnalysisLevel>latest</AnalysisLevel>
+  </PropertyGroup>
+
+  <!-- Shared NuGet package metadata for every shipped assembly. BackWave is source-available: the full
+       source lives in the public repo below, and Source Link (configured further down) points the DLLs
+       back at it. PackageId defaults to the assembly name, which is already the package name. The free
+       packages default to LICENSE.md (PolyForm Shield 1.0.0 - source-available, no-compete); the
+       BackWave.Pro.* projects override PackageLicenseFile to the commercial EULA (LICENSE-PRO.md).
+       Directory.Build.targets packs whichever file this resolves to. -->
+  <PropertyGroup>
+    <Authors>DeVito Digital Solutions LLC</Authors>
+    <Company>DeVito Digital Solutions LLC</Company>
+    <Product>BackWave</Product>
+    <Copyright>Copyright © DeVito Digital Solutions LLC</Copyright>
+    <PackageProjectUrl>https://backwave.app</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Back-Wave/BackWave</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReleaseNotes>Release notes and upgrade guidance: https://backwave.app</PackageReleaseNotes>
+    <PackageLicenseFile>LICENSE.md</PackageLicenseFile>
+    <PackageIcon>icon.png</PackageIcon>
+    <!-- Base tags shared by every package; adapters/features append their own with $(PackageTags). -->
+    <PackageTags>background-jobs;background;background-tasks;background-service;job;jobs;job-queue;queue;scheduler;scheduling;task-scheduler;cron;recurring;delayed;threading;worker;async;tasks;retry;durable;distributed;hosted-service;hangfire-alternative;dotnet</PackageTags>
+  </PropertyGroup>
+
+  <!-- Versioning. One lockstep version across every package (the source generator packs inside the
+       BackWave package and must never version-skew from the runtime it binds to), derived from git
+       tags by MinVer: an annotated tag `v1.0.0` on a commit makes that commit pack as 1.0.0; commits
+       past a tag get a height-stamped prerelease; an untagged tree packs as 0.0.0-alpha.0 for local
+       dev. Tag to release — the publish workflow fires on `v*` tags. -->
+  <PropertyGroup>
+    <MinVerTagPrefix>v</MinVerTagPrefix>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="MinVer" Version="6.0.0" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Per-package README rendered on the NuGet listing page. Convention: any project with a README.md
+       beside its .csproj gets it packed and wired (see Directory.Build.targets). -->
+  <PropertyGroup Condition="Exists('$(MSBuildProjectDirectory)/README.md')">
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <!-- Reproducible packages: normalize output on CI so the same commit always produces the same DLL. -->
+  <PropertyGroup>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+  <!-- Source Link: now that the source is public, wire each package back to the exact commit it was
+       built from so consumers can step into BackWave source while debugging. Source Link ships in the
+       .NET SDK, so no PackageReference is needed - GitHub is auto-detected from the git metadata, and
+       RepositoryUrl above pins the public repo. Symbols ship as a separate .snupkg (the modern, portable
+       symbol format nuget.org indexes); EmbedUntrackedSources also embeds generated sources so stepping
+       works even for files git doesn't track. -->
+  <PropertyGroup>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+</Project>

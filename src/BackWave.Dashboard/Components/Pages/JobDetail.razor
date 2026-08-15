@@ -1,0 +1,55 @@
+@* Job detail: the full JobSnapshot shape, with glossary blurbs spelled out for the 2am
+   reader. The body cards live in the shared <JobDetailPanel> so the Workflow graph's
+   selected-member view renders the very same detail. All data arrives via the Monitor API. *@
+<DashboardLayout BasePath="@BasePath" Title="@($"Job {Job.JobId}")" Active="jobs">
+    <div class="screen" data-screen-label="Job">
+        <header class="screen__head">
+            <div>
+                <h1 class="mono" style="font:var(--type-display);letter-spacing:var(--tracking-tight);">Job @Job.JobId</h1>
+                <p style="color:var(--text-secondary);margin-top:4px;">
+                    <span class="bw-badge bw-badge--@DashboardGlossary.Tone(Job.State)">
+                        <span class="bw-badge__dot"></span>@DashboardGlossary.StateName(Job.State)
+                    </span>
+                </p>
+            </div>
+            @if (Actions.CanCancel && !DashboardGlossary.IsTerminal(Job.State))
+            {
+                <ActionForm Action="@($"{BasePath}/jobs/{Job.JobId}/cancel")" Label="Cancel" Actions="Actions" ButtonClass="bw-btn--primary" />
+            }
+        </header>
+
+        <JobDetailPanel BasePath="@BasePath" Job="@Job" GatingParents="@GatingParents"
+                        History="@History" HistoryDisabled="@HistoryDisabled"
+                        Payload="@Payload" Output="@Output" CanViewSensitiveData="@CanViewSensitiveData" />
+    </div>
+</DashboardLayout>
+
+@code {
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+    [Parameter, EditorRequired] public JobSnapshot Job { get; set; } = null!;
+    [Parameter, EditorRequired] public DashboardActions Actions { get; set; } = DashboardActions.None;
+
+    /// <summary>For an Awaiting-Parent job: the parents still gating it (issue 0056). Empty otherwise.</summary>
+    [Parameter] public IReadOnlyList<Guid> GatingParents { get; set; } = [];
+
+    /// <summary>The job's Transition Log (issue 0057): its state-change timeline, oldest first.</summary>
+    [Parameter] public IReadOnlyList<JobTransition> History { get; set; } = [];
+
+    /// <summary>
+    /// Whether the global Job History Policy is Off (issue 0060). When true the card shows an
+    /// explicit "history disabled" state rather than the on-but-empty "No transitions" copy.
+    /// </summary>
+    [Parameter] public bool HistoryDisabled { get; set; }
+
+    /// <summary>
+    /// Whether the viewer may see raw content that can carry secrets/PII (issue 0059) — the same
+    /// gate as the payload (<c>CanViewSensitiveData &amp;&amp; SensitiveDataExposureEnabled</c>).
+    /// </summary>
+    [Parameter] public bool CanViewSensitiveData { get; set; }
+
+    /// <summary>The job's payload, opaque bytes rendered best-effort (issue 0058). Null hides the card.</summary>
+    [Parameter] public JobPayloadView? Payload { get; set; }
+
+    /// <summary>The job's Job Output, rendered best-effort like the payload. Null hides the card.</summary>
+    [Parameter] public JobPayloadView? Output { get; set; }
+}

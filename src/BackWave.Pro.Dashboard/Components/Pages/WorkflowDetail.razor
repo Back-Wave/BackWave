@@ -1,0 +1,150 @@
+@namespace BackWave.Pro.Dashboard
+@* Workflow graph view (a BackWave Pro surface): the DAG of members laid out left-to-right by
+   dependency depth, each member's per-job state, the immutable structural Dependency edges, and the
+   derived Workflow status (failure-dominates, visible at the Workflow level). The canvas pans/zooms
+   with a minimap; clicking a node selects it in place (the ?member= query) and renders its full Job
+   detail below — the very same <JobDetailPanel> the Job page uses, so the two never drift. Each node
+   also carries an "open" link to its standalone Job detail page. A Cancel Workflow control appears
+   ONLY when the viewer holds the Cancel Permission AND the Workflow is still Running — it cancels the
+   Workflow's non-terminal members (reusing the Cancel Permission, no new permission). Read through the
+   Pro Monitor surface; the inline member panel reads job-level data through the free Monitor. *@
+<DashboardLayout BasePath="@BasePath" Title="@($"Workflow {Workflow.WorkflowId}")" Active="workflows">
+    <div class="screen" data-screen-label="Workflow">
+        <header class="screen__head">
+            <div>
+                <h1 class="mono" style="font:var(--type-display);letter-spacing:var(--tracking-tight);">Workflow @Workflow.WorkflowId</h1>
+                <p style="color:var(--text-secondary);margin-top:4px;">
+                    <span class="bw-badge bw-badge--@DashboardGlossary.WorkflowStatusTone(Workflow.Status)">
+                        <span class="bw-badge__dot"></span>@DashboardGlossary.WorkflowStatusName(Workflow.Status)
+                    </span>
+                    <span style="margin-left:8px;">@DashboardGlossary.WorkflowStatusBlurb(Workflow.Status)</span>
+                </p>
+            </div>
+            @* The Cancel control is gated on the Cancel Permission (CanCancel) — the SAME Permission
+               the per-job Cancel uses; CancelWorkflowAsync cancels the non-terminal members, so no new
+               permission is introduced. Only offered while the Workflow is still Running (a drained
+               Workflow has nothing non-terminal to cancel). *@
+            @if (Actions.CanCancel && Workflow.Status == WorkflowStatus.Running)
+            {
+                <ActionForm Action="@($"{BasePath}/workflows/{Workflow.WorkflowId}/cancel")" Label="Cancel Workflow" Actions="Actions" ButtonClass="bw-btn--primary" />
+            }
+        </header>
+
+        <div class="bw-card">
+            <table class="ptable ptable--plain">
+                <tbody>
+                    <tr><th>Name</th><td>@(Workflow.Name ?? "—")</td></tr>
+                    <tr><th>Status</th><td>@DashboardGlossary.WorkflowStatusName(Workflow.Status) — @DashboardGlossary.WorkflowStatusBlurb(Workflow.Status)</td></tr>
+                    <tr><th>Members</th><td>@Workflow.Members.Count</td></tr>
+                    <tr><th>Created</th><td class="mono">@DashboardGlossary.Instant(Workflow.CreatedAt)</td></tr>
+                    @if (Workflow.RestartedFrom is { } from)
+                    {
+                        <tr>
+                            <th>Restarted from</th>
+                            <td><a class="mono" href="@($"{BasePath}/workflows/{from}")">@from</a></td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+
+        @* The DAG canvas: members in columns by dependency depth (parents left of children), drawn
+           over an SVG edge overlay. Edges are the immutable structural WorkflowEdges — total for the
+           Workflow's whole life — dashed while the child is still Awaiting Parent (gate not yet
+           released), solid once it has been let through. The whole canvas pans/zooms; a minimap and
+           zoom controls ride on top. Nodes are emitted in dependency order, so the markup reads
+           parents-before-children regardless of pixel position. *@
+        <div class="bw-card">
+            <div class="bw-card__header">
+                <span class="bw-card__title">Member graph</span>
+                <span class="bw-card__aside">@Workflow.Members.Count members · @Workflow.Edges.Count edges</span>
+            </div>
+            @if (Workflow.Members.Count == 0)
+            {
+                <p class="ptable__empty">This Workflow has no members.</p>
+            }
+            else
+            {
+                var layout = WorkflowGraphLayout.Compute(Workflow);
+                var wfBase = $"{BasePath}/workflows/{Workflow.WorkflowId}";
+                <div class="bw-graph" data-graph>
+                    <div class="bw-graph__pane" data-graph-pane>
+                        <div class="bw-graph__canvas" data-graph-canvas
+                             data-w="@Px(layout.Width)" data-h="@Px(layout.Height)"
+                             style="width:@(Px(layout.Width))px;height:@(Px(layout.Height))px;">
+                            <svg class="bw-graph__edges" width="@Px(layout.Width)" height="@Px(layout.Height)"
+                                 viewBox="0 0 @Px(layout.Width) @Px(layout.Height)" fill="none" aria-hidden="true">
+                                @foreach (var edge in layout.Edges)
+                                {
+                                    <path class="bw-graph__edge @(edge.Pending ? "is-pending" : "")" d="@EdgePath(edge)" />
+                                }
+                            </svg>
+                            @foreach (var node in layout.Nodes)
+                            {
+                                var member = node.Member;
+                                var tone = DashboardGlossary.Tone(member.State);
+                                var isSelected = Selected?.JobId == member.JobId;
+                                var href = isSelected ? wfBase : $"{wfBase}?member={member.JobId}";
+                                <div class="bw-gnode bw-gnode--@tone @(isSelected ? "is-selected" : "")"
+                                     style="left:@(Px(node.X))px;top:@(Px(node.Y))px;width:@(Px(WorkflowGraphLayout.NodeWidth))px;height:@(Px(WorkflowGraphLayout.NodeHeight))px;">
+                                    <a class="bw-gnode__hit" href="@href" aria-label="@($"Inspect {member.WireName}")"></a>
+                                    <span class="bw-gnode__icon">@StateGlyph(member.State)</span>
+                                    <span class="bw-gnode__text">
+                                        <span class="bw-gnode__name">@member.WireName</span>
+                                        <span class="bw-gnode__meta">@member.Queue · @DashboardGlossary.StateName(member.State)</span>
+                                    </span>
+                                    <a class="bw-gnode__open" href="@($"{BasePath}/jobs/{member.JobId}")" title="Open full job page" aria-label="Open full job page">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/></svg>
+                                    </a>
+                                </div>
+                            }
+                        </div>
+                    </div>
+                    <div class="bw-graph__controls" aria-hidden="true">
+                        <button type="button" data-graph-zoom="in" title="Zoom in" aria-label="Zoom in">+</button>
+                        <button type="button" data-graph-zoom="out" title="Zoom out" aria-label="Zoom out">−</button>
+                        <button type="button" data-graph-zoom="fit" title="Fit to view" aria-label="Fit to view">⤢</button>
+                    </div>
+                    <div class="bw-graph__minimap" data-graph-minimap aria-hidden="true">
+                        <svg viewBox="0 0 @Px(layout.Width) @Px(layout.Height)" preserveAspectRatio="xMidYMid meet">
+                            @foreach (var node in layout.Nodes)
+                            {
+                                <rect class="bw-graph__minimap-node is-@DashboardGlossary.Tone(node.Member.State)"
+                                      x="@Px(node.X)" y="@Px(node.Y)"
+                                      width="@Px(WorkflowGraphLayout.NodeWidth)" height="@Px(WorkflowGraphLayout.NodeHeight)" rx="6" />
+                            }
+                            <rect class="bw-graph__minimap-view" data-graph-view x="0" y="0" width="0" height="0" />
+                        </svg>
+                    </div>
+                </div>
+            }
+        </div>
+
+        @if (Selected is { } selected)
+        {
+            @* The selected member, rendered with the very same JobDetailPanel the Job page uses. The
+               panel data (history, gating, payload-behind-gate) is fetched server-side for this one
+               member when ?member= is present. *@
+            <div class="bw-card bw-card--quiet">
+                <div class="bw-card__header">
+                    <div>
+                        <span class="bw-card__title">@selected.WireName</span>
+                        <span class="bw-badge bw-badge--@DashboardGlossary.Tone(selected.State)" style="margin-left:8px;">
+                            <span class="bw-badge__dot"></span>@DashboardGlossary.StateName(selected.State)
+                        </span>
+                    </div>
+                    <span class="bw-card__aside">
+                        <a class="mono" href="@($"{BasePath}/jobs/{selected.JobId}")">open full job page</a>
+                    </span>
+                </div>
+            </div>
+            <JobDetailPanel BasePath="@BasePath" Job="@selected" GatingParents="@SelectedGatingParents"
+                            History="@SelectedHistory" HistoryDisabled="@HistoryDisabled"
+                            Payload="@SelectedPayload" Output="@SelectedOutput" CanViewSensitiveData="@SelectedCanViewSensitiveData" />
+        }
+    </div>
+    @if (Workflow.Members.Count > 0)
+    {
+        @((MarkupString)GraphScript)
+    }
+</DashboardLayout>

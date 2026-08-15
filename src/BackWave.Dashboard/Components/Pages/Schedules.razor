@@ -1,0 +1,94 @@
+@* Recurring Schedules list: a schedule and the job instances it mints are distinct things
+   with distinct lifecycles — follow a schedule to its minted instances. Via the Monitor API. *@
+<DashboardLayout BasePath="@BasePath" Title="Recurring Schedules" Active="schedules" ContentOnly="@ContentOnly" Live="@Live">
+    <div class="screen" data-screen-label="Recurring Schedules">
+        <header class="screen__head">
+            <div>
+                <h1 style="font:var(--type-display);letter-spacing:var(--tracking-tight);">Recurring Schedules</h1>
+            </div>
+        </header>
+
+        <div class="bw-card">
+            @if (Items.Count == 0)
+            {
+                <p class="ptable__empty">No Recurring Schedules defined.</p>
+            }
+            else
+            {
+                <div class="ptable-scroll">
+                <table class="ptable">
+                    <thead>
+                        <tr>
+                            <th>Schedule</th>
+                            <th>Cron</th>
+                            <th>Wire Name</th>
+                            <th>Queue</th>
+                            <th>Zone</th>
+                            <th>Catch-Up</th>
+                            <th>No-Overlap</th>
+                            <th>Next due</th>
+                            <th>Live instance</th>
+                            <th class="num">Skipped ticks</th>
+                            @if (Actions.CanTriggerSchedule)
+                            {
+                                <th>Actions</th>
+                            }
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var schedule in Items)
+                        {
+                            <tr>
+                                <td data-label="Schedule">
+                                    <a class="mono" href="@($"{BasePath}/schedules/{Uri.EscapeDataString(schedule.ScheduleId)}")">@schedule.ScheduleId</a>
+                                </td>
+                                <td class="nowrap" data-label="Cron">
+                                    @if (DashboardGlossary.CronFriendly(schedule.Cron) is { } friendly)
+                                    {
+                                        <div>@friendly</div>
+                                        <div class="mono ptable__cron-raw">@schedule.Cron</div>
+                                    }
+                                    else
+                                    {
+                                        <span class="mono">@schedule.Cron</span>
+                                    }
+                                </td>
+                                <td data-label="Wire Name">@schedule.WireName</td>
+                                <td class="mono" data-label="Queue">@schedule.Queue</td>
+                                <td data-label="Zone">@(schedule.TimeZoneId ?? "UTC")</td>
+                                <td data-label="Catch-Up">@schedule.CatchUp</td>
+                                <td data-label="No-Overlap">@(schedule.NoOverlap ? "yes" : "no")</td>
+                                <td class="mono nowrap" data-label="Next due">@(schedule.NextDue is { } next ? DashboardGlossary.Instant(next) : "—")</td>
+                                <td data-label="Live instance">@(schedule.HasLiveInstance ? "yes" : "no")</td>
+                                <td class="num" data-label="Skipped ticks">@schedule.SkippedTicks.Count</td>
+                                @if (Actions.CanTriggerSchedule)
+                                {
+                                    <td data-label="Actions"><ActionForm Action="@($"{BasePath}/schedules/{Uri.EscapeDataString(schedule.ScheduleId)}/trigger")" Label="Trigger now" Actions="Actions" /></td>
+                                }
+                            </tr>
+                            @if (schedule.Error is { } error)
+                            {
+                                <tr>
+                                    <td colspan="@(Actions.CanTriggerSchedule ? 11 : 10)" data-label="Resolve error" style="color:var(--pen-red);">Resolve error: @error</td>
+                                </tr>
+                            }
+                        }
+                    </tbody>
+                </table>
+                </div>
+            }
+        </div>
+    </div>
+</DashboardLayout>
+
+@code {
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+    [Parameter, EditorRequired] public IReadOnlyList<ScheduleStatus> Items { get; set; } = [];
+    [Parameter, EditorRequired] public DashboardActions Actions { get; set; } = DashboardActions.None;
+
+    /// <summary>Render only the live region (SSE fragment) rather than the full document.</summary>
+    [Parameter] public bool ContentOnly { get; set; }
+
+    /// <summary>Wrap in the #bw-live region and inline the SSE client.</summary>
+    [Parameter] public bool Live { get; set; }
+}

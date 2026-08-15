@@ -1,0 +1,68 @@
+name: 🐛 Bug report
+description: Report a defect in BackWave with a clear reproduction.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. A minimal, runnable reproduction is the single most useful thing
+        you can include - it's what lets us find and fix the problem fastest.
+
+        For **security vulnerabilities**, do not file here - see our
+        [security policy](https://github.com/Back-Wave/BackWave/security/policy).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what actually happened?
+      placeholder: A clear and concise description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Steps to reproduce, ideally a minimal code sample or repository.
+      placeholder: |
+        1. Configure BackWave with ...
+        2. Enqueue ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: input
+    id: packages
+    attributes:
+      label: Affected package(s) and version(s)
+      placeholder: "e.g. BackWave.Postgres 1.4.0, BackWave.Hosting 1.4.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: store
+    attributes:
+      label: Storage adapter
+      description: Which store were you using?
+      options:
+        - In-memory
+        - Postgres
+        - SQL Server
+        - SQLite
+        - Entity Framework Core
+        - Other / custom
+        - Not applicable
+    validations:
+      required: false
+  - type: input
+    id: dotnet
+    attributes:
+      label: .NET version
+      placeholder: "e.g. net10.0"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / stack trace
+      description: Any relevant log output or exception detail. This will be rendered as code, so no backticks needed.
+      render: shell
+    validations:
+      required: false

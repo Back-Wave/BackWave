@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>$(ShipTfms)</TargetFrameworks>
+    <!-- Match the Microsoft.Extensions.* Abstractions major to the target framework so a net8 consumer
+         isn't force-upgraded to the .NET 10 Extensions graph. -->
+    <ExtensionsVersion Condition="'$(TargetFramework)' == 'net8.0'">8.0.0</ExtensionsVersion>
+    <ExtensionsVersion Condition="'$(TargetFramework)' == 'net9.0'">9.0.0</ExtensionsVersion>
+    <ExtensionsVersion Condition="'$(TargetFramework)' == 'net10.0'">10.0.0</ExtensionsVersion>
+    <Description>Hosting Shell for BackWave: DI registration, Worker Group hosted services, fail-stop health.</Description>
+    <PackageTags>$(PackageTags);dependency-injection;health-checks;aspnetcore</PackageTags>
+    <IsAotCompatible>true</IsAotCompatible>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="BackWave.Hosting.Tests" />
+    <InternalsVisibleTo Include="BackWave.Postgres.Tests" />
+    <InternalsVisibleTo Include="BackWave.Sqlite.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="$(ExtensionsVersion)" />
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions" Version="$(ExtensionsVersion)" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="$(ExtensionsVersion)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BackWave\BackWave.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,19 @@
+# Keeps the Docker build context small and correct for samples/BackWave.Demo/Dockerfile (built from
+# the repo root). Host build outputs must never leak into the Linux image build — the SDK rebuilds
+# from source inside the container. .git is intentionally NOT excluded: MinVer reads it for versioning.
+**/bin/
+**/obj/
+**/.vs/
+**/.vscode/
+**/.idea/
+**/*.user
+**/TestResults/
+**/node_modules/
+
+# Dev/agent/tooling dirs — not build inputs, but heavy in the upload context. Excluding them cuts the
+# uploaded context from ~198 MB to ~22 MB. (.git stays: MinVer needs it for versioning.)
+.claude/
+.vopr-overnight/
+.scratch/
+stryker/
+docs/

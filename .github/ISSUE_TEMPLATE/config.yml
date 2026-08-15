@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Questions & ideas (Discussions)
+    url: https://github.com/Back-Wave/BackWave/discussions
+    about: Ask a question, propose a feature, or discuss an idea. Design conversation happens here.
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/Back-Wave/BackWave/security/advisories/new
+    about: Report a vulnerability privately. Please do NOT open a public issue for security reports.
+  - name: 📚 Documentation & pricing
+    url: https://backwave.app
+    about: Guides, reference, and pricing.

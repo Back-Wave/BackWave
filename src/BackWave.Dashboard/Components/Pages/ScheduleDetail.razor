@@ -1,0 +1,70 @@
+@* Schedule detail: the full ScheduleStatus shape, then the job instances it has minted —
+   distinct lifecycles. Skipped ticks are recorded visibly, never silent. Via the Monitor API. *@
+<DashboardLayout BasePath="@BasePath" Title="@($"Schedule {Schedule.ScheduleId}")" Active="schedules">
+    <div class="screen" data-screen-label="Schedule">
+        <header class="screen__head">
+            <div>
+                <h1 class="mono" style="font:var(--type-display);letter-spacing:var(--tracking-tight);">Schedule @Schedule.ScheduleId</h1>
+                <p style="color:var(--text-secondary);margin-top:4px;">
+                    <code class="mono">@Schedule.Cron</code> in @(Schedule.TimeZoneId ?? "UTC") · mints
+                    <strong>@Schedule.WireName</strong> onto Queue <strong>@Schedule.Queue</strong>.
+                </p>
+            </div>
+            @if (Actions.CanTriggerSchedule)
+            {
+                <ActionForm Action="@($"{BasePath}/schedules/{Uri.EscapeDataString(Schedule.ScheduleId)}/trigger")" Label="Trigger now" Actions="Actions" ButtonClass="bw-btn--primary" />
+            }
+        </header>
+
+        @if (Schedule.Error is { } error)
+        {
+            <div class="bw-card" style="border-color:var(--pen-red);">
+                <p style="color:var(--pen-red);margin:0;">Resolve error: @error</p>
+            </div>
+        }
+
+        <div class="bw-card">
+            <table class="ptable ptable--plain">
+                <tbody>
+                    <tr><th>Catch-Up</th><td>@Schedule.CatchUp</td></tr>
+                    <tr><th>No-Overlap</th><td>@(Schedule.NoOverlap ? "yes" : "no")</td></tr>
+                    <tr><th>Cursor</th><td class="mono">@DashboardGlossary.Instant(Schedule.Cursor)</td></tr>
+                    <tr><th>Next due</th><td class="mono">@(Schedule.NextDue is { } next ? DashboardGlossary.Instant(next) : "—")</td></tr>
+                    <tr><th>Live instance</th><td>@(Schedule.HasLiveInstance ? "yes" : "no")</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="bw-card">
+            <div class="bw-card__header">
+                <span class="bw-card__title">Minted instances</span>
+            </div>
+            <JobTable BasePath="@BasePath" Jobs="Instances" EmptyText="No instances minted yet." />
+            @if (Instances.Count >= PageSize)
+            {
+                <p><a class="mono" href="@($"{BasePath}/jobs?schedule={Uri.EscapeDataString(Schedule.ScheduleId)}")">Search all instances →</a></p>
+            }
+        </div>
+
+        @if (Schedule.SkippedTicks.Count > 0)
+        {
+            <div class="bw-card">
+                <div class="bw-card__header">
+                    <span class="bw-card__title">Skipped ticks</span>
+                </div>
+                <p style="color:var(--text-secondary);">
+                    Recorded visibly, never silent (No-Overlap or Catch-Up):
+                    <span class="mono">@string.Join(", ", Schedule.SkippedTicks.Select(DashboardGlossary.Instant))</span>
+                </p>
+            </div>
+        }
+    </div>
+</DashboardLayout>
+
+@code {
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+    [Parameter, EditorRequired] public ScheduleStatus Schedule { get; set; } = null!;
+    [Parameter, EditorRequired] public IReadOnlyList<JobSnapshot> Instances { get; set; } = [];
+    [Parameter, EditorRequired] public int PageSize { get; set; }
+    [Parameter, EditorRequired] public DashboardActions Actions { get; set; } = DashboardActions.None;
+}

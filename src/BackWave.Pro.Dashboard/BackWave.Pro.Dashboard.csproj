@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <PropertyGroup>
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>$(ShipTfms)</TargetFrameworks>
+    <Description>BackWave Pro dashboard surfaces that contribute to the free BackWave dashboard through its extension points. Free to use under $1M annual revenue; a license is required above that.</Description>
+    <PackageTags>$(PackageTags);workflows;dashboard;monitoring;pro</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Pro ships under the commercial EULA; the free packages default to LICENSE.md. Require explicit
+         license acceptance at install for the commercial terms (the free packages leave it off). -->
+    <PackageLicenseFile>LICENSE-PRO.md</PackageLicenseFile>
+    <PackageRequireLicenseAcceptance>true</PackageRequireLicenseAcceptance>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BackWave.Dashboard\BackWave.Dashboard.csproj" />
+    <ProjectReference Include="..\BackWave.Pro\BackWave.Pro.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="BackWave.Pro.Dashboard.Tests" />
+  </ItemGroup>
+
+</Project>

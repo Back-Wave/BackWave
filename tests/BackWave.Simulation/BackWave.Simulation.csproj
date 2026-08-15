@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>The seeded Deterministic Simulation Testing harness (Simulator, oracles, IsolationScheduler, FaultPlan) — internal VOPR infrastructure, never shipped.</Description>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <!-- A harness library — the xUnit battery in BackWave.Tests drives it; dotnet test must not try to. -->
+    <IsTestProject>false</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\BackWave\BackWave.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The harness surface is reached by the xUnit battery and the VOPR console; it never ships. -->
+    <InternalsVisibleTo Include="BackWave.Tests" />
+    <InternalsVisibleTo Include="BackWave.Vopr" />
+  </ItemGroup>
+
+</Project>

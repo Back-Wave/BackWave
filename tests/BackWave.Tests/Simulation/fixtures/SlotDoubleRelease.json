@@ -1,0 +1,269 @@
+{
+  "SchemaVersion": 1,
+  "Scenario": {
+    "Seed": 3203898375520701508,
+    "NodeCount": 3,
+    "JobCount": 30,
+    "WorkloadDuration": "01:00:00",
+    "DrainAllowance": "06:00:00",
+    "CrashProbabilityPerPoll": 0.006014874271349982,
+    "HeartbeatLossProbability": 0.08523534847423435,
+    "HandlerFailureProbability": 0.11151975290849805,
+    "MaxExecutionDuration": "00:01:30",
+    "MaxClockSkew": "00:00:02",
+    "MaxCrashDowntime": "00:05:00",
+    "PollInterval": "00:00:01",
+    "HeartbeatInterval": "00:00:20",
+    "LeaseDuration": "00:01:00",
+    "MaxAttempts": 3,
+    "Backoff": "00:00:30",
+    "ConcurrencyLimit": null,
+    "ConcurrencyLimits": {
+      "default": 3,
+      "q1": 1
+    },
+    "PoolSize": 2147483647,
+    "HintDeliveryProbability": 0,
+    "MaxHintLatency": "00:00:00.2500000",
+    "StoreFaultProbability": 0,
+    "OperatorActionCount": 23,
+    "IsolationCount": 0,
+    "PermanentLossProbability": 0,
+    "AckLossProbability": 0.08404077460989356,
+    "UnroutableProbability": 0.03243388399481774,
+    "TopologyQueues": 3,
+    "ForceWeightedDispatch": false,
+    "StartTime": "2026-01-01T00:00:00+00:00",
+    "Schedules": [],
+    "Sabotage": false,
+    "SabotageSlotDoubleRelease": false,
+    "SabotagePoolSize": false,
+    "SabotageOutcomeFence": false,
+    "SabotageMigrationSweep": false,
+    "SabotagePausedClaim": false,
+    "SabotageCancelProvenance": false,
+    "SabotageLegalTransition": false,
+    "SabotageExecuteLiveness": false,
+    "SabotageAuditCompleteness": false,
+    "SabotageServedSet": false
+  },
+  "FaultMap": [
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:00:29.9620491\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:09:26.9617415\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:14:24.2791952\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:18:26.1594145\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:19:05.0416074\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:19:43.2549520\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:19:59.0409985\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:23:42.4245476\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:25:10.9774318\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:28:39.4187826\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:30:42.3070753\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:32:11.7014314\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:36:11.1843559\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:38:09.2193926\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:40:29.7748354\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:41:08.5673830\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "operator",
+      "Id": "2026-01-01T00:42:49.4361462\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "1:2026-01-01T00:00:19.4406002\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "0:2026-01-01T00:02:14.0649289\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "0:2026-01-01T00:03:28.3370676\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "2:2026-01-01T00:06:22.6361881\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "1:2026-01-01T00:07:37.0699690\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "0:2026-01-01T00:08:05.0527279\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "1:2026-01-01T00:16:08.1317709\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "2:2026-01-01T00:17:00.1570302\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "2:2026-01-01T00:20:50.7438224\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "1:2026-01-01T00:23:10.6237343\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "2:2026-01-01T00:26:43.7110103\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "0:2026-01-01T00:27:54.0101248\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "unroutable",
+      "Id": "f19a3452-6203-473b-0a04-417b28babfac",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "1:2026-01-01T00:28:42.2292406\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "1:2026-01-01T00:31:38.8092015\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "2:2026-01-01T00:33:37.7061360\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "1:2026-01-01T00:35:49.9652574\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "0:2026-01-01T00:36:20.5702593\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "crash",
+      "Id": "1:2026-01-01T00:36:30.6777868\u002B00:00",
+      "Ordinal": 0,
+      "Fault": true
+    }
+  ],
+  "Failure": null
+}

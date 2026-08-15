@@ -1,0 +1,24 @@
+<Project>
+
+  <!-- Packs the license file that PackageLicenseFile resolves to into the root of each shipped
+       package. Lives in Directory.Build.targets (imported after the project body and the SDK) so it
+       sees the final PackageLicenseFile value — the BackWave.Pro.* projects override it to the
+       commercial EULA — and the final IsPackable, which the Test SDK sets to false on test projects.
+       $(MSBuildThisFileDirectory) is the repo root, where the LICENSE files live. -->
+  <ItemGroup Condition="'$(IsPackable)' != 'false' and '$(PackageLicenseFile)' != ''">
+    <None Include="$(MSBuildThisFileDirectory)$(PackageLicenseFile)" Pack="true" PackagePath="" Visible="false" />
+  </ItemGroup>
+
+  <!-- Pack the shared package icon (repo root assets/) into every shipped package; PackageIcon in
+       Directory.Build.props names it. -->
+  <ItemGroup Condition="'$(IsPackable)' != 'false' and '$(PackageIcon)' != ''">
+    <None Include="$(MSBuildThisFileDirectory)assets/icon.png" Pack="true" PackagePath="" Visible="false" />
+  </ItemGroup>
+
+  <!-- Pack the project's own README.md (set as PackageReadmeFile in Directory.Build.props when present)
+       into the package root so NuGet renders it on the listing page. -->
+  <ItemGroup Condition="'$(IsPackable)' != 'false' and '$(PackageReadmeFile)' != ''">
+    <None Include="$(MSBuildProjectDirectory)/$(PackageReadmeFile)" Pack="true" PackagePath="" Visible="false" />
+  </ItemGroup>
+
+</Project>

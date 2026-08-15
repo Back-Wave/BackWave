@@ -1,0 +1,110 @@
+@* Queues operational state (ADR 0009, issue 0055): each Queue's Paused flag and Concurrency
+   Limit cap, made observable. "In-use / cap" is composed from the existing depths (the Leased
+   count) and the cap — no new slot read. Paused Queues are shown distinctly, and the paused
+   flag drives the correct Pause/Resume toggle (issue 0052). Via the Monitor API. *@
+<DashboardLayout BasePath="@BasePath" Title="Queues" Active="queues" ContentOnly="@ContentOnly" Live="@Live">
+    <div class="screen" data-screen-label="Queues">
+        <header class="screen__head">
+            <div>
+                <h1 style="font:var(--type-display);letter-spacing:var(--tracking-tight);">Queues</h1>
+            </div>
+        </header>
+
+        <div class="bw-card">
+            @if (Rows.Count == 0)
+            {
+                <p class="ptable__empty">No Queues yet. A Queue appears once something is enqueued onto it or it is configured.</p>
+            }
+            else
+            {
+                <div class="ptable-scroll">
+                <table class="ptable">
+                    <thead>
+                        <tr>
+                            <th>Queue</th>
+                            <th>State</th>
+                            <th>In-use / cap</th>
+                            <th class="num">Depth</th>
+                            @if (Actions.CanPauseQueue)
+                            {
+                                <th>Actions</th>
+                            }
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var row in Rows)
+                        {
+                            <tr>
+                                <td data-label="Queue">
+                                    <a class="mono" href="@($"{BasePath}/jobs?queue={Uri.EscapeDataString(row.Queue)}")">@row.Queue</a>
+                                </td>
+                                <td data-label="State">
+                                    @if (row.Paused)
+                                    {
+                                        <span class="bw-badge bw-badge--amber"><span class="bw-badge__dot"></span>Paused</span>
+                                    }
+                                    else
+                                    {
+                                        <span class="bw-badge bw-badge--green"><span class="bw-badge__dot"></span>Claiming</span>
+                                    }
+                                </td>
+                                <td class="mono" data-label="In-use / cap">@row.InUse / @(row.ConcurrencyLimit?.ToString() ?? "∞")</td>
+                                <td class="num" data-label="Depth">@row.Depth</td>
+                                @if (Actions.CanPauseQueue)
+                                {
+                                    <td data-label="Actions">
+                                        @if (row.Paused)
+                                        {
+                                            <ActionForm Action="@($"{BasePath}/queues/{Uri.EscapeDataString(row.Queue)}/resume")" Label="Resume" Actions="Actions" ButtonClass="bw-btn--primary" />
+                                        }
+                                        else
+                                        {
+                                            <ActionForm Action="@($"{BasePath}/queues/{Uri.EscapeDataString(row.Queue)}/pause")" Label="Pause" Actions="Actions" />
+                                        }
+                                    </td>
+                                }
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                </div>
+            }
+        </div>
+    </div>
+</DashboardLayout>
+
+@code {
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+    [Parameter, EditorRequired] public IReadOnlyList<QueueStateCount> Depths { get; set; } = [];
+    [Parameter, EditorRequired] public IReadOnlyList<QueueSettings> Settings { get; set; } = [];
+    [Parameter, EditorRequired] public DashboardActions Actions { get; set; } = DashboardActions.None;
+
+    /// <summary>Render only the live region (SSE fragment) rather than the full document.</summary>
+    [Parameter] public bool ContentOnly { get; set; }
+
+    /// <summary>Wrap in the #bw-live region and inline the SSE client.</summary>
+    [Parameter] public bool Live { get; set; }
+
+    private record Row(string Queue, bool Paused, int? ConcurrencyLimit, int InUse, int Depth);
+
+    private List<Row> Rows = [];
+
+    protected override void OnParametersSet()
+    {
+        var settingsByQueue = Settings.ToDictionary(s => s.Queue, StringComparer.Ordinal);
+
+        // A Queue is operational if it has depth or a configured setting (paused/cap) — union both.
+        var queues = Depths.Select(d => d.Queue)
+            .Concat(Settings.Select(s => s.Queue))
+            .Distinct()
+            .Order(StringComparer.Ordinal);
+
+        Rows = queues.Select(queue =>
+        {
+            var setting = settingsByQueue.GetValueOrDefault(queue);
+            var inUse = Depths.Where(d => d.Queue == queue && d.State == JobState.Leased).Sum(d => d.Count);
+            var depth = Depths.Where(d => d.Queue == queue).Sum(d => d.Count);
+            return new Row(queue, setting?.Paused ?? false, setting?.ConcurrencyLimit, inUse, depth);
+        }).ToList();
+    }
+}

@@ -1,0 +1,262 @@
+@* The reusable Job detail body (issues 0056–0060): the JobSnapshot facts table, the optional
+   payload card (behind the ViewSensitiveData gate), the Transition Log, and — for an Awaiting-Parent
+   job — the remaining gating parents. Shared verbatim by the Job detail page and the Workflow graph's
+   selected-member panel, so the two never drift. All data arrives via the Monitor API. *@
+<div class="bw-card">
+    <table class="ptable ptable--plain">
+        <tbody>
+            <tr><th>Wire Name</th><td>@Job.WireName</td></tr>
+            <tr><th>Queue</th><td class="mono">@Job.Queue</td></tr>
+            <tr><th>State</th><td>@DashboardGlossary.StateName(Job.State)</td></tr>
+            <tr><th>Attempt</th><td>@Job.Attempt</td></tr>
+            <tr><th>Due Time</th><td class="mono">@DashboardGlossary.Instant(Job.DueTime)</td></tr>
+            @if (Job.CancelRequested)
+            {
+                <tr><th>Cancel requested</th><td>yes</td></tr>
+            }
+            @if (Job.TerminalAt is { } terminalAt)
+            {
+                <tr><th>Terminal At</th><td class="mono">@DashboardGlossary.Instant(terminalAt)</td></tr>
+            }
+            @if (Job.TerminalCause is { } cause)
+            {
+                <tr><th>Terminal cause</th><td>@cause</td></tr>
+            }
+            @if (Job.ScheduleId is { } scheduleId)
+            {
+                <tr>
+                    <th>Minted by</th>
+                    <td><a class="mono" href="@($"{BasePath}/schedules/{Uri.EscapeDataString(scheduleId)}")">@scheduleId</a></td>
+                </tr>
+            }
+            @if (Job.Tags.Count > 0)
+            {
+                @* Tags (ADR 0022): the job's observational annotations. A Label shows bare, a
+                   Keyed Tag as key:value (display only — never parsed). Each links to the Jobs
+                   list filtered by that Tag. Metadata, shown under the normal View permission. *@
+                <tr>
+                    <th>Tags</th>
+                    <td>
+                        <span class="bw-tags">
+                            @foreach (var tag in Job.Tags)
+                            {
+                                <a class="bw-tag" href="@($"{BasePath}/jobs?{TagFilterUrl.ToQueryPart(tag)}")" title="Filter the job list by this Tag">@DashboardGlossary.TagLabel(tag)</a>
+                            }
+                        </span>
+                    </td>
+                </tr>
+            }
+            <tr><th>Sequence</th><td class="mono">@Job.Sequence</td></tr>
+        </tbody>
+    </table>
+</div>
+
+@if (Payload is { } payload)
+{
+    @* Best-effort pretty-print + highlight when the bytes happen to be JSON; otherwise the
+       raw text stands as-is. Either way the dashboard never parses the payload for the job
+       itself — this is display only. *@
+    var highlighted = payload.Encoding == PayloadEncoding.Utf8 ? PayloadHighlighter.Highlight(payload.Text) : null;
+    <div class="bw-card">
+        <div class="bw-card__header">
+            <span class="bw-card__title">Payload</span>
+            <span class="bw-card__aside">@payload.ByteCount bytes</span>
+        </div>
+        @* The copy button copies the rendered <pre>'s textContent — for highlighted JSON that
+           is the pretty-printed text (the highlight spans carry no extra characters), so the
+           clipboard gets the same formatted payload the reader sees. Progressive enhancement:
+           the button is wired by the layout's copy script; without JS the payload still shows. *@
+        <div class="bw-codeblock bw-fence">
+            @* The fence chrome: a header bar carrying the encoding label and the copy button,
+               framing the payload like a code block. *@
+            <div class="bw-fence__bar">
+                <span class="bw-fence__lang">@FenceLang(payload.Encoding, highlighted is not null)</span>
+<CopyButton Label="payload" />
+            </div>
+            <div class="bw-fence__body">
+                @if (highlighted is { } json)
+                {
+                    <pre class="mono bw-json">@json</pre>
+                }
+                else
+                {
+                    <pre class="mono" style="white-space:pre-wrap;word-break:break-all;margin:0;">@payload.Text</pre>
+                }
+            </div>
+        </div>
+    </div>
+}
+
+@if (Output is { ByteCount: > 0 } output)
+{
+    @* Job Output (issue 0134, ADR 0026): the single opaque blob a handler emitted via
+       SetOutput on its Succeeded Attempt — the success-side twin of Failure Detail, read by
+       a Dependency descendant. Rendered best-effort exactly like the payload, behind the SAME
+       ViewSensitiveData gate (output may carry secrets/PII). The card renders only when there
+       is output to show: a job that set none (null) OR set empty bytes shows nothing here,
+       rather than an empty 0-byte card that reads as broken. (Withheld for lack of the
+       ViewSensitiveData Permission also arrives as null — same no-card outcome.) *@
+    var highlightedOutput = output.Encoding == PayloadEncoding.Utf8 ? PayloadHighlighter.Highlight(output.Text) : null;
+    <div class="bw-card">
+        <div class="bw-card__header">
+            <span class="bw-card__title">Output</span>
+            <span class="bw-card__aside">@output.ByteCount bytes</span>
+        </div>
+        <div class="bw-codeblock bw-fence">
+            <div class="bw-fence__bar">
+                <span class="bw-fence__lang">@FenceLang(output.Encoding, highlightedOutput is not null)</span>
+<CopyButton Label="output" />
+            </div>
+            <div class="bw-fence__body">
+                @if (highlightedOutput is { } json)
+                {
+                    <pre class="mono bw-json">@json</pre>
+                }
+                else
+                {
+                    <pre class="mono" style="white-space:pre-wrap;word-break:break-all;margin:0;">@output.Text</pre>
+                }
+            </div>
+        </div>
+    </div>
+}
+
+<div class="bw-card">
+    <div class="bw-card__header">
+        <span class="bw-card__title">Transition Log</span>
+        <span class="bw-card__aside">@(HistoryDisabled ? "recording disabled" : $"{History.Count} recorded")</span>
+    </div>
+    @if (HistoryDisabled)
+    {
+        @* Job History Policy Off (issue 0060): no transition rows are recorded for ANY job, so
+           this is an empty timeline BY DESIGN — an explicit disabled state, never a blank one
+           that reads as broken (distinct from the on-but-empty "No transitions" copy below). *@
+        <p class="ptable__empty">
+            History recording is <strong>disabled</strong> — the global Job History Policy is Off,
+            so no transitions are recorded for any job. Turn the policy on (a config change, never
+            a schema migration) to populate this timeline.
+        </p>
+    }
+    else if (History.Count == 0)
+    {
+        <p class="ptable__empty">No transitions recorded yet.</p>
+    }
+    else
+    {
+        <div class="ptable-scroll">
+        <table class="ptable">
+            <thead>
+                <tr><th>When</th><th>State</th><th>Attempt</th></tr>
+            </thead>
+            <tbody>
+                @foreach (var entry in History.Reverse())
+                {
+                    <tr>
+                        <td class="mono nowrap" data-label="When">@DashboardGlossary.Instant(entry.Timestamp)</td>
+                        <td data-label="State">
+                            <span class="bw-badge bw-badge--@DashboardGlossary.Tone(entry.State)">
+                                <span class="bw-badge__dot"></span>@DashboardGlossary.StateName(entry.State)
+                            </span>
+                        </td>
+                        <td class="mono" data-label="Attempt">@entry.Attempt</td>
+                    </tr>
+                    @if (CanViewSensitiveData && entry.FailureDetail is { } failureDetail)
+                    {
+                        @* Failure Detail (issue 0059): the opaque exception diagnostics of a
+                           failing Attempt, captured by the Shell. Inline under its row, behind
+                           the SAME ViewSensitiveData gate as the payload — a stack trace
+                           routinely carries secrets/PII. Off the gate, the row above still
+                           shows; only this detail is withheld. *@
+                        <tr>
+                            <td colspan="3" data-label="Failure Detail" style="padding-top:0;">
+                                <p style="color:var(--text-secondary);margin:0 0 6px;">
+                                    <strong>Failure Detail</strong>
+                                </p>
+                                @* Same delegated copy wiring as the payload/output cards: a
+                                   [data-bw-copy] button inside a .bw-codeblock copies the sibling
+                                   <pre>'s textContent. Progressive enhancement — without JS the
+                                   detail still shows, the button just does nothing. *@
+                                <div class="bw-codeblock">
+                                    <CopyButton Label="failure detail" />
+                                    <pre class="mono" style="white-space:pre-wrap;word-break:break-all;margin:0;">@failureDetail</pre>
+                                </div>
+                            </td>
+                        </tr>
+                    }
+                }
+            </tbody>
+        </table>
+        </div>
+    }
+</div>
+
+@if (Job.State == JobState.AwaitingParent)
+{
+    <div class="bw-card">
+        <div class="bw-card__header">
+            <span class="bw-card__title">Still blocking this Dependency</span>
+            <span class="bw-card__aside">@GatingParents.Count remaining</span>
+        </div>
+        @if (GatingParents.Count == 0)
+        {
+            <p class="ptable__empty">No remaining gating parents — the latch should release on the next sweep.</p>
+        }
+        else
+        {
+            <ul class="mono" style="margin:0;padding-left:1.2rem;">
+                @foreach (var parentId in GatingParents)
+                {
+                    <li><a class="mono" href="@($"{BasePath}/jobs/{parentId}")">@parentId</a></li>
+                }
+            </ul>
+        }
+    </div>
+}
+
+@code {
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+    [Parameter, EditorRequired] public JobSnapshot Job { get; set; } = null!;
+
+    /// <summary>For an Awaiting-Parent job: the parents still gating it (issue 0056). Empty otherwise.</summary>
+    [Parameter] public IReadOnlyList<Guid> GatingParents { get; set; } = [];
+
+    /// <summary>The job's Transition Log (issue 0057): its state-change timeline, oldest first.</summary>
+    [Parameter] public IReadOnlyList<JobTransition> History { get; set; } = [];
+
+    /// <summary>
+    /// Whether the global Job History Policy is Off (issue 0060). When true the card shows an
+    /// explicit "history disabled" state rather than the on-but-empty "No transitions" copy.
+    /// </summary>
+    [Parameter] public bool HistoryDisabled { get; set; }
+
+    /// <summary>
+    /// Whether the viewer may see raw content that can carry secrets/PII (issue 0059) — the same
+    /// gate as the payload (<c>CanViewSensitiveData &amp;&amp; SensitiveDataExposureEnabled</c>).
+    /// When false, a failing transition still shows (state/attempt/time) but its Failure Detail is
+    /// withheld.
+    /// </summary>
+    [Parameter] public bool CanViewSensitiveData { get; set; }
+
+    /// <summary>
+    /// The job's payload, opaque bytes rendered best-effort (issue 0058). Null — and the card does
+    /// not render — unless the viewer holds ViewSensitiveData and sensitive-data exposure is on.
+    /// </summary>
+    [Parameter] public JobPayloadView? Payload { get; set; }
+
+    /// <summary>
+    /// The job's Job Output: the single opaque blob a handler emitted on its Succeeded Attempt,
+    /// rendered best-effort like the payload. Null — and the card does not render —
+    /// unless the viewer holds ViewSensitiveData, sensitive-data exposure is on, and the job set output.
+    /// </summary>
+    [Parameter] public JobPayloadView? Output { get; set; }
+
+    /// <summary>The short label in the fence's header bar — "JSON" when the bytes pretty-printed
+    /// as JSON, otherwise the raw encoding the payload is shown in.</summary>
+    private static string FenceLang(PayloadEncoding encoding, bool isJson) => isJson
+        ? "JSON"
+        : encoding switch
+        {
+            PayloadEncoding.Hex => "HEX",
+            _ => "TEXT",
+        };
+}

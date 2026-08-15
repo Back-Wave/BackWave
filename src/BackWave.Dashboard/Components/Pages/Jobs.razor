@@ -1,0 +1,361 @@
+@* Jobs list: filters (state, Queue, Wire Name, Recurring Schedule) and §5.9 cursor
+   pagination (?after={sequence}), ported verbatim from the prior hand-written view onto
+   the render spine. All data arrives via the Monitor API. *@
+<DashboardLayout BasePath="@BasePath" Title="Jobs" Active="jobs">
+    <div class="screen" data-screen-label="Jobs">
+        <header class="screen__head">
+            <div>
+                <h1 style="font:var(--type-display);letter-spacing:var(--tracking-tight);">Jobs</h1>
+            </div>
+        </header>
+
+        <div class="bw-card bw-card--quiet">
+            <form method="get" action="@($"{BasePath}/jobs")">
+                <div class="form-row">
+                    <div class="bw-field">
+                        <label for="state">State</label>
+                        <div class="bw-select">
+                            <select id="state" name="state">
+                                <option value="">(any)</option>
+                                @foreach (var state in DashboardGlossary.StateOrder)
+                                {
+                                    <option value="@state" selected="@(Filter.State == state)">@DashboardGlossary.StateName(state)</option>
+                                }
+                            </select>
+                            @Chevron
+                        </div>
+                    </div>
+                    <div class="bw-field">
+                        <label for="queue">Queue</label>
+                        <div class="bw-select">
+                            <select id="queue" name="queue">
+                                <option value="">(any)</option>
+                                @foreach (var queue in QueueOptions)
+                                {
+                                    <option value="@queue" selected="@(Filter.Queue == queue)">@queue</option>
+                                }
+                            </select>
+                            @Chevron
+                        </div>
+                    </div>
+                    <div class="bw-field">
+                        <label for="wire">Wire Name</label>
+                        <div class="bw-select">
+                            <select id="wire" name="wire">
+                                <option value="">(any)</option>
+                                @foreach (var wire in WireNameOptions)
+                                {
+                                    <option value="@wire" selected="@(Filter.WireName == wire)">@wire</option>
+                                }
+                            </select>
+                            @Chevron
+                        </div>
+                    </div>
+                    <div class="bw-field">
+                        <label for="id">Job ID</label>
+                        <input id="id" name="id" class="bw-input" placeholder="(exact id)" />
+                    </div>
+                    <div class="bw-field">
+                        <label for="size">Rows</label>
+                        <div class="bw-select">
+                            <select id="size" name="size">
+                                @foreach (var size in PageSizes)
+                                {
+                                    <option value="@size" selected="@(PageSize == size)">@size</option>
+                                }
+                            </select>
+                            @Chevron
+                        </div>
+                    </div>
+                    <div class="bw-field" style="justify-content:flex-end;">
+                        <button class="bw-btn bw-btn--primary" type="submit">Search</button>
+                    </div>
+                    <div class="bw-field" style="justify-content:flex-end;">
+                        <a class="bw-btn" href="@ClearHref">Clear</a>
+                    </div>
+                </div>
+            </form>
+        </div>
+
+        @if (Filter.TagPredicates.Count > 0)
+        {
+            @* Active tag filters (ADR 0022, issue 0113): each AND-ed predicate shown as a removable
+               chip. Removing one rebuilds the filter without it (and drops back to page one). *@
+            <div class="bw-card bw-card--quiet">
+                <div class="bw-card__header">
+                    <span class="bw-card__title">Active tag filters</span>
+                    <span class="bw-card__aside">@Filter.TagPredicates.Count AND-ed</span>
+                </div>
+                <span class="bw-tags">
+                    @foreach (var predicate in Filter.TagPredicates)
+                    {
+                        <a class="bw-tag bw-tag--active" href="@RemoveTagHref(predicate)" title="Remove this tag filter">
+                            @PredicateLabel(predicate) <span aria-hidden="true">×</span>
+                        </a>
+                    }
+                </span>
+            </div>
+        }
+
+        @* Tag-filter input (issues 0214/0215): a two-stage type-ahead over every Tag in the store (not
+           just the capped facet below). The vanilla dropdown script (data-bw-suggest) fetches the JSON
+           suggest endpoint as you type. Stage one mixes Label suggestions with key drill-ins; picking a
+           Label ANDs a has-label predicate (tl=) onto the current filter, picking a key drills into
+           stage two (that key's values), where picking one ANDs a has-key/value predicate (tk=/tv=).
+           Every href is built from SuggestBaseHref so existing predicates survive and the page cursor
+           resets, exactly like a facet click; the existing Clear link still drops it. The dropdown is
+           scroll-virtualized: it pages the value set a window at a time via the keyset cursor. *@
+        <div class="bw-card bw-card--quiet">
+            <div class="bw-card__header">
+                <span class="bw-card__title">Filter by Tag</span>
+                <span class="bw-card__aside">type to search Labels and keys</span>
+            </div>
+            <div class="bw-suggest"
+                 data-bw-suggest="@($"{BasePath}/tags/suggest")"
+                 data-bw-suggest-base="@SuggestBaseHref()"
+                 data-bw-suggest-window="@LabelSuggestWindow">
+                @* WAI-ARIA combobox scaffolding (ADR 0043): the static roles/wiring the server can
+                   render; the inline dropdown script adds the per-option role/id and drives
+                   aria-expanded/aria-activedescendant as you arrow through the list. *@
+                <input class="bw-input" type="text" autocomplete="off" placeholder="Type a Label or key…"
+                       role="combobox" aria-expanded="false" aria-autocomplete="list"
+                       aria-controls="bw-suggest-menu" aria-label="Filter by Tag" data-bw-suggest-input />
+                <div class="bw-suggest__menu bw-tags" id="bw-suggest-menu" role="listbox"
+                     aria-label="Tag suggestions" data-bw-suggest-menu hidden></div>
+            </div>
+        </div>
+
+        @if (Facets.Count > 0)
+        {
+            @* Facet display (ADR 0022 §0112, issue 0113): the top Labels by count (capped, issue 0210),
+               scoped by the ACTIVE filter (the Monitor faceted with the current JobQuery as baseQuery).
+               Clicking an entry ANDs its has-label predicate onto the filter — same wiring as a pill. *@
+            <div class="bw-card bw-card--quiet">
+                <div class="bw-card__header">
+                    <span class="bw-card__title">Top labels</span>
+                    <span class="bw-card__aside">within the current filter</span>
+                </div>
+                <span class="bw-tags">
+                    @foreach (var facet in Facets)
+                    {
+                        @if (IsLabelActive(facet.Value))
+                        {
+                            @* Already AND-ed into the active filter (shown as a removable chip above):
+                               clicking would add a redundant no-op predicate, so render it inert. *@
+                            <span class="bw-tag bw-tag--disabled" aria-disabled="true" title="Already in the active filter">
+                                @facet.Value <span class="bw-tag__count">@facet.Count</span>
+                            </span>
+                        }
+                        else
+                        {
+                            <a class="bw-tag" href="@FacetHref(facet)" title="Filter by this Label">
+                                @facet.Value <span class="bw-tag__count">@facet.Count</span>
+                            </a>
+                        }
+                    }
+                </span>
+            </div>
+        }
+
+        <div class="bw-card">
+            <JobTable BasePath="@BasePath" Jobs="Shown" RowAction="@RowAction" TagHref="@TagHref" />
+        </div>
+
+        @if (NextHref is { } next)
+        {
+            <p><a class="mono" href="@next">Next page →</a></p>
+        }
+    </div>
+</DashboardLayout>
+
+@code {
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+
+    /// <summary>The applied filter — re-bound into the form so the search is shareable by URL.</summary>
+    [Parameter, EditorRequired] public JobQuery Filter { get; set; } = new();
+
+    /// <summary>The fetched page; the handler fetches PageSize+1 so a trailing row means "next page".</summary>
+    [Parameter, EditorRequired] public IReadOnlyList<JobSnapshot> Page { get; set; } = [];
+
+    /// <summary>The effective rows-per-page for this request (one of <see cref="PageSizes"/>); a display
+    /// preference carried through filters and the cursor link, not part of the filter.</summary>
+    [Parameter, EditorRequired] public int PageSize { get; set; }
+
+    /// <summary>The rows-per-page choices; the last (largest) is the store's MaxMonitorPageSize, the size
+    /// at which the "+1 next-page sentinel" is clamped away so a full page implies "there may be more".</summary>
+    [Parameter, EditorRequired] public IReadOnlyList<int> PageSizes { get; set; } = [];
+
+    [Parameter, EditorRequired] public DashboardActions Actions { get; set; } = DashboardActions.None;
+
+    /// <summary>Queue names that actually have jobs — the Queue dropdown's options (Monitor depths).</summary>
+    [Parameter] public IReadOnlyList<string> QueueOptions { get; set; } = [];
+
+    /// <summary>The known Wire Names — the Wire Name dropdown's options (registry-backed Monitor facet).</summary>
+    [Parameter] public IReadOnlyList<string> WireNameOptions { get; set; } = [];
+
+    /// <summary>The Label facet: Label values with their counts, already scoped by the
+    /// active filter (the Monitor faceted with the current JobQuery). Empty when no Labels are present.</summary>
+    [Parameter] public IReadOnlyList<TagFacet> Facets { get; set; } = [];
+
+    // A down-chevron (Hugeicons arrow-down-01) consistent with the dashboard's other inline 24×24
+    // stroke icons; the .bw-select wrapper absolutely-positions it over the (appearance:none) native select.
+    private static readonly RenderFragment Chevron = @<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 9.00005C18 9.00005 13.5811 15 12 15C10.4188 15 6 9 6 9"/></svg>;
+
+    // The single per-row Operator Action, picked by the row's state and the caller's Permissions:
+    // Requeue for a Dead-Lettered/Quarantined job (the only requeue-eligible states; ADR 0010),
+    // else Cancel for a non-terminal job, else "—". Each control appears only where its own
+    // Permission passed, so an ineligible state is never offered a control (default-deny). The
+    // column itself appears only when at least one of the two Permissions is granted.
+    private RenderFragment<JobSnapshot>? RowAction => Actions.CanRequeue || Actions.CanCancel
+        ? job =>
+            Actions.CanRequeue && job.State is JobState.DeadLettered or JobState.Quarantined
+                ? @<ActionForm Action="@($"{BasePath}/jobs/{job.JobId}/requeue")" Label="Requeue" Actions="Actions" />
+                : Actions.CanCancel && !DashboardGlossary.IsTerminal(job.State)
+                    ? @<ActionForm Action="@($"{BasePath}/jobs/{job.JobId}/cancel")" Label="Cancel" Actions="Actions" />
+                    : @<text>—</text>
+        : null;
+
+    private List<JobSnapshot> Shown = [];
+    private string? NextHref;
+    private string ClearHref = "";
+
+    protected override void OnParametersSet()
+    {
+        Shown = Page.Take(PageSize).ToList();
+        NextHref = BuildNextHref();
+        ClearHref = BuildClearHref();
+    }
+
+    private string? BuildNextHref()
+    {
+        // The handler fetches PageSize+1; a trailing sentinel row means "next page exists". At the
+        // 200 boundary that +1 clamps to the store's MaxMonitorPageSize, so the sentinel can't appear
+        // — there a FULL page (PageSize is the largest offered size) is treated as "there may be more"
+        // so the last rows are never silently dropped. Either way we still hold PageSize rows here.
+        var atMaxBoundary = PageSize == PageSizes[^1] && Page.Count == PageSize;
+        if ((Page.Count <= PageSize && !atMaxBoundary) || Shown.Count == 0)
+        {
+            return null;
+        }
+
+        var query = new List<string> { $"after={Shown[^1].Sequence}" };
+        if (Filter.State is { } state)
+        {
+            query.Add($"state={state}");
+        }
+        if (Filter.Queue is { } queue)
+        {
+            query.Add($"queue={Uri.EscapeDataString(queue)}");
+        }
+        if (Filter.WireName is { } wire)
+        {
+            query.Add($"wire={Uri.EscapeDataString(wire)}");
+        }
+        if (Filter.ScheduleId is { } schedule)
+        {
+            query.Add($"schedule={Uri.EscapeDataString(schedule)}");
+        }
+        // The active tag filters ride the cursor link too, so paging holds the same AND-ed predicates.
+        query.AddRange(TagFilterUrl.ToQueryParts(Filter.TagPredicates));
+        if (PageSize != DefaultPageSize)
+        {
+            query.Add($"size={PageSize}");
+        }
+        return $"{BasePath}/jobs?{string.Join("&", query)}";
+    }
+
+    // The non-cursor part of the active filter — State/Queue/Wire/Schedule/size, WITHOUT the page
+    // cursor — as query-string fragments. A click-to-filter pill or facet appends its own predicate
+    // to this, so the new Tag ANDs onto whatever is already filtered (and resets to page one).
+    private List<string> FilterBaseParts()
+    {
+        var parts = new List<string>();
+        if (Filter.State is { } state)
+        {
+            parts.Add($"state={state}");
+        }
+        if (Filter.Queue is { } queue)
+        {
+            parts.Add($"queue={Uri.EscapeDataString(queue)}");
+        }
+        if (Filter.WireName is { } wire)
+        {
+            parts.Add($"wire={Uri.EscapeDataString(wire)}");
+        }
+        if (Filter.ScheduleId is { } schedule)
+        {
+            parts.Add($"schedule={Uri.EscapeDataString(schedule)}");
+        }
+        if (PageSize != DefaultPageSize)
+        {
+            parts.Add($"size={PageSize}");
+        }
+        return parts;
+    }
+
+    private string ToHref(IEnumerable<string> parts)
+    {
+        var joined = string.Join("&", parts);
+        return joined.Length == 0 ? $"{BasePath}/jobs" : $"{BasePath}/jobs?{joined}";
+    }
+
+    // Clicking a pill: the active filter (base + all current tag predicates) AND the clicked Tag's
+    // predicate. Drops the page cursor so the AND-narrowed result starts at page one.
+    private string TagHref(JobTag tag)
+    {
+        var parts = FilterBaseParts();
+        parts.AddRange(TagFilterUrl.ToQueryParts(Filter.TagPredicates));
+        parts.Add(TagFilterUrl.ToQueryPart(tag));
+        return ToHref(parts);
+    }
+
+    // A facet entry is a Label value: same wiring as a Label pill (a has-label predicate).
+    private string FacetHref(TagFacet facet) => TagHref(JobTag.Label(facet.Value));
+
+    // A Top-labels entry whose has-label predicate is already AND-ed into the active filter — its
+    // click would add a redundant no-op, so it renders as a disabled (non-clickable) chip.
+    private bool IsLabelActive(string value)
+        => Filter.TagPredicates.Any(p => p.Key.Length == 0 && p.Value == value);
+
+    // The Label-suggest dropdown's base href: the active filter (base + all current tag predicates)
+    // WITHOUT the page cursor. The client script appends the picked Label as one tl= param, so the
+    // result is byte-identical to a facet click — existing predicates survive, the cursor resets to
+    // page one, and the existing Clear link still drops the added chip.
+    private string SuggestBaseHref()
+    {
+        var parts = FilterBaseParts();
+        parts.AddRange(TagFilterUrl.ToQueryParts(Filter.TagPredicates));
+        return ToHref(parts);
+    }
+
+    // The suggest window size the dropdown requests per fetch: the scroll-virtualized menu pages the
+    // Tag set a window at a time via the keyset cursor, fetching the next window on scroll-to-bottom.
+    private const int LabelSuggestWindow = 20;
+
+    // Removing one active tag chip: rebuild the filter with every OTHER predicate kept. Removes a
+    // single occurrence by index (JobTagPredicate is a value record, so equal predicates compare
+    // equal — only the clicked one drops).
+    private string RemoveTagHref(JobTagPredicate removed)
+    {
+        var kept = Filter.TagPredicates.ToList();
+        kept.Remove(removed);
+        var parts = FilterBaseParts();
+        parts.AddRange(TagFilterUrl.ToQueryParts(kept));
+        return ToHref(parts);
+    }
+
+    // An active tag chip's text: a Label by its value, a Keyed Tag as key:value (display only).
+    private static string PredicateLabel(JobTagPredicate predicate)
+        => predicate.Value is { } value
+            ? (predicate.Key.Length == 0 ? value : $"{predicate.Key}:{value}")
+            : predicate.Key; // has-key-any-value (not produced by the UI, but rendered defensively)
+
+    // Clear: back to an unfiltered first page (no state/queue/wire/id, no after cursor), but the chosen
+    // rows-per-page is a display preference and survives. A non-default size is the only carried param.
+    private string BuildClearHref()
+        => PageSize == DefaultPageSize ? $"{BasePath}/jobs" : $"{BasePath}/jobs?size={PageSize}";
+
+    // The default rows-per-page (must mirror the handler): a size equal to it is omitted from URLs to
+    // keep the unfiltered, default-size links clean (plain /jobs).
+    private const int DefaultPageSize = 50;
+}

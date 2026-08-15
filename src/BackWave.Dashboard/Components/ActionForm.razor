@@ -1,0 +1,19 @@
+@* A single Operator Action: an antiforgery-protected POST, rendered only where its
+   Permission passed (ADR 0010). The state-mutating POST is what the GET-only middleware
+   gained for write capability; the hidden token is validated server-side. *@
+<form method="post" action="@Action" style="display:inline;">
+    <input type="hidden" name="@Actions.AntiforgeryFieldName" value="@Actions.AntiforgeryToken" />
+    <button class="bw-btn @ButtonClass" type="submit">@Label</button>
+</form>
+
+@code {
+    /// <summary>Where to POST — the action route, e.g. <c>{base}/jobs/{id}/requeue</c>.</summary>
+    [Parameter, EditorRequired] public string Action { get; set; } = "";
+
+    [Parameter, EditorRequired] public string Label { get; set; } = "";
+
+    /// <summary>Carries the antiforgery field name + token for this request.</summary>
+    [Parameter, EditorRequired] public DashboardActions Actions { get; set; } = DashboardActions.None;
+
+    [Parameter] public string ButtonClass { get; set; } = "bw-btn--ghost";
+}

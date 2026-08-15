@@ -1,0 +1,103 @@
+{
+  "SchemaVersion": 1,
+  "Scenario": {
+    "Seed": 8137030289694314945,
+    "NodeCount": 3,
+    "JobCount": 30,
+    "WorkloadDuration": "01:00:00",
+    "DrainAllowance": "06:00:00",
+    "CrashProbabilityPerPoll": 0,
+    "HeartbeatLossProbability": 0.04786567952483893,
+    "HandlerFailureProbability": 0,
+    "MaxExecutionDuration": "00:01:30",
+    "MaxClockSkew": "00:00:02",
+    "MaxCrashDowntime": "00:05:00",
+    "PollInterval": "00:00:01",
+    "HeartbeatInterval": "00:00:20",
+    "LeaseDuration": "00:01:00",
+    "MaxAttempts": 3,
+    "Backoff": "00:00:30",
+    "ConcurrencyLimit": null,
+    "ConcurrencyLimits": {},
+    "PoolSize": 2147483647,
+    "HintDeliveryProbability": 0,
+    "MaxHintLatency": "00:00:00.2500000",
+    "StoreFaultProbability": 0.0730487740598619,
+    "OperatorActionCount": 0,
+    "IsolationCount": 0,
+    "PermanentLossProbability": 0,
+    "AckLossProbability": 0,
+    "UnroutableProbability": 0.05418863851577044,
+    "TopologyQueues": 2,
+    "ForceWeightedDispatch": false,
+    "StartTime": "2026-01-01T00:00:00+00:00",
+    "Schedules": [],
+    "Sabotage": false,
+    "SabotageSlotDoubleRelease": false,
+    "SabotagePoolSize": false,
+    "SabotageOutcomeFence": false,
+    "SabotageMigrationSweep": false,
+    "SabotagePausedClaim": false,
+    "SabotageCancelProvenance": false,
+    "SabotageLegalTransition": false,
+    "SabotageExecuteLiveness": false,
+    "SabotageAuditCompleteness": false,
+    "SabotageServedSet": false,
+    "SabotageInlineUnroutableReport": false,
+    "SabotageDeferredUnroutableReport": false
+  },
+  "FaultMap": [
+    {
+      "Axis": "store",
+      "Id": "-1:Enqueue",
+      "Ordinal": 17,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "0:ExpireLeases",
+      "Ordinal": 1313,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "0:ExpireLeases",
+      "Ordinal": 1331,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "0:ExpireLeases",
+      "Ordinal": 1340,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "0:ExpireLeases",
+      "Ordinal": 1346,
+      "Fault": true
+    },
+    {
+      "Axis": "unroutable",
+      "Id": "1280b9f7-b5b4-aee0-d74f-ad098583bb2f",
+      "Ordinal": 0,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "0:ExpireLeases",
+      "Ordinal": 1407,
+      "Fault": true
+    },
+    {
+      "Axis": "store",
+      "Id": "0:Claim",
+      "Ordinal": 1762,
+      "Fault": true
+    }
+  ],
+  "Failure": {
+    "Message": "[seed 8137030289694314945] invariant DrainLiveness violated at virtual 2026-01-01T07:00:00.3616897\u002B00:00 after 79442 steps: liveness: not all jobs reached a terminal state by the end of the drain window \u2014 stuck [Queue default: 1 Leased]",
+    "InvariantId": "DrainLiveness"
+  }
+}
