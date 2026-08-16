@@ -5,8 +5,9 @@ namespace BackWave.Storage.InMemory;
 /// <summary>
 /// The in-memory reference implementation of the job store. It is deterministic and clock-free —
 /// every time-dependent decision uses the instants callers pass in — so it can run on virtual time.
-/// It keeps all state in process memory and persists nothing, making it suitable for tests and
-/// local development only; it is never a production target.
+/// It keeps all state in process memory and persists nothing, so it cannot carry BackWave's
+/// execution guarantee: a restart loses in-flight work, and it is single-process. Its home is
+/// tests and local development. For the same zero-ops shape with durability, use the SQLite adapter.
 /// </summary>
 /// <param name="bounds">The size and batch limits to enforce; the default bounds when null.</param>
 /// <param name="historyPolicy">How much of each job's transition log to record; the full log by default.</param>
