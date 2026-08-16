@@ -810,7 +810,7 @@ public sealed class TypedWorkflowBuilder
     public WorkflowDefinition Build()
     {
         ThrowIfSubBuilder();
-        return Build(Activity.Current?.Id);
+        return Build(BackWaveDiagnostics.EncodeTraceContext(Activity.Current));
     }
 
     // The trace-baking build. The workflow-root traceparent is stamped onto every member's TraceContext

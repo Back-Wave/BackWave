@@ -65,6 +65,12 @@ public static class BackWaveDiagnostics
     private const string ReceiveOperation = "receive";
     private const string ProcessOperation = "process";
 
+    // The opaque trace-context string a job carries from enqueue to execution is the W3C traceparent,
+    // optionally followed by a newline and the tracestate. This cap keeps the encoded string inside the
+    // narrowest store column (SqlServer trace_context is nvarchar(450)); a context that would overflow it
+    // drops the tracestate and keeps the traceparent, so an enqueue never fails over a large tracestate.
+    private const int MaxTraceContextLength = 450;
+
     // ── Metrics ──────────────────────────────────────────────────────────────────────────────
     // The lifecycle counters and histogram are named per the messaging conventions; instruments OTel
     // has no equivalent for (attempts, failures) stay BackWave-owned. All carry the same messaging
@@ -374,11 +380,11 @@ public static class BackWaveDiagnostics
         using var activity = ActivitySource.StartActivity(SendOperation, ActivityKind.Producer, parentContext);
         if (activity is null)
         {
-            return workflowRoot?.Id ?? Activity.Current?.Id;
+            return CaptureTraceContext(workflowRoot);
         }
         activity.DisplayName = $"send {queue}";
         SetMessagingTags(activity, SendOperation, queue, wireName, jobId);
-        return activity.Id;
+        return EncodeTraceContext(activity);
     }
 
     // The Enqueue span; a PRODUCER "send" whose Id becomes the job's trace-correlation context, later
@@ -505,19 +511,61 @@ public static class BackWaveDiagnostics
         return activity;
     }
 
+    // Encodes an activity's W3C trace context into the opaque string stored on a job: the traceparent
+    // (its Id), and the tracestate after a newline when present. Activity.Id carries the traceparent
+    // alone, so without this the vendor tracestate is dropped at the enqueue hop. Returns null when there
+    // is no activity to capture. A newline never appears inside a traceparent or a tracestate, so it is a
+    // safe separator and the split on read is unambiguous.
+    internal static string? EncodeTraceContext(Activity? activity)
+    {
+        if (activity?.Id is not { } traceParent)
+        {
+            return null;
+        }
+        var traceState = activity.TraceStateString;
+        if (string.IsNullOrEmpty(traceState))
+        {
+            return traceParent;
+        }
+        var encoded = $"{traceParent}\n{traceState}";
+        // Keep the traceparent rather than overflow the store column; tracestate is best-effort vendor data.
+        return encoded.Length <= MaxTraceContextLength ? encoded : traceParent;
+    }
+
+    // The trace context to bake onto a job at enqueue: the given span when one was sampled, otherwise the
+    // ambient span. Mirrors the old "activity?.Id ?? Activity.Current?.Id" fallback, now tracestate-aware.
+    internal static string? CaptureTraceContext(Activity? preferred)
+        => EncodeTraceContext(preferred ?? Activity.Current);
+
+    // Parses a stored trace-context string back into an ActivityContext, restoring the tracestate that
+    // EncodeTraceContext wrote after the newline. Accepts a bare traceparent too, so a context written
+    // before this encoding (or by a caller that stores only a traceparent) still parses.
+    internal static bool TryParseTraceContext(string? stored, out ActivityContext context)
+    {
+        context = default;
+        if (string.IsNullOrEmpty(stored))
+        {
+            return false;
+        }
+        var newline = stored.IndexOf('\n');
+        var traceParent = newline < 0 ? stored : stored[..newline];
+        var traceState = newline < 0 ? null : stored[(newline + 1)..];
+        return ActivityContext.TryParse(traceParent, traceState, out context);
+    }
+
     // Builds the process span's link set: one link to the job's own creation (send) context stored in
     // TraceContext, plus one per fan-in ancestor send context baked into the payload envelope. A missing
     // or unparseable context is simply skipped - telemetry never fails an execution over a bad link.
     private static List<ActivityLink>? BuildProcessLinks(JobRecord job)
     {
         List<ActivityLink>? links = null;
-        if (job.TraceContext is { } context && ActivityContext.TryParse(context, null, out var creation))
+        if (TryParseTraceContext(job.TraceContext, out var creation))
         {
             links = [new ActivityLink(creation)];
         }
         foreach (var ancestor in ReadAncestorTraceContexts(job.Payload))
         {
-            if (ActivityContext.TryParse(ancestor, null, out var ancestorContext))
+            if (TryParseTraceContext(ancestor, out var ancestorContext))
             {
                 (links ??= []).Add(new ActivityLink(ancestorContext));
             }

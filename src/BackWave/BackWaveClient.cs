@@ -99,7 +99,7 @@ public sealed class BackWaveClient(
             {
                 // The traceparent travels with the payload: the execution span becomes a
                 // child of this enqueue, even hours later on another node.
-                TraceContext = activity?.Id ?? Activity.Current?.Id,
+                TraceContext = BackWaveDiagnostics.CaptureTraceContext(activity),
                 Tags = mergedTags,
             },
             now: _clock.GetUtcNow(),
@@ -175,7 +175,7 @@ public sealed class BackWaveClient(
             {
                 Parents = [parentId],
                 Mode = mode,
-                TraceContext = activity?.Id ?? Activity.Current?.Id,
+                TraceContext = BackWaveDiagnostics.CaptureTraceContext(activity),
                 Tags = mergedTags,
             },
             now: _clock.GetUtcNow(),

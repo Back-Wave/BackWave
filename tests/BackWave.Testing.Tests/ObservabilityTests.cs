@@ -111,6 +111,38 @@ public class ObservabilityTests
     }
 
     [Fact]
+    public async Task ProcessSpan_LinkPreservesTheTraceState_AcrossAVirtualTimeGap()
+    {
+        var stopped = new ConcurrentBag<Activity>();
+        using var listener = ListenToBackWave(stopped);
+
+        var (harness, log) = CreateHarness();
+
+        // The incoming request carries W3C tracestate - the vendor routing and sampling state a bare
+        // traceparent does not hold.
+        using var request = new Activity("incoming-request");
+        request.TraceStateString = "vendor=abc123";
+        request.Start();
+        await harness.EnqueueAsync(new TraceProbe("with-tracestate"), delay: TimeSpan.FromHours(6));
+        request.Stop();
+
+        await harness.AdvanceAsync(TimeSpan.FromHours(6));
+
+        var processSpan = Assert.Single(log.Captured);
+        Assert.NotNull(processSpan);
+
+        // The send span inherits the ambient tracestate, and the enqueue stores it alongside the
+        // traceparent.
+        var sendSpan = stopped.Single(a => a.OperationName == "send" && a.TraceId == request.TraceId);
+        Assert.Equal("vendor=abc123", sendSpan.TraceStateString);
+
+        // The stored context carried the tracestate across the hop, so the process span's link back to the
+        // send context restores it - not the traceparent alone.
+        var link = processSpan.Links.Single(l => l.Context.SpanId == sendSpan.SpanId);
+        Assert.Equal("vendor=abc123", link.Context.TraceState);
+    }
+
+    [Fact]
     public async Task ProcessSpan_WithoutATraceContext_IsARootWithNoLinks()
     {
         var stopped = new ConcurrentBag<Activity>();
