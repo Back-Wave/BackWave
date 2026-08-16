@@ -61,6 +61,9 @@ public static class BackWaveDiagnostics
     private const string OperationTypeKey = "messaging.operation.type";
     private const string MessageIdKey = "messaging.message.id";                     // the job id
     private const string ConsumerGroupKey = "messaging.consumer.group.name";        // the worker-group name
+    private const string CodeFunctionKey = "code.function.name";                    // the enqueue caller member
+    private const string CodeFilePathKey = "code.file.path";                        // the enqueue caller file
+    private const string CodeLineNumberKey = "code.line.number";                    // the enqueue caller line
     private const string SendOperation = "send";
     private const string ReceiveOperation = "receive";
     private const string ProcessOperation = "process";
@@ -388,16 +391,40 @@ public static class BackWaveDiagnostics
     }
 
     // The Enqueue span; a PRODUCER "send" whose Id becomes the job's trace-correlation context, later
-    // surfaced as a LINK on the job's process span.
-    internal static Activity? StartSend(string wireName, string queue, Guid jobId)
+    // surfaced as a LINK on the job's process span. The caller parameters carry the enqueue call site,
+    // supplied by the compiler through CallerInfo attributes; they add code.* tags to the send span.
+    internal static Activity? StartSend(
+        string wireName,
+        string queue,
+        Guid jobId,
+        string? callerFilePath = null,
+        string? callerMemberName = null,
+        int callerLineNumber = 0)
     {
         var activity = ActivitySource.StartActivity(SendOperation, ActivityKind.Producer);
         if (activity is not null)
         {
             activity.DisplayName = $"send {queue}";
             SetMessagingTags(activity, SendOperation, queue, wireName, jobId);
+            SetCallSiteTags(activity, callerFilePath, callerMemberName, callerLineNumber);
         }
         return activity;
+    }
+
+    // Adds the enqueue call site as OTel code.* tags. The values come from CallerInfo attributes, so they
+    // are compile-time source locations with bounded cardinality, not user or runtime data. A caller inside
+    // BackWave passes no call site, so the tags are absent for internal enqueues.
+    private static void SetCallSiteTags(Activity activity, string? filePath, string? memberName, int lineNumber)
+    {
+        if (!string.IsNullOrEmpty(memberName))
+        {
+            activity.SetTag(CodeFunctionKey, memberName);
+        }
+        if (!string.IsNullOrEmpty(filePath))
+        {
+            activity.SetTag(CodeFilePathKey, filePath);
+            activity.SetTag(CodeLineNumberKey, lineNumber);
+        }
     }
 
     internal static void RecordEnqueued(string wireName, string queue)

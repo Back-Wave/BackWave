@@ -1,4 +1,5 @@
 using System.Data.Common;
+using System.Runtime.CompilerServices;
 using BackWave.Core;
 using BackWave.Driver;
 using BackWave.Jobs;
@@ -138,13 +139,21 @@ public sealed class BackWaveHarness
     /// rolls back atomically with the transaction — rolling back means the job never existed.
     /// </param>
     /// <returns>The new job's id, for asserting against later or for use as a dependency parent.</returns>
+    /// <param name="callerFilePath">The source file of the enqueue call site. Supplied by the compiler; do not pass it.</param>
+    /// <param name="callerMemberName">The member that made the enqueue call. Supplied by the compiler; do not pass it.</param>
+    /// <param name="callerLineNumber">The source line of the enqueue call site. Supplied by the compiler; do not pass it.</param>
     /// <exception cref="InvalidOperationException">The payload type is not registered in the harness's registry.</exception>
     /// <exception cref="ArgumentException">The serialized payload exceeds the store's size bound.</exception>
     public ValueTask<Guid> EnqueueAsync<TJob>(
         TJob job, TimeSpan? delay = null, string? queue = null, JobTags? tags = null,
-        DbTransaction? transaction = null)
+        DbTransaction? transaction = null,
+        [CallerFilePath] string callerFilePath = "",
+        [CallerMemberName] string callerMemberName = "",
+        [CallerLineNumber] int callerLineNumber = 0)
         where TJob : notnull
-        => Client.EnqueueAsync(job, Now + (delay ?? TimeSpan.Zero), queue, tags, transaction);
+        => Client.EnqueueAsync(
+            job, Now + (delay ?? TimeSpan.Zero), queue, tags, transaction,
+            callerFilePath: callerFilePath, callerMemberName: callerMemberName, callerLineNumber: callerLineNumber);
 
     /// <summary>
     /// Enqueues a job that waits for another job (<paramref name="parentId"/>) to reach a terminal
@@ -157,13 +166,21 @@ public sealed class BackWaveHarness
     /// <param name="mode">Whether to release only on the parent's success, or once the parent reaches any terminal state.</param>
     /// <param name="queue">The queue to enqueue into. Null uses the job type's registered queue.</param>
     /// <returns>The new dependent job's id.</returns>
+    /// <param name="callerFilePath">The source file of the enqueue call site. Supplied by the compiler; do not pass it.</param>
+    /// <param name="callerMemberName">The member that made the enqueue call. Supplied by the compiler; do not pass it.</param>
+    /// <param name="callerLineNumber">The source line of the enqueue call site. Supplied by the compiler; do not pass it.</param>
     /// <exception cref="InvalidOperationException">The payload type is not registered in the harness's registry.</exception>
     /// <exception cref="ArgumentException">No job exists with the given <paramref name="parentId"/>.</exception>
     public ValueTask<Guid> EnqueueDependencyAsync<TJob>(
-        TJob job, Guid parentId, DependencyMode mode = DependencyMode.OnSuccess, string? queue = null)
+        TJob job, Guid parentId, DependencyMode mode = DependencyMode.OnSuccess, string? queue = null,
+        [CallerFilePath] string callerFilePath = "",
+        [CallerMemberName] string callerMemberName = "",
+        [CallerLineNumber] int callerLineNumber = 0)
         where TJob : notnull
         // No caller-passed instant: the client's injected VirtualClock stamps Virtual Time.
-        => Client.EnqueueDependencyAsync(job, parentId, mode: mode, queue: queue);
+        => Client.EnqueueDependencyAsync(
+            job, parentId, mode: mode, queue: queue,
+            callerFilePath: callerFilePath, callerMemberName: callerMemberName, callerLineNumber: callerLineNumber);
 
     /// <summary>
     /// Defines or updates a recurring schedule. Its first tick is computed from the current virtual

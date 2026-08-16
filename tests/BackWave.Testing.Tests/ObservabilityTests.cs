@@ -143,6 +143,24 @@ public class ObservabilityTests
     }
 
     [Fact]
+    public async Task SendSpan_CarriesTheEnqueueCallSite_AsCodeTags()
+    {
+        var stopped = new ConcurrentBag<Activity>();
+        using var listener = ListenToBackWave(stopped);
+
+        var (harness, _) = CreateHarness();
+
+        // The compiler fills the call-site parameters at this line, so the send span records this method,
+        // this file, and this line as code.* tags.
+        await harness.EnqueueAsync(new TraceProbe("with-callsite"));
+
+        var sendSpan = stopped.Single(a => a.OperationName == "send");
+        Assert.Equal(nameof(SendSpan_CarriesTheEnqueueCallSite_AsCodeTags), sendSpan.GetTagItem("code.function.name"));
+        Assert.EndsWith("ObservabilityTests.cs", (string)sendSpan.GetTagItem("code.file.path")!);
+        Assert.True((int)sendSpan.GetTagItem("code.line.number")! > 0);
+    }
+
+    [Fact]
     public async Task ProcessSpan_WithoutATraceContext_IsARootWithNoLinks()
     {
         var stopped = new ConcurrentBag<Activity>();

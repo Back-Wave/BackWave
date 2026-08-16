@@ -1,5 +1,6 @@
 using System.Data.Common;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using BackWave.Diagnostics;
 using BackWave.Jobs;
 using BackWave.Storage;
@@ -55,6 +56,9 @@ public sealed class BackWaveClient(
     /// same transaction. The storage adapter must support transactional enqueue.
     /// </param>
     /// <param name="cancellationToken">Cancels the enqueue request.</param>
+    /// <param name="callerFilePath">Compiler-supplied. The source file of the enqueue call site, stamped on the send span; do not set it.</param>
+    /// <param name="callerMemberName">Compiler-supplied. The member that enqueued, stamped on the send span; do not set it.</param>
+    /// <param name="callerLineNumber">Compiler-supplied. The line of the enqueue call site, stamped on the send span; do not set it.</param>
     /// <returns>The new job's id, for later tracking or for use as a dependency parent.</returns>
     /// <exception cref="NotSupportedException">A <paramref name="transaction"/> was supplied but the storage adapter does not support transactional enqueue.</exception>
     /// <exception cref="ArgumentException">The serialized payload exceeds the store's maximum payload size; store a reference (an id or blob key) instead of the data itself.</exception>
@@ -70,7 +74,10 @@ public sealed class BackWaveClient(
         string? queue = null,
         JobTags? tags = null,
         DbTransaction? transaction = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        [CallerFilePath] string callerFilePath = "",
+        [CallerMemberName] string callerMemberName = "",
+        [CallerLineNumber] int callerLineNumber = 0)
         where TJob : notnull
     {
         if (transaction is not null && !store.SupportsTransactionalEnqueue)
@@ -88,7 +95,8 @@ public sealed class BackWaveClient(
         // Tags, never subtracted. Set semantics collapse an identical Tag; merge order is moot.
         var mergedTags = MergeTags(registration.DefaultTags, tags);
 
-        using var activity = BackWaveDiagnostics.StartSend(registration.WireName, targetQueue, jobId);
+        using var activity = BackWaveDiagnostics.StartSend(
+            registration.WireName, targetQueue, jobId, callerFilePath, callerMemberName, callerLineNumber);
         var result = await store.EnqueueAsync(
             new NewJob(
                 jobId,
@@ -136,6 +144,9 @@ public sealed class BackWaveClient(
     /// <param name="queue">The Queue to enqueue into. Null uses the job type's registered Queue.</param>
     /// <param name="tags">Optional tags attached at enqueue. The job type's default tags are always added on top of these.</param>
     /// <param name="cancellationToken">Cancels the enqueue request.</param>
+    /// <param name="callerFilePath">The source file of the enqueue call site. Supplied by the compiler; do not pass it.</param>
+    /// <param name="callerMemberName">The member that made the enqueue call. Supplied by the compiler; do not pass it.</param>
+    /// <param name="callerLineNumber">The source line of the enqueue call site. Supplied by the compiler; do not pass it.</param>
     /// <returns>The new dependent job's id.</returns>
     /// <exception cref="ArgumentException">No job exists with the given <paramref name="parentId"/>.</exception>
     /// <exception cref="InvalidOperationException">The store rejected the enqueue for another reason.</exception>
@@ -152,7 +163,10 @@ public sealed class BackWaveClient(
         DependencyMode mode = DependencyMode.OnSuccess,
         string? queue = null,
         JobTags? tags = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        [CallerFilePath] string callerFilePath = "",
+        [CallerMemberName] string callerMemberName = "",
+        [CallerLineNumber] int callerLineNumber = 0)
         where TJob : notnull
     {
         // The client owns the clock (§1): default the stamp to the injected TimeProvider so a
@@ -164,7 +178,8 @@ public sealed class BackWaveClient(
         var targetQueue = queue ?? registration.Queue;
         var mergedTags = MergeTags(registration.DefaultTags, tags);
 
-        using var activity = BackWaveDiagnostics.StartSend(registration.WireName, targetQueue, jobId);
+        using var activity = BackWaveDiagnostics.StartSend(
+            registration.WireName, targetQueue, jobId, callerFilePath, callerMemberName, callerLineNumber);
         var result = await store.EnqueueAsync(
             new NewJob(
                 jobId,
