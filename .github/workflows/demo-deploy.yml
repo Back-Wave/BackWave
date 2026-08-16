@@ -8,6 +8,9 @@ name: Deploy demo
 on:
   push:
     branches: [main]
+    # Tag pushes redeploy so a release (v*) rebuilds the demo with the tag present, and MinVer
+    # stamps the clean version. GitHub ignores the paths filter for tag pushes, which is wanted here.
+    tags: ["v*"]
     paths:
       - "samples/BackWave.Demo/**"
       - "src/**"
