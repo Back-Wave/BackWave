@@ -57,6 +57,33 @@ internal static class JobDiagnostics
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    public static readonly DiagnosticDescriptor InvalidRetryCeiling = new(
+        "BW0008",
+        "Invalid [Retry] attempt ceiling",
+        $"[Retry] attempt ceiling is {{0}} - the ceiling must be from 1 to {BackWaveGenerator.MaxAttemptCeiling}. " +
+        "Remove [Retry] to inherit the Worker Group policy, or give a ceiling in that range.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor InvalidRetryBackoff = new(
+        "BW0009",
+        "Invalid [Retry] backoff intervals",
+        $"[Retry] backoff intervals are invalid: {{0}}. Declare at least 1 interval and at most " +
+        $"{BackWaveGenerator.MaxBackoffIntervals}, and make every interval 0 or more seconds.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor RetryWithoutJob = new(
+        "BW0010",
+        "[Retry] with no [Job]",
+        "[Retry] on '{0}' has no [Job], so the retry override is ignored - the same silent drop the " +
+        "loud-failure design prevents. Add [Job] to this type or method, or remove [Retry].",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public static readonly DiagnosticDescriptor WorkflowTypeNotSerializable = new(
         "BW0007",
         "Workflow type is not listed in any JsonSerializerContext",

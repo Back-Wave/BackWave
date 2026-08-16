@@ -20,6 +20,7 @@ namespace BackWave.SourceGenerators;
 public sealed class BackWaveGenerator : IIncrementalGenerator
 {
     private const string JobAttributeName = "BackWave.Jobs.JobAttribute";
+    private const string RetryAttributeName = "BackWave.Jobs.RetryAttribute";
     private const string JsonSerializableAttributeName = "System.Text.Json.Serialization.JsonSerializableAttribute";
 
     /// <summary>Tracked-step names, used by the incrementality test to assert cached reuse.</summary>
@@ -62,6 +63,18 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
         context.RegisterSourceOutput(
             parseDiagnostics, static (spc, diagnostic) => spc.ReportDiagnostic(diagnostic!.ToDiagnostic()));
 
+        // [Retry] is read only inside the [Job] pipeline above, so a [Retry] on a type or method with no
+        // [Job] would be silently ignored - the same silent drop the loud-failure design prevents. This
+        // branch visits every [Retry] target and reports BW0010 when the target carries no [Job] (ADR 0051).
+        var orphanRetryDiagnostics = context.SyntaxProvider
+            .ForAttributeWithMetadataName(
+                RetryAttributeName,
+                predicate: static (_, _) => true,
+                transform: static (ctx, _) => DetectOrphanRetry(ctx))
+            .Where(static diagnostic => diagnostic is not null);
+        context.RegisterSourceOutput(
+            orphanRetryDiagnostics, static (spc, diagnostic) => spc.ReportDiagnostic(diagnostic!.ToDiagnostic()));
+
         // Workflow Input seed types (BackWave.Pro.IWorkflowInput implementors), found by syntax so an
         // unchanged file stays cached - never a walk of the whole Compilation. Each is a seed whose codec
         // the generator wires (and whose absence from every JsonSerializerContext is a build error).
@@ -87,6 +100,23 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
             .WithTrackingName(EmitInputStep);
         context.RegisterSourceOutput(emitInput, static (spc, input) =>
             Emit(spc, input.Left.Left.Left, input.Left.Left.Right, input.Left.Right, input.Right));
+    }
+
+    /// <summary>
+    /// A BW0010 diagnostic when a [Retry] target carries no [Job], else null. [Retry] is meaningful only
+    /// on a [Job] type or method; without a [Job] the override is silently ignored (ADR 0051).
+    /// </summary>
+    private static DiagnosticInfo? DetectOrphanRetry(GeneratorAttributeSyntaxContext context)
+    {
+        var hasJob = context.TargetSymbol.GetAttributes().Any(
+            a => a.AttributeClass?.ToDisplayString() == JobAttributeName);
+        if (hasJob)
+        {
+            return null;
+        }
+
+        var location = LocationInfo.CreateFrom(context.TargetNode.GetLocation());
+        return DiagnosticInfo.Create(JobDiagnostics.RetryWithoutJob, location, context.TargetSymbol.Name);
     }
 
     /// <summary>
@@ -151,6 +181,9 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
             .Select(a => a.Value.Value as string)
             .FirstOrDefault() ?? "default";
         var labels = ExtractLabels(attribute);
+        var retryAttribute = context.TargetSymbol.GetAttributes().FirstOrDefault(
+            a => a.AttributeClass?.ToDisplayString() == RetryAttributeName);
+        var (retryMaxAttempts, retryBackoffSeconds) = ExtractRetry(retryAttribute);
         var location = LocationInfo.CreateFrom(context.TargetNode.GetLocation());
 
         if (string.IsNullOrWhiteSpace(wireName))
@@ -158,12 +191,109 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
             return new ParseResult(null, DiagnosticInfo.Create(JobDiagnostics.EmptyWireName, location));
         }
 
+        // A [Retry] ceiling outside 1..MaxAttemptCeiling is a mistake, not "no override". Fail loudly here
+        // instead of silently dropping it at the emit gate, or letting a huge literal reach FromIntervals
+        // and allocate at startup instead of failing as a diagnostic (ADR 0051).
+        if (retryAttribute is not null && (retryMaxAttempts < 1 || retryMaxAttempts > MaxAttemptCeiling))
+        {
+            return new ParseResult(null, DiagnosticInfo.Create(
+                JobDiagnostics.InvalidRetryCeiling, location,
+                retryMaxAttempts.ToString(CultureInfo.InvariantCulture)));
+        }
+
+        // The backoff list has the same compile-time constants as the ceiling, so catch the same mistakes
+        // here rather than at the registration-time FromIntervals throw (ADR 0051): empty, over 20, or negative.
+        if (retryAttribute is not null && DescribeInvalidBackoff(retryBackoffSeconds) is { } backoffProblem)
+        {
+            return new ParseResult(null, DiagnosticInfo.Create(
+                JobDiagnostics.InvalidRetryBackoff, location, backoffProblem));
+        }
+
         return context.TargetSymbol switch
         {
-            INamedTypeSymbol type => ParseRecordJob(type, wireName!, queue, labels, location),
-            IMethodSymbol method => ParseMethodJob(method, wireName!, queue, labels, location),
+            INamedTypeSymbol type => ParseRecordJob(
+                type, wireName!, queue, labels, retryMaxAttempts, retryBackoffSeconds, location),
+            IMethodSymbol method => ParseMethodJob(
+                method, wireName!, queue, labels, retryMaxAttempts, retryBackoffSeconds, location),
             _ => new ParseResult(null, null),
         };
+    }
+
+    // Mirrors Core.RetryDisposition.MaxBackoffIntervals. The generator cannot reference the runtime type,
+    // so the bound is duplicated here; FromIntervals enforces the same value at registration time (ADR 0051).
+    internal const int MaxBackoffIntervals = 20;
+
+    // Mirrors Core.RetryDisposition.MaxAttemptCeiling. Duplicated for the same reason as MaxBackoffIntervals;
+    // FromIntervals enforces the same value at registration time (ADR 0051).
+    internal const int MaxAttemptCeiling = 1000;
+
+    /// <summary>
+    /// The reason a [Retry] backoff list is invalid, or null when it is valid. Mirrors the bounds that
+    /// RetryDisposition.FromIntervals enforces at registration time (ADR 0051): at least one interval, at
+    /// most <see cref="MaxBackoffIntervals"/>, none negative.
+    /// </summary>
+    private static string? DescribeInvalidBackoff(EquatableArray<double> backoffSeconds)
+    {
+        if (backoffSeconds.Count == 0)
+        {
+            return "the list is empty";
+        }
+
+        if (backoffSeconds.Count > MaxBackoffIntervals)
+        {
+            return $"the list has {backoffSeconds.Count} intervals";
+        }
+
+        foreach (var seconds in backoffSeconds)
+        {
+            // Validate the TimeSpan, not the raw double, so this gate agrees exactly with FromIntervals.
+            // FromIntervals checks TimeSpan.FromSeconds(seconds), which the emitted code runs. A NaN, an
+            // infinity, or an out-of-range magnitude fails that conversion (the generated code would throw
+            // or not compile), and a sub-tick value that FromSeconds rounds toward zero is judged the same.
+            TimeSpan interval;
+            try
+            {
+                interval = TimeSpan.FromSeconds(seconds);
+            }
+            catch (Exception ex) when (ex is OverflowException or ArgumentException)
+            {
+                return $"an interval of {seconds.ToString(CultureInfo.InvariantCulture)} seconds is out of range";
+            }
+
+            if (interval < TimeSpan.Zero)
+            {
+                return $"an interval is {seconds.ToString(CultureInfo.InvariantCulture)} seconds";
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// The [Retry] override values (ADR 0051): the attempt ceiling plus the backoff intervals in seconds,
+    /// in declaration order. Returns (0, empty) when the target carries no [Retry]. [Retry] is a separate
+    /// attribute from [Job], so the caller looks it up on the symbol, not on context.Attributes.
+    /// </summary>
+    private static (int MaxAttempts, EquatableArray<double> BackoffSeconds) ExtractRetry(AttributeData? attribute)
+    {
+        var empty = new EquatableArray<double>(ImmutableArray<double>.Empty);
+        if (attribute is null || attribute.ConstructorArguments.Length == 0)
+        {
+            return (0, empty);
+        }
+
+        var maxAttempts = attribute.ConstructorArguments[0].Value is int ceiling ? ceiling : 0;
+        if (attribute.ConstructorArguments.Length < 2
+            || attribute.ConstructorArguments[1].Kind != TypedConstantKind.Array
+            || attribute.ConstructorArguments[1].IsNull)
+        {
+            return (maxAttempts, empty);
+        }
+
+        var seconds = attribute.ConstructorArguments[1].Values
+            .Select(v => Convert.ToDouble(v.Value, CultureInfo.InvariantCulture))
+            .ToImmutableArray();
+        return (maxAttempts, new EquatableArray<double>(seconds));
     }
 
     /// <summary>
@@ -191,7 +321,8 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
     }
 
     private static ParseResult ParseRecordJob(
-        INamedTypeSymbol type, string wireName, string queue, EquatableArray<string> labels, LocationInfo? location)
+        INamedTypeSymbol type, string wireName, string queue, EquatableArray<string> labels,
+        int retryMaxAttempts, EquatableArray<double> retryBackoffSeconds, LocationInfo? location)
     {
         var members = ParseMembers(type, wireName, location, out var failure);
         if (failure is not null)
@@ -204,6 +335,8 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
             WireName = wireName,
             Queue = queue,
             Labels = labels,
+            RetryMaxAttempts = retryMaxAttempts,
+            RetryBackoffSeconds = retryBackoffSeconds,
             JobTypeFqn = type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
             JobTypeName = type.Name,
             Namespace = type.ContainingNamespace.IsGlobalNamespace
@@ -309,7 +442,8 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
     }
 
     private static ParseResult ParseMethodJob(
-        IMethodSymbol method, string wireName, string queue, EquatableArray<string> labels, LocationInfo? location)
+        IMethodSymbol method, string wireName, string queue, EquatableArray<string> labels,
+        int retryMaxAttempts, EquatableArray<double> retryBackoffSeconds, LocationInfo? location)
     {
         var returnsTask = method.ReturnType is INamedTypeSymbol { Name: "Task", ContainingNamespace.Name: "Tasks" };
         if (method.DeclaredAccessibility != Accessibility.Public || !returnsTask)
@@ -364,6 +498,8 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
             WireName = wireName,
             Queue = queue,
             Labels = labels,
+            RetryMaxAttempts = retryMaxAttempts,
+            RetryBackoffSeconds = retryBackoffSeconds,
             JobTypeFqn = ns.Length == 0 ? $"global::{recordName}" : $"global::{ns}.{recordName}",
             JobTypeName = recordName,
             Namespace = ns,

@@ -37,7 +37,17 @@ public sealed class AttemptRecorder
     public List<int> Attempts { get; } = [];
 }
 
+public sealed record SendWebhook(string Url);
+
+/// <summary>Always fails: exercises the retry schedule, never the success path.</summary>
+public sealed class SendWebhookHandler : IJobHandler<SendWebhook>
+{
+    public Task HandleAsync(SendWebhook job, JobContext context, CancellationToken cancellationToken)
+        => throw new InvalidOperationException($"webhook down (attempt {context.Attempt})");
+}
+
 [JsonSerializable(typeof(ChargeCard))]
+[JsonSerializable(typeof(SendWebhook))]
 internal sealed partial class FailureJsonContext : JsonSerializerContext;
 
 public class FailurePathTests
@@ -75,10 +85,47 @@ public class FailurePathTests
             WorkerId = "node-1",
             Policy = new Core.DispatchPolicy.Strict(["default"]),
             RetryPolicy = policy,
+            RetryOverrides = registry.RetryOverrides,
         });
         var pump = new DeterministicPump(driver, store, registry, services);
 
         return new Fixture(new BackWaveClient(store, registry), pump, store, services.GetRequiredService<AttemptRecorder>());
+    }
+
+    private sealed record TwoTypeFixture(BackWaveClient Client, DeterministicPump Pump, IJobStore Store);
+
+    /// <summary>
+    /// One node runs two job types: charge-card inherits the group RetryPolicy; send-webhook carries a
+    /// per-job [Retry] override (5 attempts, 10s backoff) via <see cref="JobRegistration.Create"/>.
+    /// </summary>
+    private static TwoTypeFixture CreateTwoTypeFixture()
+    {
+        var services = new ServiceCollection()
+            .AddSingleton<AttemptRecorder>()
+            .AddTransient<IJobHandler<ChargeCard>, ChargeCardHandler>()
+            .AddTransient<IJobHandler<SendWebhook>, SendWebhookHandler>()
+            .BuildServiceProvider();
+
+        var registry = new JobRegistry(
+        [
+            JobRegistration.Create<ChargeCard, ChargeCardHandler>(
+                "charge-card", FailureJsonContext.Default.ChargeCard),
+            JobRegistration.Create<SendWebhook, SendWebhookHandler>(
+                "send-webhook", FailureJsonContext.Default.SendWebhook,
+                retry: Core.RetryDisposition.FromIntervals(5, [TimeSpan.FromSeconds(10)])),
+        ]);
+
+        var store = new InMemoryJobStore();
+        var driver = new NodeDriver(new NodeOptions
+        {
+            WorkerId = "node-1",
+            Policy = new Core.DispatchPolicy.Strict(["default"]),
+            RetryPolicy = OneMinuteThreeAttempts,
+            RetryOverrides = registry.RetryOverrides,
+        });
+        var pump = new DeterministicPump(driver, store, registry, services);
+
+        return new TwoTypeFixture(new BackWaveClient(store, registry), pump, store);
     }
 
     [Fact]
@@ -157,5 +204,106 @@ public class FailurePathTests
         Assert.Equal(T0.AddSeconds(2), policy.NextAttemptAt(1, T0));
         Assert.Null(policy.NextAttemptAt(10, T0));
         await Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task PerJobRetry_SchedulesOnItsOwnBackoff_WhileTheGroupJobKeepsTheGroupBackoff()
+    {
+        var fixture = CreateTwoTypeFixture();
+
+        var groupJob = await fixture.Client.EnqueueAsync(new ChargeCard("order-4"), dueTime: T0);
+        var perJob = await fixture.Client.EnqueueAsync(new SendWebhook("https://hook"), dueTime: T0);
+
+        // Both fail their first attempt at T0.
+        await fixture.Pump.PumpAsync(T0);
+        Assert.Equal(1, (await fixture.Store.GetJobAsync(groupJob))!.Attempt);
+        Assert.Equal(1, (await fixture.Store.GetJobAsync(perJob))!.Attempt);
+
+        // At T0 + 10s the per-job backoff (10s) is due; the group backoff (1 min) is not.
+        await fixture.Pump.PumpAsync(T0.AddSeconds(10));
+        Assert.Equal(1, (await fixture.Store.GetJobAsync(groupJob))!.Attempt);
+        Assert.Equal(2, (await fixture.Store.GetJobAsync(perJob))!.Attempt);
+
+        // At T0 + 1 min the group job takes its second attempt; the per-job kept its own 10s cadence.
+        await fixture.Pump.PumpAsync(T0.AddMinutes(1));
+        Assert.Equal(2, (await fixture.Store.GetJobAsync(groupJob))!.Attempt);
+    }
+
+    [Fact]
+    public async Task PerJobRetry_DeadLettersAtItsOwnCeiling_NotTheSmallerGroupCeiling()
+    {
+        var fixture = CreateTwoTypeFixture();
+
+        // send-webhook always fails; its [Retry] override allows 5 attempts, the group allows 3.
+        var perJob = await fixture.Client.EnqueueAsync(new SendWebhook("https://hook"), dueTime: T0);
+
+        // Attempts 1, 2, 3 at the override's 10s cadence.
+        await fixture.Pump.PumpAsync(T0);
+        await fixture.Pump.PumpAsync(T0.AddSeconds(10));
+        await fixture.Pump.PumpAsync(T0.AddSeconds(20));
+
+        // At attempt 3 the group ceiling would dead-letter; the override must keep the job alive.
+        var atThree = await fixture.Store.GetJobAsync(perJob);
+        Assert.Equal(3, atThree!.Attempt);
+        Assert.Equal(JobState.Scheduled, atThree.State);
+
+        await fixture.Pump.PumpAsync(T0.AddSeconds(30));
+        await fixture.Pump.PumpAsync(T0.AddSeconds(40));
+
+        // Attempt 5 hits the override ceiling and dead-letters.
+        var atFive = await fixture.Store.GetJobAsync(perJob);
+        Assert.Equal(5, atFive!.Attempt);
+        Assert.Equal(JobState.DeadLettered, atFive.State);
+    }
+
+    [Fact]
+    public void FromIntervals_RepeatsTheLastInterval_WhenShorterThanTheCeiling()
+    {
+        // 5 attempts need 4 backoff steps; the list has 2, so steps 3 and 4 repeat the last (5s).
+        var disposition = RetryDisposition.FromIntervals(5, [TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)]);
+
+        Assert.Equal(T0.AddSeconds(1), disposition.NextAttemptAt(1, T0));
+        Assert.Equal(T0.AddSeconds(5), disposition.NextAttemptAt(2, T0));
+        Assert.Equal(T0.AddSeconds(5), disposition.NextAttemptAt(3, T0));
+        Assert.Equal(T0.AddSeconds(5), disposition.NextAttemptAt(4, T0));
+        Assert.Null(disposition.NextAttemptAt(5, T0));
+    }
+
+    [Fact]
+    public void FromIntervals_RejectsAnEmptyBackoffList()
+    {
+        Assert.Throws<ArgumentException>(() => RetryDisposition.FromIntervals(3, []));
+    }
+
+    [Fact]
+    public void FromIntervals_RejectsMoreThanTwentyIntervals()
+    {
+        var intervals = new TimeSpan[RetryDisposition.MaxBackoffIntervals + 1];
+        Array.Fill(intervals, TimeSpan.FromSeconds(1));
+
+        var error = Assert.Throws<ArgumentException>(() => RetryDisposition.FromIntervals(50, intervals));
+        Assert.Contains("20", error.Message);
+    }
+
+    [Fact]
+    public void FromIntervals_RejectsANegativeInterval()
+    {
+        Assert.Throws<ArgumentException>(
+            () => RetryDisposition.FromIntervals(3, [TimeSpan.FromSeconds(-1)]));
+    }
+
+    [Fact]
+    public void FromIntervals_RejectsACeilingBelowOne()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => RetryDisposition.FromIntervals(0, [TimeSpan.FromSeconds(1)]));
+    }
+
+    [Fact]
+    public void FromIntervals_RejectsACeilingAboveTheCap()
+    {
+        var error = Assert.Throws<ArgumentOutOfRangeException>(
+            () => RetryDisposition.FromIntervals(RetryDisposition.MaxAttemptCeiling + 1, [TimeSpan.FromSeconds(1)]));
+        Assert.Contains(RetryDisposition.MaxAttemptCeiling.ToString(), error.Message);
     }
 }

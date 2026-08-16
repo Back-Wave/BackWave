@@ -17,6 +17,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The generator mirrors runtime constants (retry bounds) it cannot reference. The test project
+         asserts the two copies stay equal, so it needs the internal constants. -->
+    <InternalsVisibleTo Include="BackWave.SourceGenerators.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <AdditionalFiles Include="AnalyzerReleases.Shipped.md" />
     <AdditionalFiles Include="AnalyzerReleases.Unshipped.md" />
   </ItemGroup>

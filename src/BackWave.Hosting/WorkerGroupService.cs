@@ -154,6 +154,7 @@ internal sealed class WorkerGroupService(
             PoolSize = options.PoolSize, // the Driver subtracts in-flight work from claims
             LeaseDuration = options.LeaseDuration,
             RetryPolicy = options.RetryPolicy,
+            RetryOverrides = registry.RetryOverrides, // per-job-type [Retry] overrides, loud-failure path (0051)
             Retention = options.Retention,
             MaintenanceInterval = options.MaintenanceInterval, // the Driver throttles the sweep (0039)
         });

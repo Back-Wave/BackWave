@@ -92,6 +92,7 @@ public sealed class BackWaveHarness
             WorkerId = "test-node",
             Policy = policy,
             RetryPolicy = options.RetryPolicy,
+            RetryOverrides = registry.RetryOverrides, // honor per-job-type [Retry] overrides as production does (0051)
             Retention = options.Retention,
         });
         // Thread Virtual Time into the pump too, so the messaging.process.duration histogram it emits at the

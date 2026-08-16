@@ -60,6 +60,74 @@ public sealed record RetryPolicy
 /// </param>
 public sealed record RetryDisposition(int MaxAttempts, IReadOnlyList<TimeSpan> BackoffByAttempt)
 {
+    /// <summary>The most backoff intervals a per-job retry policy can declare (ADR 0051).</summary>
+    public const int MaxBackoffIntervals = 20;
+
+    /// <summary>
+    /// The most attempts a per-job retry policy can declare (ADR 0051). No real retry policy needs more,
+    /// and the cap bounds the attribute so a huge literal fails as a diagnostic, not a startup allocation.
+    /// </summary>
+    public const int MaxAttemptCeiling = 1000;
+
+    /// <summary>
+    /// Builds a disposition from a per-job-type retry declaration: an attempt ceiling and a fixed list
+    /// of backoff intervals (the shape a <c>[Retry(...)]</c> attribute carries, ADR 0051). The list is
+    /// expanded to one entry per retryable attempt. When it is shorter than the ceiling, the last
+    /// interval repeats for the remaining attempts. Validation runs here, at registration time.
+    /// </summary>
+    /// <param name="maxAttempts">The attempt ceiling; at least 1 and at most <see cref="MaxAttemptCeiling"/>.</param>
+    /// <param name="intervals">
+    /// The backoff intervals, one or more, at most <see cref="MaxBackoffIntervals"/>, none negative.
+    /// </param>
+    /// <returns>The disposition the loud-failure path resolves in place of the Worker Group policy.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="maxAttempts"/> is less than 1 or more than <see cref="MaxAttemptCeiling"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="intervals"/> is empty, holds more than <see cref="MaxBackoffIntervals"/> entries,
+    /// or holds a negative interval.
+    /// </exception>
+    public static RetryDisposition FromIntervals(int maxAttempts, IReadOnlyList<TimeSpan> intervals)
+    {
+        if (maxAttempts < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxAttempts), maxAttempts, "A retry policy must allow at least one attempt.");
+        }
+        if (maxAttempts > MaxAttemptCeiling)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxAttempts), maxAttempts, $"A retry policy allows at most {MaxAttemptCeiling} attempts.");
+        }
+        if (intervals is null || intervals.Count == 0)
+        {
+            throw new ArgumentException(
+                "A per-job retry policy must declare at least one backoff interval.", nameof(intervals));
+        }
+        if (intervals.Count > MaxBackoffIntervals)
+        {
+            throw new ArgumentException(
+                $"A per-job retry policy allows at most {MaxBackoffIntervals} backoff intervals; got {intervals.Count}.",
+                nameof(intervals));
+        }
+        foreach (var interval in intervals)
+        {
+            if (interval < TimeSpan.Zero)
+            {
+                throw new ArgumentException("A backoff interval cannot be negative.", nameof(intervals));
+            }
+        }
+
+        var retryable = Math.Max(0, maxAttempts - 1);
+        var byAttempt = new TimeSpan[retryable];
+        for (var i = 0; i < retryable; i++)
+        {
+            // Repeat the last interval when the list is shorter than the ceiling (TickerQ behavior).
+            byAttempt[i] = intervals[Math.Min(i, intervals.Count - 1)];
+        }
+        return new RetryDisposition(maxAttempts, byAttempt);
+    }
+
     /// <summary>
     /// The instant the next attempt should run after an attempt fails, computed from the precomputed
     /// delays alone — producing the same result as <see cref="RetryPolicy.NextAttemptAt"/>.

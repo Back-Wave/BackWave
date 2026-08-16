@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Text;
 
@@ -46,6 +47,13 @@ internal static class JobEmitter
                                 DefaultTags = {{DefaultTags(job)}},
 
             """);
+            if (job.RetryMaxAttempts > 0)
+            {
+                source.Append($$"""
+                                    Retry = {{RetryExpression(job)}},
+
+                """);
+            }
             if (job.OutputContextFqn is { } outputContextFqn)
             {
                 // The step's Job Output codec, referencing the consumer's own JsonSerializerContext - no
@@ -485,6 +493,20 @@ internal static class JobEmitter
             ? "global::BackWave.Storage.JobTags.Empty"
             : "global::BackWave.Storage.JobTags.Empty"
                 + string.Concat(job.Labels.Select(label => $".WithLabel({Literal(label)})"));
+
+    /// <summary>
+    /// The per-job retry override expression for a registration (ADR 0051): a
+    /// RetryDisposition.FromIntervals call built from the [Retry] ceiling and intervals. Validation
+    /// (non-empty, at most 20 intervals) runs inside FromIntervals at registration time. Only called
+    /// when the job declares a [Retry] override.
+    /// </summary>
+    private static string RetryExpression(JobModel job)
+    {
+        var intervals = string.Join(", ", job.RetryBackoffSeconds.Select(seconds =>
+            $"global::System.TimeSpan.FromSeconds({seconds.ToString("R", CultureInfo.InvariantCulture)}d)"));
+        return $"global::BackWave.Core.RetryDisposition.FromIntervals({job.RetryMaxAttempts}, "
+            + $"new global::System.TimeSpan[] {{ {intervals} }})";
+    }
 
     private static string WireClassFqn(JobModel job)
         => job.Namespace.Length == 0

@@ -76,6 +76,38 @@ public class BackWaveHarnessTests
     }
 
     [Fact]
+    public async Task Advance_HonorsAPerTypeRetryOverride_NotTheSlowerGroupBackoff()
+    {
+        // The registration carries a [Retry]-equivalent override: 3 attempts, 10s backoff. The group
+        // policy is far slower (60s). If the harness ignored the override, attempt 2 would not run until
+        // 60s. Advancing only 15s and finding a succeeded attempt 2 proves the 10s override reached the node.
+        var services = new ServiceCollection()
+            .AddSingleton<InvoiceLog>()
+            .AddTransient<IJobHandler<SendInvoice>, SendInvoiceHandler>()
+            .BuildServiceProvider();
+        var registry = new JobRegistry(
+        [
+            JobRegistration.Create<SendInvoice, SendInvoiceHandler>(
+                "send-invoice", HarnessJsonContext.Default.SendInvoice,
+                retry: RetryDisposition.FromIntervals(3, [TimeSpan.FromSeconds(10)])),
+        ]);
+        var harness = new BackWaveHarness(registry, services, new BackWaveHarnessOptions
+        {
+            RetryPolicy = new RetryPolicy { MaxAttempts = 3, Backoff = _ => TimeSpan.FromSeconds(60) },
+        });
+        var log = services.GetRequiredService<InvoiceLog>();
+        log.FailFirstAttempt = true;
+
+        var jobId = await harness.EnqueueAsync(new SendInvoice("flaky-order"));
+        await harness.AdvanceAsync(TimeSpan.FromSeconds(15));
+
+        var job = await harness.Monitor.GetJobAsync(jobId);
+        Assert.Equal(JobState.Succeeded, job!.State);
+        Assert.Equal(2, job.Attempt);
+        Assert.Equal([("flaky-order", 1), ("flaky-order", 2)], log.Sent);
+    }
+
+    [Fact]
     public async Task Advance_ReleasesDependencies_WhenTheParentGoesTerminal()
     {
         var (harness, log) = CreateHarness();

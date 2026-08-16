@@ -115,14 +115,20 @@ internal sealed class NodeDriver(NodeOptions options)
                     success.Job.JobId, options.WorkerId, success.Job.Attempt, new JobOutcome.Success()));
 
             case NodeEvent.ExecutionFailed failure:
+            {
                 _executing.Remove(failure.Job.JobId);
+                // Loud-failure path (ADR 0051): the node that ran the job holds its type, so a per-job-type
+                // [Retry] override resolves here, above the storage boundary. Absent an override, the job
+                // inherits the Worker Group policy. The lease-expiry sweep keeps the group policy.
+                var nextAttemptAt = options.RetryOverrides.TryGetValue(failure.Job.WireName, out var disposition)
+                    ? disposition.NextAttemptAt(failure.Job.Attempt, failure.Now)
+                    : options.RetryPolicy.NextAttemptAt(failure.Job.Attempt, failure.Now);
                 return BufferOutcome(new ReportedOutcome(
                     failure.Job.JobId,
                     options.WorkerId,
                     failure.Job.Attempt,
-                    new JobOutcome.Failure(
-                        options.RetryPolicy.NextAttemptAt(failure.Job.Attempt, failure.Now),
-                        failure.Error)));
+                    new JobOutcome.Failure(nextAttemptAt, failure.Error)));
+            }
 
             case NodeEvent.ExecutionCancelled cancelled:
                 _executing.Remove(cancelled.Job.JobId);
@@ -307,6 +313,14 @@ internal sealed record NodeOptions
 
     public TimeSpan LeaseDuration { get; init; } = TimeSpan.FromSeconds(60);
     public Core.RetryPolicy RetryPolicy { get; init; } = Core.RetryPolicy.Default;
+
+    /// <summary>
+    /// Per-job-type retry overrides, keyed by Wire Name (ADR 0051). When a job that failed loudly has a
+    /// Wire Name in this map, the node computes the next attempt from that disposition instead of from
+    /// <see cref="RetryPolicy"/>. Empty by default, so every job inherits the Worker Group policy.
+    /// </summary>
+    public IReadOnlyDictionary<string, Core.RetryDisposition> RetryOverrides { get; init; }
+        = new Dictionary<string, Core.RetryDisposition>();
 
     /// <summary>
     /// Minimum spacing between maintenance sweeps — lease expiry, schedule load/mint, and

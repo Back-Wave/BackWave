@@ -43,6 +43,12 @@ internal sealed record JobModel : IEquatable<JobModel>
     /// <summary>Default Tag Labels declared on [Job] (ADR 0022, additive). Empty when none; declaration order preserved.</summary>
     public required EquatableArray<string> Labels { get; init; }
 
+    /// <summary>Attempt ceiling declared on [Retry] (ADR 0051), or 0 when the type carries no [Retry].</summary>
+    public int RetryMaxAttempts { get; init; }
+
+    /// <summary>Backoff intervals in seconds declared on [Retry]; empty when none. Declaration order preserved.</summary>
+    public required EquatableArray<double> RetryBackoffSeconds { get; init; }
+
     /// <summary>Payload type, global::-qualified. For method sugar this type is generated.</summary>
     public required string JobTypeFqn { get; init; }
 

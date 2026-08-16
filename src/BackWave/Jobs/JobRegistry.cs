@@ -10,6 +10,7 @@ public sealed class JobRegistry
 {
     private readonly Dictionary<string, JobRegistration> _byWireName;
     private readonly Dictionary<Type, JobRegistration> _byJobType;
+    private readonly Dictionary<string, Core.RetryDisposition> _retryOverrides;
     private readonly IReadOnlyDictionary<Type, JsonTypeInfo> _seedCodecs;
 
     /// <summary>
@@ -35,6 +36,7 @@ public sealed class JobRegistry
     {
         _byWireName = new Dictionary<string, JobRegistration>(StringComparer.Ordinal);
         _byJobType = [];
+        _retryOverrides = new Dictionary<string, Core.RetryDisposition>(StringComparer.Ordinal);
         _seedCodecs = seedCodecs ?? new Dictionary<Type, JsonTypeInfo>();
 
         foreach (var registration in registrations)
@@ -56,8 +58,18 @@ public sealed class JobRegistry
                 throw new InvalidOperationException(
                     $"Job type '{registration.JobType.Name}' is registered more than once.");
             }
+
+            if (registration.Retry is not null)
+            {
+                _retryOverrides[registration.WireName] = registration.Retry;
+            }
         }
     }
+
+    // The per-job-type retry overrides, keyed by Wire Name (ADR 0051). Empty when no registered type
+    // carries a [Retry] override. Hosting hands this to the Node Driver, which prefers a match over the
+    // Worker Group policy on the loud-failure path.
+    internal IReadOnlyDictionary<string, Core.RetryDisposition> RetryOverrides => _retryOverrides;
 
     /// <summary>Every registration, ordered by Wire Name — the Job Manifest's source of truth.</summary>
     public IReadOnlyList<JobRegistration> Registrations

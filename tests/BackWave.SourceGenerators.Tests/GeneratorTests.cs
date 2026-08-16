@@ -277,6 +277,308 @@ public class GeneratorTests
     }
 
     [Fact]
+    public void JobRetry_FlowsIntoTheGeneratedRegistrationsRetryDisposition()
+    {
+        var run = GeneratorHarness.Run("""
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+
+            namespace Acme;
+
+            [Job("charge-card")]
+            [Retry(3, 1, 5)]
+            public sealed record ChargeCard(string OrderId);
+
+            public sealed class ChargeCardHandler : IJobHandler<ChargeCard>
+            {
+                public Task HandleAsync(ChargeCard job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+            """);
+
+        Assert.Empty(run.GeneratorDiagnostics);
+        Assert.Empty(run.CompilationDiagnostics.Where(d => d.Severity == DiagnosticSeverity.Error));
+        var registry = run.GeneratedSources["BackWave.Jobs.g.cs"];
+        Assert.Contains(
+            "Retry = global::BackWave.Core.RetryDisposition.FromIntervals(3, new global::System.TimeSpan[] "
+                + "{ global::System.TimeSpan.FromSeconds(1d), global::System.TimeSpan.FromSeconds(5d) }),",
+            registry);
+    }
+
+    [Fact]
+    public void NoRetryAttribute_EmitsNoRetryOverride()
+    {
+        var run = GeneratorHarness.Run(CanonicalSource);
+
+        var registry = run.GeneratedSources["BackWave.Jobs.g.cs"];
+        Assert.DoesNotContain("Retry = ", registry);
+    }
+
+    [Fact]
+    public void RetryWithACeilingBelowOne_ReportsBW0008_InsteadOfSilentlyDroppingTheOverride()
+    {
+        var run = GeneratorHarness.Run("""
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+
+            namespace Acme;
+
+            [Job("charge-card")]
+            [Retry(0, 1, 5)]
+            public sealed record ChargeCard(string OrderId);
+
+            public sealed class ChargeCardHandler : IJobHandler<ChargeCard>
+            {
+                public Task HandleAsync(ChargeCard job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+            """);
+
+        var diagnostic = Assert.Single(run.GeneratorDiagnostics);
+        Assert.Equal("BW0008", diagnostic.Id);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+    }
+
+    [Fact]
+    public void GeneratorRetryBounds_MatchTheRuntimeConstants_SoRaisingOneCannotDriftUnnoticed()
+    {
+        // The generator cannot reference the runtime type, so it duplicates these bounds. If they drift,
+        // valid code fails BW0008/BW0009 or a huge literal reaches FromIntervals. This is the tripwire.
+        Assert.Equal(BackWave.Core.RetryDisposition.MaxBackoffIntervals, BackWaveGenerator.MaxBackoffIntervals);
+        Assert.Equal(BackWave.Core.RetryDisposition.MaxAttemptCeiling, BackWaveGenerator.MaxAttemptCeiling);
+    }
+
+    [Fact]
+    public void GeneratorBackoffGate_AcceptsAndRejectsTheSameShapesAsFromIntervals()
+    {
+        // The generator's DescribeInvalidBackoff duplicates the structural rules FromIntervals enforces
+        // (empty, negative, more than the cap, TimeSpan range). Drive one shared set of shapes through
+        // both and assert identical accept/reject, so the two copies cannot drift apart unnoticed.
+        var cases = new (string Literal, double[] Values)[]
+        {
+            ("1, 5", [1.0, 5.0]),
+            ("", []),
+            ("-1", [-1.0]),
+            ("1e-9", [1e-9]),
+            (
+                string.Join(", ", Enumerable.Repeat("1", BackWaveGenerator.MaxBackoffIntervals + 1)),
+                [.. Enumerable.Repeat(1.0, BackWaveGenerator.MaxBackoffIntervals + 1)]),
+            ("double.PositiveInfinity", [double.PositiveInfinity]),
+            ("double.NaN", [double.NaN]),
+            ("1e20", [1e20]),
+        };
+
+        foreach (var (literal, values) in cases)
+        {
+            var arguments = literal.Length == 0 ? "3" : $"3, {literal}";
+            var run = GeneratorHarness.Run($$"""
+                using System.Threading;
+                using System.Threading.Tasks;
+                using BackWave.Jobs;
+
+                namespace Acme;
+
+                [Job("charge-card")]
+                [Retry({{arguments}})]
+                public sealed record ChargeCard(string OrderId);
+
+                public sealed class ChargeCardHandler : IJobHandler<ChargeCard>
+                {
+                    public Task HandleAsync(ChargeCard job, JobContext context, CancellationToken cancellationToken)
+                        => Task.CompletedTask;
+                }
+                """);
+
+            var generatorRejects = run.GeneratorDiagnostics.Any(diagnostic => diagnostic.Id == "BW0009");
+            Assert.Equal(FromIntervalsRejectsBackoff(values), generatorRejects);
+        }
+    }
+
+    private static bool FromIntervalsRejectsBackoff(double[] seconds)
+    {
+        try
+        {
+            BackWave.Core.RetryDisposition.FromIntervals(3, Array.ConvertAll(seconds, TimeSpan.FromSeconds));
+            return false;
+        }
+        catch (Exception ex) when (ex is ArgumentException or OverflowException)
+        {
+            return true;
+        }
+    }
+
+    [Fact]
+    public void RetryWithACeilingAboveTheCap_ReportsBW0008_InsteadOfAllocatingAtStartup()
+    {
+        var run = GeneratorHarness.Run("""
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+
+            namespace Acme;
+
+            [Job("charge-card")]
+            [Retry(1001, 1)]
+            public sealed record ChargeCard(string OrderId);
+
+            public sealed class ChargeCardHandler : IJobHandler<ChargeCard>
+            {
+                public Task HandleAsync(ChargeCard job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+            """);
+
+        var diagnostic = Assert.Single(run.GeneratorDiagnostics);
+        Assert.Equal("BW0008", diagnostic.Id);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+    }
+
+    [Fact]
+    public void RetryWithoutJob_ReportsBW0010_InsteadOfSilentlyIgnoringTheOverride()
+    {
+        var run = GeneratorHarness.Run("""
+            using BackWave.Jobs;
+
+            namespace Acme;
+
+            [Retry(3, 1, 5)]
+            public sealed record ChargeCard(string OrderId);
+            """);
+
+        var diagnostic = Assert.Single(run.GeneratorDiagnostics);
+        Assert.Equal("BW0010", diagnostic.Id);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+    }
+
+    [Fact]
+    public void RetryWithNoBackoffIntervals_ReportsBW0009_InsteadOfCrashingAtStartup()
+    {
+        var run = GeneratorHarness.Run("""
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+
+            namespace Acme;
+
+            [Job("charge-card")]
+            [Retry(3)]
+            public sealed record ChargeCard(string OrderId);
+
+            public sealed class ChargeCardHandler : IJobHandler<ChargeCard>
+            {
+                public Task HandleAsync(ChargeCard job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+            """);
+
+        var diagnostic = Assert.Single(run.GeneratorDiagnostics);
+        Assert.Equal("BW0009", diagnostic.Id);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+    }
+
+    [Fact]
+    public void RetryWithANegativeBackoffInterval_ReportsBW0009()
+    {
+        var run = GeneratorHarness.Run("""
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+
+            namespace Acme;
+
+            [Job("charge-card")]
+            [Retry(3, 1, -5)]
+            public sealed record ChargeCard(string OrderId);
+
+            public sealed class ChargeCardHandler : IJobHandler<ChargeCard>
+            {
+                public Task HandleAsync(ChargeCard job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+            """);
+
+        var diagnostic = Assert.Single(run.GeneratorDiagnostics);
+        Assert.Equal("BW0009", diagnostic.Id);
+    }
+
+    [Fact]
+    public void RetryWithMoreThanTwentyBackoffIntervals_ReportsBW0009()
+    {
+        var run = GeneratorHarness.Run("""
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+
+            namespace Acme;
+
+            [Job("charge-card")]
+            [Retry(3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)]
+            public sealed record ChargeCard(string OrderId);
+
+            public sealed class ChargeCardHandler : IJobHandler<ChargeCard>
+            {
+                public Task HandleAsync(ChargeCard job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+            """);
+
+        var diagnostic = Assert.Single(run.GeneratorDiagnostics);
+        Assert.Equal("BW0009", diagnostic.Id);
+    }
+
+    [Fact]
+    public void RetryWithAnOutOfRangeBackoffInterval_ReportsBW0009_InsteadOfEmittingCodeThatThrows()
+    {
+        var run = GeneratorHarness.Run("""
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+
+            namespace Acme;
+
+            [Job("charge-card")]
+            [Retry(3, 1, 1e20)]
+            public sealed record ChargeCard(string OrderId);
+
+            public sealed class ChargeCardHandler : IJobHandler<ChargeCard>
+            {
+                public Task HandleAsync(ChargeCard job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+            """);
+
+        var diagnostic = Assert.Single(run.GeneratorDiagnostics);
+        Assert.Equal("BW0009", diagnostic.Id);
+    }
+
+    [Fact]
+    public void RetryWithASubTickNegativeBackoff_IsAccepted_MatchingFromIntervalsRounding()
+    {
+        var run = GeneratorHarness.Run("""
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+
+            namespace Acme;
+
+            [Job("charge-card")]
+            [Retry(3, 1, -1e-9)]
+            public sealed record ChargeCard(string OrderId);
+
+            public sealed class ChargeCardHandler : IJobHandler<ChargeCard>
+            {
+                public Task HandleAsync(ChargeCard job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+            """);
+
+        Assert.Empty(run.GeneratorDiagnostics);
+        Assert.Empty(run.CompilationDiagnostics.Where(d => d.Severity == DiagnosticSeverity.Error));
+    }
+
+    [Fact]
     public void SameBareTypeNameInDifferentNamespaces_DoesNotCollide()
     {
         var run = GeneratorHarness.Run("""
