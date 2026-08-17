@@ -78,6 +78,33 @@ public interface IJobStore
     ValueTask<IReadOnlyList<JobRecord>> ClaimAsync(ClaimRequest request, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Claims due jobs exactly as <see cref="ClaimAsync"/> does, and additionally reports the earliest
+    /// future instant at which a currently-empty claim could begin to return work through the passage of
+    /// time alone - the next scheduled job's due time. This lets an idle worker sleep until that instant
+    /// rather than poll at a fixed rate (see <c>WorkerGroupOptions.MaxPollInterval</c>).
+    /// <para>
+    /// The default implementation delegates to <see cref="ClaimAsync"/> and reports
+    /// <see cref="ClaimResult.NextDue"/> as <c>null</c> (unknown), so an adapter that does not override it
+    /// keeps the fixed-rate behavior with no change. An overriding adapter MUST compute NextDue against a
+    /// snapshot consistent with the claim it just performed - a same-connection read taken as part of, or
+    /// immediately after, the claim is acceptable - and MUST report a value at or before <see cref="ClaimRequest.Now"/>
+    /// whenever work is due now but was withheld by a concurrency limit or the batch cap, so the caller
+    /// never extends its backoff past due-now pressure. A paused queue is excluded: its work does not become
+    /// claimable through the passage of time, so it never forces NextDue to Now and never contributes a
+    /// future due time. NextDue never affects correctness; it only schedules the next poll, so an inexact
+    /// value costs latency, nothing else.
+    /// </para>
+    /// </summary>
+    /// <param name="request">The claim parameters, identical to <see cref="ClaimAsync"/>.</param>
+    /// <param name="cancellationToken">Cancels the operation.</param>
+    /// <returns>The leased jobs and the next future due time for idle-poll scheduling.</returns>
+    async ValueTask<ClaimResult> ClaimBatchAsync(ClaimRequest request, CancellationToken cancellationToken = default)
+    {
+        var jobs = await ClaimAsync(request, cancellationToken).ConfigureAwait(false);
+        return new ClaimResult(jobs, NextDue: null);
+    }
+
+    /// <summary>
     /// Applies the outcome of one execution attempt and appends the resulting transition to the
     /// job's history atomically. The <paramref name="workerId"/> and <paramref name="attempt"/> pair
     /// fences the lease: an implementation MUST apply the outcome only when the caller still holds
@@ -988,6 +1015,18 @@ public sealed record ClaimRequest(
     int MaxJobs,
     TimeSpan LeaseDuration,
     DateTimeOffset Now);
+
+/// <summary>The result of a batch claim: the leased jobs, and the next future due time for idle-poll scheduling.</summary>
+/// <param name="Jobs">The leased jobs, exactly as <see cref="IJobStore.ClaimAsync"/> returns them; empty when nothing is due.</param>
+/// <param name="NextDue">
+/// The earliest future instant at which a currently-empty claim could begin to return work through the
+/// passage of time alone (the next scheduled job's due time), or <c>null</c> when unknown or no future work
+/// exists. A value at or before the request's <see cref="ClaimRequest.Now"/> means work is due now but was
+/// withheld by a concurrency limit or the batch cap, so the caller should poll again promptly rather than
+/// back off. A paused queue is excluded, since its work does not become claimable through time alone.
+/// Advisory only, never a correctness input.
+/// </param>
+public sealed record ClaimResult(IReadOnlyList<JobRecord> Jobs, DateTimeOffset? NextDue);
 
 /// <summary>Whether an outcome report was applied or fenced out by a stale lease.</summary>
 public enum OutcomeResult

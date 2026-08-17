@@ -66,12 +66,25 @@ public abstract class ConformanceSuite
     /// <returns>A fresh, empty store honoring the given history policy.</returns>
     protected abstract ValueTask<IJobStore> CreateStoreAsync(JobHistoryPolicy historyPolicy);
 
+    /// <summary>
+    /// Whether the store under test overrides <see cref="IJobStore.ClaimBatchAsync"/> to report a real
+    /// <see cref="ClaimResult.NextDue"/>. The contract permits an adapter to keep the default and always
+    /// report <c>null</c> (unknown); such a store sets this to <see langword="false"/>, and the NextDue
+    /// clauses then certify only the documented null fallback. Defaults to <see langword="true"/>, since
+    /// every first-party adapter computes NextDue.
+    /// </summary>
+    protected virtual bool ComputesNextDue => true;
+
     private static NewJob Job(string wireName = "conformance-job", string queue = "default", DateTimeOffset? dueTime = null)
         => new(Guid.NewGuid(), wireName, "{}"u8.ToArray(), queue, dueTime ?? T0);
 
     private static ValueTask<IReadOnlyList<JobRecord>> ClaimAsync(
         IJobStore store, DateTimeOffset now, int maxJobs = 32, string worker = "w1", string queue = "default")
         => store.ClaimAsync(new ClaimRequest(worker, [queue], maxJobs, Lease, now));
+
+    private static ValueTask<ClaimResult> ClaimBatchAsync(
+        IJobStore store, DateTimeOffset now, int maxJobs = 32, string worker = "w1", string queue = "default")
+        => store.ClaimBatchAsync(new ClaimRequest(worker, [queue], maxJobs, Lease, now));
 
     // ── §5.1 Enqueue ────────────────────────────────────────────────────────────
 
@@ -506,6 +519,139 @@ public abstract class ConformanceSuite
         await store.ExpireLeasesAsync(pastExpiry, maxJobs: 32, DefaultQueues, TwoAttempts);
         Assert.NotNull(second); // expired job rescheduled; the slot is claimable again
         Assert.Single(await ClaimAsync(store, pastExpiry.AddMinutes(2), worker: "w3"));
+    }
+
+    // ── §5.2 ClaimBatch NextDue (idle-poll backoff) ─────────────────────────────
+
+    /// <summary>
+    /// Certifies that an empty store reports no next due time. With nothing scheduled, a claim returns
+    /// no jobs and a null NextDue, so an idle poller may back off to its ceiling.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_2_NextDue_EmptyStore_IsNull()
+    {
+        var store = await CreateStoreAsync();
+
+        var result = await ClaimBatchAsync(store, T0);
+
+        Assert.Empty(result.Jobs);
+        Assert.Null(result.NextDue);
+    }
+
+    /// <summary>
+    /// Certifies that a store which computes NextDue reports the due time of the earliest future
+    /// scheduled job, so an idle poller can sleep until then. A store that keeps the default reports null.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_2_NextDue_FutureJob_ReportsItsDueTime()
+    {
+        var store = await CreateStoreAsync();
+        var future = T0.AddHours(1);
+        await store.EnqueueAsync(Job(dueTime: future), now: T0);
+
+        var result = await ClaimBatchAsync(store, T0);
+
+        Assert.Empty(result.Jobs); // not due yet
+        if (ComputesNextDue)
+        {
+            Assert.Equal(future, result.NextDue);
+        }
+        else
+        {
+            Assert.Null(result.NextDue);
+        }
+    }
+
+    /// <summary>
+    /// Certifies that after a claim drains the due-now work, NextDue advances to the next future
+    /// scheduled job. The claim returns the due job, and NextDue points past it to the future one.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_2_NextDue_AfterClaimingDueNow_ReportsNextFutureJob()
+    {
+        var store = await CreateStoreAsync();
+        var future = T0.AddHours(1);
+        await store.EnqueueAsync(Job(), now: T0); // due now
+        await store.EnqueueAsync(Job(dueTime: future), now: T0);
+
+        var result = await ClaimBatchAsync(store, T0);
+
+        Assert.Single(result.Jobs);
+        if (ComputesNextDue)
+        {
+            Assert.Equal(future, result.NextDue);
+        }
+        else
+        {
+            Assert.Null(result.NextDue);
+        }
+    }
+
+    /// <summary>
+    /// Certifies that work due now but withheld by a concurrency limit clamps NextDue to the request
+    /// instant, so the poller keeps its floor cadence instead of backing off past due-now pressure.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_2_NextDue_DueNowWithheldByConcurrencyLimit_ClampsToNow()
+    {
+        var store = await CreateStoreAsync();
+        await store.SetConcurrencyLimitAsync("default", 1, "alice", T0);
+        await store.EnqueueAsync(Job(), now: T0);
+        await store.EnqueueAsync(Job(), now: T0);
+
+        var result = await ClaimBatchAsync(store, T0);
+
+        Assert.Single(result.Jobs); // limit 1 withholds the second
+        if (ComputesNextDue)
+        {
+            Assert.Equal(T0, result.NextDue);
+        }
+        else
+        {
+            Assert.Null(result.NextDue);
+        }
+    }
+
+    /// <summary>
+    /// Certifies that work due now but withheld by the batch cap clamps NextDue to the request instant,
+    /// so the poller polls again promptly to drain the remaining due work.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_2_NextDue_DueNowWithheldByBatchCap_ClampsToNow()
+    {
+        var store = await CreateStoreAsync();
+        await store.EnqueueAsync(Job(), now: T0);
+        await store.EnqueueAsync(Job(), now: T0);
+
+        var result = await ClaimBatchAsync(store, T0, maxJobs: 1);
+
+        Assert.Single(result.Jobs); // cap 1 leaves the second due-now
+        if (ComputesNextDue)
+        {
+            Assert.Equal(T0, result.NextDue);
+        }
+        else
+        {
+            Assert.Null(result.NextDue);
+        }
+    }
+
+    /// <summary>
+    /// Certifies that a paused queue is excluded from NextDue. Its work does not become claimable
+    /// through the passage of time, so even a due-now job in a paused queue yields a null NextDue
+    /// rather than clamping to the request instant.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_2_NextDue_PausedQueue_IsExcluded()
+    {
+        var store = await CreateStoreAsync();
+        await store.PauseQueueAsync("default", "alice", T0);
+        await store.EnqueueAsync(Job(), now: T0); // due now, but the queue is paused
+
+        var result = await ClaimBatchAsync(store, T0);
+
+        Assert.Empty(result.Jobs);
+        Assert.Null(result.NextDue);
     }
 
     // ── §5.6 ReportOutcome ──────────────────────────────────────────────────────

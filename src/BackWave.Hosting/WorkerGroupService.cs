@@ -91,6 +91,24 @@ internal sealed class WorkerGroupService(
     private int _pollQueued;
 
     // <summary>
+    // Adaptive idle poll backoff. Active only when
+    // <see cref="WorkerGroupOptions.MaxPollInterval"/> is greater than
+    // <see cref="WorkerGroupOptions.PollInterval"/>. The pacer (PollPacerAsync) sleeps for the current
+    // delay, held in ticks so it can be read and written atomically (a TimeSpan cannot). A claim outcome
+    // updates it: work found or a due-now report snaps it back to the floor, an empty poll with a future
+    // next-due sleeps to that instant, an empty poll with no next-due doubles the delay toward the ceiling.
+    // Byte-for-byte unchanged when the feature is off - the fixed TickAsync ticker runs instead.
+    // </summary>
+    private long _pollDelayTicks;
+    // <summary>Wakes the adaptive pacer early (a claim that must reset the floor) without a busy
+    // wait; a 0..1 semaphore so a burst of releases coalesces to one wake, mirroring _pollQueued.</summary>
+    private readonly SemaphoreSlim _pollWake = new(0, 1);
+
+    // Adaptive backoff runs only when a strictly larger ceiling is set: at or below the floor,
+    // the fixed-cadence ticker governs polling exactly as before.
+    private bool AdaptivePoll => options.MaxPollInterval > options.PollInterval;
+
+    // <summary>
     // The classification boundary (ADR-0007 amendment): a transient store fault retries, an
     // invariant violation (and anything unclassifiable) fail-stops. Both adapters surface
     // provider-transient conditions — connection reset, failover, deadlock victim, command
@@ -177,7 +195,16 @@ internal sealed class WorkerGroupService(
             }
         }
 
-        _ = TickAsync(options.PollInterval, stoppingToken, events.Writer, RequestPoll);
+        if (AdaptivePoll)
+        {
+            // Start idle backoff at the floor and let claim outcomes stretch it toward the ceiling.
+            Volatile.Write(ref _pollDelayTicks, options.PollInterval.Ticks);
+            _ = PollPacerAsync(stoppingToken, events.Writer, RequestPoll);
+        }
+        else
+        {
+            _ = TickAsync(options.PollInterval, stoppingToken, events.Writer, RequestPoll);
+        }
         _ = TickAsync(options.HeartbeatInterval ?? options.LeaseDuration / 3, stoppingToken, events.Writer,
             () => events.Writer.TryWrite(new NodeEvent.HeartbeatDue(_clock.GetUtcNow())));
 
@@ -264,6 +291,90 @@ internal sealed class WorkerGroupService(
         }
     }
 
+    // The adaptive replacement for the fixed poll ticker, used only while
+    // AdaptivePoll is set. It sleeps for the current backoff delay, then requests a poll - but the sleep
+    // ends early when _pollWake is released, which happens only on a floor reset (WakePoll from
+    // UpdatePollBackoff when work is claimed or due-now pressure is reported), so the return to full cadence
+    // takes effect at once. A Wake-Up Hint does not touch _pollWake; it wakes the pump through RequestPoll,
+    // which writes a PollDue to the channel the reader drains independently of this sleep. The delay never
+    // drops below PollInterval, so the poll cadence keeps its correctness floor even if an update races. A
+    // dead pacer fails the pump loop, exactly as a dead ticker does.
+    private async Task PollPacerAsync(CancellationToken cancellationToken, ChannelWriter<NodeEvent> events, Action tick)
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var delayTicks = Math.Max(options.PollInterval.Ticks, Volatile.Read(ref _pollDelayTicks));
+                // A satisfied wait (true) means an early wake: skip straight to the poll. A timeout (false)
+                // is the normal backoff expiry. Either way the next action is one poll request.
+                await _pollWake.WaitAsync(TimeSpan.FromTicks(delayTicks), cancellationToken).ConfigureAwait(false);
+                tick();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal shutdown.
+        }
+        catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Teardown raced the pacer: _pollWake was disposed while a wait was parked. This is
+            // normal shutdown, not a fault - do not fault the pump into the fail-stop path.
+        }
+        catch (Exception exception)
+        {
+            events.TryComplete(exception);
+        }
+    }
+
+    // Fold a claim outcome into the idle backoff delay (adaptive mode only). Work claimed, or a store that
+    // reports due-now pressure it withheld, resets to the floor and wakes the pacer now. An empty poll with
+    // a future next-due sleeps to that instant (clamped to the floor/ceiling). An empty poll with no
+    // next-due doubles the current delay toward the ceiling. The value is advisory: it changes only WHEN
+    // the pump polls, never WHETHER a due job is claimed, so polling stays the sole correctness mechanism.
+    private void UpdatePollBackoff(bool claimedWork, DateTimeOffset? nextDue, DateTimeOffset now)
+    {
+        var floor = options.PollInterval.Ticks;
+        var ceiling = options.MaxPollInterval.Ticks;
+
+        if (claimedWork || (nextDue is { } due && due <= now))
+        {
+            // Busy again, or work is already due but was withheld (concurrency limit, batch cap, full pool):
+            // return to the floor and poll promptly so the backlog drains at full cadence.
+            Volatile.Write(ref _pollDelayTicks, floor);
+            WakePoll();
+            return;
+        }
+
+        long nextTicks;
+        if (nextDue is { } next)
+        {
+            // Sleep to the next scheduled instant, but never past the ceiling or below the floor.
+            var untilDue = (next - now).Ticks;
+            nextTicks = Math.Clamp(untilDue, floor, ceiling);
+        }
+        else
+        {
+            // Nothing scheduled and no hint of when: grow the delay geometrically toward the ceiling.
+            var current = Math.Max(floor, Volatile.Read(ref _pollDelayTicks));
+            nextTicks = Math.Min(ceiling, current <= ceiling / 2 ? current * 2 : ceiling);
+        }
+        Volatile.Write(ref _pollDelayTicks, nextTicks);
+    }
+
+    // Release the pacer's wake latch, coalescing a burst to a single wake (mirrors _pollQueued). A full
+    // latch already means "wake pending", so an extra release is a no-op, not an error.
+    private void WakePoll()
+    {
+        try { _pollWake.Release(); }
+        catch (SemaphoreFullException) { }
+        catch (ObjectDisposedException)
+        {
+            // Teardown raced the wake: _pollWake was disposed while a wake raced shutdown. This is
+            // normal shutdown, not a fault - do not fault the pump into the fail-stop path.
+        }
+    }
+
     private async ValueTask ExecuteAsync(
         Command command, ChannelWriter<NodeEvent> events, CancellationToken stoppingToken)
     {
@@ -306,9 +417,17 @@ internal sealed class WorkerGroupService(
             case Command.ClaimBatch claim:
                 using (var claimActivity = BackWaveDiagnostics.StartReceive(claim.WorkerId, options.Name))
                 {
-                    var jobs = await store.ClaimAsync(
-                        new ClaimRequest(claim.WorkerId, claim.Queues, claim.MaxJobs, claim.LeaseDuration, now),
-                        stoppingToken).ConfigureAwait(false);
+                    var request = new ClaimRequest(claim.WorkerId, claim.Queues, claim.MaxJobs, claim.LeaseDuration, now);
+                    // ClaimBatchAsync (a Default Interface Method) returns the claimed jobs plus an advisory
+                    // next-due instant; an adapter that does not override it reports NextDue = null, so the
+                    // backoff simply falls back to the geometric growth path. Only the adaptive pacer consumes
+                    // NextDue, so when the feature is off we take the plain ClaimAsync path and issue exactly
+                    // the single claim query the runtime issued before this feature existed.
+                    var result = AdaptivePoll
+                        ? await store.ClaimBatchAsync(request, stoppingToken).ConfigureAwait(false)
+                        : new ClaimResult(
+                            await store.ClaimAsync(request, stoppingToken).ConfigureAwait(false), NextDue: null);
+                    var jobs = result.Jobs;
                     BackWaveDiagnostics.RecordClaimed(claimActivity, jobs, now);
                     foreach (var job in jobs)
                     {
@@ -318,6 +437,10 @@ internal sealed class WorkerGroupService(
                     if (jobs.Count > 0)
                     {
                         events.TryWrite(new NodeEvent.ClaimCompleted(jobs, now));
+                    }
+                    if (AdaptivePoll)
+                    {
+                        UpdatePollBackoff(jobs.Count > 0, result.NextDue, now);
                     }
                 }
                 break;
@@ -634,5 +757,14 @@ internal sealed class WorkerGroupService(
                 BackWaveLog.DeadLettered(logger);
             }
         }
+    }
+
+    public override void Dispose()
+    {
+        // Cancel the pump (base) BEFORE disposing the wake latch the pacer awaits: if teardown races a
+        // parked pacer wait, that wait then sees an already-cancelled token, so the resulting
+        // ObjectDisposedException is recognized as normal shutdown instead of faulting the pump.
+        base.Dispose();
+        _pollWake.Dispose();
     }
 }

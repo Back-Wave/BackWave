@@ -344,7 +344,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         using var activity = PostgresDiagnostics.StartStore("claim", JobsCollection);
         try
         {
-            return await ClaimUntracedAsync(request, cancellationToken).ConfigureAwait(false);
+            var (jobs, _) = await ClaimUntracedAsync(request, computeNextDue: false, cancellationToken).ConfigureAwait(false);
+            return jobs;
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
@@ -353,8 +354,28 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         }
     }
 
-    private async ValueTask<IReadOnlyList<JobRecord>> ClaimUntracedAsync(
+    /// <inheritdoc/>
+    public async ValueTask<ClaimResult> ClaimBatchAsync(
         ClaimRequest request, CancellationToken cancellationToken = default)
+    {
+        using var activity = PostgresDiagnostics.StartStore("claim", JobsCollection);
+        try
+        {
+            // Idle-poll next-due: computed on the SAME connection after every per-Queue claim
+            // transaction commits, so it reads the post-claim committed snapshot. Advisory only: an
+            // enqueue also fires a Wake-Up Hint (NOTIFY), so this value only bounds the rare no-hint case.
+            var (jobs, nextDue) = await ClaimUntracedAsync(request, computeNextDue: true, cancellationToken).ConfigureAwait(false);
+            return new ClaimResult(jobs, nextDue);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            PostgresDiagnostics.RecordStoreFault(activity, exception, IsTransientStoreFault(exception));
+            throw;
+        }
+    }
+
+    private async ValueTask<(IReadOnlyList<JobRecord> Jobs, DateTimeOffset? NextDue)> ClaimUntracedAsync(
+        ClaimRequest request, bool computeNextDue, CancellationToken cancellationToken = default)
     {
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
         var maxJobs = Math.Min(request.MaxJobs, _options.Bounds.MaxClaimBatch);
@@ -486,7 +507,43 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
         // Tags already rode back with the claim (the correlated aggregate above), so no separate
         // hydration round-trip — even when tags are present they are batch-hydrated, never N+1.
-        return claimed;
+        var nextDue = computeNextDue
+            ? await NextDueAsync(connection, request, cancellationToken).ConfigureAwait(false)
+            : null;
+        return (claimed, nextDue);
+    }
+
+    // The earliest future instant a currently-empty claim could begin returning work through time alone,
+    // for idle-poll backoff. Read on the connection the claim just committed on, after every per-Queue
+    // transaction commits. A served, non-paused queue that still holds a due-now Scheduled job (withheld
+    // by a concurrency limit or the batch cap) reports Now, so the caller keeps the floor cadence;
+    // otherwise the earliest future Scheduled due time across served, non-paused queues, or null when none
+    // is scheduled. Advisory only.
+    private async ValueTask<DateTimeOffset?> NextDueAsync(
+        NpgsqlConnection connection, ClaimRequest request, CancellationToken cancellationToken)
+    {
+        // A queue is paused only when its queue_limits row sets paused = true; absent row = not paused.
+        await using var cmd = Cmd(
+            """
+            SELECT j.due_time
+            FROM backwave.jobs j
+            LEFT JOIN backwave.queue_limits ql ON ql.queue = j.queue
+            WHERE j.state = 0
+                AND j.queue = ANY(@queues)
+                AND COALESCE(ql.paused, false) = false
+            ORDER BY j.due_time
+            LIMIT 1
+            """,
+            connection);
+        cmd.Parameters.AddWithValue("queues", request.Queues.ToArray());
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            return null; // nothing scheduled in any served, non-paused queue
+        }
+        var earliest = reader.GetFieldValue<DateTimeOffset>(0);
+        // Due now but withheld (concurrency limit or batch cap): clamp to Now so the poller does not back off.
+        return earliest <= request.Now ? request.Now : earliest;
     }
 
     // True when a claim recently observed this Queue unlimited AND unpaused under the CURRENT config

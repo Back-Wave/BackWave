@@ -29,6 +29,16 @@ internal sealed record SimulationOptions
     public TimeSpan MaxClockSkew { get; init; } = TimeSpan.FromSeconds(2);
     public TimeSpan MaxCrashDowntime { get; init; } = TimeSpan.FromMinutes(5);
     public TimeSpan PollInterval { get; init; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// The idle poll-backoff ceiling, mirroring <c>WorkerGroupOptions.MaxPollInterval</c>. When it is
+    /// greater than <see cref="PollInterval"/>, an idle node backs off from the poll interval toward this
+    /// value and sleeps to the store-reported next-due instant, instead of polling at the fixed rate.
+    /// Defaults to <see cref="TimeSpan.Zero"/> (disabled): the sim polls at <see cref="PollInterval"/>,
+    /// byte-identical to before.
+    /// </summary>
+    public TimeSpan MaxPollInterval { get; init; }
+
     public TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(20);
     public TimeSpan LeaseDuration { get; init; } = TimeSpan.FromSeconds(60);
     public int MaxAttempts { get; init; } = 3;
@@ -519,6 +529,13 @@ internal sealed record SimulationResult(
     /// post-hoc from the in-flight count the per-node-cap oracle already reads; no hot-path instrumentation.
     /// </summary>
     public int BackpressureIdleTicks { get; init; }
+
+    /// <summary>
+    /// The number of Poll events driven to a live (non-crashed) node during the run. With adaptive idle backoff
+    /// (<see cref="SimulationOptions.MaxPollInterval"/> greater than <see cref="SimulationOptions.PollInterval"/>)
+    /// an idle fleet polls fewer times over the same workload, so this drops well below the fixed-cadence count.
+    /// </summary>
+    public long PollCount { get; init; }
 }
 
 /// <summary>
@@ -544,6 +561,11 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         public required TimeSpan Skew { get; init; }
         public bool Crashed { get; set; }
         public int Epoch { get; set; }
+        // The current idle poll-backoff delay, used only when the run enables adaptive polling
+        // (MaxPollInterval > PollInterval). A claim outcome folds into it: work found or due-now pressure
+        // snaps it to the floor, an empty poll with a future next-due sleeps to it, an empty poll with no
+        // next-due doubles it toward the ceiling. Starts at the floor (PollInterval).
+        public TimeSpan PollDelay { get; set; }
         // The jobs this node is executing, keyed by JobId → the Attempt's JobRecord. The record is
         // kept (not just the id) so a cooperative cancel can raise ExecutionCancelled for the exact
         // in-flight Attempt, mirroring the pumps' captured flight.Job rather than re-reading state.
@@ -662,6 +684,9 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     // (LimitSaturated / BackpressureIdle) post-hoc from the SimulationResult, never from hot-path code.
     private int _limitSaturations;
     private int _backpressureIdleTicks;
+    // Count of Poll events driven to a live (non-crashed) node, for measuring the idle-poll load
+    // an adaptive-backoff run saves against a fixed-cadence run over the same workload.
+    private long _pollCount;
     private SimNode[] _nodes = [];
     // The store the node hot-path writes go through. Identical to _store in every real regime; the
     // fence-dropping sabotage wraps it so a stale ReportOutcome is forced through (issue 0068). Reads in
@@ -868,6 +893,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             {
                 Driver = NewDriver(i),
                 Skew = _rng.NextTimeSpan(options.MaxClockSkew * 2) - options.MaxClockSkew,
+                PollDelay = options.PollInterval,
             };
             Schedule(_start + _rng.NextTimeSpan(options.PollInterval), new SimEvent(EventKind.Poll, i, 0, null, false));
             Schedule(_start + _rng.NextTimeSpan(options.HeartbeatInterval), new SimEvent(EventKind.Heartbeat, i, 0, null, false));
@@ -1072,6 +1098,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             WeightedNodeCount = _policies.Count(p => p is Core.DispatchPolicy.Weighted),
             LimitSaturations = _limitSaturations,
             BackpressureIdleTicks = _backpressureIdleTicks,
+            PollCount = _pollCount,
             ObserverDeliveries = options.Observers.ToDictionary(
                 o => o.Id,
                 o => (
@@ -1259,12 +1286,15 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     Crash(simEvent.Node);
                     break;
                 }
+                _pollCount++;
                 TryDrive(simEvent.Node, new NodeEvent.PollDue(NodeNow(simEvent.Node)));
                 // Observer delivery rides the same poll cadence (§0076): claim each Observer's next
                 // batch, invoke the recording sink, advance the cursor. Same per-node faulty store, so
                 // Node Isolation and store faults reach the delivery cursor too (§0078).
                 TryDriveObservers(simEvent.Node, new ObserverEvent.PollDue(NodeNow(simEvent.Node)));
-                Schedule(_now + options.PollInterval, simEvent);
+                // TryDrive above already ran this poll's claim, which folded its outcome into the node's
+                // PollDelay when adaptive. Reschedule at that delay; otherwise the fixed interval as before.
+                Schedule(_now + (AdaptivePoll ? _nodes[simEvent.Node].PollDelay : options.PollInterval), simEvent);
                 break;
 
             case EventKind.Heartbeat:
@@ -1344,6 +1374,8 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 var restarting = _nodes[simEvent.Node];
                 restarting.Crashed = false;
                 restarting.Driver = NewDriver(simEvent.Node);
+                restarting.PollDelay = options.PollInterval; // a fresh pump starts at the floor
+
                 Schedule(_now + _rng.NextTimeSpan(options.PollInterval), new SimEvent(EventKind.Poll, simEvent.Node, 0, null, false));
                 Schedule(_now + _rng.NextTimeSpan(options.HeartbeatInterval), new SimEvent(EventKind.Heartbeat, simEvent.Node, 0, null, false));
                 break;
@@ -1669,8 +1701,21 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     break;
 
                 case Command.ClaimBatch claim:
-                    var jobs = Get(_nodeFaulty[nodeIndex].ClaimAsync(new ClaimRequest(
-                        claim.WorkerId, claim.Queues, claim.MaxJobs, claim.LeaseDuration, NodeNow(nodeIndex))));
+                    var claimNow = NodeNow(nodeIndex);
+                    var request = new ClaimRequest(claim.WorkerId, claim.Queues, claim.MaxJobs, claim.LeaseDuration, claimNow);
+                    IReadOnlyList<JobRecord> jobs;
+                    if (AdaptivePoll)
+                    {
+                        // Take the store's next-due hint and fold it into this node's backoff, exactly as the
+                        // host pump does. Off by default (ClaimAsync path below), so a run stays byte-identical.
+                        var result = Get(_nodeFaulty[nodeIndex].ClaimBatchAsync(request));
+                        jobs = result.Jobs;
+                        UpdatePollBackoff(nodeIndex, jobs.Count > 0, result.NextDue, claimNow);
+                    }
+                    else
+                    {
+                        jobs = Get(_nodeFaulty[nodeIndex].ClaimAsync(request));
+                    }
                     if (jobs.Count > 0)
                     {
                         Drive(nodeIndex, new NodeEvent.ClaimCompleted(jobs, NodeNow(nodeIndex)));
@@ -2676,6 +2721,37 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
 
     private DateTimeOffset NodeNow(int nodeIndex) => _now + _nodes[nodeIndex].Skew;
 
+    // Adaptive idle backoff runs only when a strictly larger ceiling is set; otherwise the fixed
+    // PollInterval cadence governs polling and every run stays byte-identical to before.
+    private bool AdaptivePoll => options.MaxPollInterval > options.PollInterval;
+
+    // Fold a claim outcome into a node's idle poll-backoff delay, mirroring the host pump. Work claimed, or
+    // a store that reports due-now pressure it withheld, resets to the floor. An empty poll with a future
+    // next-due sleeps to that instant (clamped to floor/ceiling). An empty poll with no next-due doubles the
+    // delay toward the ceiling. The delay only sets WHEN the node next polls, never WHETHER work is claimed.
+    private void UpdatePollBackoff(int nodeIndex, bool claimedWork, DateTimeOffset? nextDue, DateTimeOffset now)
+    {
+        var floor = options.PollInterval;
+        var ceiling = options.MaxPollInterval;
+        TimeSpan next;
+        if (claimedWork || (nextDue is { } due && due <= now))
+        {
+            next = floor;
+        }
+        else if (nextDue is { } scheduled)
+        {
+            var untilDue = scheduled - now;
+            next = untilDue < floor ? floor : (untilDue > ceiling ? ceiling : untilDue);
+        }
+        else
+        {
+            var current = _nodes[nodeIndex].PollDelay < floor ? floor : _nodes[nodeIndex].PollDelay;
+            var doubled = current + current;
+            next = doubled > ceiling ? ceiling : doubled;
+        }
+        _nodes[nodeIndex].PollDelay = next;
+    }
+
     private void Schedule(DateTimeOffset at, SimEvent simEvent) => _queue.Enqueue(simEvent, (at, _sequence++));
 
     /// <summary>The In-Memory Store always completes synchronously; the Simulator is single-threaded.</summary>
@@ -2726,6 +2802,14 @@ internal sealed class FaultInjectingStore(IJobStore inner, Func<string, bool> sh
     {
         MaybeFault("Claim");
         return inner.ClaimAsync(request, cancellationToken);
+    }
+
+    // Forward the batch claim so the inner store's next-due hint reaches the adaptive poll pacer; a fault
+    // aborts the whole claim, exactly as it does for ClaimAsync.
+    public ValueTask<ClaimResult> ClaimBatchAsync(ClaimRequest request, CancellationToken cancellationToken = default)
+    {
+        MaybeFault("Claim");
+        return inner.ClaimBatchAsync(request, cancellationToken);
     }
 
     public ValueTask<OutcomeResult> ReportOutcomeAsync(
@@ -2906,6 +2990,9 @@ internal sealed class FenceDroppingStore(InMemoryJobStore inner) : IJobStore
 
     public ValueTask<IReadOnlyList<JobRecord>> ClaimAsync(ClaimRequest request, CancellationToken cancellationToken = default)
         => inner.ClaimAsync(request, cancellationToken);
+
+    public ValueTask<ClaimResult> ClaimBatchAsync(ClaimRequest request, CancellationToken cancellationToken = default)
+        => inner.ClaimBatchAsync(request, cancellationToken);
 
     public ValueTask<IReadOnlyList<HeartbeatResult>> HeartbeatAsync(
         string workerId, IReadOnlyList<Guid> jobIds, TimeSpan leaseDuration, DateTimeOffset now,

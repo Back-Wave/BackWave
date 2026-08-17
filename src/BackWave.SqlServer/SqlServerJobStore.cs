@@ -334,7 +334,8 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         using var activity = SqlServerDiagnostics.StartStore("claim", JobsCollection);
         try
         {
-            return await ClaimUntracedAsync(request, cancellationToken).ConfigureAwait(false);
+            var (jobs, _) = await ClaimUntracedAsync(request, computeNextDue: false, cancellationToken).ConfigureAwait(false);
+            return jobs;
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
@@ -343,8 +344,28 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         }
     }
 
-    private async ValueTask<IReadOnlyList<JobRecord>> ClaimUntracedAsync(
+    /// <inheritdoc/>
+    public async ValueTask<ClaimResult> ClaimBatchAsync(
         ClaimRequest request, CancellationToken cancellationToken = default)
+    {
+        using var activity = SqlServerDiagnostics.StartStore("claim", JobsCollection);
+        try
+        {
+            // Idle-poll next-due: computed on the SAME connection right after the per-queue claims commit,
+            // so it reads the post-claim committed snapshot. SQL Server has no Wake-Up Hint channel, so this
+            // value is the sole latency mechanism for an idle backed-off fleet on this adapter.
+            var (jobs, nextDue) = await ClaimUntracedAsync(request, computeNextDue: true, cancellationToken).ConfigureAwait(false);
+            return new ClaimResult(jobs, nextDue);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            SqlServerDiagnostics.RecordStoreFault(activity, exception, IsTransientStoreFault(exception));
+            throw;
+        }
+    }
+
+    private async ValueTask<(IReadOnlyList<JobRecord> Jobs, DateTimeOffset? NextDue)> ClaimUntracedAsync(
+        ClaimRequest request, bool computeNextDue, CancellationToken cancellationToken = default)
     {
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
         var maxJobs = Math.Min(request.MaxJobs, options.Bounds.MaxClaimBatch);
@@ -470,11 +491,49 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         // so SQL Server instead GATES the existing post-commit hydration: under the no-tags
         // configuration the job_tags table is empty, the gate skips the round-trip entirely, and the
         // claim hot path pays nothing. See TagsInUseAsync for the cheap, sound presence signal.
-        if (claimed.Count == 0 || !await TagsInUseAsync(connection, cancellationToken).ConfigureAwait(false))
+        var tagged = claimed.Count == 0 || !await TagsInUseAsync(connection, cancellationToken).ConfigureAwait(false)
+            ? claimed
+            : await WithTagsAsync(connection, claimed, cancellationToken).ConfigureAwait(false);
+        var nextDue = computeNextDue
+            ? await NextDueAsync(connection, request, cancellationToken).ConfigureAwait(false)
+            : null;
+        return (tagged, nextDue);
+    }
+
+    // The earliest future instant a currently-empty claim could begin returning work through time alone,
+    // for idle-poll backoff. Read on the connection the per-queue claims just committed on (no active
+    // transaction, so it sees the post-claim committed snapshot). A served, non-paused queue that still
+    // holds a due-now Scheduled job (withheld by a concurrency limit or the batch cap) reports Now, so the
+    // caller keeps the floor cadence; otherwise the earliest future Scheduled due time across served,
+    // non-paused queues, or null when none is scheduled. Advisory only, never a correctness input.
+    private async ValueTask<DateTimeOffset?> NextDueAsync(
+        SqlConnection connection, ClaimRequest request, CancellationToken cancellationToken)
+    {
+        if (request.Queues.Count == 0)
         {
-            return claimed;
+            return null;
         }
-        return await WithTagsAsync(connection, claimed, cancellationToken).ConfigureAwait(false);
+        // A queue is paused only when its queue_limits row sets paused = 1; absent row = not paused.
+        var queueParams = string.Join(", ", request.Queues.Select((_, i) => $"@q{i}"));
+        await using var cmd = Cmd(
+            $"""
+            SELECT TOP (1) j.due_time
+            FROM backwave.jobs j
+            LEFT JOIN backwave.queue_limits ql ON ql.queue = j.queue
+            WHERE j.state = 0 AND j.queue IN ({queueParams}) AND COALESCE(ql.paused, 0) = 0
+            ORDER BY j.due_time
+            """,
+            connection);
+        for (var i = 0; i < request.Queues.Count; i++)
+        {
+            cmd.Parameters.AddWithValue($"q{i}", request.Queues[i]);
+        }
+        if (await cmd.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not DateTimeOffset earliest)
+        {
+            return null; // nothing scheduled in any served, non-paused queue
+        }
+        // Due now but withheld (concurrency limit or batch cap): clamp to Now so the poller does not back off.
+        return earliest <= request.Now ? request.Now : earliest;
     }
 
     // Reports whether any Tag is in use, gating the post-commit hydration round-trip so the no-tags

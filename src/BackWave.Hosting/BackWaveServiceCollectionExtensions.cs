@@ -218,6 +218,11 @@ public sealed class BackWaveBuilder
             throw new InvalidOperationException(
                 $"Worker Group '{options.Name}' must run at least one Pump (Pumps = {options.Pumps}).");
         }
+        if (options.MaxPollInterval > TimeSpan.Zero && options.MaxPollInterval.TotalMilliseconds > int.MaxValue)
+        {
+            throw new InvalidOperationException(
+                $"Worker Group '{options.Name}' has a {nameof(WorkerGroupOptions.MaxPollInterval)} above the supported ceiling of int.MaxValue milliseconds (~24.85 days); the idle-poll pacer cannot wait that long.");
+        }
         _workerGroups.Add(options);
         return this;
     }

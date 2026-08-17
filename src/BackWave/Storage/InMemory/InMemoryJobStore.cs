@@ -600,64 +600,110 @@ public sealed class InMemoryJobStore(
     /// <inheritdoc/>
     public ValueTask<IReadOnlyList<JobRecord>> ClaimAsync(ClaimRequest request, CancellationToken cancellationToken = default)
     {
+        lock (_gate)
+        {
+            return ValueTask.FromResult<IReadOnlyList<JobRecord>>(ClaimLocked(request));
+        }
+    }
+
+    /// <inheritdoc/>
+    public ValueTask<ClaimResult> ClaimBatchAsync(ClaimRequest request, CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+        {
+            var claimed = ClaimLocked(request);
+            // Next-due for idle-poll scheduling (advisory, never a correctness input): computed under the
+            // same lock as the claim so it reflects exactly the post-claim state.
+            var nextDue = NextDueLocked(request);
+            return ValueTask.FromResult(new ClaimResult(claimed, nextDue));
+        }
+    }
+
+    // The claim loop, assuming _gate is held. Both ClaimAsync and ClaimBatchAsync call it so the two share
+    // one implementation and ClaimBatchAsync can read a consistent post-claim state for its next-due hint.
+    private List<JobRecord> ClaimLocked(ClaimRequest request)
+    {
         var maxJobs = Math.Min(request.MaxJobs, _bounds.MaxClaimBatch);
         var claimed = new List<JobRecord>();
 
-        lock (_gate)
+        foreach (var queue in request.Queues)
         {
-            foreach (var queue in request.Queues)
+            if (claimed.Count >= maxJobs)
             {
-                if (claimed.Count >= maxJobs)
+                break;
+            }
+
+            if (_pausedQueues.Contains(queue))
+            {
+                continue; // a Paused Queue yields nothing to Claim (§5.8)
+            }
+
+            // Concurrency Limit (I3): slot usage is the live Leased count in this Queue.
+            var slots = _queueLimits.GetValueOrDefault(queue) is { } limit
+                ? limit - _jobs.Values.Count(j => j.State == JobState.Leased && j.Queue == queue)
+                : int.MaxValue;
+            if (slots <= 0)
+            {
+                continue;
+            }
+
+            // Due-time order within a Queue, enqueue sequence as the deterministic tiebreak.
+            var due = _jobs.Values
+                .Where(j => j.State == JobState.Scheduled
+                    && j.Queue == queue
+                    && j.DueTime <= request.Now)
+                .OrderBy(j => j.DueTime)
+                .ThenBy(j => j.Sequence)
+                .ToList();
+
+            foreach (var job in due)
+            {
+                if (claimed.Count >= maxJobs || slots <= 0)
                 {
                     break;
                 }
+                slots--;
 
-                if (_pausedQueues.Contains(queue))
+                var leased = job with
                 {
-                    continue; // a Paused Queue yields nothing to Claim (§5.8)
-                }
-
-                // Concurrency Limit (I3): slot usage is the live Leased count in this Queue.
-                var slots = _queueLimits.GetValueOrDefault(queue) is { } limit
-                    ? limit - _jobs.Values.Count(j => j.State == JobState.Leased && j.Queue == queue)
-                    : int.MaxValue;
-                if (slots <= 0)
-                {
-                    continue;
-                }
-
-                // Due-time order within a Queue, enqueue sequence as the deterministic tiebreak.
-                var due = _jobs.Values
-                    .Where(j => j.State == JobState.Scheduled
-                        && j.Queue == queue
-                        && j.DueTime <= request.Now)
-                    .OrderBy(j => j.DueTime)
-                    .ThenBy(j => j.Sequence)
-                    .ToList();
-
-                foreach (var job in due)
-                {
-                    if (claimed.Count >= maxJobs || slots <= 0)
-                    {
-                        break;
-                    }
-                    slots--;
-
-                    var leased = job with
-                    {
-                        State = JobState.Leased,
-                        Attempt = job.Attempt + 1,
-                        LeaseOwner = request.WorkerId,
-                        LeaseExpiry = request.Now + request.LeaseDuration,
-                    };
-                    _jobs[leased.JobId] = leased;
-                    RecordTransition(leased.JobId, JobState.Leased, leased.Attempt, request.Now);
-                    claimed.Add(leased);
-                }
+                    State = JobState.Leased,
+                    Attempt = job.Attempt + 1,
+                    LeaseOwner = request.WorkerId,
+                    LeaseExpiry = request.Now + request.LeaseDuration,
+                };
+                _jobs[leased.JobId] = leased;
+                RecordTransition(leased.JobId, JobState.Leased, leased.Attempt, request.Now);
+                claimed.Add(leased);
             }
         }
 
-        return ValueTask.FromResult<IReadOnlyList<JobRecord>>(claimed);
+        return claimed;
+    }
+
+    // The earliest future instant an idle claim could begin returning work through time alone, assuming
+    // _gate is held. Any served, non-paused queue that still holds a due-now Scheduled job (withheld by a
+    // concurrency limit or the batch cap) reports Now, so the poller keeps the floor cadence rather than
+    // extending its backoff past due-now pressure; otherwise the earliest future Scheduled due time, or null.
+    private DateTimeOffset? NextDueLocked(ClaimRequest request)
+    {
+        var served = new HashSet<string>(request.Queues, StringComparer.Ordinal);
+        DateTimeOffset? future = null;
+        foreach (var job in _jobs.Values)
+        {
+            if (job.State != JobState.Scheduled || !served.Contains(job.Queue) || _pausedQueues.Contains(job.Queue))
+            {
+                continue;
+            }
+            if (job.DueTime <= request.Now)
+            {
+                return request.Now; // due-now pressure withheld from this claim - poll again promptly
+            }
+            if (future is null || job.DueTime < future)
+            {
+                future = job.DueTime;
+            }
+        }
+        return future;
     }
 
     /// <inheritdoc/>

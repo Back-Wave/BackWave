@@ -72,6 +72,28 @@ public sealed record WorkerGroupOptions
     public TimeSpan PollInterval { get; init; } = TimeSpan.FromSeconds(1);
 
     /// <summary>
+    /// The longest the group waits between polls while it is idle. When set greater than
+    /// <see cref="PollInterval"/>, an idle group backs off from <see cref="PollInterval"/> toward this
+    /// ceiling - sleeping until the next scheduled job comes due, when the store reports it - instead of
+    /// polling at the fixed rate, and returns to <see cref="PollInterval"/> the moment a poll claims work
+    /// or finds work due now. A Wake-Up Hint triggers a poll but does not itself reset the floor. This
+    /// lowers the store query load of an idle fleet.
+    /// <para>
+    /// Polling stays the sole correctness mechanism: the backoff is bounded by this ceiling, so
+    /// the worst-case latency for newly enqueued work is at most this value even with no hint. On a store
+    /// with a Wake-Up Hint channel (PostgreSQL, SQLite) an enqueue still wakes the group in milliseconds,
+    /// so the ceiling only affects the rare lost-hint case. On a polling-only store (SQL Server) it is the
+    /// direct latency ceiling for newly enqueued work.
+    /// </para>
+    /// <para>
+    /// Defaults to <see cref="TimeSpan.Zero"/>, which disables idle backoff: the group polls at the fixed
+    /// <see cref="PollInterval"/>, exactly as before. Any value at or below <see cref="PollInterval"/> is
+    /// treated the same way.
+    /// </para>
+    /// </summary>
+    public TimeSpan MaxPollInterval { get; init; }
+
+    /// <summary>
     /// How often background maintenance runs — expiring lapsed leases, loading and minting recurring
     /// schedules, and purging retained history — separately from claim polling. Set it slower than
     /// <see cref="PollInterval"/> so claim polls stay a cheap fast path. A missed sweep only delays

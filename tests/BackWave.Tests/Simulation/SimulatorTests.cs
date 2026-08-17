@@ -199,6 +199,67 @@ public class SimulatorTests
     }
 
     /// <summary>
+    /// Named scenario: adaptive idle backoff is behavior-neutral. The same seeded workload runs
+    /// at the fixed poll cadence and with an idle backoff ceiling. The final state must be
+    /// identical, because backoff only changes *when* a poll happens, never the outcome. The
+    /// adaptive run must also poll fewer times, since an idle fleet sleeps toward the ceiling.
+    /// Crashes and heartbeat loss are off, so poll timing does not shift any fault decision.
+    /// </summary>
+    [Theory]
+    [InlineData(31UL)]
+    [InlineData(32UL)]
+    [InlineData(33UL)]
+    public void AdaptiveBackoff_MatchesFixedCadenceFinalState_WithFewerPolls(ulong seed)
+    {
+        SimulationResult Run(TimeSpan ceiling) => new Simulator(new SimulationOptions
+        {
+            Seed = seed,
+            CrashProbabilityPerPoll = 0,
+            HeartbeatLossProbability = 0,
+            MaxPollInterval = ceiling,
+        }).Run();
+
+        var fixedCadence = Run(TimeSpan.Zero);
+        var adaptive = Run(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(fixedCadence.FinalJobs, adaptive.FinalJobs);
+        Assert.True(
+            adaptive.PollCount < fixedCadence.PollCount,
+            $"seed {seed}: adaptive polled {adaptive.PollCount}, fixed polled {fixedCadence.PollCount}");
+    }
+
+    /// <summary>
+    /// Named scenario: hint-loss equivalence still holds with idle backoff on. The same seeded
+    /// workload runs under an idle backoff ceiling with every hint dropped, every hint delivered,
+    /// and half delivered. The final state must be identical, and every job must reach a terminal
+    /// state. This proves that polling alone drains a backed-off fleet: the store-reported next
+    /// due time, not the hint, carries the correctness.
+    /// </summary>
+    [Theory]
+    [InlineData(31UL)]
+    [InlineData(32UL)]
+    [InlineData(33UL)]
+    public void AdaptiveBackoff_HintLossEquivalence_HoldsAndDrains(ulong seed)
+    {
+        SimulationResult Run(double delivery) => new Simulator(new SimulationOptions
+        {
+            Seed = seed,
+            CrashProbabilityPerPoll = 0,
+            HeartbeatLossProbability = 0,
+            HintDeliveryProbability = delivery,
+            MaxPollInterval = TimeSpan.FromSeconds(30),
+        }).Run();
+
+        var dropped = Run(0);
+        var delivered = Run(1);
+        var lossy = Run(0.5);
+
+        Assert.Equal(dropped.FinalJobs, delivered.FinalJobs);
+        Assert.Equal(dropped.FinalJobs, lossy.FinalJobs);
+        Assert.Equal(200, dropped.Succeeded + dropped.DeadLettered + dropped.Cancelled);
+    }
+
+    /// <summary>
     /// Named scenario: I1 (no double execution under a live Lease) under GC-pause and clock
     /// skew. Executions routinely outlive their Leases and clocks disagree, so jobs run on
     /// multiple nodes at once — yet the oracle (now checking I1 every step) must never find two

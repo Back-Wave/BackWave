@@ -332,7 +332,8 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         using var activity = SqliteDiagnostics.StartStore("claim", JobsCollection);
         try
         {
-            return await ClaimUntracedAsync(request, cancellationToken).ConfigureAwait(false);
+            var (jobs, _) = await ClaimUntracedAsync(request, computeNextDue: false, cancellationToken).ConfigureAwait(false);
+            return jobs;
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
@@ -341,8 +342,28 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         }
     }
 
-    private async ValueTask<IReadOnlyList<JobRecord>> ClaimUntracedAsync(
+    /// <inheritdoc/>
+    public async ValueTask<ClaimResult> ClaimBatchAsync(
         ClaimRequest request, CancellationToken cancellationToken = default)
+    {
+        using var activity = SqliteDiagnostics.StartStore("claim", JobsCollection);
+        try
+        {
+            // Idle-poll next-due: computed on the SAME connection right after the
+            // claim commits, so it reads the post-claim committed snapshot. Advisory only - a WAL enqueue
+            // also fires an in-process Wake-Up Hint, so this value only bounds the rare no-hint case.
+            var (jobs, nextDue) = await ClaimUntracedAsync(request, computeNextDue: true, cancellationToken).ConfigureAwait(false);
+            return new ClaimResult(jobs, nextDue);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            SqliteDiagnostics.RecordStoreFault(activity, exception, IsTransientStoreFault(exception));
+            throw;
+        }
+    }
+
+    private async ValueTask<(IReadOnlyList<JobRecord> Jobs, DateTimeOffset? NextDue)> ClaimUntracedAsync(
+        ClaimRequest request, bool computeNextDue, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
@@ -351,7 +372,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         var claimed = new List<JobRecord>();
         if (maxJobs <= 0 || request.Queues.Count == 0)
         {
-            return claimed;
+            return (claimed, null);
         }
 
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
@@ -464,7 +485,47 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             claimed.AddRange(queueClaims.OrderBy(j => j.DueTime).ThenBy(j => j.Sequence));
         }
 
-        return await WithTagsAsync(connection, claimed, cancellationToken).ConfigureAwait(false);
+        var tagged = await WithTagsAsync(connection, claimed, cancellationToken).ConfigureAwait(false);
+        var nextDue = computeNextDue
+            ? await NextDueAsync(connection, request, cancellationToken).ConfigureAwait(false)
+            : null;
+        return (tagged, nextDue);
+    }
+
+    // The earliest future instant a currently-empty claim could begin returning work through time alone,
+    // for idle-poll backoff. Read on the connection the claim just committed on. A
+    // served, non-paused queue that still holds a due-now Scheduled job (withheld by a concurrency limit or
+    // the batch cap) reports Now, so the caller keeps the floor cadence; otherwise the earliest future
+    // Scheduled due time across served, non-paused queues, or null when none is scheduled. Advisory only.
+    private async ValueTask<DateTimeOffset?> NextDueAsync(
+        SqliteConnection connection, ClaimRequest request, CancellationToken cancellationToken)
+    {
+        // A queue is paused only when its backwave_queue_limits row sets paused = 1; absent row = not paused.
+        var queueParams = request.Queues.Select((_, i) => $"$q{i}").ToArray();
+        var inList = string.Join(", ", queueParams);
+        await using var cmd = Cmd(
+            $"""
+            SELECT j.due_time
+            FROM backwave_jobs j
+            LEFT JOIN backwave_queue_limits ql ON ql.queue = j.queue
+            WHERE j.state = {(int)JobState.Scheduled}
+                AND j.queue IN ({inList})
+                AND COALESCE(ql.paused, 0) = 0
+            ORDER BY j.due_time
+            LIMIT 1
+            """,
+            connection);
+        for (var i = 0; i < request.Queues.Count; i++)
+        {
+            cmd.Parameters.AddWithValue(queueParams[i], request.Queues[i]);
+        }
+        if (await cmd.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not { } scalar || scalar is DBNull)
+        {
+            return null; // nothing scheduled in any served, non-paused queue
+        }
+        var earliest = SqliteValueCodec.FromTicks(Convert.ToInt64(scalar));
+        // Due now but withheld (concurrency limit or batch cap): clamp to Now so the poller does not back off.
+        return earliest <= request.Now ? request.Now : earliest;
     }
 
     // ── §5.6 ReportOutcome ──────────────────────────────────────────────────────
