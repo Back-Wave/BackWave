@@ -1,0 +1,51 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/BackWave.Benchmarks/BackWave.Benchmarks.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/BackWave.Demo/BackWave.Demo.csproj" />
+    <Project Path="samples/BackWave.Sample.Api/BackWave.Sample.Api.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/BackWave.Conformance/BackWave.Conformance.csproj" />
+    <Project Path="src/BackWave.Dashboard/BackWave.Dashboard.csproj" />
+    <Project Path="src/BackWave.EntityFrameworkCore/BackWave.EntityFrameworkCore.csproj" />
+    <Project Path="src/BackWave.Hosting/BackWave.Hosting.csproj" />
+    <Project Path="src/BackWave.OpenTelemetry/BackWave.OpenTelemetry.csproj" />
+    <Project Path="src/BackWave.Postgres/BackWave.Postgres.csproj" />
+    <Project Path="src/BackWave.Pro.Dashboard/BackWave.Pro.Dashboard.csproj" />
+    <Project Path="src/BackWave.Pro.Mcp/BackWave.Pro.Mcp.csproj" />
+    <Project Path="src/BackWave.Pro/BackWave.Pro.csproj" />
+    <Project Path="src/BackWave.SourceGenerators.CodeFixes/BackWave.SourceGenerators.CodeFixes.csproj" />
+    <Project Path="src/BackWave.SourceGenerators/BackWave.SourceGenerators.csproj" />
+    <Project Path="src/BackWave.Sqlite/BackWave.Sqlite.csproj" />
+    <Project Path="src/BackWave.SqlServer/BackWave.SqlServer.csproj" />
+    <Project Path="src/BackWave.Testing/BackWave.Testing.csproj" />
+    <Project Path="src/BackWave/BackWave.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/BackWave.Benchmarks.Tests/BackWave.Benchmarks.Tests.csproj" />
+    <Project Path="tests/BackWave.Dashboard.Tests/BackWave.Dashboard.Tests.csproj" />
+    <Project Path="tests/BackWave.EntityFrameworkCore.Tests/BackWave.EntityFrameworkCore.Tests.csproj" />
+    <Project Path="tests/BackWave.Hosting.Tests/BackWave.Hosting.Tests.csproj" />
+    <Project Path="tests/BackWave.Postgres.Tests/BackWave.Postgres.Tests.csproj" />
+    <Project Path="tests/BackWave.Pro.Dashboard.Tests/BackWave.Pro.Dashboard.Tests.csproj" />
+    <Project Path="tests/BackWave.Pro.Mcp.Tests/BackWave.Pro.Mcp.Tests.csproj" />
+    <Project Path="tests/BackWave.Pro.Tests/BackWave.Pro.Tests.csproj" />
+    <Project Path="tests/BackWave.SchemaGate.Tests/BackWave.SchemaGate.Tests.csproj" />
+    <Project Path="tests/BackWave.Simulation/BackWave.Simulation.csproj" />
+    <Project Path="tests/BackWave.SourceGenerators.Tests/BackWave.SourceGenerators.Tests.csproj" />
+    <Project Path="tests/BackWave.Sqlite.Tests/BackWave.Sqlite.Tests.csproj" />
+    <Project Path="tests/BackWave.SqlServer.Tests/BackWave.SqlServer.Tests.csproj" />
+    <Project Path="tests/BackWave.Testing.Tests/BackWave.Testing.Tests.csproj" />
+    <Project Path="tests/BackWave.Tests/BackWave.Tests.csproj" />
+    <Project Path="tests/BackWave.Torture/BackWave.Torture.csproj" />
+    <Project Path="tests/BackWave.Upgrade.Tests/BackWave.Upgrade.Tests.csproj" />
+    <Project Path="tests/BackWave.Vopr/BackWave.Vopr.csproj" />
+  </Folder>
+</Solution>
