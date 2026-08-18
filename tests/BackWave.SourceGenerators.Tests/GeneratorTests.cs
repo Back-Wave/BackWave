@@ -174,6 +174,77 @@ public class GeneratorTests
     }
 
     [Fact]
+    public void UnsupportedConstructorParameter_NamesThePayloadTypeNotTheWireName()
+    {
+        var run = GeneratorHarness.Run("""
+            using System.Collections.Generic;
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+
+            [Job("listy-job")]
+            public sealed record Listy(List<string> Items);
+
+            public sealed class ListyHandler : IJobHandler<Listy>
+            {
+                public Task HandleAsync(Listy job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+            """);
+
+        var message = Assert.Single(run.GeneratorDiagnostics).GetMessage();
+        Assert.Contains("Member 'Items' of job payload 'Listy'", message);
+        Assert.DoesNotContain("listy-job", message);
+    }
+
+    [Fact]
+    public void UnsupportedSettableProperty_NamesThePayloadTypeNotTheWireName()
+    {
+        var run = GeneratorHarness.Run("""
+            using System.Collections.Generic;
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+
+            [Job("propy-job")]
+            public sealed record Propy(string Name)
+            {
+                public List<string> Items { get; set; } = new();
+            }
+
+            public sealed class PropyHandler : IJobHandler<Propy>
+            {
+                public Task HandleAsync(Propy job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+            """);
+
+        var message = Assert.Single(run.GeneratorDiagnostics).GetMessage();
+        Assert.Contains("Member 'Items' of job payload 'Propy'", message);
+        Assert.DoesNotContain("propy-job", message);
+    }
+
+    [Fact]
+    public void UnsupportedMethodJobParameter_NamesTheGeneratedPayloadRecord()
+    {
+        var run = GeneratorHarness.Run("""
+            using System.Collections.Generic;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+
+            public class Notifications
+            {
+                [Job("methody-job")]
+                public Task SendBatchAsync(List<string> recipients) => Task.CompletedTask;
+            }
+            """);
+
+        var message = Assert.Single(run.GeneratorDiagnostics).GetMessage();
+        Assert.Contains("Member 'recipients' of job payload 'SendBatch'", message);
+        Assert.DoesNotContain("methody-job", message);
+    }
+
+    [Fact]
     public void NonTaskJobMethod_IsACompileError()
     {
         var run = GeneratorHarness.Run("""

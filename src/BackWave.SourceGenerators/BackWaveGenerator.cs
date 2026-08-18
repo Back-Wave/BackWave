@@ -324,7 +324,7 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
         INamedTypeSymbol type, string wireName, string queue, EquatableArray<string> labels,
         int retryMaxAttempts, EquatableArray<double> retryBackoffSeconds, LocationInfo? location)
     {
-        var members = ParseMembers(type, wireName, location, out var failure);
+        var members = ParseMembers(type, location, out var failure);
         if (failure is not null)
         {
             return new ParseResult(null, failure);
@@ -369,7 +369,7 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
 
     /// <summary>Maps a payload type's single richest public constructor plus settable extras.</summary>
     private static EquatableArray<PayloadMember> ParseMembers(
-        INamedTypeSymbol type, string wireName, LocationInfo? location, out DiagnosticInfo? failure)
+        INamedTypeSymbol type, LocationInfo? location, out DiagnosticInfo? failure)
     {
         failure = null;
 
@@ -399,7 +399,7 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
                 {
                     failure = DiagnosticInfo.Create(
                         JobDiagnostics.UnsupportedPayloadMember, location,
-                        parameter.Name, wireName, parameter.Type.ToDisplayString());
+                        parameter.Name, type.Name, parameter.Type.ToDisplayString());
                     return default;
                 }
                 claimed.Add(property.Name);
@@ -425,7 +425,7 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
             {
                 failure = DiagnosticInfo.Create(
                     JobDiagnostics.UnsupportedPayloadMember, location,
-                    property.Name, wireName, property.Type.ToDisplayString());
+                    property.Name, type.Name, property.Type.ToDisplayString());
                 return default;
             }
             members.Add(new PayloadMember
@@ -451,6 +451,12 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
             return new ParseResult(null, DiagnosticInfo.Create(JobDiagnostics.InvalidJobMethod, location, method.Name));
         }
 
+        // The generated payload record's name, computed up front so an unsupported parameter can name
+        // the payload type the consumer will see rather than the Wire Name.
+        var recordName = method.Name.EndsWith("Async", StringComparison.Ordinal)
+            ? method.Name.Substring(0, method.Name.Length - "Async".Length)
+            : method.Name;
+
         var members = ImmutableArray.CreateBuilder<PayloadMember>();
         var callArguments = ImmutableArray.CreateBuilder<string>();
         foreach (var parameter in method.Parameters)
@@ -470,7 +476,7 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
             {
                 return new ParseResult(null, DiagnosticInfo.Create(
                     JobDiagnostics.UnsupportedPayloadMember, location,
-                    parameter.Name, wireName, parameter.Type.ToDisplayString()));
+                    parameter.Name, recordName, parameter.Type.ToDisplayString()));
             }
             var memberName = char.ToUpperInvariant(parameter.Name[0]) + parameter.Name.Substring(1);
             callArguments.Add(memberName);
@@ -486,9 +492,6 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
         }
 
         var containingType = method.ContainingType;
-        var recordName = method.Name.EndsWith("Async", StringComparison.Ordinal)
-            ? method.Name.Substring(0, method.Name.Length - "Async".Length)
-            : method.Name;
         var ns = containingType.ContainingNamespace.IsGlobalNamespace
             ? ""
             : containingType.ContainingNamespace.ToDisplayString();
