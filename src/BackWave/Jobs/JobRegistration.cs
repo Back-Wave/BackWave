@@ -6,9 +6,25 @@ namespace BackWave.Jobs;
 
 /// <summary>
 /// One job type's entry in the Job Registry: its Wire Name, its serialization, and how to execute it
-/// against a handler resolved from dependency injection. The source generator emits exactly what
-/// <see cref="Create{TJob,THandler}"/> builds by hand.
+/// against a handler resolved from dependency injection.
 /// </summary>
+/// <remarks>
+/// <para>
+/// The source generator emits this same shape, but not this same serialization. A generated
+/// registration serializes through a per-job-type <c>Utf8JsonWriter</c> codec the generator also
+/// emits. <see cref="Create{TJob,THandler}"/> serializes through the
+/// <see cref="JsonTypeInfo{T}"/> the caller passes. The two encodings are not interchangeable: the
+/// generated codec writes an enum as its string name and tolerates a JSON null for a non-nullable
+/// member, and System.Text.Json writes an enum as a number by default and applies the naming policy of
+/// the caller's context. Moving a live job type from one path to the other rewrites its wire format.
+/// </para>
+/// <para>
+/// A host contributes a hand-built registration by registering it in the container:
+/// <c>services.AddSingleton(JobRegistration.Create&lt;TJob, THandler&gt;(...))</c>. <c>AddBackWave</c>
+/// folds every contributed registration into the registry that <c>UseRegistry(...)</c> supplied, so a
+/// type that generated serialization cannot express lives alongside the generated ones.
+/// </para>
+/// </remarks>
 public sealed class JobRegistration
 {
     /// <summary>The stable Wire Name identifying this job type on the wire and in storage.</summary>
