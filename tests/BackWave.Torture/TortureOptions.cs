@@ -5,6 +5,7 @@ internal enum TortureAdapter
 {
     Postgres,
     SqlServer,
+    Oracle,
     Sqlite,
     /// <summary>3–4 real OS child processes hammering one SQLite WAL file — the Embedded Adapter's cross-process promise.</summary>
     SqliteMultiProcess,

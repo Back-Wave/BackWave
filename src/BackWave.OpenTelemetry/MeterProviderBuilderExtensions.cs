@@ -100,4 +100,26 @@ public static class BackWaveMeterProviderBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
         return builder.AddMeter(BackWaveSourceNames.Sqlite);
     }
+
+    /// <summary>
+    /// Subscribes the meter provider to the BackWave Oracle adapter's store meter - the store-fault
+    /// counter tagged transient versus terminal. Pair it with <see cref="AddBackWaveInstrumentation"/> to
+    /// also collect the job-lifecycle instruments.
+    /// </summary>
+    /// <param name="builder">The meter provider builder to register the Oracle adapter meter on.</param>
+    /// <returns>The same <paramref name="builder"/>, so calls can be chained.</returns>
+    /// <exception cref="System.ArgumentNullException"><paramref name="builder"/> is <see langword="null"/>.</exception>
+    /// <example>
+    /// <code>
+    /// builder.Services.AddOpenTelemetry()
+    ///     .WithMetrics(metrics => metrics
+    ///         .AddBackWaveInstrumentation()
+    ///         .AddBackWaveOracleInstrumentation());
+    /// </code>
+    /// </example>
+    public static MeterProviderBuilder AddBackWaveOracleInstrumentation(this MeterProviderBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        return builder.AddMeter(BackWaveSourceNames.Oracle);
+    }
 }

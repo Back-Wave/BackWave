@@ -13,4 +13,5 @@ internal static class BackWaveSourceNames
     internal const string Postgres = "BackWave.Postgres";
     internal const string SqlServer = "BackWave.SqlServer";
     internal const string Sqlite = "BackWave.Sqlite";
+    internal const string Oracle = "BackWave.Oracle";
 }

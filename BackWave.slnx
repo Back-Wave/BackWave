@@ -17,6 +17,7 @@
     <Project Path="src/BackWave.EntityFrameworkCore/BackWave.EntityFrameworkCore.csproj" />
     <Project Path="src/BackWave.Hosting/BackWave.Hosting.csproj" />
     <Project Path="src/BackWave.OpenTelemetry/BackWave.OpenTelemetry.csproj" />
+    <Project Path="src/BackWave.Oracle/BackWave.Oracle.csproj" />
     <Project Path="src/BackWave.Postgres/BackWave.Postgres.csproj" />
     <Project Path="src/BackWave.Pro.Dashboard/BackWave.Pro.Dashboard.csproj" />
     <Project Path="src/BackWave.Pro.Mcp/BackWave.Pro.Mcp.csproj" />
@@ -33,6 +34,7 @@
     <Project Path="tests/BackWave.Dashboard.Tests/BackWave.Dashboard.Tests.csproj" />
     <Project Path="tests/BackWave.EntityFrameworkCore.Tests/BackWave.EntityFrameworkCore.Tests.csproj" />
     <Project Path="tests/BackWave.Hosting.Tests/BackWave.Hosting.Tests.csproj" />
+    <Project Path="tests/BackWave.Oracle.Tests/BackWave.Oracle.Tests.csproj" />
     <Project Path="tests/BackWave.Postgres.Tests/BackWave.Postgres.Tests.csproj" />
     <Project Path="tests/BackWave.Pro.Dashboard.Tests/BackWave.Pro.Dashboard.Tests.csproj" />
     <Project Path="tests/BackWave.Pro.Mcp.Tests/BackWave.Pro.Mcp.Tests.csproj" />

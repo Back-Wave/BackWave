@@ -46,6 +46,7 @@ jobs:
           for proj in \
             src/BackWave/BackWave.csproj \
             src/BackWave.Hosting/BackWave.Hosting.csproj \
+            src/BackWave.Oracle/BackWave.Oracle.csproj \
             src/BackWave.Postgres/BackWave.Postgres.csproj \
             src/BackWave.SqlServer/BackWave.SqlServer.csproj \
             src/BackWave.Sqlite/BackWave.Sqlite.csproj \

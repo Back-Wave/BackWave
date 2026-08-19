@@ -14,7 +14,7 @@ jobs:
   # Database-backed adapter tests: the long pole. Postgres + SQL Server boot in the
   # background while restore+build run, so their startup is hidden under compile time.
   db-tests:
-    name: DB-backed tests (Postgres + SQL Server)
+    name: DB-backed tests (Postgres + SQL Server + Oracle)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -32,20 +32,21 @@ jobs:
           path: ~/.nuget/packages
           key: nuget-${{ runner.os }}-${{ hashFiles('**/Directory.Packages.props', '**/*.csproj') }}
           restore-keys: nuget-${{ runner.os }}-
-      - name: Start Postgres and SQL Server (detached; boot overlaps with build)
-        run: docker compose up -d postgres sqlserver
+      - name: Start Postgres, SQL Server and Oracle (detached; boot overlaps with build)
+        run: docker compose up -d postgres sqlserver oracle
       - name: Restore
         run: dotnet restore
       - name: Build
         run: dotnet build --no-restore -c Release
       - name: Wait for databases to be healthy
-        run: docker compose up -d --wait postgres sqlserver
+        run: docker compose up -d --wait postgres sqlserver oracle
       - name: Test (database-backed adapters)
         run: |
           rc=0
           for proj in \
             tests/BackWave.Postgres.Tests \
             tests/BackWave.SqlServer.Tests \
+            tests/BackWave.Oracle.Tests \
             tests/BackWave.EntityFrameworkCore.Tests \
             tests/BackWave.SchemaGate.Tests \
             tests/BackWave.Upgrade.Tests; do

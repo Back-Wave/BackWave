@@ -104,6 +104,7 @@ internal static class TortureRun
     {
         TortureAdapter.Postgres => new PostgresTarget(),
         TortureAdapter.SqlServer => new SqlServerTarget(),
+        TortureAdapter.Oracle => new OracleTarget(),
         // Fresh file per run — a reused file would put a previous run's jobs in front of the audit.
         TortureAdapter.Sqlite or TortureAdapter.SqliteMultiProcess => new SqliteTarget(
             Path.Combine(Path.GetTempPath(), $"backwave_torture_{options.Seed:x16}_{Guid.NewGuid():N}.db"), migrate: true),

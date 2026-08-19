@@ -1,4 +1,5 @@
 using System.Text.Json;
+using BackWave.Oracle;
 using BackWave.Postgres;
 using BackWave.Sqlite;
 using BackWave.SqlServer;
@@ -6,6 +7,7 @@ using BackWave.Storage;
 using Microsoft.Data.SqlClient;
 using Microsoft.Data.Sqlite;
 using Npgsql;
+using Oracle.ManagedDataAccess.Client;
 
 namespace BackWave.Torture;
 
@@ -247,6 +249,189 @@ internal sealed class SqlServerTarget : ITortureTarget
     public ValueTask DisposeAsync()
     {
         SqlConnection.ClearAllPools();
+        return ValueTask.CompletedTask;
+    }
+}
+
+internal sealed class OracleTarget : ITortureTarget
+{
+    // A schema is a user on Oracle, so the torture target isolates into its own backwave_torture user/schema
+    // and never touches the backwave schema the conformance suite owns. InitializeAsync provisions the user
+    // via SYSTEM, then migrates and drives the store under that schema.
+    private const string Schema = "backwave_torture";
+
+    private static readonly string BaseConnectionString =
+        Environment.GetEnvironmentVariable("BACKWAVE_ORACLE_DSN")
+        ?? "User Id=backwave;Password=backwave;Data Source=localhost:15210/FREEPDB1;";
+
+    // Privileged login used once to create the torture user. Defaults to SYSTEM on the same service.
+    private static readonly string SystemConnectionString =
+        Environment.GetEnvironmentVariable("BACKWAVE_ORACLE_SYSTEM_DSN")
+        ?? new OracleConnectionStringBuilder(BaseConnectionString) { UserID = "SYSTEM", Password = "backwave" }.ConnectionString;
+
+    // The torture connection: the same service as the base DSN, but as the isolated backwave_torture user.
+    private static readonly string ConnectionString =
+        new OracleConnectionStringBuilder(BaseConnectionString) { UserID = Schema, Password = Schema }.ConnectionString;
+
+    // FK-safe order: job_parents references jobs without ON DELETE CASCADE, so children go first. ODP.NET
+    // sends one statement per round-trip, so the DELETEs go in a single anonymous PL/SQL block.
+    private const string WipeBlock =
+        """
+        BEGIN
+            DELETE FROM backwave_torture.workflow_edges;
+            DELETE FROM backwave_torture.job_parents;
+            DELETE FROM backwave_torture.job_tags;
+            DELETE FROM backwave_torture.job_transitions;
+            DELETE FROM backwave_torture.observer_dead_letters;
+            DELETE FROM backwave_torture.observer_deliveries;
+            DELETE FROM backwave_torture.observers;
+            DELETE FROM backwave_torture.jobs;
+            DELETE FROM backwave_torture.workflows;
+            DELETE FROM backwave_torture.schedules;
+            DELETE FROM backwave_torture.queue_limits;
+            DELETE FROM backwave_torture.queue_locks;
+            DELETE FROM backwave_torture.operator_audit;
+        END;
+        """;
+
+    public string Name => "oracle";
+
+    public async ValueTask InitializeAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await EnsureSchemaUserAsync(cancellationToken);
+            await OracleMigrator.MigrateAsync(ConnectionString, Schema);
+        }
+        catch (OracleException exception)
+        {
+            throw new InvalidOperationException(
+                "Oracle is not reachable. Start it with: docker compose up -d oracle", exception);
+        }
+
+        await using var connection = new OracleConnection(ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var wipe = connection.CreateCommand();
+        wipe.CommandText = WipeBlock;
+        await wipe.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    // Provisions the isolated torture user via a privileged login. Idempotent: a re-run reuses the existing
+    // user (ORA-01920 means it is already there). RESOURCE plus UNLIMITED TABLESPACE lets the migration
+    // create the schema objects.
+    private static async Task EnsureSchemaUserAsync(CancellationToken cancellationToken)
+    {
+        await using var admin = new OracleConnection(SystemConnectionString);
+        await admin.OpenAsync(cancellationToken);
+
+        await using (var create = admin.CreateCommand())
+        {
+            create.CommandText = $"CREATE USER {Schema} IDENTIFIED BY {Schema}";
+            try
+            {
+                await create.ExecuteNonQueryAsync(cancellationToken);
+            }
+            catch (OracleException exception) when (exception.Number == 1920)
+            {
+                // The torture user already exists from a prior run; reuse it.
+            }
+        }
+
+        await using var grant = admin.CreateCommand();
+        grant.CommandText = $"GRANT CONNECT, RESOURCE, UNLIMITED TABLESPACE TO {Schema}";
+        await grant.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public IJobStore CreateStore()
+    {
+        var bounded = new OracleConnectionStringBuilder(ConnectionString)
+        {
+            MaxPoolSize = 3,
+            MinPoolSize = 0,
+        }.ConnectionString;
+        return new OracleJobStore(new OracleStoreOptions { ConnectionString = bounded, SchemaName = Schema });
+    }
+
+    public bool IsTransientFault(Exception exception) => exception switch
+    {
+        // ORA-00060 deadlock victim, ORA-00054 resource busy (NOWAIT), ORA-30006 lock-wait timeout,
+        // plus the full connectivity/timeout set the store classifier treats as transient.
+        OracleException ora => ora.Number is 60 or 54 or 30006
+            or 12170 or 12541 or 12514 or 12518 or 12537 or 12570 or 3113 or 3114 or 28 or 1033 or 12154,
+        TimeoutException => true,
+        _ => false,
+    };
+
+    public async ValueTask<IReadOnlyList<TortureViolation>> RawAuditAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = new OracleConnection(ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        var violations = new List<TortureViolation>();
+        await RelationalRawAudit.RunAsync(
+            violations,
+            async sql =>
+            {
+                await using var command = connection.CreateCommand();
+                // The shared audit SQL is authored against the backwave schema; point it at the torture one.
+                command.CommandText = sql.Replace("backwave.", Schema + ".", StringComparison.Ordinal);
+                return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken) ?? 0L);
+            });
+        return violations;
+    }
+
+    public async ValueTask RawDumpAsync(string dir, CancellationToken cancellationToken)
+    {
+        await using var connection = new OracleConnection(ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var tables = connection.CreateCommand();
+        tables.CommandText =
+            $"SELECT table_name FROM all_tables WHERE owner = '{Schema.ToUpperInvariant()}' ORDER BY table_name";
+        var names = new List<string>();
+        await using (var reader = await tables.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                names.Add(reader.GetString(0));
+            }
+        }
+        foreach (var table in names)
+        {
+            // Build the JSON member list from the table's columns so the dump keeps null
+            // columns (NULL ON NULL) and turns BLOB columns into base64. JSON_OBJECT(t.*)
+            // would emit BLOBs as hex, so each BLOB is base64-encoded instead - a stable,
+            // human-readable text form of the BLOB rather than a hex form. The BLOB is
+            // sliced in 1440-byte chunks (a multiple of 3, so
+            // every chunk's base64 is padding-free and safely under the SQL RAW/VARCHAR2
+            // caps) so arbitrarily large payloads still encode; the CRLF that
+            // UTL_ENCODE.BASE64_ENCODE inserts every 64 chars is stripped back out.
+            // The GETLENGTH guard keeps null/empty BLOBs as null instead of feeding a
+            // null slice into BASE64_ENCODE (which would raise ORA-29261).
+            await using var columns = connection.CreateCommand();
+            columns.CommandText =
+                $"SELECT column_name, data_type FROM all_tab_columns WHERE owner = '{Schema.ToUpperInvariant()}' AND table_name = '{table}' ORDER BY column_id";
+            var members = new List<string>();
+            await using (var reader = await columns.ExecuteReaderAsync(cancellationToken))
+            {
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    var column = reader.GetString(0);
+                    var value = reader.GetString(1) == "BLOB"
+                        ? $"CASE WHEN DBMS_LOB.GETLENGTH(t.\"{column}\") > 0 THEN (SELECT XMLCAST(XMLAGG(XMLELEMENT(c, REPLACE(REPLACE(UTL_RAW.CAST_TO_VARCHAR2(UTL_ENCODE.BASE64_ENCODE(DBMS_LOB.SUBSTR(t.\"{column}\", 1440, (LEVEL - 1) * 1440 + 1))), CHR(13)), CHR(10))) ORDER BY LEVEL) AS CLOB) FROM dual CONNECT BY LEVEL <= CEIL(DBMS_LOB.GETLENGTH(t.\"{column}\") / 1440)) END"
+                        : $"t.\"{column}\"";
+                    members.Add($"KEY '{column}' VALUE {value}");
+                }
+            }
+            await using var rows = connection.CreateCommand();
+            rows.CommandText =
+                $"SELECT JSON_ARRAYAGG(JSON_OBJECT({string.Join(", ", members)} NULL ON NULL RETURNING CLOB) RETURNING CLOB) FROM {Schema}.{table} t";
+            var json = await rows.ExecuteScalarAsync(cancellationToken) as string ?? "[]";
+            await File.WriteAllTextAsync(Path.Combine(dir, $"table-{table}.json"), json, cancellationToken);
+        }
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        OracleConnection.ClearAllPools();
         return ValueTask.CompletedTask;
     }
 }

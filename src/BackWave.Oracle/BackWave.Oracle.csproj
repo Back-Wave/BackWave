@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Oracle storage adapter for BackWave: versioned SQL schema, FOR UPDATE SKIP LOCKED claims, Transactional Enqueue.</Description>
+    <PackageTags>$(PackageTags);oracle;odp.net;oracle-19c</PackageTags>
+    <!-- Oracle.ManagedDataAccess.Core is not trim/AOT-clean (reflection + Assembly.Location on core paths),
+         so this adapter is intentionally outside the Native-AOT tier: IsAotCompatible is NOT set. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BackWave\BackWave.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Test-only failpoint (OracleStoreOptions.FaultHook) and the internal SchemaRewriter/diagnostics
+         are reached by the adapter's own suite and the shared conformance harness. -->
+    <InternalsVisibleTo Include="BackWave.Oracle.Tests" />
+    <InternalsVisibleTo Include="BackWave.Conformance" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Oracle.ManagedDataAccess.Core" Version="23.9.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Schema\*.sql" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>$(ShipTfms)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

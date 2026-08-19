@@ -99,4 +99,26 @@ public static class BackWaveTracerProviderBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
         return builder.AddSource(BackWaveSourceNames.Sqlite);
     }
+
+    /// <summary>
+    /// Subscribes the tracer provider to the BackWave Oracle adapter's store spans - one CLIENT span per
+    /// store round-trip (claim, enqueue, complete, and so on), nested under the Core claim span. Pair it
+    /// with <see cref="AddBackWaveInstrumentation"/> to also collect the job-lifecycle spans.
+    /// </summary>
+    /// <param name="builder">The tracer provider builder to register the Oracle adapter source on.</param>
+    /// <returns>The same <paramref name="builder"/>, so calls can be chained.</returns>
+    /// <exception cref="System.ArgumentNullException"><paramref name="builder"/> is <see langword="null"/>.</exception>
+    /// <example>
+    /// <code>
+    /// builder.Services.AddOpenTelemetry()
+    ///     .WithTracing(tracing => tracing
+    ///         .AddBackWaveInstrumentation()
+    ///         .AddBackWaveOracleInstrumentation());
+    /// </code>
+    /// </example>
+    public static TracerProviderBuilder AddBackWaveOracleInstrumentation(this TracerProviderBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        return builder.AddSource(BackWaveSourceNames.Oracle);
+    }
 }

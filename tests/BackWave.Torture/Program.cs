@@ -39,6 +39,7 @@ for (var i = 0; i < args.Length; i++)
             {
                 "postgres" or "pg" => TortureAdapter.Postgres,
                 "sqlserver" or "mssql" => TortureAdapter.SqlServer,
+                "oracle" or "ora" => TortureAdapter.Oracle,
                 "sqlite" => TortureAdapter.Sqlite,
                 "sqlite-multiprocess" or "sqlite-mp" => TortureAdapter.SqliteMultiProcess,
                 var other => Fail<TortureAdapter?>($"unknown adapter '{other}'"),
@@ -265,7 +266,7 @@ static T Fail<T>(string message) => throw new ArgumentException(message);
 static int Usage()
 {
     Console.Error.WriteLine("""
-        usage: BackWave.Torture --adapter <postgres|sqlserver|sqlite|sqlite-multiprocess> [options]
+        usage: BackWave.Torture --adapter <postgres|sqlserver|oracle|sqlite|sqlite-multiprocess> [options]
 
         options:
           --seed <n|0xHEX>       workload seed (default: random; always logged)
@@ -278,6 +279,7 @@ static int Usage()
           --governed-limit <n>   static concurrency limit on the governed queue (default 2)
 
         Postgres/SQL Server need: docker compose up -d postgres sqlserver
+        Oracle needs: docker compose up -d oracle
         Discovery-only. Never wire this into a PR gate (ADR 0039); nightly CI is issue 0199.
         """);
     return 3;
