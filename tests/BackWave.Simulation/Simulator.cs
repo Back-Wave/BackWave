@@ -564,8 +564,13 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         // The current idle poll-backoff delay, used only when the run enables adaptive polling
         // (MaxPollInterval > PollInterval). A claim outcome folds into it: work found or due-now pressure
         // snaps it to the floor, an empty poll with a future next-due sleeps to it, an empty poll with no
-        // next-due doubles it toward the ceiling. Starts at the floor (PollInterval).
+        // next-due grows it toward the ceiling in step with how long the node has been idle. Starts at the
+        // floor (PollInterval).
         public TimeSpan PollDelay { get; set; }
+        // The instant this node first went idle (first empty poll with no next-due hint), or null while busy.
+        // The idle ramp grows PollDelay by elapsed idle time, not by the count of empty polls, so a drain
+        // tail's burst of empty re-polls cannot saturate the delay to the ceiling. Mirrors _idleSince.
+        public DateTimeOffset? IdleSince { get; set; }
         // The jobs this node is executing, keyed by JobId → the Attempt's JobRecord. The record is
         // kept (not just the id) so a cooperative cancel can raise ExecutionCancelled for the exact
         // in-flight Attempt, mirroring the pumps' captured flight.Job rather than re-reading state.
@@ -1375,6 +1380,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 restarting.Crashed = false;
                 restarting.Driver = NewDriver(simEvent.Node);
                 restarting.PollDelay = options.PollInterval; // a fresh pump starts at the floor
+                restarting.IdleSince = null;
 
                 Schedule(_now + _rng.NextTimeSpan(options.PollInterval), new SimEvent(EventKind.Poll, simEvent.Node, 0, null, false));
                 Schedule(_now + _rng.NextTimeSpan(options.HeartbeatInterval), new SimEvent(EventKind.Heartbeat, simEvent.Node, 0, null, false));
@@ -2738,8 +2744,9 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
 
     // Fold a claim outcome into a node's idle poll-backoff delay, mirroring the host pump. Work claimed, or
     // a store that reports due-now pressure it withheld, resets to the floor. An empty poll with a future
-    // next-due sleeps to that instant (clamped to floor/ceiling). An empty poll with no next-due doubles the
-    // delay toward the ceiling. The delay only sets WHEN the node next polls, never WHETHER work is claimed.
+    // next-due sleeps to that instant (clamped to floor/ceiling). An empty poll with no next-due grows the
+    // delay toward the ceiling in step with how long the node has been idle. The delay only sets WHEN the
+    // node next polls, never WHETHER work is claimed.
     private void UpdatePollBackoff(int nodeIndex, bool claimedWork, DateTimeOffset? nextDue, DateTimeOffset now)
     {
         var floor = options.PollInterval;
@@ -2747,6 +2754,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         TimeSpan next;
         if (claimedWork || (nextDue is { } due && due <= now))
         {
+            _nodes[nodeIndex].IdleSince = null;
             next = floor;
         }
         else if (nextDue is { } scheduled)
@@ -2756,9 +2764,10 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         }
         else
         {
-            var current = _nodes[nodeIndex].PollDelay < floor ? floor : _nodes[nodeIndex].PollDelay;
-            var doubled = current + current;
-            next = doubled > ceiling ? ceiling : doubled;
+            var idleSince = _nodes[nodeIndex].IdleSince ?? now;
+            _nodes[nodeIndex].IdleSince = idleSince;
+            var idleFor = now - idleSince;
+            next = idleFor < floor ? floor : (idleFor > ceiling ? ceiling : idleFor);
         }
         _nodes[nodeIndex].PollDelay = next;
     }

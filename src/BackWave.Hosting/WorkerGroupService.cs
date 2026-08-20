@@ -96,13 +96,18 @@ internal sealed class WorkerGroupService(
     // <see cref="WorkerGroupOptions.PollInterval"/>. The pacer (PollPacerAsync) sleeps for the current
     // delay, held in ticks so it can be read and written atomically (a TimeSpan cannot). A claim outcome
     // updates it: work found or a due-now report snaps it back to the floor, an empty poll with a future
-    // next-due sleeps to that instant, an empty poll with no next-due doubles the delay toward the ceiling.
+    // next-due sleeps to that instant, an empty poll with no next-due grows the delay toward the ceiling in step with how long the group has been idle.
     // Byte-for-byte unchanged when the feature is off - the fixed TickAsync ticker runs instead.
     // </summary>
     private long _pollDelayTicks;
     // <summary>Wakes the adaptive pacer early (a claim that must reset the floor) without a busy
     // wait; a 0..1 semaphore so a burst of releases coalesces to one wake, mirroring _pollQueued.</summary>
     private readonly SemaphoreSlim _pollWake = new(0, 1);
+    // <summary>The instant the group last went idle (its first empty poll with no next-due hint), or null while
+    // busy. The idle ramp grows the delay by how long the group has actually been idle, not by how many empty
+    // polls have fired, so a drain tail's burst of empty re-polls cannot saturate the delay to the ceiling.
+    // Single pump thread touches it (the reader loop), so a plain field needs no synchronization.</summary>
+    private DateTimeOffset? _idleSince;
 
     // Adaptive backoff runs only when a strictly larger ceiling is set: at or below the floor,
     // the fixed-cadence ticker governs polling exactly as before.
@@ -330,8 +335,9 @@ internal sealed class WorkerGroupService(
     // Fold a claim outcome into the idle backoff delay (adaptive mode only). Work claimed, or a store that
     // reports due-now pressure it withheld, resets to the floor and wakes the pacer now. An empty poll with
     // a future next-due sleeps to that instant (clamped to the floor/ceiling). An empty poll with no
-    // next-due doubles the current delay toward the ceiling. The value is advisory: it changes only WHEN
-    // the pump polls, never WHETHER a due job is claimed, so polling stays the sole correctness mechanism.
+    // next-due grows the delay toward the ceiling in step with how long the group has been idle. The value
+    // is advisory: it changes only WHEN the pump polls, never WHETHER a due job is claimed, so polling stays
+    // the sole correctness mechanism.
     private void UpdatePollBackoff(bool claimedWork, DateTimeOffset? nextDue, DateTimeOffset now)
     {
         var floor = options.PollInterval.Ticks;
@@ -341,6 +347,7 @@ internal sealed class WorkerGroupService(
         {
             // Busy again, or work is already due but was withheld (concurrency limit, batch cap, full pool):
             // return to the floor and poll promptly so the backlog drains at full cadence.
+            _idleSince = null;
             Volatile.Write(ref _pollDelayTicks, floor);
             WakePoll();
             return;
@@ -355,9 +362,13 @@ internal sealed class WorkerGroupService(
         }
         else
         {
-            // Nothing scheduled and no hint of when: grow the delay geometrically toward the ceiling.
-            var current = Math.Max(floor, Volatile.Read(ref _pollDelayTicks));
-            nextTicks = Math.Min(ceiling, current <= ceiling / 2 ? current * 2 : ceiling);
+            // Nothing scheduled and no hint of when: grow the delay in step with elapsed idle time, not with
+            // the count of empty polls. Anchoring on the first idle instant makes a drain tail's burst of
+            // empty re-polls - which all arrive within a few milliseconds - grow the delay by only those few
+            // milliseconds, instead of doubling it once per poll straight to the ceiling. A genuinely idle
+            // group still climbs to the ceiling because its idle span keeps widening.
+            _idleSince ??= now;
+            nextTicks = Math.Clamp((now - _idleSince.Value).Ticks, floor, ceiling);
         }
         Volatile.Write(ref _pollDelayTicks, nextTicks);
     }
@@ -420,7 +431,7 @@ internal sealed class WorkerGroupService(
                     var request = new ClaimRequest(claim.WorkerId, claim.Queues, claim.MaxJobs, claim.LeaseDuration, now);
                     // ClaimBatchAsync (a Default Interface Method) returns the claimed jobs plus an advisory
                     // next-due instant; an adapter that does not override it reports NextDue = null, so the
-                    // backoff simply falls back to the geometric growth path. Only the adaptive pacer consumes
+                    // backoff simply falls back to the idle-time ramp. Only the adaptive pacer consumes
                     // NextDue, so when the feature is off we take the plain ClaimAsync path and issue exactly
                     // the single claim query the runtime issued before this feature existed.
                     ClaimResult result;
