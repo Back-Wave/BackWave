@@ -81,6 +81,14 @@ public class NodeDriverWeightedFairnessTests
                                 served[index[primary]] += claim.MaxJobs;
                                 work.Enqueue(new NodeEvent.ClaimCompleted(jobs, now));
                             }
+                            else
+                            {
+                                // A zero-row claim still reports completion, exactly as the real pump does
+                                // (it emits ClaimCompleted even for an empty result). The empty result ends
+                                // the chain - the tail batches stay un-issued and uncharged - and lets the
+                                // Driver free the slots this issued batch reserved against the pool.
+                                work.Enqueue(new NodeEvent.ClaimCompleted([], now));
+                            }
                             break;
 
                         case Command.ExecuteJob execute:

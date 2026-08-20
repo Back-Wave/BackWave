@@ -28,6 +28,10 @@ public class PollCoalescingTests
                 PollInterval = TimeSpan.FromMinutes(10),        // the timer never fires during the test
                 HeartbeatInterval = TimeSpan.FromMinutes(10),
                 MaintenanceInterval = TimeSpan.FromMinutes(10), // the coalesced extra poll stays claim-only
+                // A claim reserves its batch against the pool while in flight (over-admission fix), so keep
+                // this batch below PoolSize; otherwise the parked claim#1 would reserve the whole pool and
+                // the coalesced poll would correctly find no room, hiding the coalescing it means to observe.
+                MaxClaimBatch = 1,
             },
             store,
             new JobRegistry([]),

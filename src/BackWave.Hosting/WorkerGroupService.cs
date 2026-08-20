@@ -423,10 +423,23 @@ internal sealed class WorkerGroupService(
                     // backoff simply falls back to the geometric growth path. Only the adaptive pacer consumes
                     // NextDue, so when the feature is off we take the plain ClaimAsync path and issue exactly
                     // the single claim query the runtime issued before this feature existed.
-                    var result = AdaptivePoll
-                        ? await store.ClaimBatchAsync(request, stoppingToken).ConfigureAwait(false)
-                        : new ClaimResult(
-                            await store.ClaimAsync(request, stoppingToken).ConfigureAwait(false), NextDue: null);
+                    ClaimResult result;
+                    try
+                    {
+                        result = AdaptivePoll
+                            ? await store.ClaimBatchAsync(request, stoppingToken).ConfigureAwait(false)
+                            : new ClaimResult(
+                                await store.ClaimAsync(request, stoppingToken).ConfigureAwait(false), NextDue: null);
+                    }
+                    catch
+                    {
+                        // The claim faulted (a transient store fault retries, anything else fail-stops): land an
+                        // empty completion first so the Driver frees the slots it reserved for this batch, then
+                        // let the fault propagate. Without this a faulted claim would strand its reservation and
+                        // wedge the pool once transient faults accumulate past PoolSize.
+                        events.TryWrite(new NodeEvent.ClaimCompleted([], now));
+                        throw;
+                    }
                     var jobs = result.Jobs;
                     BackWaveDiagnostics.RecordClaimed(claimActivity, jobs, now);
                     foreach (var job in jobs)
@@ -434,10 +447,10 @@ internal sealed class WorkerGroupService(
                         // A claim is the start of an Attempt: its Lease is now held (Trace).
                         BackWaveLog.LeaseAcquired(logger, job.JobId, job.WireName, job.Attempt, job.Queue);
                     }
-                    if (jobs.Count > 0)
-                    {
-                        events.TryWrite(new NodeEvent.ClaimCompleted(jobs, now));
-                    }
+                    // Always report the claim's completion, an empty result included: the Driver reserved this
+                    // batch's slots against the pool at issue and frees them here, so a claim that returns
+                    // nothing must still land or the reservation would strand and wedge the pool.
+                    events.TryWrite(new NodeEvent.ClaimCompleted(jobs, now));
                     if (AdaptivePoll)
                     {
                         UpdatePollBackoff(jobs.Count > 0, result.NextDue, now);

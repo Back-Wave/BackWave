@@ -1704,22 +1704,33 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     var claimNow = NodeNow(nodeIndex);
                     var request = new ClaimRequest(claim.WorkerId, claim.Queues, claim.MaxJobs, claim.LeaseDuration, claimNow);
                     IReadOnlyList<JobRecord> jobs;
-                    if (AdaptivePoll)
+                    try
                     {
-                        // Take the store's next-due hint and fold it into this node's backoff, exactly as the
-                        // host pump does. Off by default (ClaimAsync path below), so a run stays byte-identical.
-                        var result = Get(_nodeFaulty[nodeIndex].ClaimBatchAsync(request));
-                        jobs = result.Jobs;
-                        UpdatePollBackoff(nodeIndex, jobs.Count > 0, result.NextDue, claimNow);
+                        if (AdaptivePoll)
+                        {
+                            // Take the store's next-due hint and fold it into this node's backoff, exactly as the
+                            // host pump does. Off by default (ClaimAsync path below), so a run stays byte-identical.
+                            var result = Get(_nodeFaulty[nodeIndex].ClaimBatchAsync(request));
+                            jobs = result.Jobs;
+                            UpdatePollBackoff(nodeIndex, jobs.Count > 0, result.NextDue, claimNow);
+                        }
+                        else
+                        {
+                            jobs = Get(_nodeFaulty[nodeIndex].ClaimAsync(request));
+                        }
                     }
-                    else
+                    catch (SimTransientFault)
                     {
-                        jobs = Get(_nodeFaulty[nodeIndex].ClaimAsync(request));
+                        // The claim faulted: land an empty completion so the Driver frees the slots it reserved
+                        // for this batch, then let the fault propagate exactly as the production pump does — else
+                        // the reservation would strand and wedge the pool once faults accumulate past PoolSize.
+                        Drive(nodeIndex, new NodeEvent.ClaimCompleted([], NodeNow(nodeIndex)));
+                        throw;
                     }
-                    if (jobs.Count > 0)
-                    {
-                        Drive(nodeIndex, new NodeEvent.ClaimCompleted(jobs, NodeNow(nodeIndex)));
-                    }
+                    // Always report the claim's completion, an empty result included: the Driver reserved this
+                    // batch's slots at issue and frees them here, so an empty claim must still land or the
+                    // reservation would strand and wedge the pool.
+                    Drive(nodeIndex, new NodeEvent.ClaimCompleted(jobs, NodeNow(nodeIndex)));
                     break;
 
                 case Command.ExecuteJob execute:

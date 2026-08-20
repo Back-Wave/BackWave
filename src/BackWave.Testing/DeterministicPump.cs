@@ -188,10 +188,10 @@ internal sealed class DeterministicPump(
                         // A claim is the start of an Attempt: its Lease is now held (Trace).
                         BackWaveLog.LeaseAcquired(_log, job.JobId, job.WireName, job.Attempt, job.Queue);
                     }
-                    if (jobs.Count > 0)
-                    {
-                        events.Enqueue(new NodeEvent.ClaimCompleted(jobs, now));
-                    }
+                    // Always report the claim's completion, an empty result included: the Driver reserved this
+                    // batch's slots at issue and frees them here, so an empty claim must still land or the
+                    // reservation would strand and wedge the pool.
+                    events.Enqueue(new NodeEvent.ClaimCompleted(jobs, now));
                 }
                 break;
 
