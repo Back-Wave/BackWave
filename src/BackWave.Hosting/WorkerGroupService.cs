@@ -241,13 +241,38 @@ internal sealed class WorkerGroupService(
                 }
                 try
                 {
-                    foreach (var command in driver.Step(nodeEvent))
+                    var commands = driver.Step(nodeEvent);
+                    var issued = 0;
+                    try
                     {
-                        await ExecuteAsync(command, events.Writer, stoppingToken).ConfigureAwait(false);
+                        foreach (var command in commands)
+                        {
+                            await ExecuteAsync(command, events.Writer, stoppingToken).ConfigureAwait(false);
+                            issued++;
+                        }
                     }
-                    // A clean cycle clears THIS Pump's prior degraded mark — the store is reachable
-                    // again — without touching a sibling Pump's mark on the same group.
-                    health.ReportRecovered(options.Name, _workerId);
+                    catch
+                    {
+                        // A fault abandons the rest of this cycle's commands, but the Driver already
+                        // reserved the pool slots of every ClaimBatch it planned - it frees them only when
+                        // that batch's ClaimCompleted lands. Land an empty completion for each claim this
+                        // cycle never ran, so an abandoned cycle cannot strand a reservation and wedge the
+                        // pool shut. A maintenance sweep runs ahead of the claim on the same poll, so this
+                        // is the ordinary path whenever the store is unreachable, not a corner case.
+                        ReleaseUnissuedClaims(commands, issued, events.Writer, _clock.GetUtcNow());
+                        throw;
+                    }
+                    // A cycle that ran at least one command clears THIS Pump's prior degraded mark - the
+                    // store answered, so it is reachable again - without touching a sibling Pump's mark on
+                    // the same group. A cycle that ran none proves nothing about the store and must leave
+                    // the mark alone: a faulted claim lands an empty ClaimCompleted to free its reservation,
+                    // and a poll whose pool is already full issues no claim. Both reach here without a
+                    // round-trip, so clearing on them would erase the mark microseconds after the fault set
+                    // it and a group whose store is down would read healthy.
+                    if (issued > 0)
+                    {
+                        health.ReportRecovered(options.Name, _workerId);
+                    }
                 }
                 catch (Exception exception) when (IsTransientStoreFault(exception))
                 {
@@ -386,6 +411,22 @@ internal sealed class WorkerGroupService(
         }
     }
 
+    // Frees the pool slots of every ClaimBatch a fault left un-issued. The Driver reserves a batch's slots
+    // when it plans the batch and frees them when that batch's ClaimCompleted lands, so the contract is one
+    // completion per planned batch - an empty result included. A cycle that faults part-way keeps that
+    // contract here: commands[issued] is the command that faulted and everything after it never ran.
+    private static void ReleaseUnissuedClaims(
+        IReadOnlyList<Command> commands, int issued, ChannelWriter<NodeEvent> events, DateTimeOffset now)
+    {
+        for (var index = issued; index < commands.Count; index++)
+        {
+            if (commands[index] is Command.ClaimBatch)
+            {
+                events.TryWrite(new NodeEvent.ClaimCompleted([], now));
+            }
+        }
+    }
+
     private async ValueTask ExecuteAsync(
         Command command, ChannelWriter<NodeEvent> events, CancellationToken stoppingToken)
     {
@@ -434,23 +475,12 @@ internal sealed class WorkerGroupService(
                     // backoff simply falls back to the idle-time ramp. Only the adaptive pacer consumes
                     // NextDue, so when the feature is off we take the plain ClaimAsync path and issue exactly
                     // the single claim query the runtime issued before this feature existed.
-                    ClaimResult result;
-                    try
-                    {
-                        result = AdaptivePoll
-                            ? await store.ClaimBatchAsync(request, stoppingToken).ConfigureAwait(false)
-                            : new ClaimResult(
-                                await store.ClaimAsync(request, stoppingToken).ConfigureAwait(false), NextDue: null);
-                    }
-                    catch
-                    {
-                        // The claim faulted (a transient store fault retries, anything else fail-stops): land an
-                        // empty completion first so the Driver frees the slots it reserved for this batch, then
-                        // let the fault propagate. Without this a faulted claim would strand its reservation and
-                        // wedge the pool once transient faults accumulate past PoolSize.
-                        events.TryWrite(new NodeEvent.ClaimCompleted([], now));
-                        throw;
-                    }
+                    // A fault here needs no completion of its own: the batch counts as un-issued, and the
+                    // pump loop lands its empty ClaimCompleted as it abandons the cycle.
+                    var result = AdaptivePoll
+                        ? await store.ClaimBatchAsync(request, stoppingToken).ConfigureAwait(false)
+                        : new ClaimResult(
+                            await store.ClaimAsync(request, stoppingToken).ConfigureAwait(false), NextDue: null);
                     var jobs = result.Jobs;
                     BackWaveDiagnostics.RecordClaimed(claimActivity, jobs, now);
                     foreach (var job in jobs)

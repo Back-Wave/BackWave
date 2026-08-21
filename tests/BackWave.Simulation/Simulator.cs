@@ -1664,9 +1664,11 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         // The command batch runs inside a try so the deferred Unroutable reports below run even when a later
         // command in the SAME batch faults (a follow-up claim hitting a transient store fault, say). The
         // foreach/switch body keeps its original indentation to stay a surgical diff.
+        var commands = node.Driver.Step(nodeEvent);
+        var issued = 0;
         try
         {
-        foreach (var command in node.Driver.Step(nodeEvent))
+        foreach (var command in commands)
         {
             switch (command)
             {
@@ -1709,29 +1711,20 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 case Command.ClaimBatch claim:
                     var claimNow = NodeNow(nodeIndex);
                     var request = new ClaimRequest(claim.WorkerId, claim.Queues, claim.MaxJobs, claim.LeaseDuration, claimNow);
+                    // A fault here needs no completion of its own: the batch counts as un-issued, and the
+                    // catch below lands its empty ClaimCompleted as it abandons the batch.
                     IReadOnlyList<JobRecord> jobs;
-                    try
+                    if (AdaptivePoll)
                     {
-                        if (AdaptivePoll)
-                        {
-                            // Take the store's next-due hint and fold it into this node's backoff, exactly as the
-                            // host pump does. Off by default (ClaimAsync path below), so a run stays byte-identical.
-                            var result = Get(_nodeFaulty[nodeIndex].ClaimBatchAsync(request));
-                            jobs = result.Jobs;
-                            UpdatePollBackoff(nodeIndex, jobs.Count > 0, result.NextDue, claimNow);
-                        }
-                        else
-                        {
-                            jobs = Get(_nodeFaulty[nodeIndex].ClaimAsync(request));
-                        }
+                        // Take the store's next-due hint and fold it into this node's backoff, exactly as the
+                        // host pump does. Off by default (ClaimAsync path below), so a run stays byte-identical.
+                        var result = Get(_nodeFaulty[nodeIndex].ClaimBatchAsync(request));
+                        jobs = result.Jobs;
+                        UpdatePollBackoff(nodeIndex, jobs.Count > 0, result.NextDue, claimNow);
                     }
-                    catch (SimTransientFault)
+                    else
                     {
-                        // The claim faulted: land an empty completion so the Driver frees the slots it reserved
-                        // for this batch, then let the fault propagate exactly as the production pump does — else
-                        // the reservation would strand and wedge the pool once faults accumulate past PoolSize.
-                        Drive(nodeIndex, new NodeEvent.ClaimCompleted([], NodeNow(nodeIndex)));
-                        throw;
+                        jobs = Get(_nodeFaulty[nodeIndex].ClaimAsync(request));
                     }
                     // Always report the claim's completion, an empty result included: the Driver reserved this
                     // batch's slots at issue and frees them here, so an empty claim must still land or the
@@ -1847,7 +1840,24 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     throw new InvalidOperationException(
                         $"[seed {options.Seed}] Simulator received an unmodeled command: {command.GetType().Name}");
             }
+            issued++;
         }
+        }
+        catch (SimTransientFault)
+        {
+            // A fault abandons the rest of this batch's commands, but the Driver already reserved the pool
+            // slots of every ClaimBatch it planned - it frees them only when that batch's ClaimCompleted
+            // lands. Land an empty completion for each claim this batch never ran, so an abandoned batch
+            // cannot strand a reservation and wedge the pool shut. commands[issued] is the command that
+            // faulted, and everything after it never ran. Mirrors the production pump.
+            for (var index = issued; index < commands.Count; index++)
+            {
+                if (commands[index] is Command.ClaimBatch)
+                {
+                    Drive(nodeIndex, new NodeEvent.ClaimCompleted([], NodeNow(nodeIndex)));
+                }
+            }
+            throw;
         }
         finally
         {
