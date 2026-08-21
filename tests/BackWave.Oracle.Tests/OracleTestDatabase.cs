@@ -21,6 +21,22 @@ public static class OracleTestDatabase
         Environment.GetEnvironmentVariable("BACKWAVE_ORACLE_SYSTEM_DSN")
         ?? new OracleConnectionStringBuilder(ConnectionString) { UserID = "SYSTEM", Password = "backwave" }.ConnectionString;
 
+    // SYSDBA login used to grant EXECUTE ON SYS.DBMS_ALERT to the test user (see EnsureAlertAccessAsync).
+    // A revoke can only be issued by the grantor, and OracleWakeUpHintTests revokes through this same
+    // string, so the bootstrap grant must come from sys as well - a grant made by SYSTEM is not revocable
+    // here and raises ORA-01927.
+    public static readonly string SysConnectionString =
+        Environment.GetEnvironmentVariable("BACKWAVE_ORACLE_SYS_DSN")
+        ?? new OracleConnectionStringBuilder(ConnectionString)
+        {
+            UserID = "sys",
+            Password = "backwave",
+            DBAPrivilege = "SYSDBA",
+        }.ConnectionString;
+
+    // The account the store connects as. DBMS_ALERT is granted to it, and the wake-hint tests revoke from it.
+    public static readonly string AppUser = new OracleConnectionStringBuilder(ConnectionString).UserID;
+
     private static readonly SemaphoreSlim Gate = new(1, 1);
     private static bool _migrated;
 
@@ -62,6 +78,7 @@ public static class OracleTestDatabase
                     throw new InvalidOperationException(
                         "Oracle is not reachable. Start it with: docker compose up -d oracle", exception);
                 }
+                await EnsureAlertAccessAsync();
                 _migrated = true;
             }
 
@@ -81,6 +98,21 @@ public static class OracleTestDatabase
             ConnectionString = ConnectionString,
             HistoryPolicy = historyPolicy,
         });
+    }
+
+    /// <summary>
+    /// Grants EXECUTE ON SYS.DBMS_ALERT to the test user, once per run. The image does not grant it, and
+    /// OracleWakeUpHintTests revokes it to model a broken alert channel - a revoke of a privilege that was
+    /// never granted raises ORA-01927, so the first of those tests to run failed on whichever ran first.
+    /// GRANT is idempotent, so a re-run over an already-granted user is a no-op.
+    /// </summary>
+    public static async Task EnsureAlertAccessAsync()
+    {
+        await using var sys = new OracleConnection(SysConnectionString);
+        await sys.OpenAsync();
+        await using var grant = sys.CreateCommand();
+        grant.CommandText = $"GRANT EXECUTE ON SYS.DBMS_ALERT TO {AppUser}";
+        await grant.ExecuteNonQueryAsync();
     }
 
     // Drops the schema's user (with every object it owns) and recreates it empty, so the next test boots

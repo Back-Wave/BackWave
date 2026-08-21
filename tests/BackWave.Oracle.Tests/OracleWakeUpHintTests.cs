@@ -14,7 +14,7 @@ namespace BackWave.Oracle.Tests;
 /// on, a due enqueue on one connection wakes an idle pump on a separate connection through DBMS_ALERT,
 /// far sooner than the poll interval. The paired control confirms that with the hint off the same pump
 /// waits out the poll, so the fast claim is the hint and nothing else. These are integration tests: they
-/// need "docker compose up -d oracle" and an EXECUTE grant on SYS.DBMS_ALERT (the tests add it).
+/// need "docker compose up -d oracle". OracleTestDatabase grants EXECUTE on SYS.DBMS_ALERT at bootstrap.
 /// </summary>
 [Collection("oracle")]
 public sealed class OracleWakeUpHintTests(Xunit.Abstractions.ITestOutputHelper output)
@@ -240,37 +240,18 @@ public sealed class OracleWakeUpHintTests(Xunit.Abstractions.ITestOutputHelper o
         return builder.Build();
     }
 
-    // Grants the connecting user EXECUTE on SYS.DBMS_ALERT, the one out-of-band grant the wake hint needs.
-    private static async Task GrantAlertAccessAsync()
-    {
-        var sysConnectionString = new OracleConnectionStringBuilder(OracleTestDatabase.ConnectionString)
-        {
-            UserID = "sys",
-            Password = "backwave",
-            DBAPrivilege = "SYSDBA",
-        }.ConnectionString;
-
-        await using var sys = new OracleConnection(sysConnectionString);
-        await sys.OpenAsync();
-        await using var grant = sys.CreateCommand();
-        grant.CommandText = "GRANT EXECUTE ON SYS.DBMS_ALERT TO backwave";
-        await grant.ExecuteNonQueryAsync();
-    }
+    // Restores the connecting user's EXECUTE on SYS.DBMS_ALERT after a revoke below. The bootstrap grants
+    // it once per run, so this only puts back what this class took away.
+    private static Task GrantAlertAccessAsync() => OracleTestDatabase.EnsureAlertAccessAsync();
 
     // Revokes the connecting user's EXECUTE on SYS.DBMS_ALERT, so the wake hint has no channel to signal on.
+    // Runs as the same sys grantor that the bootstrap grant used - only a grantor can revoke its own grant.
     private static async Task RevokeAlertAccessAsync()
     {
-        var sysConnectionString = new OracleConnectionStringBuilder(OracleTestDatabase.ConnectionString)
-        {
-            UserID = "sys",
-            Password = "backwave",
-            DBAPrivilege = "SYSDBA",
-        }.ConnectionString;
-
-        await using var sys = new OracleConnection(sysConnectionString);
+        await using var sys = new OracleConnection(OracleTestDatabase.SysConnectionString);
         await sys.OpenAsync();
         await using var revoke = sys.CreateCommand();
-        revoke.CommandText = "REVOKE EXECUTE ON SYS.DBMS_ALERT FROM backwave";
+        revoke.CommandText = $"REVOKE EXECUTE ON SYS.DBMS_ALERT FROM {OracleTestDatabase.AppUser}";
         await revoke.ExecuteNonQueryAsync();
     }
 
