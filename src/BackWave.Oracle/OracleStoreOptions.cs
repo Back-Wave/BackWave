@@ -66,9 +66,31 @@ public sealed record OracleStoreOptions
     public JobHistoryPolicy HistoryPolicy { get; init; } = JobHistoryPolicy.TransitionsAndFailureDetail;
 
     /// <summary>
-    /// Optional logger factory. When supplied and <see cref="AutoMigrate"/> is on, the adapter records a
-    /// schema-migration event at Information level after applying the schema on first use. Null (the
-    /// default) disables that log with no allocation and does not otherwise affect the store.
+    /// When <see langword="true"/>, the adapter wakes an idle worker the moment a due job is enqueued,
+    /// through Oracle <c>DBMS_ALERT</c>, instead of waiting out the poll interval. Off by default. This is
+    /// a latency optimization only - polling stays the sole correctness mechanism, so a job is always
+    /// picked up on the next poll even with the hint off or its channel down (see the Wake-Up Hint
+    /// contract). Three costs come with turning it on:
+    /// <list type="bullet">
+    /// <item>The connecting user needs an <c>EXECUTE</c> grant on <c>SYS.DBMS_ALERT</c>.</item>
+    /// <item>Each pump holds one extra dedicated database session that waits for signals, so a worker group
+    /// with <c>Pumps = N</c> parks N of them.</item>
+    /// <item><c>DBMS_ALERT.SIGNAL</c> holds a lock on the alert until the enclosing transaction commits, so
+    /// concurrent hinted enqueues in the same schema serialize on it; under a long-lived Transactional
+    /// Enqueue that hold lasts the caller's whole transaction.</item>
+    /// </list>
+    /// If the grant is missing or the channel fails, the adapter keeps polling. When a
+    /// <see cref="LoggerFactory"/> is supplied, it also logs one warning for that outage.
+    /// Some managed Oracle offerings (for example Autonomous Database) restrict <c>DBMS_ALERT</c>; leave
+    /// this off there.
+    /// </summary>
+    public bool EnableWakeUpHints { get; init; }
+
+    /// <summary>
+    /// Optional logger factory. When supplied, the adapter records a schema-migration event at Information
+    /// level after applying the schema on first use (when <see cref="AutoMigrate"/> is on), and logs one
+    /// warning if the wake-up hint channel is unavailable (see <see cref="EnableWakeUpHints"/>). Null (the
+    /// default) disables both logs with no allocation.
     /// </summary>
     public ILoggerFactory? LoggerFactory { get; init; }
 

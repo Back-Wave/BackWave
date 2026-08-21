@@ -3,6 +3,7 @@ using System.Text.Json;
 using BackWave.Core;
 using BackWave.Diagnostics;
 using BackWave.Storage;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Oracle.ManagedDataAccess.Client;
 using Oracle.ManagedDataAccess.Types;
@@ -32,11 +33,18 @@ namespace BackWave.Oracle;
 /// });
 /// </code>
 /// </example>
-public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, IStoreFaultClassifier
+public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, IStoreFaultClassifier, IWakeUpHintSource
 {
     // The EFFECTIVE Job History Policy: the configured rung with the top one downgraded by the
     // Failure Detail env kill-switch. Resolved once - env is an input to the run.
     private readonly JobHistoryPolicy _historyPolicy = JobHistoryPolicyResolver.Resolve(options.HistoryPolicy);
+
+    // One logger for the whole store, resolved from the configured factory (a no-op logger when none is
+    // supplied). Used for the rare Wake-Up Hint channel-fault warning.
+    private readonly ILogger _logger =
+        options.LoggerFactory?.CreateLogger(OracleDiagnostics.SourceName) ?? NullLogger.Instance;
+
+    private bool _publishFaultLogged;
 
     // Swaps the canonical 'backwave' schema qualifier for the configured SchemaName in every query
     // and DDL script. The default schema is a zero-cost passthrough.
@@ -109,8 +117,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             if (options.AutoMigrate)
             {
                 await OracleMigrator.MigrateAsync(options.ConnectionString, options.SchemaName, options.CoordinateMigration, cancellationToken).ConfigureAwait(false);
-                BackWaveLog.MigrationApplied(
-                    options.LoggerFactory?.CreateLogger(OracleDiagnostics.SourceName) ?? NullLogger.Instance, "oracle");
+                BackWaveLog.MigrationApplied(_logger, "oracle");
             }
             await OracleMigrator.VerifySchemaVersionAsync(options.ConnectionString, options.SchemaName, cancellationToken).ConfigureAwait(false);
             _ready = true;
@@ -332,7 +339,46 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         // Attempt 0, in this same transaction (atomic with the job row, even under Transactional Enqueue).
         await RecordTransitionAsync(connection, transaction, job.JobId, state, attempt: 0, now, cancellationToken)
             .ConfigureAwait(false);
+
+        if (state == JobState.Scheduled && job.DueTime <= now)
+        {
+            // Wake-Up Hint (§8): DBMS_ALERT.SIGNAL is transactional, so the hint fires on commit -
+            // including the caller's own commit under Transactional Enqueue - or never.
+            await PublishHintAsync(connection, transaction, job.Queue, cancellationToken).ConfigureAwait(false);
+        }
         return EnqueueResult.Ok;
+    }
+
+    // Fires a Wake-Up Hint on the Queue through DBMS_ALERT within the caller's transaction. A no-op unless
+    // EnableWakeUpHints is on; then it needs an EXECUTE grant on SYS.DBMS_ALERT. The alert name is the
+    // channel and the Queue rides in the message, mirroring Postgres pg_notify. SIGNAL takes effect only on
+    // commit, so a rolled-back enqueue fires no hint (a hint is an optimization, never truth).
+    private async ValueTask PublishHintAsync(
+        OracleConnection connection, OracleTransaction transaction, string queue, CancellationToken cancellationToken)
+    {
+        if (!options.EnableWakeUpHints)
+        {
+            return;
+        }
+        try
+        {
+            await using var signal = Cmd("BEGIN DBMS_ALERT.SIGNAL(:name, :msg); END;", connection, transaction);
+            signal.Parameters.Add(Str("name", _schema.HintAlertName));
+            signal.Parameters.Add(Str("msg", queue));
+            await signal.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            if (!_publishFaultLogged)
+            {
+                _publishFaultLogged = true;
+                BackWaveLog.WakeHintChannelUnavailable(_logger, "oracle", exception);
+            }
+        }
     }
     // ── §5.2 Claim ──────────────────────────────────────────────────────────────
 
@@ -361,8 +407,9 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         try
         {
             // Idle-poll next-due: computed on the SAME connection right after the per-queue claims commit,
-            // so it reads the post-claim committed snapshot. Oracle has no Wake-Up Hint channel, so this
-            // value is the sole latency mechanism for an idle backed-off fleet on this adapter.
+            // so it reads the post-claim committed snapshot. With Wake-Up Hints off (the default) this
+            // value is the sole latency mechanism for an idle backed-off fleet on this adapter; with them
+            // on, a DBMS_ALERT signal wakes the pump sooner, but this next-due still bounds the no-hint case.
             var (jobs, nextDue) = await ClaimUntracedAsync(request, computeNextDue: true, cancellationToken).ConfigureAwait(false);
             return new ClaimResult(jobs, nextDue);
         }
@@ -1756,6 +1803,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             // cursor so the ticks are minted, never silently lost.
             await FailpointAsync("mint-due", cancellationToken).ConfigureAwait(false);
 
+            var mintedForDecision = 0;
             foreach (var tick in decision.Ticks)
             {
                 var mintedId = JobIds.ForMintedTick(decision.ScheduleId, tick);
@@ -1774,13 +1822,19 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 insert.Parameters.Add(Str("scheduleId", decision.ScheduleId));
                 if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0)
                 {
-                    minted++;
+                    mintedForDecision++;
                     // MintDue carries no `now`; the tick (the instance's due instant) is the deterministic
                     // timestamp for its first Scheduled transition.
                     await RecordTransitionAsync(connection, transaction, mintedId,
                         JobState.Scheduled, attempt: 0, tick, cancellationToken).ConfigureAwait(false);
                 }
             }
+            if (mintedForDecision > 0)
+            {
+                // Minted ticks are due by construction - hint the cluster (§8) in this same transaction.
+                await PublishHintAsync(connection, transaction, schedule.Queue, cancellationToken).ConfigureAwait(false);
+            }
+            minted += mintedForDecision;
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -3181,6 +3235,162 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
 
     private static string RenderSkippedTicks(IReadOnlyList<DateTimeOffset> ticks)
         => "[" + string.Join(",", ticks.Select(t => $"\"{t.ToUniversalTime():O}\"")) + "]";
+
+    // ── §8 Wake-Up Hints ────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public Task<IAsyncDisposable> SubscribeAsync(
+        Action<string> onHint, CancellationToken cancellationToken = default)
+    {
+        if (!options.EnableWakeUpHints)
+        {
+            // Feature off: hand back a no-op so the pump subscribes to nothing and stays on the poll
+            // interval, exactly as an adapter that does not implement IWakeUpHintSource would.
+            return Task.FromResult<IAsyncDisposable>(NoopSubscription.Instance);
+        }
+        var subscription = new HintSubscription(options.ConnectionString, _schema.HintAlertName, onHint, _logger);
+        subscription.Start();
+        return Task.FromResult<IAsyncDisposable>(subscription);
+    }
+
+    private sealed class NoopSubscription : IAsyncDisposable
+    {
+        public static readonly NoopSubscription Instance = new();
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    // A dedicated DBMS_ALERT waiting session, the Oracle analog to the Postgres LISTEN connection. Channel
+    // loss is a latency event, never a correctness event: the loop reconnects forever until
+    // disposed, and while it is down polling carries everything at the poll interval. It logs the first
+    // fault after a healthy registration, so a missing EXECUTE grant is visible without flooding the log.
+    private sealed class HintSubscription(
+        string connectionString, string alertName, Action<string> onHint, ILogger logger) : IAsyncDisposable
+    {
+        // Named bound: how long a dead hint channel waits before it redials.
+        private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
+
+        // The dispose bound for the waiter. A cancellation token does NOT break a parked DBMS_ALERT.WAITONE:
+        // ODP.NET surfaces ORA-01013 only after the server-side wait ends, so this timeout, not the token, is
+        // what lets DisposeAsync return. Keep it small - one idle round-trip per second per waiting pump is
+        // the price of a prompt shutdown.
+        private const int WaitTimeoutSeconds = 1;
+
+        private readonly CancellationTokenSource _stop = new();
+        private Task _loop = Task.CompletedTask;
+        private bool _faultLogged;
+
+        public void Start() => _loop = RunAsync(_stop.Token);
+
+        private async Task RunAsync(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                OracleConnection? connection = null;
+                try
+                {
+                    connection = new OracleConnection(connectionString);
+                    await connection.OpenAsync(token).ConfigureAwait(false);
+                    await RegisterAsync(connection, token).ConfigureAwait(false);
+                    // A healthy registration re-arms the one-shot fault log for the next outage.
+                    _faultLogged = false;
+                    while (!token.IsCancellationRequested)
+                    {
+                        var (status, message) = await WaitOneAsync(connection, token).ConfigureAwait(false);
+                        // status 0 is an alert (message is the Queue); status 1 is the WAITONE timeout.
+                        if (status == 0 && !string.IsNullOrEmpty(message))
+                        {
+                            onHint(message);
+                        }
+                    }
+                }
+                catch (Exception exception)
+                {
+                    // Cancellation can surface as OperationCanceledException or as an Oracle break
+                    // (ORA-01013) on the parked WAITONE; either way, a requested stop ends the loop.
+                    if (token.IsCancellationRequested)
+                    {
+                        return;
+                    }
+                    if (!_faultLogged)
+                    {
+                        _faultLogged = true;
+                        BackWaveLog.WakeHintChannelUnavailable(logger, "oracle", exception);
+                    }
+                    try
+                    {
+                        await Task.Delay(ReconnectDelay, token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+                }
+                finally
+                {
+                    if (connection is not null)
+                    {
+                        try
+                        {
+                            await connection.DisposeAsync().ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            // A dead connection on the way down is nothing to act on.
+                        }
+                    }
+                }
+            }
+        }
+
+        private async Task RegisterAsync(OracleConnection connection, CancellationToken token)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "BEGIN DBMS_ALERT.REGISTER(:name); END;";
+            command.BindByName = true;
+            command.Parameters.Add(new OracleParameter("name", OracleDbType.Varchar2) { Value = alertName });
+            await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
+        }
+
+        private async Task<(int Status, string Message)> WaitOneAsync(
+            OracleConnection connection, CancellationToken token)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "BEGIN DBMS_ALERT.WAITONE(:name, :msg, :status, :timeout); END;";
+            command.BindByName = true;
+            command.Parameters.Add(new OracleParameter("name", OracleDbType.Varchar2) { Value = alertName });
+            var message = new OracleParameter("msg", OracleDbType.Varchar2, 1800)
+            {
+                Direction = System.Data.ParameterDirection.Output,
+            };
+            command.Parameters.Add(message);
+            var status = new OracleParameter("status", OracleDbType.Int32)
+            {
+                Direction = System.Data.ParameterDirection.Output,
+            };
+            command.Parameters.Add(status);
+            command.Parameters.Add(new OracleParameter("timeout", OracleDbType.Int32) { Value = WaitTimeoutSeconds });
+            await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
+
+            var statusCode = ((OracleDecimal)status.Value).ToInt32();
+            var payload = message.Value is OracleString text && !text.IsNull ? text.Value : string.Empty;
+            return (statusCode, payload);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await _stop.CancelAsync().ConfigureAwait(false);
+            try
+            {
+                await _loop.ConfigureAwait(false);
+            }
+            catch
+            {
+                // The loop ends on cancellation; any exception on the way down is part of shutdown.
+            }
+            _stop.Dispose();
+        }
+    }
 
     // ── parameter and reader helpers ──────────────────────────────────────────────
     //

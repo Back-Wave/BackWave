@@ -32,6 +32,30 @@ public sealed class SchemaRewriterTests
         Assert.Equal($"{name}.jobs", rewriter.Rewrite("backwave.jobs"));
     }
 
+    [Fact]
+    public void HintAlertName_DefaultSchema_IsBackwaveHints()
+    {
+        var rewriter = new SchemaRewriter("backwave");
+        Assert.Equal("backwave_hints", rewriter.HintAlertName);
+    }
+
+    [Fact]
+    public void HintAlertName_CustomShortSchema_AppendsHintsSuffix()
+    {
+        var rewriter = new SchemaRewriter("bw_alt");
+        Assert.Equal("bw_alt_hints", rewriter.HintAlertName);
+    }
+
+    [Fact]
+    public void HintAlertName_LongSchema_TruncatesToFitThirtyChars()
+    {
+        // DBMS_ALERT stores the alert name in a VARCHAR2(30) column, so the derived name must fit 30 chars.
+        var rewriter = new SchemaRewriter(new string('a', MaxSchemaLength));
+        Assert.True(rewriter.HintAlertName.Length <= 30, "the derived alert name must fit the VARCHAR2(30) column");
+        Assert.EndsWith("_hints", rewriter.HintAlertName);
+        Assert.Equal(new string('a', 24) + "_hints", rewriter.HintAlertName);
+    }
+
     [Theory]
     [InlineData("")]          // empty
     [InlineData("has space")] // invalid character

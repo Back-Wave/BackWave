@@ -21,9 +21,20 @@ internal sealed partial class SchemaRewriter
     // Oracle identifiers cap at 128 characters (12.2+); reject longer names rather than silently truncating.
     private const int MaxSchemaLength = 128;
 
+    // DBMS_ALERT stores an alert name in a VARCHAR2(30) column, so the Wake-Up Hint channel name must fit
+    // 30 characters. It is derived from the schema so two BackWave deployments in different schemas of one
+    // database wake their own pumps. An alert name is database-wide, not schema-scoped; a long schema name
+    // is truncated to fit, and if two truncated names collide the only effect is a spurious cross-wake,
+    // which is harmless - a hint is advisory and the woken pump finds no work.
+    private const int MaxAlertNameLength = 30;
+    private const string AlertSuffix = "_hints";
+
     private readonly string _schema;
     private readonly bool _isDefault;
     private readonly ConcurrentDictionary<string, string> _cache = new(StringComparer.Ordinal);
+
+    // The DBMS_ALERT name for Wake-Up Hints, namespaced to the schema (default 'backwave_hints').
+    public string HintAlertName { get; }
 
     public SchemaRewriter(string schemaName)
     {
@@ -38,6 +49,10 @@ internal sealed partial class SchemaRewriter
 
         _schema = schemaName;
         _isDefault = string.Equals(schemaName, DefaultSchema, StringComparison.Ordinal);
+
+        var maxSchemaPart = MaxAlertNameLength - AlertSuffix.Length;
+        var alertSchemaPart = schemaName.Length <= maxSchemaPart ? schemaName : schemaName[..maxSchemaPart];
+        HintAlertName = alertSchemaPart + AlertSuffix;
     }
 
     // Returns the SQL with the 'backwave' schema qualifier replaced by the configured name. Identity

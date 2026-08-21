@@ -59,7 +59,7 @@ internal static partial class BackWaveLog
 
     // ── Lifecycle events ─────────────────────────────────────────────────────────────────────────
     // EventIds are stable and grouped by phase (10xx enqueue/claim, 11xx execution, 12xx settlement,
-    // 13xx store/schema, 14xx observer) so a consumer can filter on them. Parameter names are snake_case
+    // 13xx store/schema, 14xx observer, 15xx wake-up hints) so a consumer can filter on them. Parameter names are snake_case
     // so the [LoggerMessage] generator maps them to the same-named template placeholders (the emitted
     // structured keys).
 
@@ -107,4 +107,8 @@ internal static partial class BackWaveLog
     [LoggerMessage(EventId = 1401, Level = LogLevel.Warning,
         Message = "Observer '{observer_id}' delivery dead-lettered after exhausting its retry ceiling.")]
     internal static partial void ObserverDeliveryDeadLettered(ILogger logger, string observer_id);
+
+    [LoggerMessage(EventId = 1501, Level = LogLevel.Warning,
+        Message = "Wake-Up Hint channel for {db_system} is unavailable; falling back to polling until it recovers.")]
+    internal static partial void WakeHintChannelUnavailable(ILogger logger, string db_system, Exception exception);
 }

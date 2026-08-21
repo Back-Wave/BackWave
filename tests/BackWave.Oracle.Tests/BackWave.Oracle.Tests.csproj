@@ -17,6 +17,8 @@
          the name still matches. Versions track the OpenTelemetry.Api 1.16.0 that package pins. -->
     <PackageReference Include="OpenTelemetry" Version="1.16.0" />
     <PackageReference Include="OpenTelemetry.Exporter.InMemory" Version="1.16.0" />
+    <!-- The generic host drives WorkerGroupService against a real Oracle store in the load test. -->
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
   </ItemGroup>
 
   <ItemGroup>
@@ -25,6 +27,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\BackWave.Oracle\BackWave.Oracle.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Hosting\BackWave.Hosting.csproj" />
     <ProjectReference Include="..\..\src\BackWave.Conformance\BackWave.Conformance.csproj" />
     <ProjectReference Include="..\..\src\BackWave.OpenTelemetry\BackWave.OpenTelemetry.csproj" />
   </ItemGroup>
