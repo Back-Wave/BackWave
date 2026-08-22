@@ -22,6 +22,7 @@
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
     <PackageReference Include="Npgsql" Version="9.0.3" />
     <PackageReference Include="Microsoft.Data.SqlClient" Version="6.1.1" />
+    <PackageReference Include="Oracle.ManagedDataAccess.Core" Version="23.9.1" />
     <!-- The Hangfire competitor (bench-0140): its own server + storage behind the IBenchmarkTarget seam,
          so the measurement code around it is provably identical to BackWave's. SQL Server is first-party
          (the flagship comparison); Hangfire.PostgreSql is the community adapter (footnoted in the doc). -->
@@ -38,6 +39,7 @@
     <ProjectReference Include="..\..\src\BackWave.Hosting\BackWave.Hosting.csproj" />
     <ProjectReference Include="..\..\src\BackWave.Postgres\BackWave.Postgres.csproj" />
     <ProjectReference Include="..\..\src\BackWave.SqlServer\BackWave.SqlServer.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Oracle\BackWave.Oracle.csproj" />
     <ProjectReference Include="..\..\src\BackWave.SourceGenerators\BackWave.SourceGenerators.csproj"
                       OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
   </ItemGroup>

@@ -12,6 +12,7 @@ public sealed class TuningDialsTests
 {
     private const string PgDsn = "Host=localhost;Port=5499;Username=u;Password=p;Database=d";
     private const string MssqlDsn = "Server=localhost,1433;User Id=sa;Password=p;Database=d";
+    private const string OracleDsn = "User Id=u;Password=p;Data Source=localhost:1521/FREEPDB1;";
 
     [Fact]
     public void Hangfire_worker_count_is_matched_to_backwave_pool_size_on_both_engines()
@@ -29,10 +30,37 @@ public sealed class TuningDialsTests
     {
         var pg = new PostgresBenchmarkTarget(PgDsn).TuningDials;
         var mssql = new SqlServerBenchmarkTarget(MssqlDsn).TuningDials;
+        var oracle = new OracleBenchmarkTarget(OracleDsn).TuningDials;
 
         Assert.Contains("SKIP LOCKED", pg["claim-strategy"]);
         Assert.Contains("READPAST", mssql["claim-strategy"]);
+        Assert.Contains("ROWNUM-bounded", oracle["claim-strategy"]);
         Assert.Contains("source-generated", pg["serialization"]);
+    }
+
+    [Fact]
+    public void Oracle_runs_the_identical_dials_to_the_other_adapters_apart_from_its_claim_dialect()
+    {
+        // Oracle is a BackWave-only cell with no competitor beside it, which is exactly how an adapter-only
+        // dial sneaks in and quietly makes the number incomparable with the Postgres and SQL Server cells.
+        // Every dial an adapter target records must therefore be the same dial, with the same value, except
+        // the two surfaced-architecture ones the engines genuinely differ on.
+        var pg = new PostgresBenchmarkTarget(PgDsn).TuningDials;
+        var mssql = new SqlServerBenchmarkTarget(MssqlDsn).TuningDials;
+        var oracle = new OracleBenchmarkTarget(OracleDsn).TuningDials;
+
+        Assert.Equal(pg.Keys.Order(), oracle.Keys.Order());
+        Assert.Equal(mssql.Keys.Order(), oracle.Keys.Order());
+
+        foreach (var key in oracle.Keys.Where(k => k is not ("claim-strategy" or "serialization")))
+        {
+            Assert.Equal(pg[key], oracle[key]);
+            Assert.Equal(mssql[key], oracle[key]);
+        }
+
+        // The claim dialect differs; the batch size in front of it is a tuning dial and must not.
+        Assert.StartsWith("batch-claim up to 128 per poll", oracle["claim-strategy"]);
+        Assert.StartsWith("batch-claim up to 128 per poll", pg["claim-strategy"]);
     }
 
     [Fact]
@@ -45,6 +73,7 @@ public sealed class TuningDialsTests
         foreach (var key in neutralized)
         {
             Assert.True(new PostgresBenchmarkTarget(PgDsn).TuningDials.ContainsKey(key), $"BackWave missing {key}");
+            Assert.True(new OracleBenchmarkTarget(OracleDsn).TuningDials.ContainsKey(key), $"Oracle missing {key}");
             Assert.True(new HangfirePostgresTarget(PgDsn).TuningDials.ContainsKey(key), $"Hangfire missing {key}");
         }
     }

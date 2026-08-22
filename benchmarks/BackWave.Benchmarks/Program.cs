@@ -13,7 +13,7 @@ using BackWave.Benchmarks.Workload;
 // Usage:
 //   dotnet run -c Release --project benchmarks/BackWave.Benchmarks -- [options]
 //
-//   --target  postgres|sqlserver|hangfire-postgres|hangfire-sqlserver
+//   --target  postgres|sqlserver|oracle|hangfire-postgres|hangfire-sqlserver
 //                                  system under test                    (default: postgres)
 //   --mode    local|official       run mode; only official+native-x64 is publishable (default: local)
 //   --jobs    N                    number of jobs in the stream         (default: 10000)
@@ -69,7 +69,7 @@ var spec = new WorkloadSpec
     PayloadSizeBytes = options.PayloadBytes,
 };
 
-await using var target = CreateTarget(options.Target);
+await using var target = BenchmarkTargetRegistry.Create(options.Target);
 
 Console.Error.WriteLine(
     $"Running {target.Name} | {spec.Arrival} | {spec.JobCount} jobs | {spec.DelayMs}ms handler | " +
@@ -102,17 +102,6 @@ Console.Error.WriteLine(
     $"{result.Resources.Internal.Gen1Collections}/{result.Resources.Internal.Gen2Collections}");
 
 return 0;
-
-static IBenchmarkTarget CreateTarget(string target) => target switch
-{
-    "postgres" or "pg" => new PostgresBenchmarkTarget(),
-    "sqlserver" or "mssql" => new SqlServerBenchmarkTarget(),
-    "hangfire-postgres" or "hangfire-pg" => new HangfirePostgresTarget(),
-    "hangfire-sqlserver" or "hangfire-mssql" => new HangfireSqlServerTarget(),
-    _ => throw new ArgumentException(
-        $"Unknown target '{target}'. Expected 'postgres', 'sqlserver', " +
-        "'hangfire-postgres', or 'hangfire-sqlserver'."),
-};
 
 static JsonSerializerOptions JsonOptions() => new()
 {
