@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Data;
 using System.Text.Json;
 using BackWave.Core;
 using BackWave.Diagnostics;
@@ -1563,45 +1564,32 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await audit.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    // The ordinal AppendTransitionAsync reports when the Job History Policy suppressed the row. Below
+    // every real ordinal and below every cap, so a caller's "did anything reach the cap?" test reads
+    // false without a special case.
+    private const long NoTransitionRecorded = -1;
+
     // Appends one Transition Log entry for a job's resulting state, inside the SAME transaction as the
     // state change it records - a crash leaves neither or both. The ordinal is the per-job max + 1 (a
-    // sub-select against the same table), so it climbs even as oldest rows age out. The trailing bounded
-    // delete enforces MaxTransitionsPerJob. `now` is always the caller's clock. `failureDetail` is the
-    // Shell-captured exception text, written only on a failing transition and clamped to
-    // MaxFailureDetailBytes; null on every other transition.
+    // scalar sub-select against the same table), so it climbs even as oldest rows age out. The trailing
+    // bounded delete enforces MaxTransitionsPerJob, and runs only when this entry put the cap in play.
+    // `now` is always the caller's clock. `failureDetail` is the Shell-captured exception text, written
+    // only on a failing transition and clamped to MaxFailureDetailBytes; null on every other transition.
     private async Task RecordTransitionAsync(
         OracleConnection connection, OracleTransaction transaction, Guid jobId, JobState state,
         int attempt, DateTimeOffset now, CancellationToken cancellationToken, string? failureDetail = null)
     {
-        // Job History Policy gates writes, not schema. Off appends no row at all; Transitions appends the
-        // row but never the detail; the full rung keeps the clamped detail. The table always exists -
-        // flipping the policy is config, never a migration.
-        if (_historyPolicy == JobHistoryPolicy.Off)
+        var ordinal = await AppendTransitionAsync(
+            connection, transaction, jobId, state, attempt, now, cancellationToken, failureDetail).ConfigureAwait(false);
+
+        // Per-job-life cap: skip the DELETE entirely unless the entry just written reached the cap. Under
+        // the cap the delete can only be a no-op - its bound is MAX(ordinal) - cap, which is negative
+        // while the newest ordinal is below the cap, and no ordinal is negative - so a job nowhere near
+        // MaxTransitionsPerJob pays no round trip for it.
+        if (ordinal < options.Bounds.MaxTransitionsPerJob)
         {
             return;
         }
-        if (_historyPolicy == JobHistoryPolicy.Transitions)
-        {
-            failureDetail = null; // record the transition, but never the detail it would have carried
-        }
-
-        await using (var insert = Cmd(
-            """
-            INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
-            SELECT :id, COALESCE(MAX(ordinal) + 1, 0), :now, :state, :attempt, :detail
-            FROM backwave.job_transitions WHERE job_id = :id
-            """,
-            connection, transaction))
-        {
-            insert.Parameters.Add(Raw("id", jobId));
-            insert.Parameters.Add(Tstz("now", now));
-            insert.Parameters.Add(Int("state", (int)state));
-            insert.Parameters.Add(Int("attempt", attempt));
-            insert.Parameters.Add(Clob("detail", options.Bounds.ClampFailureDetail(failureDetail)));
-            await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
-        }
-
-        // Per-job-life cap: keep only the newest MaxTransitionsPerJob entries, dropping oldest.
         await using var prune = Cmd(
             """
             DELETE FROM backwave.job_transitions
@@ -1616,10 +1604,12 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
     }
 
     // Appends a BATCH of Transition Log entries. Oracle has no OPENJSON, and each job appears exactly once
-    // per batch, so this is a straight per-row loop over the single-row recorder - each entry's ordinal is
-    // still the per-job MAX(ordinal)+1, and every write rides the caller's transaction, so the whole batch
-    // is atomic with the lease/outcome write. Honors the history policy (Off writes nothing) via the
-    // per-row recorder.
+    // per batch, so the insert is still a per-row loop - each entry's ordinal is the per-job MAX(ordinal)+1,
+    // and every write rides the caller's transaction, so the whole batch is atomic with the lease/outcome
+    // write. The prune is NOT per row: the loop learns the highest ordinal it assigned, and a batch where
+    // no job reached the cap - the common shape, since most jobs live two transitions - issues no DELETE at
+    // all. When one did reach it, a single set-based DELETE covers the whole batch; its correlated MAX
+    // no-ops for the jobs still under the cap. Honors the history policy (Off writes nothing).
     private async Task RecordTransitionsBatchAsync(
         OracleConnection connection, OracleTransaction transaction,
         IReadOnlyList<(Guid JobId, JobState State, int Attempt, string? FailureDetail)> rows,
@@ -1629,11 +1619,77 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         {
             return;
         }
+
+        var maxNewOrdinal = NoTransitionRecorded;
         foreach (var (jobId, state, attempt, failureDetail) in rows)
         {
-            await RecordTransitionAsync(connection, transaction, jobId, state, attempt, now, cancellationToken, failureDetail)
+            var ordinal = await AppendTransitionAsync(
+                connection, transaction, jobId, state, attempt, now, cancellationToken, failureDetail)
                 .ConfigureAwait(false);
+            if (ordinal > maxNewOrdinal)
+            {
+                maxNewOrdinal = ordinal;
+            }
         }
+
+        if (maxNewOrdinal < options.Bounds.MaxTransitionsPerJob)
+        {
+            return;
+        }
+        await using var prune = Cmd(
+            $"""
+            DELETE FROM backwave.job_transitions jt
+            WHERE jt.job_id IN ({ParameterList("j", rows.Count)})
+              AND jt.ordinal <= (
+                  SELECT MAX(ordinal) FROM backwave.job_transitions x WHERE x.job_id = jt.job_id
+              ) - :cap
+            """,
+            connection, transaction);
+        AddIdList(prune, "j", [.. rows.Select(row => row.JobId)]);
+        prune.Parameters.Add(Int("cap", options.Bounds.MaxTransitionsPerJob));
+        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    // The insert half of recording a transition, shared by the single-row and batch recorders. Returns the
+    // ordinal the row was assigned, so the caller can decide whether the per-job-life cap is even in play,
+    // or NoTransitionRecorded when the Job History Policy suppressed the write. The ordinal comes back on
+    // the insert's own round trip: Oracle rejects RETURNING on an INSERT ... SELECT, so the new ordinal is
+    // a scalar sub-query in the VALUES list and RETURNING reads back what it evaluated to.
+    private async Task<long> AppendTransitionAsync(
+        OracleConnection connection, OracleTransaction transaction, Guid jobId, JobState state,
+        int attempt, DateTimeOffset now, CancellationToken cancellationToken, string? failureDetail)
+    {
+        // Job History Policy gates writes, not schema. Off appends no row at all; Transitions appends the
+        // row but never the detail; the full rung keeps the clamped detail. The table always exists -
+        // flipping the policy is config, never a migration.
+        if (_historyPolicy == JobHistoryPolicy.Off)
+        {
+            return NoTransitionRecorded;
+        }
+        if (_historyPolicy == JobHistoryPolicy.Transitions)
+        {
+            failureDetail = null; // record the transition, but never the detail it would have carried
+        }
+
+        await using var insert = Cmd(
+            """
+            INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
+            VALUES (
+                :id,
+                (SELECT COALESCE(MAX(ordinal) + 1, 0) FROM backwave.job_transitions WHERE job_id = :id),
+                :now, :state, :attempt, :detail)
+            RETURNING ordinal INTO :ordinal
+            """,
+            connection, transaction);
+        insert.Parameters.Add(Raw("id", jobId));
+        insert.Parameters.Add(Tstz("now", now));
+        insert.Parameters.Add(Int("state", (int)state));
+        insert.Parameters.Add(Int("attempt", attempt));
+        insert.Parameters.Add(Clob("detail", options.Bounds.ClampFailureDetail(failureDetail)));
+        var assigned = OutLong("ordinal");
+        insert.Parameters.Add(assigned);
+        await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        return ((OracleDecimal)assigned.Value).ToInt64();
     }
     // ── §5.7 Schedules & minting ─────────────────────────────────────────────────
 
@@ -3428,6 +3484,10 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
 
     private static OracleParameter LongN(string name, long? value)
         => new(name, OracleDbType.Int64) { Value = (object?)value ?? DBNull.Value };
+
+    // An OUT bind for a RETURNING clause. ODP.NET hands the value back as an OracleDecimal.
+    private static OracleParameter OutLong(string name)
+        => new(name, OracleDbType.Int64) { Direction = ParameterDirection.Output };
 
     private static OracleParameter Tstz(string name, DateTimeOffset value)
         => new(name, OracleDbType.TimeStampTZ) { Value = ToTstz(value) };
