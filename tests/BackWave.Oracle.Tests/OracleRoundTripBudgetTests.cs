@@ -38,10 +38,10 @@ public sealed class OracleRoundTripBudgetTests
     // version 1. Each is the cost of ONE call; the arithmetic behind each number is in its test.
 
     private static readonly Budget Claim = new(
-        "ClaimBatchAsync of 32 jobs (one queue, cold caches)", Statements: 39, LobReads: 32);
+        "ClaimBatchAsync of 32 jobs (one queue, cold caches)", Statements: 9, LobReads: 32);
 
     private static readonly Budget ReportOutcomes = new(
-        "ReportOutcomesAsync of 32 succeeded rows", Statements: 65, LobReads: 0);
+        "ReportOutcomesAsync of 32 succeeded rows", Statements: 35, LobReads: 0);
 
     private static readonly Budget ListJobs = new(
         "ListJobsAsync over a 200-job page of terminal jobs", Statements: 2, LobReads: 400);
@@ -60,9 +60,11 @@ public sealed class OracleRoundTripBudgetTests
         }
 
         // 2 queue-lock anchor + 1 queue_limits read + 1 claim select + 1 lease update
-        // + 32 transition inserts + 1 tags probe + 1 next-due = 39. No prune: the batch recorder issues
-        // a DELETE only when some job in it reached MaxTransitionsPerJob, and a freshly claimed job is
-        // on its second transition.
+        // + 1 batched transition insert + 1 highest-ordinal read + 1 tags probe + 1 next-due = 9. The
+        // insert is set-based over JSON_TABLE, so 32 rows cost one statement; the read after it is how
+        // the batch learns the highest ordinal it assigned, because Oracle rejects RETURNING on an
+        // INSERT ... SELECT. No prune: the batch recorder issues a DELETE only when some job in it
+        // reached MaxTransitionsPerJob, and a freshly claimed job is on its second transition.
         // The 32 LOB reads are one payload BLOB per claimed row; terminal_cause is null on a Scheduled
         // job, and a null LOB costs nothing.
         ClaimResult result;
@@ -91,8 +93,9 @@ public sealed class OracleRoundTripBudgetTests
 
         // The plain drain: every row succeeded, none carries output or a tag delta, so nothing but the
         // fenced state write and the transition log runs.
-        // 32 fenced updates + 32 transition inserts + 1 child-latch probe = 65. As above, no job in this
-        // batch is near the cap, so the batch recorder issues no prune DELETE.
+        // 32 fenced updates + 1 batched transition insert + 1 highest-ordinal read + 1 child-latch probe
+        // = 35. As above, no job in this batch is near the cap, so the batch recorder issues no prune
+        // DELETE. The 32 fenced updates are still per row - batching them is issue 0264.
         // Writing a terminal_cause CLOB is a parameter bind, not a materialization, so no LOB is read.
         var batch = claimed
             .Select(job => new OutcomeReport(job.JobId, "budget-worker", job.Attempt, new JobOutcome.Success()))

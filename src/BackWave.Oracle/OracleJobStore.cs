@@ -1564,9 +1564,9 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await audit.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    // The ordinal AppendTransitionAsync reports when the Job History Policy suppressed the row. Below
-    // every real ordinal and below every cap, so a caller's "did anything reach the cap?" test reads
-    // false without a special case.
+    // The ordinal a recorder reports when it wrote nothing - the Job History Policy suppressed the row,
+    // or the batch read back no maximum at all. Below every real ordinal and below every cap, so a
+    // caller's "did anything reach the cap?" test reads false without a special case.
     private const long NoTransitionRecorded = -1;
 
     // Appends one Transition Log entry for a job's resulting state, inside the SAME transaction as the
@@ -1603,13 +1603,21 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    // Appends a BATCH of Transition Log entries. Oracle has no OPENJSON, and each job appears exactly once
-    // per batch, so the insert is still a per-row loop - each entry's ordinal is the per-job MAX(ordinal)+1,
-    // and every write rides the caller's transaction, so the whole batch is atomic with the lease/outcome
-    // write. The prune is NOT per row: the loop learns the highest ordinal it assigned, and a batch where
-    // no job reached the cap - the common shape, since most jobs live two transitions - issues no DELETE at
-    // all. When one did reach it, a single set-based DELETE covers the whole batch; its correlated MAX
-    // no-ops for the jobs still under the cap. Honors the history policy (Off writes nothing).
+    // Appends a BATCH of Transition Log entries in ONE set-based INSERT - the per-row recorder amortized
+    // for the claim and batched-report paths. JSON_TABLE unpacks the payload into a set, exactly as the
+    // SQL Server adapter uses OPENJSON; a job id travels as its ToByteArray hex, because JSON carries no
+    // RAW, and HEXTORAW turns it back. Each entry's ordinal is still the per-job MAX(ordinal)+1: a
+    // correlated scalar sub-query supplies the job's current max (read consistency keeps this statement's
+    // own rows out of it), and ROW_NUMBER over the payload order adds one per repeat, so a job appearing
+    // twice in one batch gets two consecutive ordinals rather than one duplicate. The whole insert rides
+    // the caller's transaction, so it stays atomic with the lease/outcome write.
+    //
+    // Oracle rejects RETURNING on an INSERT ... SELECT, so the highest ordinal the batch assigned comes
+    // back on a following read: after the insert, every job in the batch has its new entry as its own
+    // maximum, so one MAX over the batch's ids IS that number. It buys the prune skip - a batch where no
+    // job reached the cap, the common shape since most jobs live two transitions, issues no DELETE at all.
+    // When one did reach it, a single set-based DELETE covers the whole batch; its correlated MAX no-ops
+    // for the jobs still under the cap. Honors the history policy (Off writes nothing).
     private async Task RecordTransitionsBatchAsync(
         OracleConnection connection, OracleTransaction transaction,
         IReadOnlyList<(Guid JobId, JobState State, int Attempt, string? FailureDetail)> rows,
@@ -1620,18 +1628,61 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             return;
         }
 
-        var maxNewOrdinal = NoTransitionRecorded;
-        foreach (var (jobId, state, attempt, failureDetail) in rows)
+        var payloadRows = new TransitionRow[rows.Count];
+        for (var i = 0; i < rows.Count; i++)
         {
-            var ordinal = await AppendTransitionAsync(
-                connection, transaction, jobId, state, attempt, now, cancellationToken, failureDetail)
-                .ConfigureAwait(false);
-            if (ordinal > maxNewOrdinal)
-            {
-                maxNewOrdinal = ordinal;
-            }
+            // Transitions records the row but never the detail; the full rung clamps and keeps it.
+            var detail = _historyPolicy == JobHistoryPolicy.Transitions
+                ? null
+                : options.Bounds.ClampFailureDetail(rows[i].FailureDetail);
+            payloadRows[i] = new TransitionRow(
+                Convert.ToHexString(rows[i].JobId.ToByteArray()), (int)rows[i].State, rows[i].Attempt, detail);
+        }
+        var payload = JsonSerializer.Serialize(payloadRows);
+
+        // position reads its DEFAULT from a sequence, one draw per row as the row is inserted, so the
+        // row order decides the Positions an Observer walks. ORDER BY the payload order states that
+        // order outright instead of leaving it to fall out of the window function's own sort.
+        await using (var insert = Cmd(
+            """
+            INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
+            SELECT HEXTORAW(d.job_hex),
+                   COALESCE((SELECT MAX(t.ordinal) FROM backwave.job_transitions t
+                             WHERE t.job_id = HEXTORAW(d.job_hex)), -1)
+                     + ROW_NUMBER() OVER (PARTITION BY d.job_hex ORDER BY d.seq),
+                   :now, d.state, d.attempt, d.detail
+            FROM JSON_TABLE(:payload, '$[*]' COLUMNS (
+                     seq FOR ORDINALITY,
+                     job_hex VARCHAR2(32) PATH '$.JobHex',
+                     state NUMBER PATH '$.State',
+                     attempt NUMBER PATH '$.Attempt',
+                     detail CLOB PATH '$.Detail')) d
+            ORDER BY d.seq
+            """,
+            connection, transaction))
+        {
+            insert.Parameters.Add(Clob("payload", payload));
+            insert.Parameters.Add(Tstz("now", now));
+            await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        // Distinct, because a batch may name one job more than once and both statements below want the
+        // job once. The same bind list serves the read and the prune.
+        var ids = (IReadOnlyList<Guid>)[.. rows.Select(row => row.JobId).Distinct()];
+        var idList = ParameterList("j", ids.Count);
+        long maxNewOrdinal;
+        await using (var highest = Cmd(
+            $"SELECT MAX(ordinal) FROM backwave.job_transitions WHERE job_id IN ({idList})",
+            connection, transaction))
+        {
+            AddIdList(highest, "j", ids);
+            var value = await highest.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
+            maxNewOrdinal = value is null or DBNull ? NoTransitionRecorded : Convert.ToInt64(value);
+        }
+
+        // Per-job-life cap: skip the DELETE entirely unless some job's new ordinal reached the cap. Under
+        // the cap the delete can only be a no-op - its bound is MAX(ordinal) - cap, which is negative while
+        // the newest ordinal is below the cap, and no ordinal is negative.
         if (maxNewOrdinal < options.Bounds.MaxTransitionsPerJob)
         {
             return;
@@ -1639,22 +1690,28 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using var prune = Cmd(
             $"""
             DELETE FROM backwave.job_transitions jt
-            WHERE jt.job_id IN ({ParameterList("j", rows.Count)})
+            WHERE jt.job_id IN ({idList})
               AND jt.ordinal <= (
                   SELECT MAX(ordinal) FROM backwave.job_transitions x WHERE x.job_id = jt.job_id
               ) - :cap
             """,
             connection, transaction);
-        AddIdList(prune, "j", [.. rows.Select(row => row.JobId)]);
+        AddIdList(prune, "j", ids);
         prune.Parameters.Add(Int("cap", options.Bounds.MaxTransitionsPerJob));
         await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    // The insert half of recording a transition, shared by the single-row and batch recorders. Returns the
-    // ordinal the row was assigned, so the caller can decide whether the per-job-life cap is even in play,
-    // or NoTransitionRecorded when the Job History Policy suppressed the write. The ordinal comes back on
-    // the insert's own round trip: Oracle rejects RETURNING on an INSERT ... SELECT, so the new ordinal is
-    // a scalar sub-query in the VALUES list and RETURNING reads back what it evaluated to.
+    // The set-valued transition row for the batch INSERT, serialized to JSON and unpacked by JSON_TABLE.
+    // JobHex is the job id in the same byte order every other bind uses (Guid.ToByteArray), because JSON
+    // has no RAW literal.
+    private sealed record TransitionRow(string JobHex, int State, int Attempt, string? Detail);
+
+    // The insert half of recording ONE transition. Returns the ordinal the row was assigned, so the
+    // caller can decide whether the per-job-life cap is even in play, or NoTransitionRecorded when the
+    // Job History Policy suppressed the write. The ordinal comes back on the insert's own round trip:
+    // Oracle rejects RETURNING on an INSERT ... SELECT, so the new ordinal is a scalar sub-query in the
+    // VALUES list and RETURNING reads back what it evaluated to. The batch recorder cannot use that trick
+    // - RETURNING carries no multi-row result - and pays a read of its own instead.
     private async Task<long> AppendTransitionAsync(
         OracleConnection connection, OracleTransaction transaction, Guid jobId, JobState state,
         int attempt, DateTimeOffset now, CancellationToken cancellationToken, string? failureDetail)
