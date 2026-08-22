@@ -141,6 +141,51 @@ public sealed class OracleCustomSchemaTests : IAsyncLifetime
         Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(Job(), now: T0));
     }
 
+    [Fact]
+    public async Task RepeatedTags_UnderCustomSchema_LandOnceAndRaiseNoDuplicateKey()
+    {
+        var store = await FreshCustomSchemaStoreAsync();
+        var tag = JobTag.Keyed("tenant", "acme");
+        var job = Job(JobTags.Empty.WithTag("tenant", "acme"));
+        Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(job, now: T0));
+
+        var record = Assert.Single(await store.ClaimAsync(
+            new ClaimRequest("w1", ["default"], MaxJobs: 8, LeaseDuration: TimeSpan.FromMinutes(1), Now: T0)));
+
+        // The batch tag insert defends against a duplicate key three ways, and only one of them is
+        // schema-sensitive: the IGNORE_ROW_ON_DUPKEY_INDEX hint names its table unqualified, because
+        // Oracle resolves a hint against the name written in the statement rather than against its owner.
+        // A hint that fails to resolve is DROPPED IN SILENCE - no error, no warning - so under a custom
+        // schema a mis-shaped hint leaves the insert with no arbiter and the whole batch fails on
+        // ORA-00001. That failure mode exists only here, which is why this case lives in this class.
+        //
+        // Both duplicate shapes ride in one call. The tag already on the job is the one the anti-join
+        // catches, because the table holds it. The tag named twice inside this payload is the one the
+        // anti-join cannot catch, because the insert reads the table as it stood before the statement.
+        var results = await store.ReportOutcomesAsync(
+            [
+                new OutcomeReport(job.JobId, "w1", record.Attempt, new JobOutcome.Success())
+                {
+                    AddedTags = JobTags.Empty.WithTag("tenant", "acme").WithLabel("nightly"),
+                },
+                new OutcomeReport(job.JobId, "w1", record.Attempt, new JobOutcome.Success())
+                {
+                    AddedTags = JobTags.Empty.WithTag("tenant", "acme").WithLabel("nightly"),
+                },
+            ],
+            now: T0);
+        Assert.All(results, result => Assert.Equal(OutcomeResult.Applied, result.Result));
+
+        // Set semantics: two tags, each once, however many times they were reported.
+        var stored = (await store.GetJobAsync(job.JobId))!.Tags;
+        Assert.Equal(2, stored.Count);
+        Assert.Contains(tag, stored);
+        Assert.Contains(JobTag.Label("nightly"), stored);
+
+        var facet = await store.FacetAsync("tenant");
+        Assert.Contains(facet, f => f is { Value: "acme", Count: 1 });
+    }
+
     public Task InitializeAsync() => Task.CompletedTask;
 
     // Drop the custom-schema user at end of suite so bw_alt and every object it owns do not linger in the

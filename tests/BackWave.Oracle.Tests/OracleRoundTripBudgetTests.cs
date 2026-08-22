@@ -1,3 +1,4 @@
+using BackWave.Core;
 using BackWave.Storage;
 using Oracle.ManagedDataAccess.Client;
 
@@ -50,7 +51,11 @@ public sealed class OracleRoundTripBudgetTests
 
     private static readonly Budget ReportOutcomes = new(
         "ReportOutcomesAsync of 32 succeeded rows",
-        Statements: 35, LobReads: 0, FetchWindowBytes: 0);
+        Statements: 5, LobReads: 0, FetchWindowBytes: 0);
+
+    private static readonly Budget ReportOutcomesWithOutput = new(
+        "ReportOutcomesAsync of 32 succeeded rows, every one carrying job output",
+        Statements: 6, LobReads: 0, FetchWindowBytes: 0);
 
     private static readonly Budget ListJobs = new(
         "ListJobsAsync over a 200-job page of terminal jobs",
@@ -112,11 +117,14 @@ public sealed class OracleRoundTripBudgetTests
 
         // The plain drain: every row succeeded, none carries output or a tag delta, so nothing but the
         // fenced state write and the transition log runs.
-        // 32 fenced updates + 1 batched transition insert + 1 highest-ordinal read + 1 child-latch probe
-        // = 35. As above, no job in this batch is near the cap, so the batch recorder issues no prune
-        // DELETE. The 32 fenced updates are still per row - batching them is issue 0264.
+        // 1 fenced locking read + 1 batched MERGE + 1 batched transition insert + 1 highest-ordinal read
+        // + 1 child-latch probe = 5, independent of batch size. The locking read is the round trip this
+        // path ADDS to recover the per-row Effect-Once verdict a multi-row write cannot report: Oracle
+        // has no OUTPUT and no set-valued RETURNING, so the fence is read under FOR UPDATE and applied
+        // second. It replaces 32 per-row updates, so the batch is 30 statements cheaper than it was.
+        // As above, no job in this batch is near the cap, so the batch recorder issues no prune DELETE.
         // Writing a terminal_cause CLOB is a parameter bind, not a materialization, so no LOB is read,
-        // and no statement on this path pulls a LOB column, so none declares a fetch window either.
+        // and the fenced read pulls no LOB column at all, so it declares no fetch window either.
         var batch = claimed
             .Select(job => new OutcomeReport(job.JobId, "budget-worker", job.Attempt, new JobOutcome.Success()))
             .ToArray();
@@ -131,6 +139,55 @@ public sealed class OracleRoundTripBudgetTests
 
         Assert.All(results, result => Assert.Equal(OutcomeResult.Applied, result.Result));
         AssertBudget(ReportOutcomes, measured);
+    }
+
+    [Fact]
+    public async Task ReportOutcomes_carrying_job_output_costs_one_statement_for_every_blob_together()
+    {
+        var store = await OracleTestDatabase.CreateFreshStoreAsync();
+        for (var i = 0; i < ClaimBatch; i++)
+        {
+            await store.EnqueueAsync(Job(), T0);
+        }
+        var claimed = await store.ClaimAsync(new ClaimRequest("budget-worker", ["budget"], ClaimBatch, Lease, T0));
+        Assert.Equal(ClaimBatch, claimed.Count);
+
+        // The drain budget above plus ONE statement, not plus 32. Output is the one write on this path
+        // that no set-based statement can carry: a blob has no JSON representation, and HEXTORAW caps at
+        // 32,767 bytes - half of MaxOutputBytes - so the ids and the blobs go over as two parallel arrays
+        // under ArrayBindCount instead. The driver sends them in one round trip and the server runs the
+        // UPDATE once per element.
+        //
+        // This budget is the guard on that. A refactor back to one UPDATE per row reads as the obvious
+        // way to write it and passes every functional test in the suite; here it fails, 37 against 6.
+        // Zero LOB reads still: binding a blob out is a parameter cost, never a materialization.
+        var payload = new byte[4_096];
+        Random.Shared.NextBytes(payload);
+        var batch = claimed
+            .Select(job => new OutcomeReport(job.JobId, "budget-worker", job.Attempt, new JobOutcome.Success())
+            {
+                Output = payload,
+            })
+            .ToArray();
+
+        IReadOnlyList<OutcomeReportResult> results;
+        Measured measured;
+        using (var scope = OracleRoundTrips.Observe())
+        {
+            results = await store.ReportOutcomesAsync(batch, T0);
+            measured = Measured.From(scope);
+        }
+
+        Assert.All(results, result => Assert.Equal(OutcomeResult.Applied, result.Result));
+        AssertBudget(ReportOutcomesWithOutput, measured);
+
+        // The batching is only worth pinning if every row actually landed. Array binding runs the
+        // statement once per element server-side, so a bad bind loses rows silently rather than throwing.
+        foreach (var job in claimed)
+        {
+            var stored = await store.GetJobOutputAsync(job.JobId);
+            Assert.Equal(payload, stored?.ToArray());
+        }
     }
 
     [Fact]

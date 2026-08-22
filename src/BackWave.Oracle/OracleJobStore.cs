@@ -386,7 +386,8 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
 
         // Job Tags: the enqueue-time set, in this same transaction so they are visible exactly when the
         // job is - and rolled back with it under Transactional Enqueue.
-        await InsertTagsAsync(connection, transaction, job.JobId, job.Tags, cancellationToken).ConfigureAwait(false);
+        await InsertTagsAsync(connection, transaction, [(job.JobId, job.Tags)], cancellationToken)
+            .ConfigureAwait(false);
 
         // Transition Log: the actual resulting state - Scheduled, AwaitingParent, or Cancelled - at
         // Attempt 0, in this same transaction (atomic with the job row, even under Transactional Enqueue).
@@ -857,7 +858,8 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         // only because the fence held. Effect-Once; set semantics make re-adding an identical Tag a no-op.
         if (addedTags is { Count: > 0 })
         {
-            await InsertTagsAsync(connection, transaction, jobId, addedTags, cancellationToken).ConfigureAwait(false);
+            await InsertTagsAsync(connection, transaction, [(jobId, addedTags)], cancellationToken)
+                .ConfigureAwait(false);
         }
 
         // Transition Log: the resulting state at this Attempt, atomic with the outcome write. Failure
@@ -919,22 +921,15 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
 
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
 
-        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var transaction = await BeginAsync(connection, cancellationToken).ConfigureAwait(false);
-
-        // Oracle has no OPENJSON, so the batch is applied as a per-row fenced UPDATE loop inside ONE
-        // transaction: each row carries its computed target state and per-state columns, and the WHERE
-        // applies the per-(worker, attempt, live-lease) Effect-Once fence to that row alone. A row whose
-        // lease is no longer live changes nothing (StaleLease); a matched row (rowcount > 0) is recorded
-        // by job id. due_time moves only for a retry row (COALESCE keeps it otherwise); cancel_requested
-        // clears only for a Cancelled row (CASE); terminal_at/terminal_cause carry per-row (null for retry).
-        var matched = new Dictionary<Guid, int>();
-        foreach (var report in batch)
+        // The per-row target the fence applies if it holds. Success -> Succeeded (3, terminal now);
+        // Failure with a retry instant -> Scheduled (0, due then, NOT terminal); Failure at the ceiling
+        // -> Dead-Lettered (5); Cancelled -> 4; Unroutable -> Quarantined (6). The cause rides terminal
+        // failures/cancel/unroutable; due rides retry.
+        var count = batch.Count;
+        var targets = new (int State, string? Cause, DateTimeOffset? Due, DateTimeOffset? TerminalAt)[count];
+        for (var i = 0; i < count; i++)
         {
-            // Success -> Succeeded (3, terminal now); Failure with a retry instant -> Scheduled (0, due
-            // then, NOT terminal); Failure at the ceiling -> Dead-Lettered (5); Cancelled -> 4; Unroutable
-            // -> Quarantined (6). The cause rides terminal failures/cancel/unroutable; due rides retry.
-            (int State, string? Cause, DateTimeOffset? Due, DateTimeOffset? TerminalAt) target = report.Outcome switch
+            targets[i] = batch[i].Outcome switch
             {
                 JobOutcome.Success => (3, null, null, now),
                 JobOutcome.Failure { NextDueTime: { } retryAt } => (0, null, retryAt, null),
@@ -943,36 +938,129 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 JobOutcome.Unroutable unroutable => (6, unroutable.Reason, null, now),
                 _ => throw new ArgumentOutOfRangeException(nameof(batch)),
             };
-            await using var update = Cmd(
-                """
-                UPDATE backwave.jobs
-                SET state = :state,
-                    lease_owner = NULL,
-                    lease_expiry = NULL,
-                    terminal_at = :terminalAt,
-                    terminal_cause = :cause,
-                    due_time = COALESCE(:due, due_time),
-                    cancel_requested = CASE WHEN :state = 4 THEN 0 ELSE cancel_requested END
-                WHERE job_id = :id AND state = 2 AND lease_owner = :worker AND attempt = :attempt
-                  AND lease_expiry > :now
-                """,
-                connection, transaction);
-            update.Parameters.Add(Raw("id", report.JobId));
-            update.Parameters.Add(Str("worker", report.WorkerId));
-            update.Parameters.Add(Int("attempt", report.Attempt));
-            update.Parameters.Add(Int("state", target.State));
-            update.Parameters.Add(Clob("cause", target.Cause));
-            update.Parameters.Add(TstzN("due", target.Due));
-            update.Parameters.Add(TstzN("terminalAt", target.TerminalAt));
-            update.Parameters.Add(Tstz("now", now));
-            if (await update.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) > 0)
+        }
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginAsync(connection, cancellationToken).ConfigureAwait(false);
+
+        // Effect-Once, split into a read and a write that a row lock joins. Oracle hands back no per-row
+        // verdict for a multi-row write - there is no OUTPUT, and RETURNING carries no set - so the fence
+        // is READ first and applied second. That read is the one round trip this path ADDS; it replaces
+        // one UPDATE per row.
+        //
+        // FOR UPDATE takes the row locks the per-row UPDATE took and holds them to commit, so state,
+        // lease owner, attempt, and lease expiry cannot move between the verdict and the write. A lease
+        // expiring concurrently either lands before this read, in which case the row does not come back
+        // and the outcome reports StaleLease, or waits behind the lock until this transaction ends. The
+        // batch-wide half of the fence - Leased, lease still live at :now - sits in the read's WHERE, so
+        // a row that is already stale is never locked at all. The per-row half - worker and attempt -
+        // is compared below against the values the locked row returned, because Oracle rejects FOR
+        // UPDATE on any query that mentions JSON_TABLE (ORA-01786) and the two vary per row.
+        //
+        // Moving that per-row half out of the WHERE widens what this read locks. A job still leased to a
+        // DIFFERENT worker satisfies the batch-wide half, so it is locked here and held to commit, where
+        // the old per-row UPDATE matched no row and took no lock at all. The verdict below still refuses
+        // the write, so the only cost is contention - but two nodes reporting overlapping batches can now
+        // block each other, which is why the ids are sorted. A fixed order across nodes turns what would
+        // be a deadlock into a wait.
+        var ids = (IReadOnlyList<Guid>)[.. batch.Select(row => row.JobId).Distinct().Order()];
+        var live = new Dictionary<Guid, (string? Owner, int Attempt)>(ids.Count);
+        await using (var fence = Cmd(
+            $"""
+            SELECT job_id, lease_owner, attempt FROM backwave.jobs
+            WHERE job_id IN ({ParameterList("j", ids.Count)}) AND state = 2 AND lease_expiry > :now
+            FOR UPDATE
+            """,
+            connection, transaction))
+        {
+            AddIdList(fence, "j", ids);
+            fence.Parameters.Add(Tstz("now", now));
+            await using var reader = (OracleDataReader)await fence
+                .ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
-                matched[report.JobId] = target.State;
+                live[ReadGuid(reader, 0)] = (reader.IsDBNull(1) ? null : reader.GetString(1), reader.GetInt32(2));
             }
         }
 
+        // The verdict, per batch row, against the locked values. A job named twice in one batch resolves
+        // as the per-row loop resolved it: the FIRST matching row wins the write, and every row naming
+        // that job reports Applied.
+        var matched = new Dictionary<Guid, int>(ids.Count);
+        var writes = new List<OutcomeRow>(ids.Count);
+        for (var i = 0; i < count; i++)
+        {
+            var report = batch[i];
+            if (!live.TryGetValue(report.JobId, out var leased)
+                || !string.Equals(leased.Owner, report.WorkerId, StringComparison.Ordinal)
+                || leased.Attempt != report.Attempt
+                || !matched.TryAdd(report.JobId, targets[i].State))
+            {
+                continue;
+            }
+            writes.Add(new OutcomeRow(
+                Convert.ToHexString(report.JobId.ToByteArray()), report.WorkerId, report.Attempt,
+                targets[i].State, targets[i].Cause, Iso(targets[i].Due), Iso(targets[i].TerminalAt)));
+        }
+
+        // One set-based write over the matched rows. MERGE rather than an updatable join, because Oracle
+        // cannot key-preserve a join to JSON_TABLE; the USING set carries each row's target state and
+        // per-state columns. The fence is repeated in the WHEN MATCHED filter, so the database still
+        // authorizes every write - the verdict above only decides what the caller is told. due_time
+        // moves only for a retry row (COALESCE keeps it otherwise); cancel_requested clears only for a
+        // Cancelled row (CASE); terminal_at and terminal_cause carry per row and are null for a retry.
+        // Both instants travel as ISO text under an explicit format. A JSON_TABLE column declared
+        // TIMESTAMP WITH TIME ZONE takes second precision 6 and rounds away the seventh digit, which is
+        // a digit this store hands back; TO_TIMESTAMP_TZ over the text keeps all of them.
+        if (writes.Count > 0)
+        {
+            await using var apply = Cmd(
+                """
+                MERGE INTO backwave.jobs j
+                USING (SELECT HEXTORAW(d.job_hex) AS job_id, d.worker, d.attempt, d.state, d.cause,
+                              TO_TIMESTAMP_TZ(d.due, :fmt) AS due,
+                              TO_TIMESTAMP_TZ(d.terminal_at, :fmt) AS terminal_at
+                       FROM JSON_TABLE(:payload, '$[*]' COLUMNS (
+                                job_hex VARCHAR2(32) PATH '$.JobHex',
+                                worker VARCHAR2(4000) PATH '$.WorkerId',
+                                attempt NUMBER PATH '$.Attempt',
+                                state NUMBER PATH '$.State',
+                                cause CLOB PATH '$.Cause',
+                                due VARCHAR2(40) PATH '$.Due',
+                                terminal_at VARCHAR2(40) PATH '$.TerminalAt')) d) d
+                ON (j.job_id = d.job_id)
+                WHEN MATCHED THEN UPDATE SET
+                    j.state = d.state,
+                    j.lease_owner = NULL,
+                    j.lease_expiry = NULL,
+                    j.terminal_at = d.terminal_at,
+                    j.terminal_cause = d.cause,
+                    j.due_time = COALESCE(d.due, j.due_time),
+                    j.cancel_requested = CASE WHEN d.state = 4 THEN 0 ELSE j.cancel_requested END
+                WHERE j.state = 2 AND j.lease_owner = d.worker AND j.attempt = d.attempt
+                  AND j.lease_expiry > :now
+                """,
+                connection, transaction);
+            apply.Parameters.Add(Clob("payload", JsonSerializer.Serialize(writes)));
+            apply.Parameters.Add(Str("fmt", IsoTimestampFormat));
+            apply.Parameters.Add(Tstz("now", now));
+            await apply.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         // Output and Tag deltas land ONLY for matched rows. Output persists only on a Success outcome;
-        // Tags union onto the job's existing tags (set semantics). Both ride this same fenced transaction.
+        // Tags union onto the job's existing tags (set semantics). Both ride this same fenced
+        // transaction, and both cost one statement for the whole batch.
+        //
+        // Output cannot batch the way every other set-based write here does: a blob has no place in the
+        // JSON payload - JSON carries no binary type, and HEXTORAW caps at 32767 bytes, below
+        // MaxOutputBytes - so there is no set for a MERGE to read. Array binding is the other batching
+        // mechanism the driver offers and it has no such limit: the ids and the blobs travel as two
+        // parallel arrays, the driver sends them in ONE round trip, and the server runs the UPDATE once
+        // per element. A job named twice in one batch keeps the per-row loop's outcome, because the
+        // elements execute in array order and the last write wins either way.
+        var outputIds = new List<Guid>();
+        var outputBlobs = new List<ReadOnlyMemory<byte>>();
+        var tagRows = new List<(Guid JobId, JobTags Tags)>();
         foreach (var row in batch)
         {
             if (!matched.ContainsKey(row.JobId))
@@ -981,17 +1069,24 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             }
             if (row.Outcome is JobOutcome.Success && row.Output is { } blob)
             {
-                await using var setOutput = Cmd(
-                    "UPDATE backwave.jobs SET output = :output WHERE job_id = :id", connection, transaction);
-                setOutput.Parameters.Add(Raw("id", row.JobId));
-                setOutput.Parameters.Add(Blob("output", blob));
-                await setOutput.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+                outputIds.Add(row.JobId);
+                outputBlobs.Add(blob);
             }
             if (row.AddedTags is { Count: > 0 } addedTags)
             {
-                await InsertTagsAsync(connection, transaction, row.JobId, addedTags, cancellationToken).ConfigureAwait(false);
+                tagRows.Add((row.JobId, addedTags));
             }
         }
+        if (outputIds.Count > 0)
+        {
+            await using var setOutput = Cmd(
+                "UPDATE backwave.jobs SET output = :output WHERE job_id = :id", connection, transaction);
+            setOutput.ArrayBindCount = outputIds.Count;
+            setOutput.Parameters.Add(RawArray("id", outputIds));
+            setOutput.Parameters.Add(BlobArray("output", outputBlobs));
+            await setOutput.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
+        await InsertTagsAsync(connection, transaction, tagRows, cancellationToken).ConfigureAwait(false);
 
         // Transition Log: one entry per matched row for its resulting state at this Attempt. Failure
         // Detail rides only a failing transition; every other outcome records null. Honors the history
@@ -1048,7 +1143,6 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
         // One result per input row, in input order, keyed by job id: matched => Applied, else StaleLease.
-        var count = batch.Count;
         var results = new OutcomeReportResult[count];
         for (var i = 0; i < count; i++)
         {
@@ -1058,6 +1152,19 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         }
         return results;
     }
+
+    // The set-valued outcome row for the batched MERGE, serialized to JSON and unpacked by JSON_TABLE.
+    // JobHex is the job id in the same byte order every other bind uses (Guid.ToByteArray), because JSON
+    // has no RAW literal. Due and TerminalAt are round-trip ISO text, which the statement converts under
+    // an explicit format rather than as a JSON timestamp.
+    private sealed record OutcomeRow(
+        string JobHex, string WorkerId, int Attempt, int State, string? Cause, string? Due, string? TerminalAt);
+
+    // The Oracle picture for the round-trip ("O") format DateTimeOffset renders, normalized to UTC.
+    private const string IsoTimestampFormat = "YYYY-MM-DD\"T\"HH24:MI:SS.FFTZH:TZM";
+
+    private static string? Iso(DateTimeOffset? instant)
+        => instant is { } value ? $"{value.ToUniversalTime():O}" : null;
 
     /// <summary>
     /// The latch, inside the same transaction as the terminal transition. Deleting the edge claims it:
@@ -3295,44 +3402,78 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
     // ── Job Tags ──────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Inserts a Tag set into job_tags within the caller's transaction. Tags are already a set upstream
-    /// (JobTags collapses duplicates), so the insert is idempotent-by-construction: a duplicate
-    /// (job_id, key, value) converges to the existing row rather than throwing. A Label's key is the
-    /// empty-string sentinel; Oracle folds an empty string to NULL, and key/value are NOT NULL primary-key
-    /// columns, so an empty key or value is encoded to a CHR(1) sentinel on write and decoded back on read.
+    /// Inserts Tag sets into job_tags within the caller's transaction, one statement for the whole batch.
+    /// Tags are already a set upstream (JobTags collapses duplicates), and the insert is
+    /// idempotent-by-construction: IGNORE_ROW_ON_DUPKEY_INDEX skips a row whose (job_id, key, value)
+    /// already exists instead of raising, so a duplicate converges to the existing row - including
+    /// against a concurrent writer holding that key uncommitted, which the insert waits behind and then
+    /// converges on. A Label's key is the empty-string sentinel; Oracle folds an empty string to NULL,
+    /// and key/value are NOT NULL primary-key columns, so an empty key or value is encoded to a CHR(1)
+    /// sentinel on write and decoded back on read.
     /// </summary>
     private async Task InsertTagsAsync(
-        OracleConnection connection, OracleTransaction transaction, Guid jobId, JobTags tags,
-        CancellationToken cancellationToken)
+        OracleConnection connection, OracleTransaction transaction,
+        IReadOnlyList<(Guid JobId, JobTags Tags)> rows, CancellationToken cancellationToken)
     {
-        foreach (var tag in tags)
+        // Distinct across the WHOLE payload, not just within one job's set. A report batch may name the
+        // same job twice, and both entries contribute their tag delta, so one (job_id, key, value) can
+        // reach this list more than once. The anti-join below cannot catch that: the insert reads the
+        // table as it stood before the statement, so a repeat inside the payload is invisible to it and
+        // would land on the primary key.
+        var payloadRows = new List<TagRow>();
+        var seen = new HashSet<TagRow>();
+        foreach (var (jobId, tags) in rows)
         {
-            // A Tag is being written on THIS process, so latch the tags-in-use signal: every later claim
-            // now hydrates without waiting for the periodic probe to notice.
-            _tagsInUse = true;
-            await using var insert = Cmd(
-                """
-                INSERT INTO backwave.job_tags (job_id, key, value)
-                SELECT :id, :key, :value FROM dual
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM backwave.job_tags WHERE job_id = :id AND key = :key AND value = :value)
-                """,
-                connection, transaction);
-            insert.Parameters.Add(Raw("id", jobId));
-            insert.Parameters.Add(Str("key", EncodeTag(tag.Key)));
-            insert.Parameters.Add(Str("value", EncodeTag(tag.Value)));
-            try
+            var jobHex = Convert.ToHexString(jobId.ToByteArray());
+            foreach (var tag in tags)
             {
-                await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OracleException exception) when (IsDuplicate(exception))
-            {
-                // The unlocked NOT EXISTS does not serialize two concurrent writers of the same
-                // (job_id, key, value): both can pass it and the loser then hits the primary key. The key
-                // is the arbiter - swallowing it converges idempotently, exactly as the jobs-insert catch does.
+                var candidate = new TagRow(jobHex, EncodeTag(tag.Key), EncodeTag(tag.Value));
+                if (seen.Add(candidate))
+                {
+                    payloadRows.Add(candidate);
+                }
             }
         }
+        if (payloadRows.Count == 0)
+        {
+            return;
+        }
+
+        // A Tag is being written on THIS process, so latch the tags-in-use signal: every later claim
+        // now hydrates without waiting for the periodic probe to notice.
+        _tagsInUse = true;
+
+        // Two filters, because neither alone is enough. NOT EXISTS removes every duplicate this
+        // transaction can SEE, which is the ordinary case - re-reporting a tag a job already carries -
+        // and it removes it without depending on a hint. The hint is left as the arbiter for the one
+        // case the anti-join cannot serialize: a concurrent writer holding the same key uncommitted,
+        // which both statements pass and one then loses on. Restoring the anti-join matters more here
+        // than it did per row, because a raised ORA-00001 now fails the WHOLE batch rather than one tag,
+        // and a hint that fails to resolve is dropped by Oracle in silence.
+        //
+        // The hint names the table unqualified: Oracle resolves a hint against the table name in the
+        // statement, not against its owner, so this holds under a custom schema too.
+        await using var insert = Cmd(
+            """
+            INSERT /*+ IGNORE_ROW_ON_DUPKEY_INDEX(job_tags (job_id, key, value)) */
+            INTO backwave.job_tags (job_id, key, value)
+            SELECT HEXTORAW(d.job_hex), d.tag_key, d.tag_value
+            FROM JSON_TABLE(:payload, '$[*]' COLUMNS (
+                     job_hex VARCHAR2(32) PATH '$.JobHex',
+                     tag_key VARCHAR2(1024) PATH '$.Key',
+                     tag_value VARCHAR2(1024) PATH '$.Value')) d
+            WHERE NOT EXISTS (
+                SELECT 1 FROM backwave.job_tags t
+                WHERE t.job_id = HEXTORAW(d.job_hex) AND t.key = d.tag_key AND t.value = d.tag_value)
+            """,
+            connection, transaction);
+        insert.Parameters.Add(Clob("payload", JsonSerializer.Serialize(payloadRows)));
+        await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    // The set-valued tag row for the batch INSERT, serialized to JSON and unpacked by JSON_TABLE. Key
+    // and Value are already encoded, so the empty-string sentinel never reaches Oracle as a NULL.
+    private sealed record TagRow(string JobHex, string Key, string Value);
 
     // Reads the Tags for a batch of jobs in one round-trip (job_id IN (...)) - never N+1. Reconstructs each
     // set with the empty-key => Label discriminator, decoding the CHR(1) sentinel back to empty. Jobs with
@@ -3581,6 +3722,14 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
 
     private static OracleParameter Blob(string name, ReadOnlyMemory<byte> value)
         => new(name, OracleDbType.Blob) { Value = value.ToArray() };
+
+    // The array-bound forms of the two binds above, for a statement run under ArrayBindCount. Size is the
+    // cap on ONE element rather than on the array, which is why the RAW form still declares 16.
+    private static OracleParameter RawArray(string name, IReadOnlyList<Guid> values)
+        => new(name, OracleDbType.Raw) { Size = 16, Value = values.Select(value => value.ToByteArray()).ToArray() };
+
+    private static OracleParameter BlobArray(string name, IReadOnlyList<ReadOnlyMemory<byte>> values)
+        => new(name, OracleDbType.Blob) { Value = values.Select(value => value.ToArray()).ToArray() };
 
     private static OracleParameter Int(string name, int value)
         => new(name, OracleDbType.Int32) { Value = value };
