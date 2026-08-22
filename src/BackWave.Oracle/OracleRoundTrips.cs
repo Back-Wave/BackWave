@@ -1,0 +1,126 @@
+using Oracle.ManagedDataAccess.Client;
+
+namespace BackWave.Oracle;
+
+// Counts what an Oracle store operation actually costs the network: the statements it executes and the
+// LOB values it materializes. Both are per-round-trip on this driver - ODP.NET sends one statement per
+// round trip, and a LOB column left at the default InitialLOBFetchSize of 0 arrives as a locator whose
+// value costs another - so a count here is a latency figure that needs no clock and no network. That
+// matters because the cost this measures is invisible to a co-located test container: a per-row round
+// trip and a batched one are indistinguishable at sub-millisecond latency, and only a count separates
+// them. The adapter's own suite pins the numbers so an optimization has to move them on purpose.
+//
+// This is instrumentation, not a feature: it is internal, reached only through [InternalsVisibleTo], and
+// it is inert unless a test is observing. Every hook reads one volatile int and returns, so an
+// unobserved process allocates nothing, executes no extra statement, and touches no AsyncLocal.
+internal static class OracleRoundTrips
+{
+    // How many scopes are live anywhere in the process. Checked FIRST by every hook, before the
+    // AsyncLocal lookup, which is the only part of the path with real cost. Production never observes,
+    // so production never pays more than this read.
+    private static int _observers;
+
+    // The scope belonging to the async flow in flight. An AsyncLocal rather than a static counter
+    // because a budget belongs to ONE operation: ExecutionContext carries the scope down through every
+    // await inside the store call and no further, so work on a detached background task - the Wake-Up
+    // Hint pump's own session, say - can never contribute to the number under test.
+    private static readonly AsyncLocal<OracleRoundTripScope?> Flow = new();
+
+    // Begins observing this async flow. Dispose the returned scope to stop; the counts stay readable
+    // afterwards. Scopes nest (an inner scope shadows the outer one) so a helper can measure a sub-step.
+    internal static OracleRoundTripScope Observe()
+    {
+        var scope = new OracleRoundTripScope(Flow.Value);
+        Flow.Value = scope;
+        Interlocked.Increment(ref _observers);
+        return scope;
+    }
+
+    internal static void EndScope(OracleRoundTripScope scope)
+    {
+        Flow.Value = scope.Outer;
+        Interlocked.Decrement(ref _observers);
+    }
+
+    // One statement left for the server. Counted at EXECUTION, never at construction: a round trip
+    // happens when a statement runs, and OracleJobStore.Cmd - the one place a command is BUILT - is not
+    // the one place a command RUNS (the dynamic-SQL query builders assemble theirs inline, and a command
+    // may be built and then never executed, or executed more than once). Counted BEFORE the call, so a
+    // statement that comes back as an ORA- error still counts: it made the trip.
+    internal static void CountStatement()
+    {
+        if (Volatile.Read(ref _observers) == 0)
+        {
+            return;
+        }
+        Flow.Value?.AddStatement();
+    }
+
+    // One LOB value pulled across the wire. Counts READS only - the write side binds a Clob/Blob
+    // parameter, which is a parameter cost rather than a materialization, and it is the read side that
+    // the default zero LOB fetch size penalizes. A NULL LOB is not a read: nothing is fetched, which is
+    // exactly why a page of TERMINAL jobs (non-null terminal_cause) costs so much more than a live one.
+    internal static void CountLobRead()
+    {
+        if (Volatile.Read(ref _observers) == 0)
+        {
+            return;
+        }
+        Flow.Value?.AddLobRead();
+    }
+
+    // The adapter's execution entry points. Every ExecuteXxxAsync in the store goes through one of these
+    // - grep for a bare `.ExecuteNonQueryAsync(` in OracleJobStore.cs and the only hits should be the
+    // three wrappers below plus the Wake-Up Hint pump, which is deliberately outside the count: its
+    // session parks on DBMS_ALERT.WAITONE on its own task and belongs to no operation.
+    internal static Task<int> ExecuteNonQueryCountedAsync(
+        this OracleCommand command, CancellationToken cancellationToken)
+    {
+        CountStatement();
+        return command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    internal static Task<OracleDataReader> ExecuteReaderCountedAsync(
+        this OracleCommand command, CancellationToken cancellationToken)
+    {
+        CountStatement();
+        return command.ExecuteReaderAsync(cancellationToken);
+    }
+
+    internal static Task<object?> ExecuteScalarCountedAsync(
+        this OracleCommand command, CancellationToken cancellationToken)
+    {
+        CountStatement();
+        return command.ExecuteScalarAsync(cancellationToken);
+    }
+}
+
+// The counts an observed async flow accumulated. Mutated through Interlocked because the store is free
+// to fan a single operation across tasks; reading is only meaningful once the work being measured has
+// completed, and the counts remain readable after Dispose so a test can assert outside the using block.
+internal sealed class OracleRoundTripScope(OracleRoundTripScope? outer) : IDisposable
+{
+    private int _statements;
+    private int _lobReads;
+    private bool _disposed;
+
+    internal OracleRoundTripScope? Outer { get; } = outer;
+
+    internal int Statements => Volatile.Read(ref _statements);
+
+    internal int LobReads => Volatile.Read(ref _lobReads);
+
+    internal void AddStatement() => Interlocked.Increment(ref _statements);
+
+    internal void AddLobRead() => Interlocked.Increment(ref _lobReads);
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return; // a second Dispose must not unbalance the observer count
+        }
+        _disposed = true;
+        OracleRoundTrips.EndScope(this);
+    }
+}

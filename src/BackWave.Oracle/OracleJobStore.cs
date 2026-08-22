@@ -250,7 +250,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 await using var parent = Cmd(
                     "SELECT state FROM backwave.jobs WHERE job_id = :id FOR UPDATE", connection, transaction);
                 parent.Parameters.Add(Raw("id", parentId));
-                await using var reader = (OracleDataReader)await parent.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = (OracleDataReader)await parent.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     states[parentId] = (JobState)reader.GetInt32(0);
@@ -306,7 +306,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
 
         try
         {
-            if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 0)
+            if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) == 0)
             {
                 return EnqueueResult.Duplicate;
             }
@@ -328,7 +328,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 connection, transaction);
             edge.Parameters.Add(Raw("parent", parentId));
             edge.Parameters.Add(Raw("child", job.JobId));
-            await edge.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await edge.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // Job Tags: the enqueue-time set, in this same transaction so they are visible exactly when the
@@ -365,7 +365,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             await using var signal = Cmd("BEGIN DBMS_ALERT.SIGNAL(:name, :msg); END;", connection, transaction);
             signal.Parameters.Add(Str("name", _schema.HintAlertName));
             signal.Parameters.Add(Str("msg", queue));
-            await signal.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await signal.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception)
         {
@@ -459,7 +459,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     connection, transaction))
                 {
                     limit.Parameters.Add(Str("queue", queue));
-                    await using var reader = await limit.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                    await using var reader = await limit.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     {
                         configured = reader.IsDBNull(0) ? null : reader.GetInt32(0);
@@ -479,7 +479,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     "SELECT count(*) FROM backwave.jobs WHERE queue = :queue AND state = 2",
                     connection, transaction);
                 leased.Parameters.Add(Str("queue", queue));
-                var inUse = Convert.ToInt32(await leased.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
+                var inUse = Convert.ToInt32(await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false));
                 slots = limitValue - inUse;
             }
             if (slots <= 0)
@@ -514,7 +514,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 claim.Parameters.Add(Str("queue", queue));
                 claim.Parameters.Add(Tstz("now", request.Now));
                 claim.Parameters.Add(Int("take", take));
-                await using var reader = (OracleDataReader)await claim.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = (OracleDataReader)await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     queueClaims.Add(ReadJob(reader));
@@ -535,7 +535,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     update.Parameters.Add(Str("worker", request.WorkerId));
                     update.Parameters.Add(Tstz("expiry", expiry));
                     AddIdList(update, "j", [.. queueClaims.Select(j => j.JobId)]);
-                    await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await update.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 }
                 // The read saw the pre-lease row; reflect the lease in memory to match the committed state.
                 queueClaims = [.. queueClaims.Select(j => j with
@@ -600,7 +600,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         {
             cmd.Parameters.Add(Str($"q{i}", request.Queues[i]));
         }
-        await using var reader = (OracleDataReader)await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = (OracleDataReader)await cmd.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             return null; // nothing scheduled in any served, non-paused queue
@@ -627,7 +627,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         }
         Interlocked.Exchange(ref _tagsProbeTicks, Environment.TickCount64);
         await using var probe = Cmd("SELECT 1 FROM backwave.job_tags FETCH FIRST 1 ROW ONLY", connection);
-        var present = await probe.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
+        var present = await probe.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not null;
         if (present)
         {
             _tagsInUse = true;
@@ -683,7 +683,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             ensure.Parameters.Add(Str("queue", queue));
             try
             {
-                await ensure.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await ensure.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (OracleException exception) when (IsDuplicate(exception))
             {
@@ -694,7 +694,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using var applock = Cmd(
             "SELECT queue FROM backwave.queue_locks WHERE queue = :queue FOR UPDATE", connection, transaction);
         applock.Parameters.Add(Str("queue", queue));
-        await using var reader = await applock.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await applock.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
         }
@@ -793,7 +793,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         update.Parameters.Add(Tstz("now", now));
         configure(update);
 
-        if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 0)
+        if (await update.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) == 0)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return OutcomeResult.StaleLease; // the (workerId, attempt) fence
@@ -912,7 +912,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             update.Parameters.Add(TstzN("due", target.Due));
             update.Parameters.Add(TstzN("terminalAt", target.TerminalAt));
             update.Parameters.Add(Tstz("now", now));
-            if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0)
+            if (await update.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) > 0)
             {
                 matched[report.JobId] = target.State;
             }
@@ -932,7 +932,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     "UPDATE backwave.jobs SET output = :output WHERE job_id = :id", connection, transaction);
                 setOutput.Parameters.Add(Raw("id", row.JobId));
                 setOutput.Parameters.Add(Blob("output", blob));
-                await setOutput.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await setOutput.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
             if (row.AddedTags is { Count: > 0 } addedTags)
             {
@@ -977,7 +977,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 connection, transaction))
             {
                 AddIdList(withChildren, "p", terminalIds);
-                await using var reader = (OracleDataReader)await withChildren.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = (OracleDataReader)await withChildren.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     parents.Add(ReadGuid(reader, 0));
@@ -1029,7 +1029,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 "SELECT child_id FROM backwave.job_parents WHERE parent_id = :parent", connection, transaction))
             {
                 edges.Parameters.Add(Raw("parent", currentParent));
-                await using var reader = (OracleDataReader)await edges.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = (OracleDataReader)await edges.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     children.Add(ReadGuid(reader, 0));
@@ -1039,7 +1039,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 "DELETE FROM backwave.job_parents WHERE parent_id = :parent", connection, transaction))
             {
                 delete.Parameters.Add(Raw("parent", currentParent));
-                await delete.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await delete.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
 
             // Lock the child rows in a single deterministic id order - the same order the enqueue path
@@ -1054,7 +1054,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     connection, transaction))
                 {
                     child.Parameters.Add(Raw("id", childId));
-                    await using var reader = await child.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                    await using var reader = await child.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     {
                         continue;
@@ -1079,7 +1079,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     cancel.Parameters.Add(Raw("id", childId));
                     cancel.Parameters.Add(Tstz("now", now));
                     cancel.Parameters.Add(Clob("cause", ParentFailureCause(currentState)));
-                    await cancel.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await cancel.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                     await RecordTransitionAsync(connection, transaction, childId, JobState.Cancelled, childAttempt, now, cancellationToken)
                         .ConfigureAwait(false);
                     work.Push((childId, JobState.Cancelled)); // cascade
@@ -1101,7 +1101,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 {
                     resolve.Parameters.Add(Tstz("now", now));
                 }
-                await resolve.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await resolve.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 // Only the latch RELEASE (last parent terminal -> Scheduled) is a state change worth a
                 // transition; a mere decrement keeps the child in AwaitingParent.
                 if (remaining - 1 <= 0)
@@ -1147,7 +1147,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             AddIdList(select, "p", jobIds);
             select.Parameters.Add(Str("worker", workerId));
             select.Parameters.Add(Tstz("now", now));
-            await using var reader = (OracleDataReader)await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 renewed[ReadGuid(reader, 0)] = reader.GetInt32(1) != 0;
@@ -1161,7 +1161,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 connection, transaction);
             extend.Parameters.Add(Tstz("expiry", now + leaseDuration));
             AddIdList(extend, "r", [.. renewed.Keys]);
-            await extend.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await extend.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
@@ -1231,7 +1231,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             {
                 select.Parameters.Add(Str($"q{i}", queues[i]));
             }
-            await using var reader = (OracleDataReader)await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 expired.Add((ReadGuid(reader, 0), reader.GetInt32(1)));
@@ -1263,7 +1263,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 connection, transaction);
             reschedule.Parameters.Add(Raw("id", jobId));
             reschedule.Parameters.Add(Tstz("due", due));
-            await reschedule.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await reschedule.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         if (deadLettered.Count > 0)
@@ -1280,7 +1280,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 deadLetter.Parameters.Add(Raw("id", jobId));
                 deadLetter.Parameters.Add(Tstz("now", now));
                 deadLetter.Parameters.Add(Clob("cause", cause));
-                await deadLetter.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
 
             // Crash after the dead-letter write, before the latch cascade: rollback must leave the parent
@@ -1297,7 +1297,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 connection, transaction))
             {
                 AddIdList(withChildren, "p", deadIds);
-                await using var reader = (OracleDataReader)await withChildren.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = (OracleDataReader)await withChildren.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     parents.Add(ReadGuid(reader, 0));
@@ -1342,7 +1342,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             "SELECT state, attempt FROM backwave.jobs WHERE job_id = :id FOR UPDATE", connection, transaction))
         {
             current.Parameters.Add(Raw("id", jobId));
-            await using var reader = await current.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await current.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 return CancelResult.NotCancellable;
@@ -1360,7 +1360,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     cancel.Parameters.Add(Raw("id", jobId));
                     cancel.Parameters.Add(Tstz("now", now));
                     cancel.Parameters.Add(Clob("actor", actor));
-                    await cancel.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await cancel.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 }
                 // Transition Log: the immediate Cancelled state, atomic with the cancel.
                 await RecordTransitionAsync(connection, transaction, jobId, JobState.Cancelled, attempt, now, cancellationToken)
@@ -1377,7 +1377,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     "UPDATE backwave.jobs SET cancel_requested = 1 WHERE job_id = :id", connection, transaction))
                 {
                     request.Parameters.Add(Raw("id", jobId));
-                    await request.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await request.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 }
                 await AppendAuditAsync(connection, transaction, actor, OperatorAction.Cancel, jobId.ToString(), now, cancellationToken)
                     .ConfigureAwait(false);
@@ -1412,7 +1412,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             connection, transaction);
         update.Parameters.Add(Raw("id", jobId));
         update.Parameters.Add(Tstz("now", now));
-        if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 0)
+        if (await update.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) == 0)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return RequeueResult.NotRequeueable;
@@ -1459,7 +1459,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         {
             upsert.Parameters.Add(Str("queue", queue));
             upsert.Parameters.Add(Int("paused", paused ? 1 : 0));
-            await upsert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await upsert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         await AppendAuditAsync(connection, transaction, actor, action, queue, now, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -1480,7 +1480,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             "SELECT wire_name, payload, queue FROM backwave.schedules WHERE schedule_id = :id", connection, transaction))
         {
             select.Parameters.Add(Str("id", scheduleId));
-            await using var reader = (OracleDataReader)await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 schedule = (reader.GetString(0), ReadBytes(reader, 1), reader.GetString(2));
@@ -1509,7 +1509,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             insert.Parameters.Add(Str("queue", schedule.Value.Queue));
             insert.Parameters.Add(Tstz("due", now));
             insert.Parameters.Add(Str("scheduleId", scheduleId));
-            if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0)
+            if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) > 0)
             {
                 // Transition Log: the minted instance's first Scheduled state, at Attempt 0.
                 await RecordTransitionAsync(connection, transaction, mintedId,
@@ -1535,7 +1535,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         command.Parameters.Add(Str("target", target));
 
         var records = new List<OperatorAuditRecord>();
-        await using var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             records.Add(new OperatorAuditRecord(
@@ -1560,7 +1560,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         audit.Parameters.Add(Int("action", (int)action));
         audit.Parameters.Add(Str("target", target));
         audit.Parameters.Add(Tstz("now", now));
-        await audit.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await audit.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // Appends one Transition Log entry for a job's resulting state, inside the SAME transaction as the
@@ -1598,7 +1598,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             insert.Parameters.Add(Int("state", (int)state));
             insert.Parameters.Add(Int("attempt", attempt));
             insert.Parameters.Add(Clob("detail", options.Bounds.ClampFailureDetail(failureDetail)));
-            await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // Per-job-life cap: keep only the newest MaxTransitionsPerJob entries, dropping oldest.
@@ -1612,7 +1612,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             connection, transaction);
         prune.Parameters.Add(Raw("id", jobId));
         prune.Parameters.Add(Int("cap", options.Bounds.MaxTransitionsPerJob));
-        await prune.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // Appends a BATCH of Transition Log entries. Oracle has no OPENJSON, and each job appears exactly once
@@ -1672,7 +1672,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         {
             try
             {
-                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 break;
             }
             catch (OracleException exception) when (IsDuplicate(exception) && attempt < 5)
@@ -1695,7 +1695,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using var command = Cmd(
             "DELETE FROM backwave.schedules WHERE schedule_id = :id", connection, transaction);
         command.Parameters.Add(Str("id", scheduleId));
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -1721,7 +1721,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             connection);
 
         var snapshots = new List<ScheduleSnapshot>();
-        await using var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             snapshots.Add(new ScheduleSnapshot(
@@ -1736,7 +1736,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     TimeZoneId = reader.IsDBNull(5) ? null : reader.GetString(5),
                     CatchUp = (CatchUpPolicy)reader.GetInt32(6),
                     NoOverlap = reader.GetInt32(7) != 0,
-                    SkippedTicks = ParseSkippedTicks(reader.GetString(8)),
+                    SkippedTicks = ParseSkippedTicks(ReadText(reader, 8)),
                 },
                 HasLiveInstance: reader.GetInt32(9) == 1));
         }
@@ -1766,7 +1766,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 fence.Parameters.Add(Str("id", decision.ScheduleId));
                 fence.Parameters.Add(Tstz("newCursor", decision.NewCursor));
                 fence.Parameters.Add(Tstz("expected", decision.ExpectedCursor));
-                fenced = await fence.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                fenced = await fence.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
             if (fenced == 0)
             {
@@ -1780,9 +1780,9 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 connection, transaction))
             {
                 select.Parameters.Add(Str("id", decision.ScheduleId));
-                await using var reader = (OracleDataReader)await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = (OracleDataReader)await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
-                schedule = (reader.GetString(0), ReadBytes(reader, 1), reader.GetString(2), reader.GetString(3));
+                schedule = (reader.GetString(0), ReadBytes(reader, 1), reader.GetString(2), ReadText(reader, 3));
             }
 
             if (decision.SkippedTicks.Count > 0)
@@ -1796,7 +1796,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     connection, transaction);
                 record.Parameters.Add(Str("id", decision.ScheduleId));
                 record.Parameters.Add(Clob("ticks", RenderSkippedTicks(combined)));
-                await record.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await record.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
 
             // Crash after the cursor advanced, before the instances are minted: rollback must restore the
@@ -1820,7 +1820,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 insert.Parameters.Add(Str("queue", schedule.Queue));
                 insert.Parameters.Add(Tstz("due", tick));
                 insert.Parameters.Add(Str("scheduleId", decision.ScheduleId));
-                if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0)
+                if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) > 0)
                 {
                     mintedForDecision++;
                     // MintDue carries no `now`; the tick (the instance's due instant) is the deterministic
@@ -1866,7 +1866,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         {
             command.Parameters.Add(Str("queue", queue));
             command.Parameters.Add(IntN("limit", limit));
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         await AppendAuditAsync(
             connection, transaction, actor, OperatorAction.SetConcurrencyLimit, queue, now, cancellationToken).ConfigureAwait(false);
@@ -1884,7 +1884,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using var command = Cmd($"SELECT {JobColumns} FROM backwave.jobs WHERE job_id = :id", connection);
         command.Parameters.Add(Raw("id", jobId));
         JobRecord? record;
-        await using (var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        await using (var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
         {
             record = await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadJob(reader) : null;
         }
@@ -1906,7 +1906,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Cmd("SELECT output FROM backwave.jobs WHERE job_id = :id", connection);
         command.Parameters.Add(Raw("id", jobId));
-        await using var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false) || reader.IsDBNull(0))
         {
             return null;
@@ -1932,7 +1932,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         command.Parameters.Add(Raw("id", jobId));
 
         var transitions = new List<JobTransition>();
-        await using var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             transitions.Add(new JobTransition(
@@ -1940,7 +1940,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 ReadTstz(reader, 1),
                 (JobState)reader.GetInt32(2),
                 reader.GetInt32(3),
-                reader.IsDBNull(4) ? null : reader.GetString(4)));
+                ReadTextOrNull(reader, 4)));
         }
         return transitions;
     }
@@ -1972,7 +1972,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         command.Parameters.Add(Int("take", Math.Min(query.MaxResults, options.Bounds.MaxMonitorPageSize)));
 
         var jobs = new List<JobRecord>();
-        await using (var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        await using (var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
         {
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -1993,7 +1993,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             connection);
 
         var counts = new List<QueueStateCount>();
-        await using var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             counts.Add(new QueueStateCount(
@@ -2081,7 +2081,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             + "FETCH FIRST :max ROWS ONLY");
 
         var facets = new List<TagFacet>();
-        await using var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             facets.Add(new TagFacet(DecodeTag(reader.GetString(0)), reader.GetInt32(1)));
@@ -2129,7 +2129,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 + ") ORDER BY NLSSORT(value_lower, 'NLS_SORT=BINARY'), NLSSORT(value, 'NLS_SORT=BINARY') "
                 + "FETCH FIRST :limit ROWS ONLY");
 
-            await using var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 suggestions.Add(new TagSuggestion(query.Key, DecodeTag(reader.GetString(0))));
@@ -2166,7 +2166,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             + "ORDER BY section, NLSSORT(LOWER(name), 'NLS_SORT=BINARY'), NLSSORT(name, 'NLS_SORT=BINARY') "
             + "FETCH FIRST :limit ROWS ONLY");
 
-        await using var stageOneReader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var stageOneReader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await stageOneReader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             var name = DecodeTag(stageOneReader.GetString(1));
@@ -2195,7 +2195,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             "SELECT queue, paused, max_concurrent FROM backwave.queue_limits ORDER BY queue", connection);
 
         var settings = new List<QueueSettings>();
-        await using var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             settings.Add(new QueueSettings(
@@ -2332,7 +2332,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             insertRow.Parameters.Add(RawN("restartedFrom", workflow.RestartedFrom));
             try
             {
-                await insertRow.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await insertRow.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (OracleException exception) when (IsDuplicate(exception))
             {
@@ -2390,7 +2390,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 edge.Parameters.Add(Raw("child", member.JobId));
                 try
                 {
-                    await edge.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await edge.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 }
                 catch (OracleException exception) when (IsDuplicate(exception))
                 {
@@ -2411,7 +2411,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using var command = Cmd(
             "SELECT 1 FROM backwave.workflows WHERE workflow_id = :id", connection, transaction);
         command.Parameters.Add(Raw("id", workflowId));
-        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
+        return await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not null;
     }
 
     private async ValueTask<bool> JobExistsAsync(
@@ -2420,7 +2420,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using var command = Cmd(
             "SELECT 1 FROM backwave.jobs WHERE job_id = :id", connection, transaction);
         command.Parameters.Add(Raw("id", jobId));
-        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
+        return await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not null;
     }
 
     private async ValueTask<HashSet<Guid>> MembersOfAsync(
@@ -2430,7 +2430,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using var command = Cmd(
             "SELECT job_id FROM backwave.jobs WHERE workflow_id = :id", connection, transaction);
         command.Parameters.Add(Raw("id", workflowId));
-        await using var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             members.Add(ReadGuid(reader, 0));
@@ -2489,7 +2489,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using (var members = Cmd(
             "SELECT workflow_id, state FROM backwave.jobs WHERE workflow_id IS NOT NULL", connection))
         {
-            await using var reader = (OracleDataReader)await members.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await members.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var wf = ReadGuid(reader, 0);
@@ -2503,7 +2503,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             "SELECT workflow_id, name, created_at, restarted_from FROM backwave.workflows " +
             "ORDER BY created_at, workflow_id", connection))
         {
-            await using var reader = (OracleDataReader)await workflows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await workflows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var workflowId = ReadGuid(reader, 0);
@@ -2511,7 +2511,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 snapshots.Add(new WorkflowSnapshot
                 {
                     WorkflowId = workflowId,
-                    Name = reader.IsDBNull(1) ? null : reader.GetString(1),
+                    Name = ReadTextOrNull(reader, 1),
                     CreatedAt = ReadTstz(reader, 2),
                     Status = WorkflowStatusProjection.Project(states),
                     MemberCount = states.Count,
@@ -2536,12 +2536,12 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             "SELECT name, created_at, restarted_from FROM backwave.workflows WHERE workflow_id = :id", connection))
         {
             row.Parameters.Add(Raw("id", workflowId));
-            await using var reader = (OracleDataReader)await row.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await row.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 return null;
             }
-            name = reader.IsDBNull(0) ? null : reader.GetString(0);
+            name = ReadTextOrNull(reader, 0);
             createdAt = ReadTstz(reader, 1);
             restartedFrom = reader.IsDBNull(2) ? null : ReadGuid(reader, 2);
         }
@@ -2553,7 +2553,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             $"SELECT {JobColumns} FROM backwave.jobs WHERE workflow_id = :id ORDER BY sequence", connection))
         {
             memberRows.Parameters.Add(Raw("id", workflowId));
-            await using var reader = (OracleDataReader)await memberRows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await memberRows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 members.Add(ReadJob(reader));
@@ -2567,7 +2567,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             "ORDER BY parent_id, child_id", connection))
         {
             edgeRows.Parameters.Add(Raw("id", workflowId));
-            await using var reader = (OracleDataReader)await edgeRows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await edgeRows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 edges.Add(new WorkflowEdge(ReadGuid(reader, 0), ReadGuid(reader, 1)));
@@ -2600,7 +2600,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             "SELECT parent_id FROM backwave.job_parents WHERE child_id = :id ORDER BY parent_id", connection))
         {
             parents.Parameters.Add(Raw("id", jobId));
-            await using var reader = (OracleDataReader)await parents.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await parents.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 gatingParents.Add(ReadGuid(reader, 0));
@@ -2612,7 +2612,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             "SELECT child_id FROM backwave.job_parents WHERE parent_id = :id ORDER BY child_id", connection))
         {
             childRows.Parameters.Add(Raw("id", jobId));
-            await using var reader = (OracleDataReader)await childRows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await childRows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 children.Add(ReadGuid(reader, 0));
@@ -2669,7 +2669,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         command.Parameters.Add(Int("stateB", (int)stateB));
         command.Parameters.Add(Tstz("before", terminalBefore));
         command.Parameters.Add(Int("max", Math.Min(maxJobs, options.Bounds.MaxPurgeBatch)));
-        var purged = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        var purged = await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
 
         // When a Workflow's last member is purged, drop its now-orphaned identity row (structural edges
         // cascade via FK) so the tables never leak rows for Workflows with no surviving jobs.
@@ -2680,7 +2680,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             """,
             connection, transaction))
         {
-            await prune.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
@@ -2713,7 +2713,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             ensure.Parameters.Add(Str("id", request.ObserverId));
             try
             {
-                await ensure.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await ensure.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (OracleException exception) when (IsDuplicate(exception))
             {
@@ -2730,7 +2730,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             connection, transaction))
         {
             locked.Parameters.Add(Str("id", request.ObserverId));
-            await using var reader = (OracleDataReader)await locked.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await locked.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
             cursor = reader.GetInt64(0);
             leaseOwner = reader.IsDBNull(1) ? null : reader.GetString(1);
@@ -2750,7 +2750,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             sub.Parameters.Add(StrN("states", string.Join(',', states)));
             sub.Parameters.Add(StrN("wire", request.WireName));
             sub.Parameters.Add(StrN("queue", request.Queue));
-            await sub.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await sub.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // A live Lease held by a different worker means that node is delivering - back off.
@@ -2787,7 +2787,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             scan.Parameters.Add(StrN("wire", request.WireName));
             scan.Parameters.Add(StrN("queue", request.Queue));
             scan.Parameters.Add(Int("take", Math.Max(0, request.MaxRows)));
-            await using var reader = (OracleDataReader)await scan.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await scan.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var nextAttemptAt = reader.IsDBNull(10) ? (DateTimeOffset?)null : ReadTstz(reader, 10);
@@ -2801,7 +2801,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 candidates.Add(new ObserverClaimedDelivery(
                     reader.GetInt64(0), ReadGuid(reader, 1), reader.GetInt64(2), reader.GetString(3), reader.GetString(4),
                     (JobState)reader.GetInt32(5), reader.GetInt32(6), ReadTstz(reader, 7),
-                    reader.IsDBNull(8) ? null : reader.GetString(8), priorAttempt + 1)); // the claim starts a delivery Attempt
+                    ReadTextOrNull(reader, 8), priorAttempt + 1)); // the claim starts a delivery Attempt
             }
         }
 
@@ -2826,7 +2826,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             upsert.Parameters.Add(Str("id", request.ObserverId));
             upsert.Parameters.Add(Long("pos", delivery.Position));
             upsert.Parameters.Add(Int("attempt", delivery.DeliveryAttempt));
-            await upsert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await upsert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await using (var lease = Cmd(
@@ -2836,7 +2836,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             lease.Parameters.Add(Str("id", request.ObserverId));
             lease.Parameters.Add(Str("worker", request.WorkerId));
             lease.Parameters.Add(Tstz("expiry", request.Now + request.LeaseDuration));
-            await lease.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await lease.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -2865,7 +2865,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             connection, transaction))
         {
             locked.Parameters.Add(Str("id", report.ObserverId));
-            await using var reader = (OracleDataReader)await locked.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = (OracleDataReader)await locked.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             found = await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
             if (found)
             {
@@ -2909,7 +2909,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             resolve.Parameters.Add(Int("resolution", resolution));
             resolve.Parameters.Add(TstzN("next",
                 outcome.Disposition == ObserverDeliveryDisposition.Retry ? outcome.NextAttemptAt : null));
-            await resolve.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await resolve.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await AdvanceObserverCursorAsync(
@@ -2949,7 +2949,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             blockCommand.Parameters.Add(Long("cursor", cursor));
             blockCommand.Parameters.Add(StrN("wire", wireName));
             blockCommand.Parameters.Add(StrN("queue", queue));
-            var result = await blockCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            var result = await blockCommand.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             block = result is null or DBNull ? null : Convert.ToInt64(result);
         }
 
@@ -2961,7 +2961,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         {
             advance.Parameters.Add(Long("cursor", cursor));
             advance.Parameters.Add(LongN("block", block));
-            var result = await advance.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            var result = await advance.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             newCursor = result is null or DBNull ? null : Convert.ToInt64(result);
         }
 
@@ -2988,7 +2988,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             deadLetter.Parameters.Add(Long("cursor", cursor));
             deadLetter.Parameters.Add(Long("target", target));
             deadLetter.Parameters.Add(Tstz("now", now));
-            await deadLetter.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // The swept rows are all resolved now - drop their in-flight bookkeeping.
@@ -2998,7 +2998,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         {
             sweep.Parameters.Add(Str("id", observerId));
             sweep.Parameters.Add(Long("target", target));
-            await sweep.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await sweep.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await using (var move = Cmd(
@@ -3007,7 +3007,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         {
             move.Parameters.Add(Str("id", observerId));
             move.Parameters.Add(Long("target", target));
-            await move.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await move.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -3027,7 +3027,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using var command = Cmd(
             "SELECT cursor_pos FROM backwave.observers WHERE observer_id = :id", connection);
         command.Parameters.Add(Str("id", observerId));
-        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        var result = await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
         return result is null or DBNull ? -1L : Convert.ToInt64(result);
     }
 
@@ -3064,7 +3064,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         command.Parameters.Add(StrN("wire", request.WireName));
         command.Parameters.Add(StrN("queue", request.Queue));
 
-        await using var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
         var oldest = reader.IsDBNull(2) ? (DateTimeOffset?)null : ReadTstz(reader, 2);
         return new ObserverLag(reader.GetInt64(0), (int)reader.GetInt64(1), oldest);
@@ -3086,7 +3086,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         command.Parameters.Add(Str("id", observerId));
 
         var records = new List<ObserverDeadLetterRecord>();
-        await using var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             records.Add(new ObserverDeadLetterRecord(
@@ -3118,7 +3118,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         LeaseExpiry = reader.IsDBNull(8) ? null : ReadTstz(reader, 8),
         CancelRequested = reader.GetInt32(9) != 0,
         TerminalAt = reader.IsDBNull(10) ? null : ReadTstz(reader, 10),
-        TerminalCause = reader.IsDBNull(11) ? null : reader.GetString(11),
+        TerminalCause = ReadTextOrNull(reader, 11),
         ScheduleId = reader.IsDBNull(12) ? null : reader.GetString(12),
         ParentsRemaining = reader.GetInt32(13),
         Mode = (DependencyMode)reader.GetInt32(14),
@@ -3158,7 +3158,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             insert.Parameters.Add(Str("value", EncodeTag(tag.Value)));
             try
             {
-                await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (OracleException exception) when (IsDuplicate(exception))
             {
@@ -3184,7 +3184,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             $"SELECT job_id, key, value FROM backwave.job_tags WHERE job_id IN ({ParameterList("id", jobIds.Count)})",
             connection);
         AddIdList(command, "id", jobIds);
-        await using var reader = (OracleDataReader)await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             var jobId = ReadGuid(reader, 0);
@@ -3449,9 +3449,25 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         return new DateTimeOffset(timestamp.Value, timestamp.GetTimeZoneOffset());
     }
 
+    // The two LOB read helpers, and the only places the adapter pulls a LOB value across the wire. Both
+    // are counted: at the default InitialLOBFetchSize of 0 the row fetch brings back a locator and the
+    // value costs a further round trip, so a LOB read is a network event the way a statement is, and the
+    // round-trip budget has to see it. Route every BLOB and CLOB column through these - a bare
+    // GetString on a CLOB column reads the same locator without being counted, and the count would lie.
     private static byte[] ReadBytes(OracleDataReader reader, int ordinal)
     {
+        OracleRoundTrips.CountLobRead();
         using var blob = reader.GetOracleBlob(ordinal);
         return blob.Value;
     }
+
+    private static string ReadText(OracleDataReader reader, int ordinal)
+    {
+        OracleRoundTrips.CountLobRead();
+        return reader.GetString(ordinal);
+    }
+
+    // A NULL CLOB costs nothing: there is no locator to follow, so the null branch is not a LOB read.
+    private static string? ReadTextOrNull(OracleDataReader reader, int ordinal)
+        => reader.IsDBNull(ordinal) ? null : ReadText(reader, ordinal);
 }
