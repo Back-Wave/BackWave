@@ -79,6 +79,7 @@ public static class OracleTestDatabase
                         "Oracle is not reachable. Start it with: docker compose up -d oracle", exception);
                 }
                 await EnsureAlertAccessAsync();
+                await EnsureRoundTripStatsAccessAsync();
                 _migrated = true;
             }
 
@@ -113,6 +114,24 @@ public static class OracleTestDatabase
         await using var grant = sys.CreateCommand();
         grant.CommandText = $"GRANT EXECUTE ON SYS.DBMS_ALERT TO {AppUser}";
         await grant.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// Grants the test user SELECT on the session-statistics views, once per run. The database's own
+    /// SQL*Net round-trip counter is the only measurement of round trips that does not come from the
+    /// adapter being measured, and OracleLobPrefetchTests reads it to check the LOB prefetch against
+    /// ground truth. A stock image grants none of these to an application user.
+    /// </summary>
+    public static async Task EnsureRoundTripStatsAccessAsync()
+    {
+        await using var sys = new OracleConnection(SysConnectionString);
+        await sys.OpenAsync();
+        foreach (var view in new[] { "V_$SESSTAT", "V_$STATNAME", "V_$SESSION", "V_$MYSTAT" })
+        {
+            await using var grant = sys.CreateCommand();
+            grant.CommandText = $"GRANT SELECT ON SYS.{view} TO {AppUser}";
+            await grant.ExecuteNonQueryAsync();
+        }
     }
 
     // Drops the schema's user (with every object it owns) and recreates it empty, so the next test boots

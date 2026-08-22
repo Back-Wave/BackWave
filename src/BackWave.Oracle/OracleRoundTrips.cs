@@ -69,6 +69,37 @@ internal static class OracleRoundTrips
         Flow.Value?.AddLobRead();
     }
 
+    // One LOB value, counted only if the wire actually carried it on its own. A value the driver
+    // prefetched arrived inside the row and cost nothing further, so counting it would report a round
+    // trip that never happened. InitialLOBFetchSize is the prefetch size the command asked for - bytes
+    // for a BLOB, characters for a CLOB - which is the unit `length` is measured in on each read path.
+    // A zero-length LOB is never prefetched: an empty prefetch buffer cannot be told apart from an
+    // absent one, so the driver follows the locator for it and pays the trip.
+    internal static void CountLobRead(OracleDataReader reader, int length)
+    {
+        if (Volatile.Read(ref _observers) == 0)
+        {
+            return;
+        }
+        if (length == 0 || length > reader.InitialLOBFetchSize)
+        {
+            Flow.Value?.AddLobRead();
+        }
+    }
+
+    // The widest fetch window a command in this flow declared. FetchSize is the driver's byte budget for
+    // one fetch round trip, so this one number is both the memory a read command may hold in flight and
+    // the size of the unit a fetch trip moves. Recorded as a maximum rather than counted: what a budget
+    // needs to know is the largest buffer an operation asked the driver to hold.
+    internal static void RecordFetchWindow(long bytes)
+    {
+        if (Volatile.Read(ref _observers) == 0)
+        {
+            return;
+        }
+        Flow.Value?.RecordFetchWindow(bytes);
+    }
+
     // The adapter's execution entry points. Every ExecuteXxxAsync in the store goes through one of these
     // - grep for a bare `.ExecuteNonQueryAsync(` in OracleJobStore.cs and the only hits should be the
     // three wrappers below plus the Wake-Up Hint pump, which is deliberately outside the count: its
@@ -102,6 +133,7 @@ internal sealed class OracleRoundTripScope(OracleRoundTripScope? outer) : IDispo
 {
     private int _statements;
     private int _lobReads;
+    private long _fetchWindow;
     private bool _disposed;
 
     internal OracleRoundTripScope? Outer { get; } = outer;
@@ -110,9 +142,25 @@ internal sealed class OracleRoundTripScope(OracleRoundTripScope? outer) : IDispo
 
     internal int LobReads => Volatile.Read(ref _lobReads);
 
+    internal long FetchWindowBytes => Volatile.Read(ref _fetchWindow);
+
     internal void AddStatement() => Interlocked.Increment(ref _statements);
 
     internal void AddLobRead() => Interlocked.Increment(ref _lobReads);
+
+    internal void RecordFetchWindow(long bytes)
+    {
+        var seen = Volatile.Read(ref _fetchWindow);
+        while (bytes > seen)
+        {
+            var prior = Interlocked.CompareExchange(ref _fetchWindow, bytes, seen);
+            if (prior == seen)
+            {
+                return;
+            }
+            seen = prior;
+        }
+    }
 
     public void Dispose()
     {

@@ -17,10 +17,17 @@ namespace BackWave.Oracle.Tests;
 /// after, and it should be recorded here in the same commit that earns it; a number that rises is a
 /// regression that would otherwise reach production as nothing but a slightly slower job rate.
 ///
-/// What the count covers: statements executed and LOB values read, per operation. What it does not:
-/// opening a pooled connection, COMMIT, and the one-time schema-version check. Those are round trips
-/// too, but they are a small constant per operation rather than a cost per row - and per row is the
-/// shape of the problem these budgets exist to watch.
+/// What the count covers: statements executed, LOB values read, and the widest fetch window declared,
+/// per operation. What it does not: opening a pooled connection, COMMIT, and the one-time
+/// schema-version check. Those are round trips too, but they are a small constant per operation rather
+/// than a cost per row - and per row is the shape of the problem these budgets exist to watch.
+///
+/// The fetch window is here because it is the other half of the LOB prefetch, and the half a change can
+/// silently drop. FetchSize is a byte budget: prefetching LOBs makes a row orders of magnitude larger,
+/// and a window left at the driver default collapses to one row per round trip, which trades the LOB
+/// trips away for an equal number of fetch trips that the LOB count cannot see. Pinning the window
+/// makes that trade visible. It is also the per-command memory ceiling, since it is the bytes the
+/// driver may hold in flight for one read.
 /// </summary>
 [Collection("oracle")]
 public sealed class OracleRoundTripBudgetTests
@@ -38,13 +45,24 @@ public sealed class OracleRoundTripBudgetTests
     // version 1. Each is the cost of ONE call; the arithmetic behind each number is in its test.
 
     private static readonly Budget Claim = new(
-        "ClaimBatchAsync of 32 jobs (one queue, cold caches)", Statements: 9, LobReads: 32);
+        "ClaimBatchAsync of 32 jobs (one queue, cold caches)",
+        Statements: 9, LobReads: 0, FetchWindowBytes: JobPageWindow);
 
     private static readonly Budget ReportOutcomes = new(
-        "ReportOutcomesAsync of 32 succeeded rows", Statements: 35, LobReads: 0);
+        "ReportOutcomesAsync of 32 succeeded rows",
+        Statements: 35, LobReads: 0, FetchWindowBytes: 0);
 
     private static readonly Budget ListJobs = new(
-        "ListJobsAsync over a 200-job page of terminal jobs", Statements: 2, LobReads: 400);
+        "ListJobsAsync over a 200-job page of terminal jobs",
+        Statements: 2, LobReads: 0, FetchWindowBytes: JobPageWindow);
+
+    // The window a statement selecting the full jobs column set declares: 32 rows (one claim batch) of
+    // 140,447 bytes, which is the driver's own size for that row - both LOB columns at the 65,536
+    // payload prefetch, plus about 9 KB of scalars. Claim and job list select the same columns, so they
+    // share it. The page size does NOT enter it: a 200-row page arrives in seven windows of this size
+    // rather than one window seven times as wide, which is what keeps the monitor listing off the
+    // memory ceiling.
+    private const long JobPageWindow = 4_494_304;
 
     [Fact]
     public async Task Claim_of_a_full_batch_stays_within_its_round_trip_budget()
@@ -65,19 +83,20 @@ public sealed class OracleRoundTripBudgetTests
         // the batch learns the highest ordinal it assigned, because Oracle rejects RETURNING on an
         // INSERT ... SELECT. No prune: the batch recorder issues a DELETE only when some job in it
         // reached MaxTransitionsPerJob, and a freshly claimed job is on its second transition.
-        // The 32 LOB reads are one payload BLOB per claimed row; terminal_cause is null on a Scheduled
-        // job, and a null LOB costs nothing.
+        // Zero LOB reads: the claim select prefetches every payload BLOB into its row, and
+        // terminal_cause is null on a Scheduled job, which costs nothing either way. Before the payload
+        // was prefetched this was 32 - one round trip per claimed row, on the hottest path there is.
         ClaimResult result;
-        int statements, lobReads;
+        Measured measured;
         using (var scope = OracleRoundTrips.Observe())
         {
             result = await store.ClaimBatchAsync(
                 new ClaimRequest("budget-worker", ["budget"], ClaimBatch, Lease, T0));
-            (statements, lobReads) = (scope.Statements, scope.LobReads);
+            measured = Measured.From(scope);
         }
 
         Assert.Equal(ClaimBatch, result.Jobs.Count);
-        AssertBudget(Claim, statements, lobReads);
+        AssertBudget(Claim, measured);
     }
 
     [Fact]
@@ -96,21 +115,22 @@ public sealed class OracleRoundTripBudgetTests
         // 32 fenced updates + 1 batched transition insert + 1 highest-ordinal read + 1 child-latch probe
         // = 35. As above, no job in this batch is near the cap, so the batch recorder issues no prune
         // DELETE. The 32 fenced updates are still per row - batching them is issue 0264.
-        // Writing a terminal_cause CLOB is a parameter bind, not a materialization, so no LOB is read.
+        // Writing a terminal_cause CLOB is a parameter bind, not a materialization, so no LOB is read,
+        // and no statement on this path pulls a LOB column, so none declares a fetch window either.
         var batch = claimed
             .Select(job => new OutcomeReport(job.JobId, "budget-worker", job.Attempt, new JobOutcome.Success()))
             .ToArray();
 
         IReadOnlyList<OutcomeReportResult> results;
-        int statements, lobReads;
+        Measured measured;
         using (var scope = OracleRoundTrips.Observe())
         {
             results = await store.ReportOutcomesAsync(batch, T0);
-            (statements, lobReads) = (scope.Statements, scope.LobReads);
+            measured = Measured.From(scope);
         }
 
         Assert.All(results, result => Assert.Equal(OutcomeResult.Applied, result.Result));
-        AssertBudget(ReportOutcomes, statements, lobReads);
+        AssertBudget(ReportOutcomes, measured);
     }
 
     [Fact]
@@ -131,19 +151,20 @@ public sealed class OracleRoundTripBudgetTests
         await MarkEveryJobDeadLetteredAsync();
 
         // 1 page select + 1 batched tag hydration = 2 statements, independent of page size.
-        // 200 payload BLOBs + 200 terminal_cause CLOBs = 400 LOB reads, one round trip each: the whole
-        // cost of this operation is per row, and none of it is in the statement count.
+        // Zero LOB reads: both the payload BLOB and the terminal_cause CLOB ride in the row. This was
+        // 400 - the whole cost of this operation was per row, and none of it was in the statement count.
+        // The window is the claim's, not the page's: 200 rows arrive in seven trips of 32.
         IReadOnlyList<JobRecord> jobs;
-        int statements, lobReads;
+        Measured measured;
         using (var scope = OracleRoundTrips.Observe())
         {
             jobs = await store.ListJobsAsync(new JobQuery { MaxResults = page });
-            (statements, lobReads) = (scope.Statements, scope.LobReads);
+            measured = Measured.From(scope);
         }
 
         Assert.Equal(page, jobs.Count);
         Assert.All(jobs, job => Assert.False(string.IsNullOrEmpty(job.TerminalCause)));
-        AssertBudget(ListJobs, statements, lobReads);
+        AssertBudget(ListJobs, measured);
     }
 
     [Fact]
@@ -203,27 +224,37 @@ public sealed class OracleRoundTripBudgetTests
         await update.ExecuteNonQueryAsync();
     }
 
-    private sealed record Budget(string Operation, int Statements, int LobReads);
+    private sealed record Budget(string Operation, int Statements, int LobReads, long FetchWindowBytes);
 
-    private static void AssertBudget(Budget budget, int statements, int lobReads)
+    private sealed record Measured(int Statements, int LobReads, long FetchWindowBytes)
     {
-        if (statements == budget.Statements && lobReads == budget.LobReads)
+        public static Measured From(OracleRoundTripScope scope)
+            => new(scope.Statements, scope.LobReads, scope.FetchWindowBytes);
+    }
+
+    private static void AssertBudget(Budget budget, Measured measured)
+    {
+        if (measured.Statements == budget.Statements
+            && measured.LobReads == budget.LobReads
+            && measured.FetchWindowBytes == budget.FetchWindowBytes)
         {
             return;
         }
         Assert.Fail(
             $"""
             Oracle round-trip budget moved: {budget.Operation}
-              statements: budgeted {budget.Statements}, measured {statements} ({Delta(budget.Statements, statements)})
-              LOB reads:  budgeted {budget.LobReads}, measured {lobReads} ({Delta(budget.LobReads, lobReads)})
+              statements:   budgeted {budget.Statements}, measured {measured.Statements} ({Delta(budget.Statements, measured.Statements)})
+              LOB reads:    budgeted {budget.LobReads}, measured {measured.LobReads} ({Delta(budget.LobReads, measured.LobReads)})
+              fetch window: budgeted {budget.FetchWindowBytes} bytes, measured {measured.FetchWindowBytes} ({Delta(budget.FetchWindowBytes, measured.FetchWindowBytes)})
 
             A budget moves in either direction only deliberately. If a change was meant to move this,
             record the new numbers in OracleRoundTripBudgetTests in the same commit. If it was not, the
             operation just gained or lost database round trips that no other test in the suite can see.
+            A fetch window that fell to the driver default means a LOB prefetch lost its other half.
             """);
     }
 
-    private static string Delta(int budgeted, int measured) => measured switch
+    private static string Delta(long budgeted, long measured) => measured switch
     {
         _ when measured > budgeted => $"+{measured - budgeted}, a regression",
         _ when measured < budgeted => $"{measured - budgeted}, an improvement to record",

@@ -66,6 +66,58 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         return command;
     }
 
+    // The prefetch size for a LOB column the store puts no explicit byte cap on: a Workflow name, a
+    // schedule's skipped-tick list. Borrowed from the failure-detail cap, the largest bound the store
+    // does enforce on a text column, so an uncapped column still gets a bounded buffer. A longer value
+    // reads correctly through the locator at the cost of one trip.
+    private int UncappedTextPrefetchBytes => options.Bounds.MaxFailureDetailBytes;
+
+    // Runs a read whose result set carries LOB columns, with both halves of the LOB prefetch set
+    // together. Left at its default of 0, InitialLOBFetchSize makes the driver hand back a locator per
+    // LOB value, and following it costs a round trip per value - the cost that made a 200-row job page
+    // 400 round trips. Setting it alone does not help: FetchSize is a BYTE budget, a prefetched row is
+    // orders of magnitude larger, and the fetch array collapses to a single row per trip, trading LOB
+    // trips for fetch trips one for one. So the two are set in one place and no call site can get one
+    // half right and the other wrong.
+    //
+    // `prefetchBytes` is the size cap the store already enforces on the largest LOB column the statement
+    // selects - bytes for a BLOB, characters for a CLOB. A value over it still reads correctly: the
+    // driver falls back to the locator and pays one trip, so this is a latency knob and never a
+    // correctness one.
+    //
+    // `rows` is how many rows the window should hold. RowSize is the driver's own per-row buffer size for
+    // this statement, and it cannot exceed the LOB columns at their caps plus the scalars, so the bytes
+    // one read command holds in flight are bounded by the row SHAPE and this count - never by how many
+    // rows the query returns. That is what keeps a 200-row monitor page from asking for a 26 MB buffer:
+    // the page arrives in windows of LobFetchWindowRows rows instead. A read that can match at most one
+    // row passes SingleRow, so a primary-key lookup buys no buffer it cannot fill.
+    private async Task<OracleDataReader> ExecuteLobReaderAsync(
+        OracleCommand command, int prefetchBytes, int rows, CancellationToken cancellationToken)
+    {
+        command.InitialLOBFetchSize = prefetchBytes;
+        var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        // Never shrink the driver's own default; a row too small to reach it fetches as widely as before.
+        reader.FetchSize = Math.Max(
+            reader.FetchSize, Math.Min((long)reader.RowSize * rows, MaxFetchWindowBytes));
+        OracleRoundTrips.RecordFetchWindow(reader.FetchSize);
+        return reader;
+    }
+
+    // How many rows a page read buffers per fetch trip. Borrowed from the claim batch, the size class the
+    // store already treats as one unit of work.
+    private int LobFetchWindowRows => options.Bounds.MaxClaimBatch;
+
+    // A read that can match at most one row - a primary-key lookup - wants no more window than that.
+    private const int SingleRow = 1;
+
+    // The hard ceiling on one read command's fetch window, whatever the row shape works out to. The
+    // window above is derived from RowSize and the store's own size bounds, and every one of those bounds
+    // is operator-settable with no validation, so the derivation alone cannot promise a bounded buffer:
+    // raising MaxPayloadBytes to 64 MB would have a claim ask the driver to hold 4 GB. This is the
+    // backstop that binds regardless. 8 MB sits well above the default job page (about 4.5 MB), so no
+    // default configuration ever reaches it, and well below a size that would matter to a host.
+    internal const long MaxFetchWindowBytes = 8L * 1024 * 1024;
+
     // Tags-in-use signal. Under the no-tags configuration the job_tags table is empty, so a claim must
     // not pay an unconditional tag-hydration round-trip. Once any Tag is seen - or written on THIS
     // process - the signal latches true and every later claim hydrates; while false, a single cheap
@@ -515,7 +567,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 claim.Parameters.Add(Str("queue", queue));
                 claim.Parameters.Add(Tstz("now", request.Now));
                 claim.Parameters.Add(Int("take", take));
-                await using var reader = (OracleDataReader)await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = await ExecuteLobReaderAsync(claim, options.Bounds.MaxPayloadBytes, LobFetchWindowRows, cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     queueClaims.Add(ReadJob(reader));
@@ -1481,7 +1533,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             "SELECT wire_name, payload, queue FROM backwave.schedules WHERE schedule_id = :id", connection, transaction))
         {
             select.Parameters.Add(Str("id", scheduleId));
-            await using var reader = (OracleDataReader)await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await ExecuteLobReaderAsync(select, options.Bounds.MaxPayloadBytes, SingleRow, cancellationToken).ConfigureAwait(false);
             if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 schedule = (reader.GetString(0), ReadBytes(reader, 1), reader.GetString(2));
@@ -1834,7 +1886,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             connection);
 
         var snapshots = new List<ScheduleSnapshot>();
-        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await ExecuteLobReaderAsync(command, UncappedTextPrefetchBytes, LobFetchWindowRows, cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             snapshots.Add(new ScheduleSnapshot(
@@ -1893,7 +1945,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 connection, transaction))
             {
                 select.Parameters.Add(Str("id", decision.ScheduleId));
-                await using var reader = (OracleDataReader)await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = await ExecuteLobReaderAsync(select, options.Bounds.MaxPayloadBytes, SingleRow, cancellationToken).ConfigureAwait(false);
                 await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
                 schedule = (reader.GetString(0), ReadBytes(reader, 1), reader.GetString(2), ReadText(reader, 3));
             }
@@ -1997,7 +2049,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using var command = Cmd($"SELECT {JobColumns} FROM backwave.jobs WHERE job_id = :id", connection);
         command.Parameters.Add(Raw("id", jobId));
         JobRecord? record;
-        await using (var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
+        await using (var reader = await ExecuteLobReaderAsync(command, options.Bounds.MaxPayloadBytes, SingleRow, cancellationToken).ConfigureAwait(false))
         {
             record = await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadJob(reader) : null;
         }
@@ -2019,7 +2071,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Cmd("SELECT output FROM backwave.jobs WHERE job_id = :id", connection);
         command.Parameters.Add(Raw("id", jobId));
-        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await ExecuteLobReaderAsync(command, options.Bounds.MaxOutputBytes, SingleRow, cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false) || reader.IsDBNull(0))
         {
             return null;
@@ -2045,7 +2097,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         command.Parameters.Add(Raw("id", jobId));
 
         var transitions = new List<JobTransition>();
-        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await ExecuteLobReaderAsync(command, options.Bounds.MaxFailureDetailBytes, LobFetchWindowRows, cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             transitions.Add(new JobTransition(
@@ -2085,7 +2137,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         command.Parameters.Add(Int("take", Math.Min(query.MaxResults, options.Bounds.MaxMonitorPageSize)));
 
         var jobs = new List<JobRecord>();
-        await using (var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
+        await using (var reader = await ExecuteLobReaderAsync(command, options.Bounds.MaxPayloadBytes, LobFetchWindowRows, cancellationToken).ConfigureAwait(false))
         {
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -2616,7 +2668,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             "SELECT workflow_id, name, created_at, restarted_from FROM backwave.workflows " +
             "ORDER BY created_at, workflow_id", connection))
         {
-            await using var reader = (OracleDataReader)await workflows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await ExecuteLobReaderAsync(workflows, UncappedTextPrefetchBytes, LobFetchWindowRows, cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var workflowId = ReadGuid(reader, 0);
@@ -2649,7 +2701,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             "SELECT name, created_at, restarted_from FROM backwave.workflows WHERE workflow_id = :id", connection))
         {
             row.Parameters.Add(Raw("id", workflowId));
-            await using var reader = (OracleDataReader)await row.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await ExecuteLobReaderAsync(row, UncappedTextPrefetchBytes, SingleRow, cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 return null;
@@ -2666,7 +2718,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             $"SELECT {JobColumns} FROM backwave.jobs WHERE workflow_id = :id ORDER BY sequence", connection))
         {
             memberRows.Parameters.Add(Raw("id", workflowId));
-            await using var reader = (OracleDataReader)await memberRows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await ExecuteLobReaderAsync(memberRows, options.Bounds.MaxPayloadBytes, LobFetchWindowRows, cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 members.Add(ReadJob(reader));
@@ -2900,7 +2952,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             scan.Parameters.Add(StrN("wire", request.WireName));
             scan.Parameters.Add(StrN("queue", request.Queue));
             scan.Parameters.Add(Int("take", Math.Max(0, request.MaxRows)));
-            await using var reader = (OracleDataReader)await scan.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await ExecuteLobReaderAsync(scan, options.Bounds.MaxFailureDetailBytes, LobFetchWindowRows, cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var nextAttemptAt = reader.IsDBNull(10) ? (DateTimeOffset?)null : ReadTstz(reader, 10);
@@ -3567,21 +3619,23 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
     }
 
     // The two LOB read helpers, and the only places the adapter pulls a LOB value across the wire. Both
-    // are counted: at the default InitialLOBFetchSize of 0 the row fetch brings back a locator and the
-    // value costs a further round trip, so a LOB read is a network event the way a statement is, and the
-    // round-trip budget has to see it. Route every BLOB and CLOB column through these - a bare
-    // GetString on a CLOB column reads the same locator without being counted, and the count would lie.
+    // are counted, and both count only what the wire cost: a value the reader's command prefetched came
+    // in the row and is free, while one over the prefetch size left a locator behind and costs a further
+    // round trip. Route every BLOB and CLOB column through these - a bare GetString on a CLOB column
+    // reads the same locator without being counted, and the count would lie.
     private static byte[] ReadBytes(OracleDataReader reader, int ordinal)
     {
-        OracleRoundTrips.CountLobRead();
         using var blob = reader.GetOracleBlob(ordinal);
-        return blob.Value;
+        var value = blob.Value;
+        OracleRoundTrips.CountLobRead(reader, value.Length);
+        return value;
     }
 
     private static string ReadText(OracleDataReader reader, int ordinal)
     {
-        OracleRoundTrips.CountLobRead();
-        return reader.GetString(ordinal);
+        var value = reader.GetString(ordinal);
+        OracleRoundTrips.CountLobRead(reader, value.Length);
+        return value;
     }
 
     // A NULL CLOB costs nothing: there is no locator to follow, so the null branch is not a LOB read.
