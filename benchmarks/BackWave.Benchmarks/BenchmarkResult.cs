@@ -61,6 +61,12 @@ public sealed record BenchmarkResult
 
     /// <summary>Whether this number may be published (mirrors <see cref="EnvironmentManifest.Publishable"/>).</summary>
     public bool Publishable => Manifest.Publishable;
+
+    /// <summary>
+    /// Whether the latency-profile dial was engaged, which makes this a diagnostic result. Derived from the
+    /// recorded delay so the mark travels with the number and cannot be dropped from the JSON by itself.
+    /// </summary>
+    public bool Diagnostic => Manifest.RoundTripDelayMs > 0;
 }
 
 /// <summary>A flat, JSON-friendly snapshot of the <see cref="WorkloadSpec"/> that produced a result.</summary>

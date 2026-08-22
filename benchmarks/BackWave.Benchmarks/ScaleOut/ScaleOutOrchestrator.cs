@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using BackWave.Benchmarks.Environment;
+using BackWave.Benchmarks.Latency;
 using BackWave.Benchmarks.Targets;
 using BackWave.Benchmarks.Workload;
 using BackWave.Jobs;
@@ -51,7 +52,9 @@ internal sealed class ScaleOutOrchestrator
         // separate store handles the parent's drain poll so it never shares a connection with the pumps.
         await using var target = new PostgresBenchmarkTarget(_connectionString);
         var version = await target.SetupAsync(cancellationToken).ConfigureAwait(false);
-        var manifest = EnvironmentManifest.Capture(_mode, target.Engine, version);
+        // The latency dial is a single-run diagnostic and is not offered on the scale-out sweep, so the
+        // curve is always stamped with the dial off.
+        var manifest = EnvironmentManifest.Capture(_mode, target.Engine, version, LatencyProfile.Disabled);
 
         await using var pollStore = new PostgresJobStore(
             new PostgresStoreOptions { ConnectionString = _connectionString });

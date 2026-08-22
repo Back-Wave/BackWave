@@ -1,4 +1,5 @@
 using BackWave.Benchmarks.Environment;
+using BackWave.Benchmarks.Latency;
 using BackWave.Benchmarks.Workload;
 
 namespace BackWave.Benchmarks;
@@ -55,6 +56,13 @@ public sealed record BenchmarkOptions
     /// <summary>Optional path to write the result JSON to.</summary>
     public string? OutPath { get; init; }
 
+    /// <summary>
+    /// The round-trip delay dial. Off by default, and off is the only setting an official run accepts.
+    /// Engaging it routes the target's database traffic through a loopback proxy that prices every round
+    /// trip, which turns a run into a diagnostic one.
+    /// </summary>
+    public LatencyProfile Latency { get; init; } = LatencyProfile.Disabled;
+
     /// <summary>Parses harness options from <c>--key value</c> arguments, applying defaults for omitted keys.</summary>
     public static BenchmarkOptions Parse(string[] args)
     {
@@ -78,6 +86,7 @@ public sealed record BenchmarkOptions
                 "--warmup" => result with { WarmupRuns = int.Parse(value) },
                 "--runs" => result with { MeasuredRuns = int.Parse(value) },
                 "--out" => result with { OutPath = value },
+                "--rtt-ms" => result with { Latency = LatencyProfile.OfMilliseconds(double.Parse(value)) },
                 _ => throw new ArgumentException($"Unknown option '{key}'."),
             };
         }

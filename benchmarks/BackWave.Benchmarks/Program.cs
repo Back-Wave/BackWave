@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using BackWave.Benchmarks;
 using BackWave.Benchmarks.Environment;
+using BackWave.Benchmarks.Latency;
 using BackWave.Benchmarks.ScaleOut;
 using BackWave.Benchmarks.Targets;
 using BackWave.Benchmarks.Workload;
@@ -27,6 +28,8 @@ using BackWave.Benchmarks.Workload;
 //   --warmup  W                    warmup runs discarded                (default: 1)
 //   --runs    N                    measured runs reported as min/median/max distribution (default: 3)
 //   --out     path.json            write result JSON to a file          (default: stdout only)
+//   --rtt-ms  D                    latency profile: add D ms to every database round trip
+//                                  (default: 0 = off; DIAGNOSTIC only, refused in official mode)
 
 // Scale-out curve + per-Node subprocess (bench-0141). Both use flags the single-run parser does not know,
 // so they are dispatched before BenchmarkOptions.Parse: a `--node` process runs only a pump and drains the
@@ -49,7 +52,7 @@ var options = BenchmarkOptions.Parse(args);
 // clean stderr message + non-zero exit, not a stack trace — it is expected operator feedback.
 try
 {
-    OfficialModeGuard.Assert(options.Mode);
+    OfficialModeGuard.Assert(options.Mode, options.Latency);
 }
 catch (OfficialModeNotSupportedException refusal)
 {
@@ -69,13 +72,40 @@ var spec = new WorkloadSpec
     PayloadSizeBytes = options.PayloadBytes,
 };
 
+// The latency profile (bench-0265). Off by default: with the dial at 0 nothing is started and no
+// connection string is touched, so the official path is byte-for-byte the path it always was. Engaged, it
+// stands a loopback proxy in front of the database and rewrites the target's DSN to point at it, BEFORE the
+// target is constructed and reads that DSN. The delay lands on the wire, so it prices round TRIPS - the
+// thing that differs by adapter - rather than store calls.
+LatencyProxy? installed;
+try
+{
+    installed = LatencyProfileInstaller.Install(options.Target, options.Latency);
+}
+catch (InvalidOperationException refusal)
+{
+    // Expected operator feedback, like the official-mode refusal above: a message and an exit code rather
+    // than a stack trace.
+    Console.Error.WriteLine($"latency profile refused: {refusal.Message}");
+    return 2;
+}
+
+await using var latencyProxy = installed;
+if (options.Latency.IsEngaged)
+{
+    Console.Error.WriteLine(
+        $"LATENCY PROFILE ENGAGED: +{options.Latency.RoundTripMs:0}ms on every database round trip. " +
+        "This is a DIAGNOSTIC run. Its numbers are never published and never enter the result matrix.");
+}
+
 await using var target = BenchmarkTargetRegistry.Create(options.Target);
 
 Console.Error.WriteLine(
     $"Running {target.Name} | {spec.Arrival} | {spec.JobCount} jobs | {spec.DelayMs}ms handler | " +
-    $"{options.WarmupRuns} warmup + {options.MeasuredRuns} runs | mode={options.Mode}");
+    $"{options.WarmupRuns} warmup + {options.MeasuredRuns} runs | mode={options.Mode} | " +
+    $"rtt-delay={options.Latency.RoundTripMs:0}ms");
 
-var orchestrator = new RunOrchestrator(target, options.Mode);
+var orchestrator = new RunOrchestrator(target, options.Mode, options.Latency);
 var result = await orchestrator.RunAsync(spec, options.WarmupRuns, options.MeasuredRuns, CancellationToken.None);
 
 var json = JsonSerializer.Serialize(result, JsonOptions());
@@ -89,7 +119,17 @@ if (options.OutPath is { } path)
 Console.Error.WriteLine(
     $"throughput jobs/sec  min={result.ThroughputJobsPerSecond.Min:N0}  " +
     $"median={result.ThroughputJobsPerSecond.Median:N0}  max={result.ThroughputJobsPerSecond.Max:N0}  " +
-    $"publishable={result.Publishable}");
+    $"publishable={result.Publishable}  diagnostic={result.Diagnostic}");
+
+if (latencyProxy is not null)
+{
+    // The task timer overshoots a short wait, so report what the proxy actually held segments for rather
+    // than leaving the reader to assume the setting was delivered exactly.
+    Console.Error.WriteLine(
+        $"latency profile  requested={options.Latency.RoundTripMs:0}ms  " +
+        $"achieved-mean={latencyProxy.MeanHold.TotalMilliseconds:N3}ms  " +
+        $"held-segments={latencyProxy.HeldSegments:N0}");
+}
 
 Console.Error.WriteLine(
     "tuning dials  " + string.Join("  ", result.TuningDials.Select(d => $"{d.Key}={d.Value}")));

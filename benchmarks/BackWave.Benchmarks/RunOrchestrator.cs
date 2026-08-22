@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using BackWave.Benchmarks.Environment;
+using BackWave.Benchmarks.Latency;
 using BackWave.Benchmarks.Metrics;
 using BackWave.Benchmarks.Targets;
 using BackWave.Benchmarks.Workload;
@@ -17,12 +18,17 @@ public sealed class RunOrchestrator
 {
     private readonly IBenchmarkTarget _target;
     private readonly RunMode _mode;
+    private readonly LatencyProfile _latency;
 
-    /// <summary>Creates an orchestrator for one target in one run mode.</summary>
-    public RunOrchestrator(IBenchmarkTarget target, RunMode mode)
+    /// <summary>Creates an orchestrator for one target in one run mode, under one latency-dial setting.</summary>
+    /// <param name="target">The system under test.</param>
+    /// <param name="mode">The run mode.</param>
+    /// <param name="latency">The latency-profile dial the run is being made under.</param>
+    public RunOrchestrator(IBenchmarkTarget target, RunMode mode, LatencyProfile latency)
     {
         _target = target;
         _mode = mode;
+        _latency = latency;
     }
 
     /// <summary>
@@ -34,7 +40,7 @@ public sealed class RunOrchestrator
     {
         var totalRuns = warmupRuns + measuredRuns;
         var version = await _target.SetupAsync(cancellationToken).ConfigureAwait(false);
-        var manifest = EnvironmentManifest.Capture(_mode, _target.Engine, version);
+        var manifest = EnvironmentManifest.Capture(_mode, _target.Engine, version, _latency);
 
         var perRun = new List<RunOutcome>(totalRuns);
         try

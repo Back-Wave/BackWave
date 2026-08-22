@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using BackWave.Benchmarks.Latency;
 
 namespace BackWave.Benchmarks.Environment;
 
@@ -51,26 +52,47 @@ public sealed record EnvironmentManifest
     public required RunMode Mode { get; init; }
 
     /// <summary>
+    /// The delay the latency-profile dial added to every database round trip, in milliseconds. Zero means
+    /// the dial was off, which is the only setting an official run may carry. Any other value marks the
+    /// result a diagnostic and forces <see cref="Publishable"/> to false.
+    /// </summary>
+    public required double RoundTripDelayMs { get; init; }
+
+    /// <summary>
     /// True only when this number may be published: <see cref="RunMode.Official"/> on a native-x86-64
-    /// (<see cref="Architecture.X64"/>) host. Local mode, Apple Silicon, and Rosetta emulation are
-    /// always false. Derived, never set independently — the credibility guard (ADR 0027 §8).
+    /// (<see cref="Architecture.X64"/>) host with the latency-profile dial off. Local mode, Apple Silicon,
+    /// Rosetta emulation, and any added round-trip delay are always false. Derived, never set
+    /// independently - the credibility guard (ADR 0027 §8).
     /// </summary>
     public required bool Publishable { get; init; }
 
     /// <summary>
     /// The single source of truth for the publishable rule: official mode AND a native-x86-64 process
-    /// architecture (<see cref="Architecture.X64"/>) that is NOT Rosetta-emulated. Anything else — local
-    /// mode, any non-X64 arch (including Apple Silicon Arm64), or a Rosetta-translated x64 process — is
-    /// unpublishable.
+    /// architecture (<see cref="Architecture.X64"/>) that is NOT Rosetta-emulated AND the latency-profile
+    /// dial off. Anything else - local mode, any non-X64 arch (including Apple Silicon Arm64), a
+    /// Rosetta-translated x64 process, or an added round-trip delay - is unpublishable.
     /// </summary>
-    public static bool DerivePublishable(RunMode mode, Architecture processArchitecture, bool isRosettaEmulated)
-        => mode == RunMode.Official && processArchitecture == Architecture.X64 && !isRosettaEmulated;
+    /// <param name="mode">The requested run mode.</param>
+    /// <param name="processArchitecture">The live process architecture.</param>
+    /// <param name="isRosettaEmulated">Whether the x64 process is Rosetta-translated on Apple Silicon.</param>
+    /// <param name="latency">The latency-profile dial the run was produced under.</param>
+    public static bool DerivePublishable(
+        RunMode mode, Architecture processArchitecture, bool isRosettaEmulated, LatencyProfile latency)
+        => mode == RunMode.Official
+            && processArchitecture == Architecture.X64
+            && !isRosettaEmulated
+            && !latency.IsEngaged;
 
     /// <summary>
     /// Captures the live environment for <paramref name="mode"/> against the given DB engine/version,
-    /// deriving <see cref="Publishable"/> from the captured architecture and Rosetta state.
+    /// deriving <see cref="Publishable"/> from the captured architecture, Rosetta state, and latency dial.
     /// </summary>
-    public static EnvironmentManifest Capture(RunMode mode, string dbEngine, string dbVersion)
+    /// <param name="mode">The requested run mode.</param>
+    /// <param name="dbEngine">The storage engine under test.</param>
+    /// <param name="dbVersion">The storage engine's reported version string.</param>
+    /// <param name="latency">The latency-profile dial the run was produced under.</param>
+    public static EnvironmentManifest Capture(
+        RunMode mode, string dbEngine, string dbVersion, LatencyProfile latency)
     {
         var arch = RuntimeInformation.ProcessArchitecture;
         var rosetta = DetectRosetta();
@@ -84,7 +106,8 @@ public sealed record EnvironmentManifest
             DbEngine = dbEngine,
             DbVersion = dbVersion,
             Mode = mode,
-            Publishable = DerivePublishable(mode, arch, rosetta),
+            RoundTripDelayMs = latency.RoundTripMs,
+            Publishable = DerivePublishable(mode, arch, rosetta, latency),
         };
     }
 
