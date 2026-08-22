@@ -30,6 +30,9 @@ services:
 
   oracle:
     image: gvenzl/oracle-free:23-slim
+    # Oracle needs far more shared memory than Docker's 64 MB default. Without this the instance
+    # dies on first boot with ORA-00600 [ksipc: no private ips avail] + ORA-29701.
+    shm_size: 2gb
     environment:
       ORACLE_PASSWORD: backwave
       APP_USER: backwave

@@ -19,10 +19,11 @@ confirmed finding into a per-site clause (0196 pattern,
 ## Running
 
 ```bash
-docker compose up -d postgres sqlserver   # not needed for the sqlite shapes
+docker compose up -d postgres sqlserver oracle   # not needed for the sqlite shapes
 
 dotnet run -- --adapter postgres              --duration 5m
 dotnet run -- --adapter sqlserver             --duration 5m
+dotnet run -- --adapter oracle                --duration 5m
 dotnet run -- --adapter sqlite                --duration 5m
 dotnet run -- --adapter sqlite-multiprocess   --duration 5m   # 4 real OS processes, one WAL file
 ```
