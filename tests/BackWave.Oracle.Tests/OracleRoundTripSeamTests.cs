@@ -1,4 +1,3 @@
-using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 
 namespace BackWave.Oracle.Tests;
@@ -77,20 +76,33 @@ public sealed class OracleRoundTripSeamTests
     private static IEnumerable<string> AdapterSources()
     {
         var adapter = AdapterDirectory();
-        Assert.True(Directory.Exists(adapter), $"Oracle adapter sources not found at {adapter}.");
+        Assert.True(
+            adapter is not null,
+            $"Oracle adapter sources not found: no directory above {AppContext.BaseDirectory} holds src/BackWave.Oracle.");
 
-        return Directory.EnumerateFiles(adapter, "*.cs", SearchOption.AllDirectories)
+        return Directory.EnumerateFiles(adapter!, "*.cs", SearchOption.AllDirectories)
             .Where(path => !path.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.Ordinal)
                 && !path.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.Ordinal))
             .OrderBy(path => path, StringComparer.Ordinal);
     }
 
-    // Anchored to this file's own compile-time path rather than the test binary's location, which moves
-    // with the TFM and configuration and says nothing about where the source it is guarding lives.
-    private static string AdapterDirectory([CallerFilePath] string thisFile = "")
+    // Found by walking up from the test binary until a directory holds the adapter. Not this file's own
+    // [CallerFilePath]: a CI build sets ContinuousIntegrationBuild, which makes the compiler rewrite every
+    // embedded source path to a deterministic "/_" root that exists on no disk, so the anchor resolved
+    // locally and failed on every CI run. The walk searches for the adapter itself rather than counting
+    // directory levels, so it does not move with the TFM or the configuration either.
+    private static string? AdapterDirectory()
     {
-        var repoRoot = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(thisFile)!, "..", ".."));
-        return Path.Combine(repoRoot, "src", "BackWave.Oracle");
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            var adapter = Path.Combine(dir.FullName, "src", "BackWave.Oracle");
+            if (Directory.Exists(adapter))
+            {
+                return adapter;
+            }
+        }
+
+        return null;
     }
 
     // A wrapper body is a driver call that the line above it already counted. Checking for the count
