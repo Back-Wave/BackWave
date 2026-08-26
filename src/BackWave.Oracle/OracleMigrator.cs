@@ -113,6 +113,9 @@ public static class OracleMigrator
 
             await using var command = connection.CreateCommand();
             command.CommandText = rewriter.Rewrite(sql);
+            // uncounted round trip: migration runs once at startup, on its own connection, before any
+            // store operation exists to charge it to. Its cost is a fixed price for provisioning the
+            // schema rather than a per-operation cost, which is the only thing the budgets watch.
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
@@ -163,6 +166,8 @@ public static class OracleMigrator
         object? version;
         try
         {
+            // uncounted round trip: the schema-version check is the one-time startup probe the budgets
+            // already exclude by name, on a connection of its own that no operation is measured through.
             version = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (OracleException exception) when (exception.Number == 942) // table or view does not exist

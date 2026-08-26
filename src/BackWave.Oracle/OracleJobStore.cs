@@ -3698,6 +3698,9 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             command.CommandText = "BEGIN DBMS_ALERT.REGISTER(:name); END;";
             command.BindByName = true;
             command.Parameters.Add(new OracleParameter("name", OracleDbType.Varchar2) { Value = alertName });
+            // uncounted round trip: the pump owns this session for the process lifetime and registers on
+            // it once, on its own task. It is nobody's operation, so counting it would charge whichever
+            // operation happened to be in flight for a statement it never asked for.
             await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
         }
 
@@ -3719,6 +3722,9 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             };
             command.Parameters.Add(status);
             command.Parameters.Add(new OracleParameter("timeout", OracleDbType.Int32) { Value = WaitTimeoutSeconds });
+            // uncounted round trip: this statement parks on DBMS_ALERT.WAITONE for the whole wait window
+            // rather than making a trip and returning. It is a blocked session, not a cost any operation
+            // pays, and it belongs to the pump's task rather than to any operation being measured.
             await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
 
             var statusCode = ((OracleDecimal)status.Value).ToInt32();

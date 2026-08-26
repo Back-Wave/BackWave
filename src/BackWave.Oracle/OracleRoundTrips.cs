@@ -100,10 +100,11 @@ internal static class OracleRoundTrips
         Flow.Value?.RecordFetchWindow(bytes);
     }
 
-    // The adapter's execution entry points. Every ExecuteXxxAsync in the store goes through one of these
-    // - grep for a bare `.ExecuteNonQueryAsync(` in OracleJobStore.cs and the only hits should be the
-    // three wrappers below plus the Wake-Up Hint pump, which is deliberately outside the count: its
-    // session parks on DBMS_ALERT.WAITONE on its own task and belongs to no operation.
+    // The adapter's execution entry points. Every ExecuteXxxAsync in the adapter goes through one of
+    // these, and that is enforced rather than trusted: OracleRoundTripSeamTests fails the build's test
+    // pass on any bare driver call in src/BackWave.Oracle that is neither a wrapper body below nor
+    // marked "uncounted round trip:" at the call site with a reason. The marked ones are statements
+    // belonging to no operation - the Wake-Up Hint pump's parked session, and migration.
     internal static Task<int> ExecuteNonQueryCountedAsync(
         this OracleCommand command, CancellationToken cancellationToken)
     {
