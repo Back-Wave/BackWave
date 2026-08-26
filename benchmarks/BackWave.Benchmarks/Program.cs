@@ -112,6 +112,12 @@ var json = JsonSerializer.Serialize(result, JsonOptions());
 Console.WriteLine(json);
 if (options.OutPath is { } path)
 {
+    // A run costs minutes. Losing it to a missing directory is not a useful error.
+    if (Path.GetDirectoryName(Path.GetFullPath(path)) is { Length: > 0 } directory)
+    {
+        Directory.CreateDirectory(directory);
+    }
+
     await File.WriteAllTextAsync(path, json);
     Console.Error.WriteLine($"Wrote result to {path}");
 }
