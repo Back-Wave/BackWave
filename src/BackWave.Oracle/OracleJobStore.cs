@@ -1414,32 +1414,52 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             }
         }
 
-        // Oracle has no VALUES table constructor, so each disposition is a bounded per-row UPDATE loop
-        // inside this one transaction (maxJobs caps the count).
-        foreach (var (jobId, due) in retries)
+        // One set-based write per disposition, whatever maxJobs is. Oracle has no VALUES table
+        // constructor, so the set arrives as a JSON payload and JSON_TABLE unpacks it - the same shape the
+        // outcome write uses, and for the same reason: a sweep of 500 expired leases is 500 round trips as
+        // a per-row loop and two as this. Every row here is already locked by the FOR UPDATE SKIP LOCKED
+        // above and the ids are distinct, so the MERGE needs no fence of its own. The due instant travels
+        // as ISO text under an explicit format, because a JSON_TABLE column declared TIMESTAMP WITH TIME
+        // ZONE rounds away the seventh fractional digit that this store hands back.
+        if (retries.Count > 0)
         {
             await using var reschedule = Cmd(
-                "UPDATE backwave.jobs SET state = 0, due_time = :due, lease_owner = NULL, lease_expiry = NULL WHERE job_id = :id",
+                """
+                MERGE INTO backwave.jobs j
+                USING (SELECT HEXTORAW(d.job_hex) AS job_id, TO_TIMESTAMP_TZ(d.due, :fmt) AS due
+                       FROM JSON_TABLE(:payload, '$[*]' COLUMNS (
+                                job_hex VARCHAR2(32) PATH '$.JobHex',
+                                due VARCHAR2(40) PATH '$.Due')) d) d
+                ON (j.job_id = d.job_id)
+                WHEN MATCHED THEN UPDATE SET
+                    j.state = 0, j.due_time = d.due, j.lease_owner = NULL, j.lease_expiry = NULL
+                """,
                 connection, transaction);
-            reschedule.Parameters.Add(Raw("id", jobId));
-            reschedule.Parameters.Add(Tstz("due", due));
+            reschedule.Parameters.Add(Clob("payload", JsonSerializer.Serialize(
+                retries.Select(r => new RescheduleRow(Convert.ToHexString(r.JobId.ToByteArray()), Iso(r.Due))))));
+            reschedule.Parameters.Add(Str("fmt", IsoTimestampFormat));
             await reschedule.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         if (deadLettered.Count > 0)
         {
-            foreach (var (jobId, cause) in deadLettered)
+            await using (var deadLetter = Cmd(
+                """
+                MERGE INTO backwave.jobs j
+                USING (SELECT HEXTORAW(d.job_hex) AS job_id, d.cause
+                       FROM JSON_TABLE(:payload, '$[*]' COLUMNS (
+                                job_hex VARCHAR2(32) PATH '$.JobHex',
+                                cause CLOB PATH '$.Cause')) d) d
+                ON (j.job_id = d.job_id)
+                WHEN MATCHED THEN UPDATE SET
+                    j.state = 5, j.lease_owner = NULL, j.lease_expiry = NULL,
+                    j.terminal_at = :now, j.terminal_cause = d.cause
+                """,
+                connection, transaction))
             {
-                await using var deadLetter = Cmd(
-                    """
-                    UPDATE backwave.jobs
-                    SET state = 5, lease_owner = NULL, lease_expiry = NULL, terminal_at = :now, terminal_cause = :cause
-                    WHERE job_id = :id
-                    """,
-                    connection, transaction);
-                deadLetter.Parameters.Add(Raw("id", jobId));
+                deadLetter.Parameters.Add(Clob("payload", JsonSerializer.Serialize(
+                    deadLettered.Select(d => new DeadLetterRow(Convert.ToHexString(d.JobId.ToByteArray()), d.Cause)))));
                 deadLetter.Parameters.Add(Tstz("now", now));
-                deadLetter.Parameters.Add(Clob("cause", cause));
                 await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
 
@@ -1472,15 +1492,18 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         }
 
         // Transition Log: one entry per expired job for its resulting state - Scheduled (rescheduled) or
-        // DeadLettered (ceiling) - at its post-claim Attempt, atomic with the disposition writes.
+        // DeadLettered (ceiling) - at its post-claim Attempt, atomic with the disposition writes. Batched,
+        // so a wide sweep does not undo the two statements above with one insert per job.
+        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(expired.Count);
         foreach (var (jobId, attempt) in expired)
         {
             var resulting = disposition.NextAttemptAt(attempt, now) is not null
                 ? JobState.Scheduled
                 : JobState.DeadLettered;
-            await RecordTransitionAsync(connection, transaction, jobId, resulting, attempt, now, cancellationToken)
-                .ConfigureAwait(false);
+            transitions.Add((jobId, resulting, attempt, null));
         }
+        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
+            .ConfigureAwait(false);
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return expired.Count;
@@ -1784,6 +1807,20 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
     {
         if (rows.Count == 0 || _historyPolicy == JobHistoryPolicy.Off)
         {
+            return;
+        }
+
+        // One row costs LESS through the single-row recorder: it gets its ordinal back on the insert's own
+        // RETURNING, where the batch form has to read MAX(ordinal) afterwards because Oracle rejects
+        // RETURNING on an INSERT ... SELECT. At a batch of one there is no second row to amortize that read
+        // over, so the batch form would be a round trip worse than the code it replaced. A batch of one is
+        // not a corner case either - the driver flushes outcomes as soon as its executing set empties, so
+        // it is the ordinary shape for a lightly loaded worker.
+        if (rows.Count == 1)
+        {
+            var (jobId, state, attempt, detail) = rows[0];
+            await RecordTransitionAsync(
+                connection, transaction, jobId, state, attempt, now, cancellationToken, detail).ConfigureAwait(false);
             return;
         }
 
@@ -3470,6 +3507,12 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         insert.Parameters.Add(Clob("payload", JsonSerializer.Serialize(payloadRows)));
         await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    // The set-valued disposition rows for the lease sweep's two MERGE statements. JobHex is the job id in
+    // the same byte order every other bind uses (Guid.ToByteArray), because JSON has no RAW literal.
+    private sealed record RescheduleRow(string JobHex, string? Due);
+
+    private sealed record DeadLetterRow(string JobHex, string Cause);
 
     // The set-valued tag row for the batch INSERT, serialized to JSON and unpacked by JSON_TABLE. Key
     // and Value are already encoded, so the empty-string sentinel never reaches Oracle as a NULL.

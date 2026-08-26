@@ -57,6 +57,10 @@ public sealed class OracleRoundTripBudgetTests
         "ReportOutcomesAsync of 32 succeeded rows, every one carrying job output",
         Statements: 6, LobReads: 0, FetchWindowBytes: 0);
 
+    private static readonly Budget ExpireLeases = new(
+        "ExpireLeasesAsync over 32 expired leases, all rescheduled",
+        Statements: 4, LobReads: 0, FetchWindowBytes: 0);
+
     private static readonly Budget ListJobs = new(
         "ListJobsAsync over a 200-job page of terminal jobs",
         Statements: 2, LobReads: 0, FetchWindowBytes: JobPageWindow);
@@ -188,6 +192,40 @@ public sealed class OracleRoundTripBudgetTests
             var stored = await store.GetJobOutputAsync(job.JobId);
             Assert.Equal(payload, stored?.ToArray());
         }
+    }
+
+    [Fact]
+    public async Task Expiring_a_full_sweep_of_leases_stays_within_its_round_trip_budget()
+    {
+        var store = await OracleTestDatabase.CreateFreshStoreAsync();
+        for (var i = 0; i < ClaimBatch; i++)
+        {
+            await store.EnqueueAsync(Job(), T0);
+        }
+        var claimed = await store.ClaimAsync(new ClaimRequest("budget-worker", ["budget"], ClaimBatch, Lease, T0));
+        Assert.Equal(ClaimBatch, claimed.Count);
+
+        // 1 locking select + 1 batched reschedule MERGE + 1 batched transition insert + 1 highest-ordinal
+        // read = 4, independent of how many leases the sweep reclaims. Every job here retries rather than
+        // dead-letters, which is the shape a sweep is usually full of and the cheaper of the two: the
+        // dead-letter arm adds its own MERGE and a child-latch lookup.
+        //
+        // The sweep is the widest per-row loop the adapter had - maxJobs is 500 by default where a claim
+        // batch is 32 - so this is where a per-row disposition costs the most. Before the two dispositions
+        // and the transition log were batched, this same call cost 97 statements.
+        var afterExpiry = T0 + Lease + TimeSpan.FromMinutes(1);
+        var disposition = new RetryDisposition(MaxAttempts: 5, [TimeSpan.FromMinutes(1)]);
+
+        int reclaimed;
+        Measured measured;
+        using (var scope = OracleRoundTrips.Observe())
+        {
+            reclaimed = await store.ExpireLeasesAsync(afterExpiry, maxJobs: 500, ["budget"], disposition);
+            measured = Measured.From(scope);
+        }
+
+        Assert.Equal(ClaimBatch, reclaimed);
+        AssertBudget(ExpireLeases, measured);
     }
 
     [Fact]
