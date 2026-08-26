@@ -65,6 +65,14 @@ public sealed class OracleRoundTripBudgetTests
         "ListJobsAsync over a 200-job page of terminal jobs",
         Statements: 2, LobReads: 0, FetchWindowBytes: JobPageWindow);
 
+    private static readonly Budget Enqueue = new(
+        "EnqueueAsync of one untagged job",
+        Statements: 2, LobReads: 0, FetchWindowBytes: 0);
+
+    private static readonly Budget EnqueueTagged = new(
+        "EnqueueAsync of one job carrying three tags",
+        Statements: 3, LobReads: 0, FetchWindowBytes: 0);
+
     // The window a statement selecting the full jobs column set declares: 32 rows (one claim batch) of
     // 140,447 bytes, which is the driver's own size for that row - both LOB columns at the 65,536
     // payload prefetch, plus about 9 KB of scalars. Claim and job list select the same columns, so they
@@ -260,6 +268,58 @@ public sealed class OracleRoundTripBudgetTests
         Assert.Equal(page, jobs.Count);
         Assert.All(jobs, job => Assert.False(string.IsNullOrEmpty(job.TerminalCause)));
         AssertBudget(ListJobs, measured);
+    }
+
+    [Fact]
+    public async Task Enqueue_of_one_job_stays_within_its_round_trip_budget()
+    {
+        var store = await OracleTestDatabase.CreateFreshStoreAsync();
+        await store.EnqueueAsync(Job(), T0); // warms the one-time schema check, off the measured path
+
+        // 1 job insert + 1 transition insert = 2 statements. Enqueue is a per-CALL path, not a per-row
+        // one, so there is no batch here for a set-based statement to collapse - which is exactly why
+        // the batching work in this file's other three budgets left this number alone.
+        //
+        // Two is also NOT the number the wire charges. This counter deliberately excludes acquiring a
+        // pooled connection, BEGIN, and COMMIT (see the class remarks), and enqueue pays all three on
+        // every single call because it opens and commits its own connection per job. Measured against
+        // the benchmark's 1 ms latency profile, one enqueue costs about 5.6 delayed inbound segments
+        // while this budget sees 2 of them. That gap is the reason enqueue barely moved when the claim
+        // and outcome paths got 4.1x faster, and it is a per-call fixed cost that only a bulk enqueue
+        // on the Storage Contract can amortize.
+        Measured measured;
+        using (var scope = OracleRoundTrips.Observe())
+        {
+            await store.EnqueueAsync(Job(), T0);
+            measured = Measured.From(scope);
+        }
+
+        AssertBudget(Enqueue, measured);
+    }
+
+    [Fact]
+    public async Task Enqueue_of_a_tagged_job_costs_one_statement_for_every_tag_together()
+    {
+        var store = await OracleTestDatabase.CreateFreshStoreAsync();
+        await store.EnqueueAsync(Job(), T0);
+
+        // Three tags cost ONE statement, not three: the tag insert is set-based over JSON_TABLE. This
+        // budget is the guard on that. A refactor that walks the tag list and binds one insert per tag
+        // reads as harmless and passes every functional test in the suite, because a co-located
+        // container finishes three inserts and one insert in the same blink. Here it fails: 5 against 3.
+        var tagged = Job() with
+        {
+            Tags = JobTags.Empty.WithTag("tenant", "acme").WithTag("region", "eu").WithTag("tier", "gold"),
+        };
+
+        Measured measured;
+        using (var scope = OracleRoundTrips.Observe())
+        {
+            await store.EnqueueAsync(tagged, T0);
+            measured = Measured.From(scope);
+        }
+
+        AssertBudget(EnqueueTagged, measured);
     }
 
     [Fact]
