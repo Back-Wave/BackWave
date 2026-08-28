@@ -1505,11 +1505,11 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
     // Appends one Transition Log entry (§5.12) for a job's resulting state, inside the SAME
     // transaction as the state change it records — a crash leaves neither or both (§4). The
     // ordinal is the per-job max + 1 (a sub-select against the same table), so it climbs even as
-    // oldest rows age out. The trailing bounded delete enforces MaxTransitionsPerJob (§7):
-    // once the cap is exceeded, the oldest entry is dropped. `now` is always the caller's clock —
-    // the database clock is never consulted. `failureDetail` is the Shell-captured exception text,
-    // written only on a failing transition (§5.12) and clamped to MaxFailureDetailBytes; null on
-    // every other transition.
+    // oldest rows age out. The trailing bounded delete enforces MaxTransitionsPerJob (§7): once the
+    // cap is exceeded, the oldest entry is dropped, and it runs only when this entry put the cap in
+    // play. `now` is always the caller's clock — the database clock is never consulted.
+    // `failureDetail` is the Shell-captured exception text, written only on a failing transition
+    // (§5.12) and clamped to MaxFailureDetailBytes; null on every other transition.
     private async Task RecordTransitionAsync(
         SqlConnection connection, SqlTransaction transaction, Guid jobId, JobState state,
         int attempt, DateTimeOffset now, CancellationToken cancellationToken, string? failureDetail = null)
@@ -1526,9 +1526,13 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             failureDetail = null; // record the transition, but never the detail it would have carried
         }
 
+        // OUTPUT the assigned ordinal so the prune can be skipped entirely (below) when the entry
+        // just written has not reached the cap - the common 2-transition job pays no DELETE round-trip.
+        long ordinal;
         await using (var insert = Cmd(
             """
             INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
+            OUTPUT inserted.ordinal
             SELECT @id, COALESCE(MAX(ordinal) + 1, 0), @now, @state, @attempt, @detail
             FROM backwave.job_transitions WHERE job_id = @id
             """,
@@ -1540,10 +1544,18 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             insert.Parameters.AddWithValue("attempt", attempt);
             insert.Parameters.AddWithValue(
                 "detail", (object?)options.Bounds.ClampFailureDetail(failureDetail) ?? DBNull.Value);
-            await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            ordinal = (long)(await insert.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
         }
 
-        // Per-job-life cap: keep only the newest MaxTransitionsPerJob entries, dropping oldest.
+        // Per-job-life cap (§7): skip the prune entirely unless the entry just written reached the
+        // cap - a job nowhere near MaxTransitionsPerJob never pays the DELETE. Under the cap the
+        // delete could only be a no-op: its bound is MAX(ordinal) - cap, which is negative while the
+        // newest ordinal is below the cap, and no ordinal is negative. When the entry did reach it,
+        // the bounded DELETE keeps only the newest MaxTransitionsPerJob entries, dropping oldest.
+        if (ordinal < options.Bounds.MaxTransitionsPerJob)
+        {
+            return;
+        }
         await using var prune = Cmd(
             """
             DELETE FROM backwave.job_transitions
