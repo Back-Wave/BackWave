@@ -1173,6 +1173,28 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             }
         }
 
+        // Transition Log (§5.12): one entry per expired job for its resulting state -
+        // Scheduled (rescheduled) or DeadLettered (ceiling) - at its post-claim Attempt
+        // (expiry counts as the already-claimed Attempt), atomic with the disposition writes.
+        // Batched, so a wide sweep does not undo the two set-based UPDATEs above with one
+        // insert per job. Each job appears once here (job_id is the key), so its ordinal holds.
+        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(expired.Count);
+        foreach (var (jobId, attempt) in expired)
+        {
+            var resulting = disposition.NextAttemptAt(attempt, now) is not null
+                ? JobState.Scheduled
+                : JobState.DeadLettered;
+            transitions.Add((jobId, resulting, attempt, null));
+        }
+        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
+            .ConfigureAwait(false);
+
+        // The transition log is written first, before either UPDATE takes an X lock on jobs. Its FK
+        // to jobs makes SQL Server read every jobs row the insert names, and the optimizer serves that
+        // read with a full scan of jobs whatever the batch size. A scan under READ COMMITTED takes an
+        // S lock per row, and S is compatible with the U locks the READPAST select above holds, so
+        // concurrent sweeps pass through each other. Writing it last instead puts the same scan behind
+        // every other sweeper's X locks, and two sweeps then deadlock on jobs (§5.5).
         // Set-based disposition: one UPDATE joins the whole retry set to a VALUES list of
         // (job_id, due_time), one more does the dead-letter set - O(1) statements, not one per job.
         // Both put the VALUES list first and hint INNER LOOP JOIN so each seeks the clustered PK per
@@ -1243,22 +1265,6 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                     .ConfigureAwait(false);
             }
         }
-
-        // Transition Log (§5.12): one entry per expired job for its resulting state —
-        // Scheduled (rescheduled) or DeadLettered (ceiling) — at its post-claim Attempt
-        // (expiry counts as the already-claimed Attempt), atomic with the disposition writes.
-        // Batched, so a wide sweep does not undo the two set-based UPDATEs above with one
-        // insert per job. Each job appears once here (job_id is the key), so its ordinal holds.
-        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(expired.Count);
-        foreach (var (jobId, attempt) in expired)
-        {
-            var resulting = disposition.NextAttemptAt(attempt, now) is not null
-                ? JobState.Scheduled
-                : JobState.DeadLettered;
-            transitions.Add((jobId, resulting, attempt, null));
-        }
-        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
-            .ConfigureAwait(false);
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return expired.Count;
@@ -1610,10 +1616,13 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         // the batch has reached the cap — the common 2-transition job pays no DELETE round-trip.
         var maxNewOrdinal = -1L;
         // Materialize the payload into a keyed table variable before the INSERT. OPENJSON carries no
-        // cardinality, so feeding it straight into the INSERT lets the optimizer validate the FK to
-        // jobs with a scan that range-locks rows beyond this batch's own; concurrent claimers then
-        // cross-lock those scans and deadlock. A PRIMARY KEY gives the optimizer the exact small set,
-        // so the FK check seeks only this batch's jobs rows — which the claim already holds.
+        // cardinality, and the key lets the optimizer cost the join to job_transitions.
+        // The key does not settle the FK check to jobs. That plan stays the optimizer's to pick, and
+        // for a batch that is large next to the jobs table it picks a full scan, which asks for an S
+        // lock on rows outside this batch. No hint removes that scan: LOOP JOIN only moves it into an
+        // eager index spool. So the caller, not the plan, must make the scan safe. A caller that
+        // records transitions while it holds only U locks passes through concurrent scans, because U
+        // and S are compatible - see the note in ExpireLeasesUntracedAsync.
         await using (var insert = Cmd(
             """
             DECLARE @batch TABLE (job_id uniqueidentifier PRIMARY KEY, state int, attempt int, detail nvarchar(max));
