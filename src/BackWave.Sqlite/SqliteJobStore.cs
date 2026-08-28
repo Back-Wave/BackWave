@@ -240,7 +240,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 await using var parent = Cmd(
                     "SELECT state FROM backwave_jobs WHERE job_id = $id", connection, transaction);
                 parent.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(parentId));
-                if (await parent.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is long parentState)
+                if (await parent.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is long parentState)
                 {
                     states[parentId] = SqliteValueCodec.ToEnum<JobState>(parentState);
                 }
@@ -292,7 +292,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 cancelledByParent is not null ? ParentFailureCause(cancelledByParent.Value) : DBNull.Value);
             insert.Parameters.AddWithValue("$workflowId",
                 workflowId is { } wf ? SqliteValueCodec.ToText(wf) : DBNull.Value);
-            if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 0)
+            if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) == 0)
             {
                 return (EnqueueResult.Duplicate, null);
             }
@@ -308,7 +308,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 connection, transaction);
             edge.Parameters.AddWithValue("$parent", SqliteValueCodec.ToText(parentId));
             edge.Parameters.AddWithValue("$child", SqliteValueCodec.ToText(job.JobId));
-            await edge.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await edge.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // Job Tags (ADR 0022): the enqueue-time set, in this same transaction so they are visible
@@ -399,7 +399,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             {
                 peek.Parameters.AddWithValue("$queue", queue);
                 peek.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(request.Now));
-                if (await peek.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is null)
+                if (await peek.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is null)
                 {
                     continue; // nothing committed and due in this Queue — no write lock taken
                 }
@@ -417,7 +417,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 connection, transaction))
             {
                 limit.Parameters.AddWithValue("$queue", queue);
-                await using var reader = await limit.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = await limit.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     configured = reader.IsDBNull(0) ? null : reader.GetInt32(0);
@@ -435,7 +435,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                     $"SELECT count(*) FROM backwave_jobs WHERE queue = $queue AND state = {(int)JobState.Leased}",
                     connection, transaction);
                 leased.Parameters.AddWithValue("$queue", queue);
-                var inUse = (long)(await leased.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+                var inUse = (long)(await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
                 slots = limitValue - (int)inUse;
             }
             if (slots <= 0)
@@ -464,7 +464,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             claim.Parameters.AddWithValue("$take", Math.Min(maxJobs - claimed.Count, slots));
 
             var queueClaims = new List<JobRecord>();
-            await using (var reader = await claim.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+            await using (var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
             {
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
@@ -519,7 +519,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         {
             cmd.Parameters.AddWithValue(queueParams[i], request.Queues[i]);
         }
-        if (await cmd.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not { } scalar || scalar is DBNull)
+        if (await cmd.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not { } scalar || scalar is DBNull)
         {
             return null; // nothing scheduled in any served, non-paused queue
         }
@@ -594,7 +594,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             update.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
             configure(update);
 
-            var scalar = await update.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            var scalar = await update.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             if (scalar is not long resultState)
             {
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -739,7 +739,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 update.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
                 configure(update);
 
-                if (await update.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not long resultState)
+                if (await update.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not long resultState)
                 {
                     continue; // the (workerId, attempt) fence — StaleLease, nothing buffered survives
                 }
@@ -826,7 +826,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 connection, transaction))
             {
                 edges.Parameters.AddWithValue("$parent", SqliteValueCodec.ToText(currentParent));
-                await using var reader = await edges.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = await edges.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     children.Add(SqliteValueCodec.ToGuid(reader.GetString(0)));
@@ -841,7 +841,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                     connection, transaction))
                 {
                     child.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(childId));
-                    await using var reader = await child.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                    await using var reader = await child.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     {
                         continue;
@@ -866,7 +866,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                     cancel.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(childId));
                     cancel.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
                     cancel.Parameters.AddWithValue("$cause", ParentFailureCause(currentState));
-                    await cancel.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await cancel.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                     await RecordTransitionAsync(connection, transaction, childId, JobState.Cancelled, childAttempt, now, cancellationToken)
                         .ConfigureAwait(false);
                     work.Push((childId, JobState.Cancelled)); // cascade
@@ -887,7 +887,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 {
                     resolve.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
                 }
-                await resolve.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await resolve.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 // Only the latch RELEASE (last parent terminal → Scheduled) is a transition worth
                 // recording; a mere decrement keeps the child in AwaitingParent (§5.12).
                 if (remaining - 1 <= 0)
@@ -936,7 +936,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             {
                 command.Parameters.AddWithValue(name, value);
             }
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 renewed[SqliteValueCodec.ToGuid(reader.GetString(0))] = reader.GetBoolean(1);
@@ -1001,7 +1001,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             {
                 select.Parameters.AddWithValue(name, value);
             }
-            await using var reader = await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 expired.Add((SqliteValueCodec.ToGuid(reader.GetString(0)), reader.GetInt32(1)));
@@ -1022,7 +1022,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                     connection, transaction);
                 reschedule.Parameters.AddWithValue("$due", SqliteValueCodec.ToTicks(retryAt));
                 reschedule.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
-                await reschedule.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await reschedule.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
             else
             {
@@ -1037,7 +1037,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 deadLetter.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
                 deadLetter.Parameters.AddWithValue("$cause", $"Lease expired on attempt {attempt} (attempt ceiling reached).");
                 deadLetter.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
-                await deadLetter.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 deadLetteredParents.Add(jobId);
             }
         }
@@ -1089,7 +1089,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             "SELECT state, attempt FROM backwave_jobs WHERE job_id = $id", connection, transaction))
         {
             current.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
-            await using var reader = await current.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await current.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 return CancelResult.NotCancellable;
@@ -1107,7 +1107,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                     cancel.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
                     cancel.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
                     cancel.Parameters.AddWithValue("$actor", actor);
-                    await cancel.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await cancel.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 }
                 await RecordTransitionAsync(connection, transaction, jobId, JobState.Cancelled, attempt, now, cancellationToken)
                     .ConfigureAwait(false);
@@ -1123,7 +1123,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                     "UPDATE backwave_jobs SET cancel_requested = 1 WHERE job_id = $id", connection, transaction))
                 {
                     request.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
-                    await request.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await request.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 }
                 await AppendAuditAsync(connection, transaction, actor, OperatorAction.Cancel, jobId.ToString(), now, cancellationToken)
                     .ConfigureAwait(false);
@@ -1161,7 +1161,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         {
             update.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
             update.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
-            if (await update.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is null)
+            if (await update.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is null)
             {
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
                 return RequeueResult.NotRequeueable;
@@ -1205,7 +1205,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         {
             upsert.Parameters.AddWithValue("$queue", queue);
             upsert.Parameters.AddWithValue("$paused", paused ? 1 : 0);
-            await upsert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await upsert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         await AppendAuditAsync(connection, transaction, actor, action, queue, now, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -1225,7 +1225,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             "SELECT wire_name, payload, queue FROM backwave_schedules WHERE schedule_id = $id", connection, transaction))
         {
             select.Parameters.AddWithValue("$id", scheduleId);
-            await using var reader = await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 schedule = (reader.GetString(0), (byte[])reader[1], reader.GetString(2));
@@ -1253,7 +1253,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             insert.Parameters.AddWithValue("$queue", schedule.Value.Queue);
             insert.Parameters.AddWithValue("$due", SqliteValueCodec.ToTicks(now));
             insert.Parameters.AddWithValue("$scheduleId", scheduleId);
-            if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0)
+            if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) > 0)
             {
                 triggered = true;
                 await RecordTransitionAsync(connection, transaction, mintedId, JobState.Scheduled, attempt: 0, now, cancellationToken)
@@ -1283,7 +1283,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         command.Parameters.AddWithValue("$target", target);
 
         var records = new List<OperatorAuditRecord>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             records.Add(new OperatorAuditRecord(
@@ -1307,7 +1307,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         audit.Parameters.AddWithValue("$action", (int)action);
         audit.Parameters.AddWithValue("$target", target);
         audit.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
-        await audit.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await audit.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // Appends one Transition Log entry (§5.12) for a job's resulting state, inside the SAME
@@ -1350,7 +1350,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             insert.Parameters.AddWithValue("$attempt", attempt);
             insert.Parameters.AddWithValue(
                 "$detail", (object?)_options.Bounds.ClampFailureDetail(failureDetail) ?? DBNull.Value);
-            ordinal = (long)(await insert.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+            ordinal = (long)(await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
         }
 
         // Per-job-life cap (§7): skip the prune entirely unless the entry just written reached the
@@ -1372,7 +1372,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             connection, transaction);
         prune.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
         prune.Parameters.AddWithValue("$cap", _options.Bounds.MaxTransitionsPerJob);
-        await prune.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // Appends a BATCH of Transition Log entries (§5.12) in ONE set-based INSERT — the per-row
@@ -1412,7 +1412,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         await using (var maxPosition = Cmd(
             "SELECT COALESCE(MAX(position), 0) FROM backwave_job_transitions", connection, transaction))
         {
-            basePosition = (long)(await maxPosition.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+            basePosition = (long)(await maxPosition.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
         }
 
         // RETURNING the assigned ordinals lets the prune be skipped entirely (below) when no job in
@@ -1443,7 +1443,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             insert.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
             insert.Parameters.AddWithValue("$basePos", basePosition);
             insert.Parameters.AddWithValue("$payload", payload);
-            await using var reader = await insert.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await insert.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var ordinal = reader.GetInt64(0);
@@ -1473,7 +1473,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             connection, transaction);
         prune.Parameters.AddWithValue("$payload", payload);
         prune.Parameters.AddWithValue("$cap", _options.Bounds.MaxTransitionsPerJob);
-        await prune.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // The set-valued transition row for the batch INSERT, serialized to JSON and unpacked by
@@ -1508,7 +1508,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         command.Parameters.AddWithValue("$zone", (object?)schedule.TimeZoneId ?? DBNull.Value);
         command.Parameters.AddWithValue("$catchUp", (int)schedule.CatchUp);
         command.Parameters.AddWithValue("$noOverlap", schedule.NoOverlap ? 1 : 0);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
@@ -1520,7 +1520,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         await using var command = Cmd(
             "DELETE FROM backwave_schedules WHERE schedule_id = $id", connection);
         command.Parameters.AddWithValue("$id", scheduleId);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
@@ -1544,7 +1544,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             connection);
 
         var snapshots = new List<ScheduleSnapshot>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             snapshots.Add(new ScheduleSnapshot(
@@ -1593,7 +1593,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 fence.Parameters.AddWithValue("$id", decision.ScheduleId);
                 fence.Parameters.AddWithValue("$expected", SqliteValueCodec.ToTicks(decision.ExpectedCursor));
                 fence.Parameters.AddWithValue("$newCursor", SqliteValueCodec.ToTicks(decision.NewCursor));
-                await using var reader = await fence.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = await fence.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     schedule = (reader.GetString(0), (byte[])reader[1], reader.GetString(2), reader.GetString(3));
@@ -1616,7 +1616,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                     connection, transaction);
                 record.Parameters.AddWithValue("$id", decision.ScheduleId);
                 record.Parameters.AddWithValue("$ticks", RenderSkippedTicks(combined));
-                await record.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await record.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
 
             // Crash after the cursor advanced, before the instances are minted: rollback must restore
@@ -1640,7 +1640,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 insert.Parameters.AddWithValue("$queue", schedule.Value.Queue);
                 insert.Parameters.AddWithValue("$due", SqliteValueCodec.ToTicks(tick));
                 insert.Parameters.AddWithValue("$scheduleId", decision.ScheduleId);
-                if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0)
+                if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) > 0)
                 {
                     mintedForDecision++;
                     // MintDue carries no `now`; the tick (the instance's due instant) is the
@@ -1685,7 +1685,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         {
             command.Parameters.AddWithValue("$queue", queue);
             command.Parameters.AddWithValue("$limit", (object?)limit ?? DBNull.Value);
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         await AppendAuditAsync(connection, transaction, actor, OperatorAction.SetConcurrencyLimit, queue, now, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -1703,7 +1703,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             $"SELECT {JobColumns} FROM backwave_jobs WHERE job_id = $id", connection);
         command.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
         JobRecord? record;
-        await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        await using (var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
         {
             record = await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadJob(reader) : null;
         }
@@ -1725,7 +1725,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         await using var command = Cmd(
             "SELECT output FROM backwave_jobs WHERE job_id = $id", connection);
         command.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
-        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        var result = await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
         // byte[] has an implicit conversion to ReadOnlyMemory<byte>, so an unqualified `: null` would
         // be the empty `default` memory (HasValue) rather than no value — cast explicitly.
         return result is byte[] bytes ? new ReadOnlyMemory<byte>(bytes) : (ReadOnlyMemory<byte>?)null;
@@ -1747,7 +1747,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         command.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
 
         var transitions = new List<JobTransition>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             transitions.Add(new JobTransition(
@@ -1784,7 +1784,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         command.Parameters.AddWithValue("$take", Math.Min(query.MaxResults, _options.Bounds.MaxMonitorPageSize));
 
         var jobs = new List<JobRecord>();
-        await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        await using (var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
         {
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -1805,7 +1805,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             connection);
 
         var counts = new List<QueueStateCount>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             counts.Add(new QueueStateCount(
@@ -1890,7 +1890,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             + "GROUP BY value ORDER BY count(DISTINCT job_id) DESC, value LIMIT $max");
 
         var facets = new List<TagFacet>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             facets.Add(new TagFacet(reader.GetString(0), (int)reader.GetInt64(1)));
@@ -1938,7 +1938,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 + cursor
                 + "GROUP BY value ORDER BY lower(value), value LIMIT $limit");
 
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 suggestions.Add(new TagSuggestion(query.Key, reader.GetString(0)));
@@ -1973,7 +1973,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             + stageOneCursor
             + "ORDER BY section, lower(name), name LIMIT $limit");
 
-        await using var stageOneReader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var stageOneReader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await stageOneReader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             var name = stageOneReader.GetString(1);
@@ -1999,7 +1999,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             "SELECT queue, paused, max_concurrent FROM backwave_queue_limits ORDER BY queue", connection);
 
         var settings = new List<QueueSettings>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             settings.Add(new QueueSettings(
@@ -2022,7 +2022,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             "SELECT parent_id FROM backwave_job_parents WHERE child_id = $id ORDER BY parent_id", connection))
         {
             parents.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
-            await using var reader = await parents.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await parents.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 gatingParents.Add(SqliteValueCodec.ToGuid(reader.GetString(0)));
@@ -2034,7 +2034,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             "SELECT child_id FROM backwave_job_parents WHERE parent_id = $id ORDER BY child_id", connection))
         {
             childRows.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
-            await using var reader = await childRows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await childRows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 children.Add(SqliteValueCodec.ToGuid(reader.GetString(0)));
@@ -2093,7 +2093,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             {
                 command.Parameters.AddWithValue(name, value);
             }
-            var purged = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            var purged = await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
 
             // When a Workflow's last member is purged, drop its now-orphaned identity row (structural
             // edges cascade via FK) so the tables never leak rows for Workflows with no surviving jobs.
@@ -2102,7 +2102,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 "(SELECT workflow_id FROM backwave_jobs WHERE workflow_id IS NOT NULL)",
                 connection))
             {
-                await prune.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
             return purged;
         }
@@ -2229,7 +2229,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             insertRow.Parameters.AddWithValue("$retention", (int)workflow.Retention);
             insertRow.Parameters.AddWithValue("$restartedFrom",
                 workflow.RestartedFrom is { } from ? SqliteValueCodec.ToText(from) : DBNull.Value);
-            await insertRow.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await insertRow.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // Members in dependency order (parents before children), each stamped with the WorkflowId.
@@ -2264,7 +2264,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 edge.Parameters.AddWithValue("$workflowId", SqliteValueCodec.ToText(workflow.WorkflowId));
                 edge.Parameters.AddWithValue("$parent", SqliteValueCodec.ToText(parent));
                 edge.Parameters.AddWithValue("$child", SqliteValueCodec.ToText(member.JobId));
-                await edge.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await edge.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -2277,7 +2277,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         await using var command = Cmd(
             "SELECT 1 FROM backwave_workflows WHERE workflow_id = $id", connection, transaction);
         command.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(workflowId));
-        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
+        return await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not null;
     }
 
     private async ValueTask<bool> JobExistsAsync(
@@ -2286,7 +2286,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         await using var command = Cmd(
             "SELECT 1 FROM backwave_jobs WHERE job_id = $id", connection, transaction);
         command.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
-        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
+        return await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not null;
     }
 
     private async ValueTask<HashSet<Guid>> MembersOfAsync(
@@ -2296,7 +2296,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         await using var command = Cmd(
             "SELECT job_id FROM backwave_jobs WHERE workflow_id = $id", connection, transaction);
         command.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(workflowId));
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             members.Add(SqliteValueCodec.ToGuid(reader.GetString(0)));
@@ -2352,7 +2352,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         await using (var members = Cmd(
             "SELECT workflow_id, state FROM backwave_jobs WHERE workflow_id IS NOT NULL", connection))
         {
-            await using var reader = await members.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await members.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var wf = SqliteValueCodec.ToGuid(reader.GetString(0));
@@ -2366,7 +2366,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             "SELECT workflow_id, name, created_at, restarted_from FROM backwave_workflows " +
             "ORDER BY created_at, workflow_id", connection))
         {
-            await using var reader = await workflows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await workflows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var workflowId = SqliteValueCodec.ToGuid(reader.GetString(0));
@@ -2399,7 +2399,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             "SELECT name, created_at, restarted_from FROM backwave_workflows WHERE workflow_id = $id", connection))
         {
             row.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(workflowId));
-            await using var reader = await row.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await row.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 return null;
@@ -2414,7 +2414,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             $"SELECT {JobColumns} FROM backwave_jobs WHERE workflow_id = $id ORDER BY sequence", connection))
         {
             memberRows.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(workflowId));
-            await using var reader = await memberRows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await memberRows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 members.Add(ReadJob(reader));
@@ -2428,7 +2428,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             "ORDER BY parent_id, child_id", connection))
         {
             edgeRows.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(workflowId));
-            await using var reader = await edgeRows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await edgeRows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 edges.Add(new WorkflowEdge(
@@ -2469,7 +2469,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             connection, transaction))
         {
             ensure.Parameters.AddWithValue("$id", request.ObserverId);
-            await ensure.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await ensure.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         long cursor;
@@ -2480,7 +2480,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             connection, transaction))
         {
             locked.Parameters.AddWithValue("$id", request.ObserverId);
-            await using var reader = await locked.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await locked.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
             cursor = reader.GetInt64(0);
             leaseOwner = reader.IsDBNull(1) ? null : reader.GetString(1);
@@ -2498,7 +2498,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             sub.Parameters.AddWithValue("$states", string.Join(',', states));
             sub.Parameters.AddWithValue("$wire", (object?)request.WireName ?? DBNull.Value);
             sub.Parameters.AddWithValue("$queue", (object?)request.Queue ?? DBNull.Value);
-            await sub.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await sub.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // A live Lease held by a different worker means that node is delivering — back off (§5.13).
@@ -2538,7 +2538,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             {
                 scan.Parameters.AddWithValue(name, value);
             }
-            await using var reader = await scan.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await scan.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var nextAttemptAt = reader.IsDBNull(10) ? (DateTimeOffset?)null : SqliteValueCodec.FromTicks(reader.GetInt64(10));
@@ -2576,7 +2576,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             upsert.Parameters.AddWithValue("$id", request.ObserverId);
             upsert.Parameters.AddWithValue("$pos", delivery.Position);
             upsert.Parameters.AddWithValue("$attempt", delivery.DeliveryAttempt);
-            await upsert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await upsert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await using (var lease = Cmd(
@@ -2586,7 +2586,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             lease.Parameters.AddWithValue("$id", request.ObserverId);
             lease.Parameters.AddWithValue("$worker", request.WorkerId);
             lease.Parameters.AddWithValue("$expiry", SqliteValueCodec.ToTicks(request.Now + request.LeaseDuration));
-            await lease.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await lease.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -2614,7 +2614,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             connection, transaction))
         {
             locked.Parameters.AddWithValue("$id", report.ObserverId);
-            await using var reader = await locked.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await locked.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -2653,7 +2653,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             resolve.Parameters.AddWithValue(
                 "$next", outcome.Disposition == ObserverDeliveryDisposition.Retry && outcome.NextAttemptAt is { } at
                     ? SqliteValueCodec.ToTicks(at) : (object)DBNull.Value);
-            await resolve.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await resolve.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await AdvanceObserverCursorAsync(
@@ -2697,7 +2697,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             {
                 blockCommand.Parameters.AddWithValue(name, value);
             }
-            var result = await blockCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            var result = await blockCommand.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             block = result is DBNull or null ? null : (long)result;
         }
 
@@ -2708,7 +2708,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         {
             advance.Parameters.AddWithValue("$cursor", cursor);
             advance.Parameters.AddWithValue("$block", (object?)block ?? DBNull.Value);
-            var result = await advance.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            var result = await advance.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             newCursor = result is DBNull or null ? null : (long)result;
         }
 
@@ -2734,7 +2734,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             deadLetter.Parameters.AddWithValue("$cursor", cursor);
             deadLetter.Parameters.AddWithValue("$target", target);
             deadLetter.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
-            await deadLetter.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // The swept rows are all resolved now — drop their in-flight bookkeeping.
@@ -2744,7 +2744,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         {
             sweep.Parameters.AddWithValue("$id", observerId);
             sweep.Parameters.AddWithValue("$target", target);
-            await sweep.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await sweep.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await using (var move = Cmd(
@@ -2753,7 +2753,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         {
             move.Parameters.AddWithValue("$id", observerId);
             move.Parameters.AddWithValue("$target", target);
-            await move.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await move.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -2770,7 +2770,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         await using var command = Cmd(
             "SELECT cursor_pos FROM backwave_observers WHERE observer_id = $id", connection);
         command.Parameters.AddWithValue("$id", observerId);
-        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        var result = await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
         return result is DBNull or null ? -1L : (long)result;
     }
 
@@ -2806,7 +2806,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             command.Parameters.AddWithValue(name, value);
         }
 
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
         var oldest = reader.IsDBNull(2) ? (DateTimeOffset?)null : SqliteValueCodec.FromTicks(reader.GetInt64(2));
         return new ObserverLag(reader.GetInt64(0), (int)reader.GetInt64(1), oldest);
@@ -2828,7 +2828,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         command.Parameters.AddWithValue("$id", observerId);
 
         var records = new List<ObserverDeadLetterRecord>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             records.Add(new ObserverDeadLetterRecord(
@@ -2905,7 +2905,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             insert.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
             insert.Parameters.AddWithValue("$key", tag.Key);
             insert.Parameters.AddWithValue("$value", tag.Value);
-            await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -2924,7 +2924,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         {
             command.Parameters.AddWithValue(name, value);
         }
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             var jobId = SqliteValueCodec.ToGuid(reader.GetString(0));

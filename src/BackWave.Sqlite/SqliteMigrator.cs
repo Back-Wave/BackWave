@@ -91,6 +91,9 @@ public static class SqliteMigrator
         await using (var pragmas = connection.CreateCommand())
         {
             pragmas.CommandText = $"PRAGMA journal_mode=WAL; PRAGMA busy_timeout={MigrationBusyTimeoutMs};";
+            // uncounted round trip: the connection-open PRAGMAs. journal_mode and busy_timeout are set
+            // once on the migrator's own unpooled connection, before any store operation exists to
+            // charge them to.
             await pragmas.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -144,6 +147,9 @@ public static class SqliteMigrator
             await using var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = rewriter.Rewrite(sql);
+            // uncounted round trip: schema DDL. The migration scripts run at boot on the migrator's
+            // connection, outside every operation the budgets measure, and their cost is a one-time
+            // constant per database rather than a cost per row.
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
@@ -161,6 +167,8 @@ public static class SqliteMigrator
             probe.Transaction = transaction;
             probe.CommandText = rewriter.Rewrite(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='backwave_schema_version'");
+            // uncounted round trip: migration's own existence probe for the schema-version table. Part
+            // of the boot path, on the migrator's connection, and never reached from a store operation.
             var exists = (long)(await probe.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
             if (exists == 0)
             {
@@ -171,6 +179,9 @@ public static class SqliteMigrator
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = rewriter.Rewrite("SELECT version FROM backwave_schema_version LIMIT 1");
+        // uncounted round trip: migration's in-lock schema-version re-check, on the migrator's
+        // connection. It decides whether the scripts still need running, which is boot work, not store
+        // work.
         var version = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return version is long deployed && deployed == ExpectedSchemaVersion;
     }
@@ -224,6 +235,10 @@ public static class SqliteMigrator
         object? version;
         try
         {
+            // uncounted round trip: the one-time schema-version check EnsureReadyAsync runs before the
+            // store's first operation. The budgets exclude it on purpose - see the class remarks on
+            // SqliteStatementBudgetTests - because it is a single constant per process, not a per-row
+            // cost, and it is warmed off the measured path by every budget's fixture.
             version = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (SqliteException exception) when (exception.SqliteErrorCode == 1) // SQLITE_ERROR: no such table
@@ -251,6 +266,8 @@ public static class SqliteMigrator
 
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT sqlite_version()";
+        // uncounted round trip: the engine-version floor probe. It runs once at startup on its own
+        // connection to fail-stop an engine too old for UPDATE ... RETURNING.
         var raw = (string)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
 
         if (!TryParseEngineVersion(raw, out var actual) || actual < MinimumEngineVersion)
