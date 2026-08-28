@@ -817,6 +817,11 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         // keeps it for everyone else); cancel_requested clears only for a Cancelled row (CASE).
         // terminal_at/terminal_cause carry per-row (null for a retry).
         var matched = new Dictionary<Guid, int>();
+        // The payload leads the join and INNER LOOP JOIN pins the shape, so this seeks the clustered
+        // PK once per row and locks only the batch's own jobs. Left to itself the optimizer reads no
+        // cardinality from OPENJSON or from a VALUES list, picks a merge join over a full scan of
+        // backwave.jobs, and takes a U lock on every row it passes. Two concurrent writers each
+        // holding rows the other must scan past then deadlock (§5.5).
         await using (var update = Cmd(
             """
             UPDATE j
@@ -828,12 +833,11 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 due_time = COALESCE(d.due, j.due_time),
                 cancel_requested = CASE WHEN d.state = 4 THEN 0 ELSE j.cancel_requested END
             OUTPUT inserted.job_id, inserted.state
-            FROM backwave.jobs j
-            INNER JOIN OPENJSON(@payload)
+            FROM OPENJSON(@payload)
                 WITH (job_id uniqueidentifier '$.JobId', worker nvarchar(450) '$.WorkerId',
                       attempt int '$.Attempt', state int '$.State', cause nvarchar(max) '$.Cause',
                       due datetimeoffset '$.Due', terminal_at datetimeoffset '$.TerminalAt') d
-                ON j.job_id = d.job_id
+            INNER LOOP JOIN backwave.jobs j ON j.job_id = d.job_id
             WHERE j.state = 2 AND j.lease_owner = d.worker AND j.attempt = d.attempt
               AND j.lease_expiry > @now
             """,
@@ -1170,15 +1174,17 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         }
 
         // Set-based disposition: one UPDATE joins the whole retry set to a VALUES list of
-        // (job_id, due_time), one more does the dead-letter set — O(1) statements, not one per job.
+        // (job_id, due_time), one more does the dead-letter set - O(1) statements, not one per job.
+        // Both put the VALUES list first and hint INNER LOOP JOIN so each seeks the clustered PK per
+        // row and locks only its own jobs. See the note on the fenced outcome UPDATE above.
         if (retries.Count > 0)
         {
             var rows = string.Join(", ", retries.Select((_, i) => $"(@rid{i}, @rdue{i})"));
             await using var reschedule = Cmd(
                 $"""
                 UPDATE j SET state = 0, due_time = d.due, lease_owner = NULL, lease_expiry = NULL
-                FROM backwave.jobs j
-                JOIN (VALUES {rows}) AS d(job_id, due) ON j.job_id = d.job_id
+                FROM (VALUES {rows}) AS d(job_id, due)
+                INNER LOOP JOIN backwave.jobs j ON j.job_id = d.job_id
                 """,
                 connection, transaction);
             for (var i = 0; i < retries.Count; i++)
@@ -1195,8 +1201,8 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             await using var deadLetter = Cmd(
                 $"""
                 UPDATE j SET state = 5, lease_owner = NULL, lease_expiry = NULL, terminal_at = @now, terminal_cause = d.cause
-                FROM backwave.jobs j
-                JOIN (VALUES {rows}) AS d(job_id, cause) ON j.job_id = d.job_id
+                FROM (VALUES {rows}) AS d(job_id, cause)
+                INNER LOOP JOIN backwave.jobs j ON j.job_id = d.job_id
                 """,
                 connection, transaction);
             deadLetter.Parameters.AddWithValue("now", now);
