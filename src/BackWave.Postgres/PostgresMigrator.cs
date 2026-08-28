@@ -97,6 +97,9 @@ public static class PostgresMigrator
         {
             lockCommand.Parameters.AddWithValue("classid", MigrationLockClassId);
             lockCommand.Parameters.AddWithValue("schema", schemaName);
+            // uncounted round trip: taking the migration advisory lock is part of provisioning the
+            // schema, not of any store operation. It runs once at startup on the migrator's own
+            // connection, before there is an operation in flight to charge it to.
             await lockCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -128,6 +131,9 @@ public static class PostgresMigrator
             var sql = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
 
             await using var command = new NpgsqlCommand(rewriter.Rewrite(sql), connection, transaction);
+            // uncounted round trip: migration runs once at startup, on its own connection, before any
+            // store operation exists to charge it to. Its cost is a fixed price for provisioning the
+            // schema rather than a per-operation cost, which is the only thing the budgets watch.
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
@@ -144,6 +150,9 @@ public static class PostgresMigrator
         await using (var probe = new NpgsqlCommand(
             rewriter.Rewrite("SELECT to_regclass('backwave.schema_version')::text"), connection, transaction))
         {
+            // uncounted round trip: the schema-current probe runs only inside MigrateAsync, on the
+            // migrator's own connection and inside the migration transaction. No operation is measured
+            // through it.
             var exists = await probe.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
             if (exists is null or DBNull)
             {
@@ -153,6 +162,8 @@ public static class PostgresMigrator
 
         await using var command = new NpgsqlCommand(
             rewriter.Rewrite("SELECT version FROM backwave.schema_version LIMIT 1"), connection, transaction);
+        // uncounted round trip: the second half of the same schema-current probe, on the migrator's
+        // own connection inside the migration transaction.
         var version = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return version is int deployed && deployed == ExpectedSchemaVersion;
     }
@@ -205,6 +216,8 @@ public static class PostgresMigrator
         object? version;
         try
         {
+            // uncounted round trip: the schema-version check is the one-time startup probe the budgets
+            // already exclude by name, on a connection of its own that no operation is measured through.
             version = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (PostgresException exception) when (exception.SqlState == PostgresErrorCodes.UndefinedTable)

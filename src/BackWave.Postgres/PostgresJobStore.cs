@@ -236,7 +236,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 await using var parent = Cmd(
                     "SELECT state FROM backwave.jobs WHERE job_id = @id FOR UPDATE", connection, transaction);
                 parent.Parameters.AddWithValue("id", parentId);
-                if (await parent.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is int parentState)
+                if (await parent.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is int parentState)
                 {
                     states[parentId] = (JobState)parentState;
                 }
@@ -288,7 +288,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // Workflow membership (ADR 0023): the immutable scalar, stamped once here at enqueue; null for
         // an ordinary job. The Core never reads it — it lives entirely above the determinism boundary.
         insert.Parameters.AddWithValue("workflowId", (object?)workflowId ?? DBNull.Value);
-        if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 0)
+        if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) == 0)
         {
             return EnqueueResult.Duplicate;
         }
@@ -303,7 +303,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 connection, transaction);
             edge.Parameters.AddWithValue("parent", parentId);
             edge.Parameters.AddWithValue("child", job.JobId);
-            await edge.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await edge.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // Job Tags (ADR 0022): the enqueue-time set, in this same transaction so they are visible
@@ -332,7 +332,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var notify = Cmd(
             $"SELECT pg_notify('{_schema.HintChannel}', @queue)", connection, transaction);
         notify.Parameters.AddWithValue("queue", queue);
-        await notify.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await notify.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // ── §5.2 Claim ──────────────────────────────────────────────────────────────
@@ -416,7 +416,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     connection, transaction))
                 {
                     limit.Parameters.AddWithValue("queue", queue);
-                    await using var reader = await limit.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                    await using var reader = await limit.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     {
                         configured = reader.IsDBNull(0) ? null : reader.GetInt32(0);
@@ -436,7 +436,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     "SELECT count(*) FROM backwave.jobs WHERE queue = @queue AND state = 2",
                     connection, transaction);
                 leased.Parameters.AddWithValue("queue", queue);
-                var inUse = (long)(await leased.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+                var inUse = (long)(await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
                 slots = limitValue - (int)inUse;
             }
             if (slots <= 0)
@@ -477,7 +477,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             claim.Parameters.AddWithValue("worker", request.WorkerId);
             claim.Parameters.AddWithValue("expiry", (request.Now + request.LeaseDuration).ToUniversalTime());
             var queueClaims = new List<JobRecord>();
-            await using (var reader = await claim.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+            await using (var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
             {
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
@@ -536,7 +536,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             """,
             connection);
         cmd.Parameters.AddWithValue("queues", request.Queues.ToArray());
-        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await cmd.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             return null; // nothing scheduled in any served, non-paused queue
@@ -583,7 +583,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var advisory = Cmd(
             "SELECT pg_advisory_xact_lock(hashtext(@queue))", connection, transaction);
         advisory.Parameters.AddWithValue("queue", queue);
-        await advisory.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await advisory.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // ── §5.6 ReportOutcome ──────────────────────────────────────────────────────
@@ -681,7 +681,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         update.Parameters.AddWithValue("now", now.ToUniversalTime());
         configure(update);
 
-        if (await update.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not int newState)
+        if (await update.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not int newState)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return OutcomeResult.StaleLease; // the (workerId, attempt) fence
@@ -826,7 +826,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             update.Parameters.AddWithValue("dues", dues);
             update.Parameters.AddWithValue("terminalAts", terminalAts);
             update.Parameters.AddWithValue("now", nowUtc);
-            await using var reader = await update.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await update.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 matched[reader.GetGuid(0)] = reader.GetInt32(1);
@@ -849,7 +849,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     "UPDATE backwave.jobs SET output = @output WHERE job_id = @id", connection, transaction);
                 setOutput.Parameters.AddWithValue("id", row.JobId);
                 setOutput.Parameters.AddWithValue("output", blob.ToArray());
-                await setOutput.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await setOutput.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
             if (row.AddedTags is { Count: > 0 } addedTags)
             {
@@ -898,7 +898,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 connection, transaction))
             {
                 withChildren.Parameters.AddWithValue("ids", terminalIds.ToArray());
-                await using var reader = await withChildren.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = await withChildren.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     parents.Add(reader.GetGuid(0));
@@ -947,7 +947,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 connection, transaction))
             {
                 edges.Parameters.AddWithValue("parent", currentParent);
-                await using var reader = await edges.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = await edges.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     children.Add(reader.GetGuid(0));
@@ -968,7 +968,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     connection, transaction))
                 {
                     child.Parameters.AddWithValue("id", childId);
-                    await using var reader = await child.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                    await using var reader = await child.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     {
                         continue;
@@ -993,7 +993,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     cancel.Parameters.AddWithValue("id", childId);
                     cancel.Parameters.AddWithValue("now", now.ToUniversalTime());
                     cancel.Parameters.AddWithValue("cause", ParentFailureCause(currentState));
-                    await cancel.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await cancel.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                     await RecordTransitionAsync(connection, transaction, childId, JobState.Cancelled, childAttempt, now, cancellationToken)
                         .ConfigureAwait(false);
                     work.Push((childId, JobState.Cancelled)); // cascade
@@ -1014,7 +1014,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 {
                     resolve.Parameters.AddWithValue("now", now.ToUniversalTime());
                 }
-                await resolve.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await resolve.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 // Only the latch RELEASE (last parent terminal → Scheduled) is a state change worth
                 // a transition; a mere decrement keeps the child in AwaitingParent (§5.12).
                 if (remaining - 1 <= 0)
@@ -1052,7 +1052,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         command.Parameters.AddWithValue("now", now.ToUniversalTime());
 
         var renewed = new Dictionary<Guid, bool>();
-        await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        await using (var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
         {
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -1115,7 +1115,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             select.Parameters.AddWithValue("now", now.ToUniversalTime());
             select.Parameters.AddWithValue("queues", queues.ToArray());
             select.Parameters.AddWithValue("max", maxJobs);
-            await using var reader = await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 expired.Add((reader.GetGuid(0), reader.GetInt32(1)));
@@ -1156,7 +1156,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 connection, transaction);
             reschedule.Parameters.AddWithValue("ids", retryIds.ToArray());
             reschedule.Parameters.AddWithValue("dues", retryDueTimes.ToArray());
-            await reschedule.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await reschedule.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         if (deadIds.Count > 0)
@@ -1172,7 +1172,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             deadLetter.Parameters.AddWithValue("now", now.ToUniversalTime());
             deadLetter.Parameters.AddWithValue("ids", deadIds.ToArray());
             deadLetter.Parameters.AddWithValue("causes", deadCauses.ToArray());
-            await deadLetter.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
 
             // Crash after the dead-letter write, before the latch cascade: rollback must leave the
             // parent leased and every child latch un-resolved (issue 0034, invariant I2).
@@ -1187,7 +1187,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 connection, transaction))
             {
                 withChildren.Parameters.AddWithValue("ids", deadIds.ToArray());
-                await using var reader = await withChildren.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = await withChildren.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     parents.Add(reader.GetGuid(0));
@@ -1237,7 +1237,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             "SELECT state, attempt FROM backwave.jobs WHERE job_id = @id FOR UPDATE", connection, transaction))
         {
             current.Parameters.AddWithValue("id", jobId);
-            await using var reader = await current.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await current.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 return CancelResult.NotCancellable;
@@ -1255,7 +1255,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     cancel.Parameters.AddWithValue("id", jobId);
                     cancel.Parameters.AddWithValue("now", now.ToUniversalTime());
                     cancel.Parameters.AddWithValue("actor", actor);
-                    await cancel.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await cancel.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 }
                 // Transition Log (§5.12): the immediate Cancelled state, atomic with the cancel.
                 await RecordTransitionAsync(connection, transaction, jobId, JobState.Cancelled, attempt, now, cancellationToken)
@@ -1272,7 +1272,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     "UPDATE backwave.jobs SET cancel_requested = true WHERE job_id = @id", connection, transaction))
                 {
                     request.Parameters.AddWithValue("id", jobId);
-                    await request.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await request.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 }
                 await AppendAuditAsync(connection, transaction, actor, OperatorAction.Cancel, jobId.ToString(), now, cancellationToken)
                     .ConfigureAwait(false);
@@ -1309,7 +1309,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             connection, transaction);
         update.Parameters.AddWithValue("id", jobId);
         update.Parameters.AddWithValue("now", now.ToUniversalTime());
-        if (await update.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is null)
+        if (await update.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is null)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return RequeueResult.NotRequeueable;
@@ -1358,7 +1358,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         {
             upsert.Parameters.AddWithValue("queue", queue);
             upsert.Parameters.AddWithValue("paused", paused);
-            await upsert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await upsert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         await AppendAuditAsync(connection, transaction, actor, action, queue, now, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -1379,7 +1379,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             "SELECT wire_name, payload, queue FROM backwave.schedules WHERE schedule_id = @id", connection, transaction))
         {
             select.Parameters.AddWithValue("id", scheduleId);
-            await using var reader = await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 schedule = (reader.GetString(0), reader.GetFieldValue<byte[]>(1), reader.GetString(2));
@@ -1407,7 +1407,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             insert.Parameters.AddWithValue("queue", schedule.Value.Queue);
             insert.Parameters.AddWithValue("due", now.ToUniversalTime());
             insert.Parameters.AddWithValue("scheduleId", scheduleId);
-            if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0)
+            if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) > 0)
             {
                 // Transition Log (§5.12): the minted instance's first Scheduled state, at Attempt 0.
                 await RecordTransitionAsync(connection, transaction, JobIds.ForMintedTick(scheduleId, now),
@@ -1433,7 +1433,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         command.Parameters.AddWithValue("target", target);
 
         var records = new List<OperatorAuditRecord>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             records.Add(new OperatorAuditRecord(
@@ -1458,7 +1458,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         audit.Parameters.AddWithValue("action", (int)action);
         audit.Parameters.AddWithValue("target", target);
         audit.Parameters.AddWithValue("now", now.ToUniversalTime());
-        await audit.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await audit.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // Appends one Transition Log entry (spec §5.12) for a job's resulting state, inside the SAME
@@ -1504,7 +1504,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             insert.Parameters.AddWithValue("attempt", attempt);
             insert.Parameters.AddWithValue(
                 "detail", (object?)_options.Bounds.ClampFailureDetail(failureDetail) ?? DBNull.Value);
-            ordinal = (long)(await insert.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+            ordinal = (long)(await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
         }
 
         // Per-job-life cap (§7): skip the prune entirely unless the entry just written reached the
@@ -1526,7 +1526,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             connection, transaction);
         prune.Parameters.AddWithValue("id", jobId);
         prune.Parameters.AddWithValue("cap", _options.Bounds.MaxTransitionsPerJob);
-        await prune.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // Appends a BATCH of Transition Log entries (§5.12) in ONE set-based INSERT — the per-row
@@ -1586,7 +1586,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             insert.Parameters.AddWithValue("attempts", attempts);
             insert.Parameters.AddWithValue("details", details);
             insert.Parameters.AddWithValue("now", now.ToUniversalTime());
-            await using var reader = await insert.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await insert.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var ordinal = reader.GetInt64(0);
@@ -1614,7 +1614,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             connection, transaction);
         prune.Parameters.AddWithValue("ids", ids);
         prune.Parameters.AddWithValue("cap", _options.Bounds.MaxTransitionsPerJob);
-        await prune.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // ── §5.7 Schedules & minting ────────────────────────────────────────────────
@@ -1645,7 +1645,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         command.Parameters.AddWithValue("zone", (object?)schedule.TimeZoneId ?? DBNull.Value);
         command.Parameters.AddWithValue("catchUp", (int)schedule.CatchUp);
         command.Parameters.AddWithValue("noOverlap", schedule.NoOverlap);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
@@ -1657,7 +1657,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var command = Cmd(
             "DELETE FROM backwave.schedules WHERE schedule_id = @id", connection);
         command.Parameters.AddWithValue("id", scheduleId);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
@@ -1681,7 +1681,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             connection);
 
         var snapshots = new List<ScheduleSnapshot>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             snapshots.Add(new ScheduleSnapshot(
@@ -1729,7 +1729,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 fence.Parameters.AddWithValue("id", decision.ScheduleId);
                 fence.Parameters.AddWithValue("expected", decision.ExpectedCursor.ToUniversalTime());
                 fence.Parameters.AddWithValue("newCursor", decision.NewCursor.ToUniversalTime());
-                await using var reader = await fence.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = await fence.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     schedule = (reader.GetString(0), reader.GetFieldValue<byte[]>(1),
@@ -1753,7 +1753,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     connection, transaction);
                 record.Parameters.AddWithValue("id", decision.ScheduleId);
                 record.Parameters.AddWithValue("ticks", RenderSkippedTicks(combined));
-                await record.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await record.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
 
             // Crash after the cursor advanced, before the instances are minted: rollback must
@@ -1776,7 +1776,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 insert.Parameters.AddWithValue("queue", schedule.Value.Queue);
                 insert.Parameters.AddWithValue("due", tick.ToUniversalTime());
                 insert.Parameters.AddWithValue("scheduleId", decision.ScheduleId);
-                if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0)
+                if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) > 0)
                 {
                     mintedForDecision++;
                     // MintDue carries no `now`; the tick (the instance's due instant) is the
@@ -1822,7 +1822,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         {
             command.Parameters.AddWithValue("queue", queue);
             command.Parameters.AddWithValue("limit", (object?)limit ?? DBNull.Value);
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         await AppendAuditAsync(
             connection, transaction, actor, OperatorAction.SetConcurrencyLimit, queue, now, cancellationToken).ConfigureAwait(false);
@@ -1842,7 +1842,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             $"SELECT {JobColumns} FROM backwave.jobs WHERE job_id = @id", connection);
         command.Parameters.AddWithValue("id", jobId);
         JobRecord? record;
-        await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        await using (var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
         {
             record = await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadJob(reader) : null;
         }
@@ -1866,7 +1866,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var command = Cmd(
             "SELECT output FROM backwave.jobs WHERE job_id = @id", connection);
         command.Parameters.AddWithValue("id", jobId);
-        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        var result = await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
         // Explicit nullable cast: byte[] has an implicit conversion to ReadOnlyMemory<byte>, so an
         // unqualified `: null` here would be the empty `default` memory (HasValue) rather than no value.
         return result is byte[] bytes ? new ReadOnlyMemory<byte>(bytes) : (ReadOnlyMemory<byte>?)null;
@@ -1890,7 +1890,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         command.Parameters.AddWithValue("id", jobId);
 
         var transitions = new List<JobTransition>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             transitions.Add(new JobTransition(
@@ -1929,7 +1929,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         command.Parameters.AddWithValue("take", Math.Min(query.MaxResults, _options.Bounds.MaxMonitorPageSize));
 
         var jobs = new List<JobRecord>();
-        await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        await using (var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
         {
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -1950,7 +1950,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             connection);
 
         var counts = new List<QueueStateCount>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             counts.Add(new QueueStateCount(
@@ -2041,7 +2041,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             + "GROUP BY value ORDER BY count(DISTINCT job_id) DESC, value COLLATE \"C\" LIMIT @max");
 
         var facets = new List<TagFacet>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             facets.Add(new TagFacet(reader.GetString(0), (int)reader.GetInt64(1)));
@@ -2089,7 +2089,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 + cursor
                 + ") d ORDER BY lower(v) COLLATE \"C\", v COLLATE \"C\" LIMIT @limit");
 
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 suggestions.Add(new TagSuggestion(query.Key, reader.GetString(0)));
@@ -2125,7 +2125,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             + stageOneCursor
             + "ORDER BY section, lower(name) COLLATE \"C\", name COLLATE \"C\" LIMIT @limit");
 
-        await using var stageOneReader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var stageOneReader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await stageOneReader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             var name = stageOneReader.GetString(1);
@@ -2153,7 +2153,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             "SELECT queue, paused, max_concurrent FROM backwave.queue_limits ORDER BY queue", connection);
 
         var settings = new List<QueueSettings>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             settings.Add(new QueueSettings(
@@ -2298,7 +2298,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             insertRow.Parameters.AddWithValue("restartedFrom", (object?)workflow.RestartedFrom ?? DBNull.Value);
             // Zero rows: a concurrent create won this id first. Nothing else is written yet, so the whole
             // graph rolls back and the caller gets the defined duplicate result, not a thrown 23505.
-            if (await insertRow.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 0)
+            if (await insertRow.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) == 0)
             {
                 return WorkflowEnqueueResult.DuplicateWorkflow;
             }
@@ -2342,7 +2342,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 edge.Parameters.AddWithValue("workflowId", workflow.WorkflowId);
                 edge.Parameters.AddWithValue("parent", parent);
                 edge.Parameters.AddWithValue("child", member.JobId);
-                await edge.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await edge.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -2355,7 +2355,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var command = Cmd(
             "SELECT 1 FROM backwave.workflows WHERE workflow_id = @id", connection, transaction);
         command.Parameters.AddWithValue("id", workflowId);
-        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
+        return await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not null;
     }
 
     private async ValueTask<bool> JobExistsAsync(
@@ -2364,7 +2364,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var command = Cmd(
             "SELECT 1 FROM backwave.jobs WHERE job_id = @id", connection, transaction);
         command.Parameters.AddWithValue("id", jobId);
-        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
+        return await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not null;
     }
 
     private async ValueTask<HashSet<Guid>> MembersOfAsync(
@@ -2374,7 +2374,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var command = Cmd(
             "SELECT job_id FROM backwave.jobs WHERE workflow_id = @id", connection, transaction);
         command.Parameters.AddWithValue("id", workflowId);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             members.Add(reader.GetGuid(0));
@@ -2433,7 +2433,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using (var members = Cmd(
             "SELECT workflow_id, state FROM backwave.jobs WHERE workflow_id IS NOT NULL", connection))
         {
-            await using var reader = await members.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await members.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var wf = reader.GetGuid(0);
@@ -2447,7 +2447,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             "SELECT workflow_id, name, created_at, restarted_from FROM backwave.workflows " +
             "ORDER BY created_at, workflow_id", connection))
         {
-            await using var reader = await workflows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await workflows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var workflowId = reader.GetGuid(0);
@@ -2480,7 +2480,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             "SELECT name, created_at, restarted_from FROM backwave.workflows WHERE workflow_id = @id", connection))
         {
             row.Parameters.AddWithValue("id", workflowId);
-            await using var reader = await row.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await row.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 return null;
@@ -2497,7 +2497,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             $"SELECT {JobColumns} FROM backwave.jobs WHERE workflow_id = @id ORDER BY sequence", connection))
         {
             memberRows.Parameters.AddWithValue("id", workflowId);
-            await using var reader = await memberRows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await memberRows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 members.Add(ReadJob(reader));
@@ -2511,7 +2511,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             "ORDER BY parent_id, child_id", connection))
         {
             edgeRows.Parameters.AddWithValue("id", workflowId);
-            await using var reader = await edgeRows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await edgeRows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 edges.Add(new WorkflowEdge(reader.GetGuid(0), reader.GetGuid(1)));
@@ -2544,7 +2544,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             "SELECT parent_id FROM backwave.job_parents WHERE child_id = @id ORDER BY parent_id", connection))
         {
             parents.Parameters.AddWithValue("id", jobId);
-            await using var reader = await parents.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await parents.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 gatingParents.Add(reader.GetGuid(0));
@@ -2556,7 +2556,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             "SELECT child_id FROM backwave.job_parents WHERE parent_id = @id ORDER BY child_id", connection))
         {
             childRows.Parameters.AddWithValue("id", jobId);
-            await using var reader = await childRows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await childRows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 children.Add(reader.GetGuid(0));
@@ -2611,7 +2611,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             : new[] { (int)JobState.DeadLettered, (int)JobState.Quarantined });
         command.Parameters.AddWithValue("before", terminalBefore.ToUniversalTime());
         command.Parameters.AddWithValue("max", Math.Min(maxJobs, _options.Bounds.MaxPurgeBatch));
-        var purged = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        var purged = await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
 
         // When a Workflow's last member is purged, drop its now-orphaned identity row (structural edges
         // cascade via FK) so the tables never leak rows for Workflows with no surviving jobs.
@@ -2621,7 +2621,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             WHERE NOT EXISTS (SELECT 1 FROM backwave.jobs j WHERE j.workflow_id = w.workflow_id)
             """,
             connection);
-        await prune.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
 
         return purged;
     }
@@ -2651,7 +2651,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             connection, transaction))
         {
             ensure.Parameters.AddWithValue("id", request.ObserverId);
-            await ensure.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await ensure.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         long cursor;
@@ -2662,7 +2662,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             connection, transaction))
         {
             locked.Parameters.AddWithValue("id", request.ObserverId);
-            await using var reader = await locked.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await locked.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
             cursor = reader.GetInt64(0);
             leaseOwner = reader.IsDBNull(1) ? null : reader.GetString(1);
@@ -2680,7 +2680,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             sub.Parameters.AddWithValue("states", string.Join(',', states));
             sub.Parameters.AddWithValue("wire", (object?)request.WireName ?? DBNull.Value);
             sub.Parameters.AddWithValue("queue", (object?)request.Queue ?? DBNull.Value);
-            await sub.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await sub.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // A live Lease held by a different worker means that node is delivering — back off (§5.13).
@@ -2718,7 +2718,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             scan.Parameters.AddWithValue("wire", (object?)request.WireName ?? DBNull.Value);
             scan.Parameters.AddWithValue("queue", (object?)request.Queue ?? DBNull.Value);
             scan.Parameters.AddWithValue("take", Math.Max(0, request.MaxRows));
-            await using var reader = await scan.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await scan.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var nextAttemptAt = reader.IsDBNull(10) ? (DateTimeOffset?)null : reader.GetFieldValue<DateTimeOffset>(10);
@@ -2755,7 +2755,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             upsert.Parameters.AddWithValue("id", request.ObserverId);
             upsert.Parameters.AddWithValue("pos", delivery.Position);
             upsert.Parameters.AddWithValue("attempt", delivery.DeliveryAttempt);
-            await upsert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await upsert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await using (var lease = Cmd(
@@ -2765,7 +2765,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             lease.Parameters.AddWithValue("id", request.ObserverId);
             lease.Parameters.AddWithValue("worker", request.WorkerId);
             lease.Parameters.AddWithValue("expiry", (request.Now + request.LeaseDuration).ToUniversalTime());
-            await lease.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await lease.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -2794,7 +2794,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             connection, transaction))
         {
             locked.Parameters.AddWithValue("id", report.ObserverId);
-            await using var reader = await locked.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await locked.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             found = await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
             if (found)
             {
@@ -2841,7 +2841,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             resolve.Parameters.AddWithValue(
                 "next", outcome.Disposition == ObserverDeliveryDisposition.Retry && outcome.NextAttemptAt is { } at
                     ? at.ToUniversalTime() : (object)DBNull.Value);
-            await resolve.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await resolve.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await AdvanceObserverCursorAsync(
@@ -2882,7 +2882,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             blockCommand.Parameters.AddWithValue("states", states);
             blockCommand.Parameters.AddWithValue("wire", (object?)wireName ?? DBNull.Value);
             blockCommand.Parameters.AddWithValue("queue", (object?)queue ?? DBNull.Value);
-            var result = await blockCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            var result = await blockCommand.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             block = result is DBNull or null ? null : (long)result;
         }
 
@@ -2894,7 +2894,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         {
             advance.Parameters.AddWithValue("cursor", cursor);
             advance.Parameters.AddWithValue("block", (object?)block ?? DBNull.Value);
-            var result = await advance.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            var result = await advance.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             newCursor = result is DBNull or null ? null : (long)result;
         }
 
@@ -2920,7 +2920,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             deadLetter.Parameters.AddWithValue("cursor", cursor);
             deadLetter.Parameters.AddWithValue("target", target);
             deadLetter.Parameters.AddWithValue("now", now.ToUniversalTime());
-            await deadLetter.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // The swept rows are all resolved now — drop their in-flight bookkeeping.
@@ -2930,7 +2930,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         {
             sweep.Parameters.AddWithValue("id", observerId);
             sweep.Parameters.AddWithValue("target", target);
-            await sweep.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await sweep.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await using (var move = Cmd(
@@ -2939,7 +2939,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         {
             move.Parameters.AddWithValue("id", observerId);
             move.Parameters.AddWithValue("target", target);
-            await move.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await move.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -2956,7 +2956,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var command = Cmd(
             "SELECT cursor_pos FROM backwave.observers WHERE observer_id = @id", connection);
         command.Parameters.AddWithValue("id", observerId);
-        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        var result = await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
         return result is DBNull or null ? -1L : (long)result;
     }
 
@@ -2989,7 +2989,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         command.Parameters.AddWithValue("wire", (object?)request.WireName ?? DBNull.Value);
         command.Parameters.AddWithValue("queue", (object?)request.Queue ?? DBNull.Value);
 
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
         var oldest = reader.IsDBNull(2) ? (DateTimeOffset?)null : reader.GetFieldValue<DateTimeOffset>(2);
         return new ObserverLag(reader.GetInt64(0), (int)reader.GetInt64(1), oldest);
@@ -3011,7 +3011,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         command.Parameters.AddWithValue("id", observerId);
 
         var records = new List<ObserverDeadLetterRecord>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             records.Add(new ObserverDeadLetterRecord(
@@ -3056,6 +3056,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     connection.Notification += (_, args) => onHint(args.Payload);
                     await using (var listen = new NpgsqlCommand($"LISTEN {channel}", connection))
                     {
+                        // uncounted round trip: this LISTEN runs on the subscription's own parked
+                        // connection, once per dial, on a loop that outlives every store operation. It
+                        // belongs to no operation the budgets measure, and counting it would charge
+                        // whichever operation happened to be in flight when the channel reconnected.
                         await listen.ExecuteNonQueryAsync(token).ConfigureAwait(false);
                     }
                     while (!token.IsCancellationRequested)
@@ -3144,7 +3148,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             insert.Parameters.AddWithValue("id", jobId);
             insert.Parameters.AddWithValue("key", tag.Key);
             insert.Parameters.AddWithValue("value", tag.Value);
-            await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -3162,7 +3166,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var command = Cmd(
             "SELECT job_id, key, value FROM backwave.job_tags WHERE job_id = ANY(@ids)", connection);
         command.Parameters.AddWithValue("ids", jobIds.ToArray());
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             var jobId = reader.GetGuid(0);
