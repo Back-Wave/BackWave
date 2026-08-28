@@ -2995,6 +2995,65 @@ public abstract class ConformanceSuite
     }
 
     /// <summary>
+    /// Certifies that ONE sweep spanning jobs at different attempts appends each job's own disposition -
+    /// the ceiling job dead-letters while its neighbors reschedule - each at its own attempt and its own
+    /// next ordinal, all stamped at the sweep instant.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_12_LeaseExpiry_AppendsEachJobsOwnDisposedState_AcrossOneMixedSweep()
+    {
+        // A sweep is a batch, and every other §5.12 expiry clause drives it with exactly one job. A store
+        // that wrote the FIRST job's disposition to every row in the batch, or that assigned one shared
+        // ordinal, passes all of them. This is the clause that separates a batched sweep from a correct
+        // one: three jobs, two dispositions, one call.
+        var store = await CreateStoreAsync();
+        var ceiling = Job();                              // due now: reaches the attempt ceiling below
+        var firstNeighbor = Job(dueTime: T0.AddMinutes(10));
+        var secondNeighbor = Job(dueTime: T0.AddMinutes(10));
+        foreach (var job in new[] { ceiling, firstNeighbor, secondNeighbor })
+        {
+            await store.EnqueueAsync(job, now: T0);
+        }
+
+        // Take the ceiling job to attempt 1 and expire it alone, which reschedules it. Its neighbors are
+        // not due yet, so this first sweep cannot touch them.
+        Assert.Single(await ClaimAsync(store, T0));
+        var afterFirst = T0 + Lease + TimeSpan.FromSeconds(1);
+        Assert.Equal(1, await store.ExpireLeasesAsync(afterFirst, maxJobs: 32, DefaultQueues, TwoAttempts));
+
+        // One claim takes all three: the ceiling job to attempt 2 of 2, both neighbors to attempt 1 of 2.
+        var claimAt = T0.AddMinutes(15);
+        Assert.Equal(3, (await ClaimAsync(store, claimAt)).Count);
+
+        // ONE sweep, two dispositions: the ceiling job dead-letters, both neighbors reschedule.
+        var sweptAt = claimAt + Lease + TimeSpan.FromSeconds(1);
+        Assert.Equal(3, await store.ExpireLeasesAsync(sweptAt, maxJobs: 32, DefaultQueues, TwoAttempts));
+
+        Assert.Equal(JobState.DeadLettered, (await store.GetJobAsync(ceiling.JobId))!.State);
+        var ceilingHistory = await store.GetJobHistoryAsync(ceiling.JobId);
+        var disposed = ceilingHistory[^1];
+        Assert.Equal(JobState.DeadLettered, disposed.State);
+        Assert.Equal(2, disposed.Attempt);                // expiry-as-Attempt, at the ceiling
+        Assert.Equal(sweptAt, disposed.Timestamp);
+        Assert.Null(disposed.FailureDetail);
+        // Scheduled, Leased, Scheduled, Leased, DeadLettered: its own sequence, unbroken by the batch.
+        Assert.Equal([0L, 1, 2, 3, 4], ceilingHistory.Select(entry => entry.Ordinal).ToList());
+
+        foreach (var neighbor in new[] { firstNeighbor, secondNeighbor })
+        {
+            Assert.Equal(JobState.Scheduled, (await store.GetJobAsync(neighbor.JobId))!.State);
+            var history = await store.GetJobHistoryAsync(neighbor.JobId);
+            var rescheduled = history[^1];
+            Assert.Equal(JobState.Scheduled, rescheduled.State); // NOT the ceiling job's DeadLettered
+            Assert.Equal(1, rescheduled.Attempt);                // NOT the ceiling job's attempt 2
+            Assert.Equal(sweptAt, rescheduled.Timestamp);
+            Assert.Null(rescheduled.FailureDetail);
+            // Scheduled, Leased, Scheduled: each neighbor counts its own ordinals from zero.
+            Assert.Equal([0L, 1, 2], history.Select(entry => entry.Ordinal).ToList());
+        }
+    }
+
+    /// <summary>
     /// Certifies that cancel appends Cancelled, requeue appends Scheduled at attempt zero, and a minted
     /// schedule instance's first transition is Scheduled.
     /// </summary>
