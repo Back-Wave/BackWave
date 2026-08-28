@@ -156,6 +156,9 @@ public static class SqlServerMigrator
             connection, transaction))
         {
             lockCommand.Parameters.AddWithValue("schema", schemaName);
+            // uncounted round trip: migration coordination runs once at startup, on its own connection,
+            // before any store operation exists to charge it to. Its cost is a fixed price for
+            // provisioning the schema rather than a per-operation cost, which is all the budgets watch.
             await lockCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -202,6 +205,8 @@ public static class SqlServerMigrator
             var sql = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
 
             await using var command = new SqlCommand(rewriter.Rewrite(sql), connection, transaction);
+            // uncounted round trip: applying a schema script is startup provisioning, not store work.
+            // It runs at most once per process on a connection no operation is ever measured through.
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
@@ -236,6 +241,8 @@ public static class SqlServerMigrator
             coordinator))
         {
             acquire.Parameters.AddWithValue("resource", resource);
+            // uncounted round trip: the RCSI coordination lock is held on a tempdb connection of its own
+            // for the length of a one-time database setting change, outside every store operation.
             await acquire.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -249,6 +256,8 @@ public static class SqlServerMigrator
                 "           WHERE database_id = DB_ID() AND is_read_committed_snapshot_on = 0) " +
                 "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;",
                 appDb);
+            // uncounted round trip: ALTER DATABASE is a once-per-database setting change at startup. It
+            // cannot ride a store operation - SQL Server forbids it inside a transaction at all.
             await alter.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -259,6 +268,8 @@ public static class SqlServerMigrator
             await using var release = new SqlCommand(
                 "EXEC sp_releaseapplock @Resource = @resource, @LockOwner = 'Session';", coordinator);
             release.Parameters.AddWithValue("resource", resource);
+            // uncounted round trip: the other half of the RCSI coordination lock above, on the same
+            // startup-only tempdb connection.
             await release.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
         }
     }
@@ -294,6 +305,8 @@ public static class SqlServerMigrator
                 "IF OBJECT_ID('backwave.schema_version', 'U') IS NULL SELECT CAST(NULL AS int); " +
                 "ELSE SELECT TOP 1 version FROM backwave.schema_version;"),
             connection, transaction);
+        // uncounted round trip: the schema-version probe is the one-time startup check the budgets
+        // exclude by name, on a connection of its own that no operation is measured through.
         var version = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return version is int deployed && deployed == ExpectedSchemaVersion;
     }
@@ -344,6 +357,8 @@ public static class SqlServerMigrator
         object? version;
         try
         {
+            // uncounted round trip: the schema-version check is the one-time startup probe the budgets
+            // already exclude by name, on a connection of its own that no operation is measured through.
             version = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (SqlException exception) when (exception.Number == 208) // invalid object name

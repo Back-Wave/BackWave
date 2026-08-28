@@ -233,7 +233,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                     "SELECT state FROM backwave.jobs WITH (UPDLOCK, ROWLOCK) WHERE job_id = @id",
                     connection, transaction);
                 parent.Parameters.AddWithValue("id", parentId);
-                if (await parent.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is int parentState)
+                if (await parent.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is int parentState)
                 {
                     states[parentId] = (JobState)parentState;
                 }
@@ -288,7 +288,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
 
         try
         {
-            if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 0)
+            if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) == 0)
             {
                 return EnqueueResult.Duplicate;
             }
@@ -310,7 +310,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 connection, transaction);
             edge.Parameters.AddWithValue("parent", parentId);
             edge.Parameters.AddWithValue("child", job.JobId);
-            await edge.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await edge.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // Job Tags (ADR 0022): the enqueue-time set, in this same transaction so they are visible
@@ -406,7 +406,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                     connection, transaction))
                 {
                     limit.Parameters.AddWithValue("queue", queue);
-                    await using var reader = await limit.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                    await using var reader = await limit.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     {
                         configured = reader.IsDBNull(0) ? null : reader.GetInt32(0);
@@ -426,7 +426,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                     "SELECT count(*) FROM backwave.jobs WHERE queue = @queue AND state = 2",
                     connection, transaction);
                 leased.Parameters.AddWithValue("queue", queue);
-                var inUse = (int)(await leased.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+                var inUse = (int)(await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
                 slots = limitValue - inUse;
             }
             if (slots <= 0)
@@ -461,7 +461,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             claim.Parameters.AddWithValue("worker", request.WorkerId);
             claim.Parameters.AddWithValue("expiry", request.Now + request.LeaseDuration);
             var queueClaims = new List<JobRecord>();
-            await using (var reader = await claim.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+            await using (var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
             {
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
@@ -528,7 +528,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         {
             cmd.Parameters.AddWithValue($"q{i}", request.Queues[i]);
         }
-        if (await cmd.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not DateTimeOffset earliest)
+        if (await cmd.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not DateTimeOffset earliest)
         {
             return null; // nothing scheduled in any served, non-paused queue
         }
@@ -554,7 +554,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         }
         Interlocked.Exchange(ref _tagsProbeTicks, Environment.TickCount64);
         await using var probe = Cmd("SELECT TOP 1 1 FROM backwave.job_tags", connection);
-        var present = await probe.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
+        var present = await probe.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not null;
         if (present)
         {
             _tagsInUse = true;
@@ -605,7 +605,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             """,
             connection, transaction);
         applock.Parameters.AddWithValue("queue", queue);
-        await applock.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await applock.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // ── §5.6 ReportOutcome ──────────────────────────────────────────────────────
@@ -704,7 +704,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         update.Parameters.AddWithValue("now", now);
         configure(update);
 
-        if (await update.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not int newState)
+        if (await update.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not int newState)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return OutcomeResult.StaleLease; // the (workerId, attempt) fence
@@ -841,7 +841,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         {
             update.Parameters.Add("payload", SqlDbType.NVarChar, -1).Value = payload;
             update.Parameters.AddWithValue("now", now);
-            await using var reader = await update.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await update.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 matched[reader.GetGuid(0)] = reader.GetInt32(1);
@@ -864,7 +864,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                     "UPDATE backwave.jobs SET output = @output WHERE job_id = @id", connection, transaction);
                 setOutput.Parameters.AddWithValue("id", row.JobId);
                 setOutput.Parameters.Add("output", SqlDbType.VarBinary, -1).Value = blob.ToArray();
-                await setOutput.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await setOutput.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
             if (row.AddedTags is { Count: > 0 } addedTags)
             {
@@ -913,7 +913,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 connection, transaction))
             {
                 AddIdList(withChildren, "p", terminalIds);
-                await using var reader = await withChildren.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = await withChildren.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     parents.Add(reader.GetGuid(0));
@@ -968,7 +968,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 connection, transaction))
             {
                 edges.Parameters.AddWithValue("parent", currentParent);
-                await using var reader = await edges.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = await edges.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     children.Add(reader.GetGuid(0));
@@ -989,7 +989,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                     connection, transaction))
                 {
                     child.Parameters.AddWithValue("id", childId);
-                    await using var reader = await child.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                    await using var reader = await child.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     {
                         continue;
@@ -1014,7 +1014,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                     cancel.Parameters.AddWithValue("id", childId);
                     cancel.Parameters.AddWithValue("now", now);
                     cancel.Parameters.AddWithValue("cause", ParentFailureCause(currentState));
-                    await cancel.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await cancel.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                     await RecordTransitionAsync(connection, transaction, childId, JobState.Cancelled, childAttempt, now, cancellationToken)
                         .ConfigureAwait(false);
                     work.Push((childId, JobState.Cancelled)); // cascade
@@ -1036,7 +1036,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 {
                     resolve.Parameters.AddWithValue("now", now);
                 }
-                await resolve.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await resolve.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 // Only the latch RELEASE (last parent terminal → Scheduled) is a state change worth
                 // a transition; a mere decrement keeps the child in AwaitingParent (§5.12).
                 if (remaining - 1 <= 0)
@@ -1079,7 +1079,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         command.Parameters.AddWithValue("now", now);
 
         var renewed = new Dictionary<Guid, bool>();
-        await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        await using (var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
         {
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -1146,7 +1146,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             {
                 select.Parameters.AddWithValue($"q{i}", queues[i]);
             }
-            await using var reader = await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 expired.Add((reader.GetGuid(0), reader.GetInt32(1)));
@@ -1186,7 +1186,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 reschedule.Parameters.Add($"rid{i}", SqlDbType.UniqueIdentifier).Value = retries[i].JobId;
                 reschedule.Parameters.Add($"rdue{i}", SqlDbType.DateTimeOffset).Value = retries[i].Due;
             }
-            await reschedule.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await reschedule.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         if (deadLettered.Count > 0)
@@ -1205,7 +1205,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 deadLetter.Parameters.Add($"did{i}", SqlDbType.UniqueIdentifier).Value = deadLettered[i].JobId;
                 deadLetter.Parameters.Add($"dcause{i}", SqlDbType.NVarChar).Value = deadLettered[i].Cause;
             }
-            await deadLetter.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
 
             // Crash after the dead-letter write, before the latch cascade: rollback must leave the
             // parent leased and every child latch un-resolved (issue 0034, invariant I2).
@@ -1224,7 +1224,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 {
                     withChildren.Parameters.Add($"p{i}", SqlDbType.UniqueIdentifier).Value = deadLettered[i].JobId;
                 }
-                await using var reader = await withChildren.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = await withChildren.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     parents.Add(reader.GetGuid(0));
@@ -1275,7 +1275,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             "SELECT state, attempt FROM backwave.jobs WITH (UPDLOCK, ROWLOCK) WHERE job_id = @id", connection, transaction))
         {
             current.Parameters.AddWithValue("id", jobId);
-            await using var reader = await current.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await current.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 return CancelResult.NotCancellable;
@@ -1293,7 +1293,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                     cancel.Parameters.AddWithValue("id", jobId);
                     cancel.Parameters.AddWithValue("now", now);
                     cancel.Parameters.AddWithValue("actor", actor);
-                    await cancel.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await cancel.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 }
                 // Transition Log (§5.12): the immediate Cancelled state, atomic with the cancel.
                 await RecordTransitionAsync(connection, transaction, jobId, JobState.Cancelled, attempt, now, cancellationToken)
@@ -1310,7 +1310,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                     "UPDATE backwave.jobs SET cancel_requested = 1 WHERE job_id = @id", connection, transaction))
                 {
                     request.Parameters.AddWithValue("id", jobId);
-                    await request.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await request.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 }
                 await AppendAuditAsync(connection, transaction, actor, OperatorAction.Cancel, jobId.ToString(), now, cancellationToken)
                     .ConfigureAwait(false);
@@ -1348,7 +1348,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             connection, transaction);
         update.Parameters.AddWithValue("id", jobId);
         update.Parameters.AddWithValue("now", now);
-        if (await update.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is null)
+        if (await update.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is null)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return RequeueResult.NotRequeueable;
@@ -1398,7 +1398,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         {
             upsert.Parameters.AddWithValue("queue", queue);
             upsert.Parameters.Add("paused", SqlDbType.Bit).Value = paused;
-            await upsert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await upsert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         await AppendAuditAsync(connection, transaction, actor, action, queue, now, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -1420,7 +1420,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             "SELECT wire_name, payload, queue FROM backwave.schedules WHERE schedule_id = @id", connection, transaction))
         {
             select.Parameters.AddWithValue("id", scheduleId);
-            await using var reader = await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 schedule = (reader.GetString(0), reader.GetFieldValue<byte[]>(1), reader.GetString(2));
@@ -1448,7 +1448,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             insert.Parameters.AddWithValue("queue", schedule.Value.Queue);
             insert.Parameters.AddWithValue("due", now);
             insert.Parameters.AddWithValue("scheduleId", scheduleId);
-            if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0)
+            if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) > 0)
             {
                 // Transition Log (§5.12): the minted instance's first Scheduled state, at Attempt 0.
                 await RecordTransitionAsync(connection, transaction, JobIds.ForMintedTick(scheduleId, now),
@@ -1474,7 +1474,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         command.Parameters.AddWithValue("target", target);
 
         var records = new List<OperatorAuditRecord>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             records.Add(new OperatorAuditRecord(
@@ -1499,7 +1499,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         audit.Parameters.AddWithValue("action", (int)action);
         audit.Parameters.AddWithValue("target", target);
         audit.Parameters.Add("now", SqlDbType.DateTimeOffset).Value = now;
-        await audit.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await audit.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // Appends one Transition Log entry (§5.12) for a job's resulting state, inside the SAME
@@ -1544,7 +1544,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             insert.Parameters.AddWithValue("attempt", attempt);
             insert.Parameters.AddWithValue(
                 "detail", (object?)options.Bounds.ClampFailureDetail(failureDetail) ?? DBNull.Value);
-            ordinal = (long)(await insert.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+            ordinal = (long)(await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
         }
 
         // Per-job-life cap (§7): skip the prune entirely unless the entry just written reached the
@@ -1566,7 +1566,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             connection, transaction);
         prune.Parameters.AddWithValue("id", jobId);
         prune.Parameters.AddWithValue("cap", options.Bounds.MaxTransitionsPerJob);
-        await prune.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // Appends a BATCH of Transition Log entries (§5.12) in ONE set-based INSERT — the per-row
@@ -1632,7 +1632,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         {
             insert.Parameters.Add("payload", SqlDbType.NVarChar, -1).Value = payload;
             insert.Parameters.Add("now", SqlDbType.DateTimeOffset).Value = now;
-            await using var reader = await insert.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await insert.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var ordinal = reader.GetInt64(0);
@@ -1661,7 +1661,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             connection, transaction);
         prune.Parameters.Add("payload", SqlDbType.NVarChar, -1).Value = payload;
         prune.Parameters.AddWithValue("cap", options.Bounds.MaxTransitionsPerJob);
-        await prune.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // The set-valued transition row for the batch INSERT, serialized to JSON and unpacked by OPENJSON.
@@ -1704,7 +1704,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         command.Parameters.Add("zone", SqlDbType.NVarChar, 450).Value = (object?)schedule.TimeZoneId ?? DBNull.Value;
         command.Parameters.AddWithValue("catchUp", (int)schedule.CatchUp);
         command.Parameters.AddWithValue("noOverlap", schedule.NoOverlap);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -1717,7 +1717,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         await using var command = Cmd(
             "DELETE FROM backwave.schedules WHERE schedule_id = @id", connection);
         command.Parameters.AddWithValue("id", scheduleId);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
@@ -1742,7 +1742,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             connection);
 
         var snapshots = new List<ScheduleSnapshot>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             snapshots.Add(new ScheduleSnapshot(
@@ -1791,7 +1791,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 fence.Parameters.AddWithValue("id", decision.ScheduleId);
                 fence.Parameters.AddWithValue("expected", decision.ExpectedCursor);
                 fence.Parameters.AddWithValue("newCursor", decision.NewCursor);
-                await using var reader = await fence.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using var reader = await fence.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     schedule = (reader.GetString(0), reader.GetFieldValue<byte[]>(1),
@@ -1815,7 +1815,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                     connection, transaction);
                 record.Parameters.AddWithValue("id", decision.ScheduleId);
                 record.Parameters.AddWithValue("ticks", RenderSkippedTicks(combined));
-                await record.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await record.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
 
             // Crash after the cursor advanced, before the instances are minted: rollback must
@@ -1837,7 +1837,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 insert.Parameters.AddWithValue("queue", schedule.Value.Queue);
                 insert.Parameters.AddWithValue("due", tick);
                 insert.Parameters.AddWithValue("scheduleId", decision.ScheduleId);
-                if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0)
+                if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) > 0)
                 {
                     minted++;
                     // MintDue carries no `now`; the tick (the instance's due instant) is the
@@ -1880,7 +1880,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         {
             command.Parameters.AddWithValue("queue", queue);
             command.Parameters.Add("limit", SqlDbType.Int).Value = (object?)limit ?? DBNull.Value;
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         await AppendAuditAsync(
             connection, transaction, actor, OperatorAction.SetConcurrencyLimit, queue, now, cancellationToken).ConfigureAwait(false);
@@ -1900,7 +1900,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             $"SELECT {JobColumns} FROM backwave.jobs WHERE job_id = @id", connection);
         command.Parameters.AddWithValue("id", jobId);
         JobRecord? record;
-        await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        await using (var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
         {
             record = await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadJob(reader) : null;
         }
@@ -1924,7 +1924,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         await using var command = Cmd(
             "SELECT output FROM backwave.jobs WHERE job_id = @id", connection);
         command.Parameters.Add("id", SqlDbType.UniqueIdentifier).Value = jobId;
-        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        var result = await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
         // Explicit nullable cast: byte[] has an implicit conversion to ReadOnlyMemory<byte>, so an
         // unqualified `: null` here would be the empty `default` memory (HasValue) rather than no value.
         return result is byte[] bytes ? new ReadOnlyMemory<byte>(bytes) : (ReadOnlyMemory<byte>?)null;
@@ -1948,7 +1948,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         command.Parameters.AddWithValue("id", jobId);
 
         var transitions = new List<JobTransition>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             transitions.Add(new JobTransition(
@@ -1987,7 +1987,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         command.Parameters.AddWithValue("take", Math.Min(query.MaxResults, options.Bounds.MaxMonitorPageSize));
 
         var jobs = new List<JobRecord>();
-        await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        await using (var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
         {
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -2008,7 +2008,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             connection);
 
         var counts = new List<QueueStateCount>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             counts.Add(new QueueStateCount(
@@ -2100,7 +2100,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             + "GROUP BY [value] ORDER BY count(DISTINCT job_id) DESC, [value] COLLATE Latin1_General_BIN2");
 
         var facets = new List<TagFacet>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             facets.Add(new TagFacet(reader.GetString(0), reader.GetInt32(1)));
@@ -2153,7 +2153,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 + ") d "
                 + "ORDER BY LOWER(v) COLLATE Latin1_General_BIN2, v COLLATE Latin1_General_BIN2");
 
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 suggestions.Add(new TagSuggestion(query.Key, reader.GetString(0)));
@@ -2191,7 +2191,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             + stageOneCursor
             + "ORDER BY section, LOWER(name) COLLATE Latin1_General_BIN2, name COLLATE Latin1_General_BIN2");
 
-        await using var stageOneReader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var stageOneReader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await stageOneReader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             var name = stageOneReader.GetString(1);
@@ -2222,7 +2222,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             "SELECT queue, paused, max_concurrent FROM backwave.queue_limits ORDER BY queue", connection);
 
         var settings = new List<QueueSettings>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             settings.Add(new QueueSettings(
@@ -2368,7 +2368,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 (object?)workflow.RestartedFrom ?? DBNull.Value;
             try
             {
-                await insertRow.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await insertRow.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (SqlException exception) when (exception.Number is 2627 or 2601)
             {
@@ -2421,7 +2421,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 edge.Parameters.AddWithValue("child", member.JobId);
                 try
                 {
-                    await edge.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await edge.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 }
                 catch (SqlException exception) when (exception.Number is 2627 or 2601)
                 {
@@ -2442,7 +2442,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         await using var command = Cmd(
             "SELECT 1 FROM backwave.workflows WHERE workflow_id = @id", connection, transaction);
         command.Parameters.AddWithValue("id", workflowId);
-        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
+        return await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not null;
     }
 
     private async ValueTask<bool> JobExistsAsync(
@@ -2451,7 +2451,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         await using var command = Cmd(
             "SELECT 1 FROM backwave.jobs WHERE job_id = @id", connection, transaction);
         command.Parameters.AddWithValue("id", jobId);
-        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
+        return await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not null;
     }
 
     private async ValueTask<HashSet<Guid>> MembersOfAsync(
@@ -2461,7 +2461,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         await using var command = Cmd(
             "SELECT job_id FROM backwave.jobs WHERE workflow_id = @id", connection, transaction);
         command.Parameters.AddWithValue("id", workflowId);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             members.Add(reader.GetGuid(0));
@@ -2520,7 +2520,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         await using (var members = Cmd(
             "SELECT workflow_id, state FROM backwave.jobs WHERE workflow_id IS NOT NULL", connection))
         {
-            await using var reader = await members.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await members.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var wf = reader.GetGuid(0);
@@ -2534,7 +2534,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             "SELECT workflow_id, name, created_at, restarted_from FROM backwave.workflows " +
             "ORDER BY created_at, workflow_id", connection))
         {
-            await using var reader = await workflows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await workflows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var workflowId = reader.GetGuid(0);
@@ -2567,7 +2567,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             "SELECT name, created_at, restarted_from FROM backwave.workflows WHERE workflow_id = @id", connection))
         {
             row.Parameters.AddWithValue("id", workflowId);
-            await using var reader = await row.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await row.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 return null;
@@ -2584,7 +2584,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             $"SELECT {JobColumns} FROM backwave.jobs WHERE workflow_id = @id ORDER BY [sequence]", connection))
         {
             memberRows.Parameters.AddWithValue("id", workflowId);
-            await using var reader = await memberRows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await memberRows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 members.Add(ReadJob(reader));
@@ -2598,7 +2598,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             "ORDER BY parent_id, child_id", connection))
         {
             edgeRows.Parameters.AddWithValue("id", workflowId);
-            await using var reader = await edgeRows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await edgeRows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 edges.Add(new WorkflowEdge(reader.GetGuid(0), reader.GetGuid(1)));
@@ -2631,7 +2631,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             "SELECT parent_id FROM backwave.job_parents WHERE child_id = @id ORDER BY parent_id", connection))
         {
             parents.Parameters.AddWithValue("id", jobId);
-            await using var reader = await parents.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await parents.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 gatingParents.Add(reader.GetGuid(0));
@@ -2643,7 +2643,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             "SELECT child_id FROM backwave.job_parents WHERE parent_id = @id ORDER BY child_id", connection))
         {
             childRows.Parameters.AddWithValue("id", jobId);
-            await using var reader = await childRows.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await childRows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 children.Add(reader.GetGuid(0));
@@ -2698,7 +2698,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         command.Parameters.AddWithValue("stateB", (int)stateB);
         command.Parameters.AddWithValue("before", terminalBefore);
         command.Parameters.AddWithValue("max", Math.Min(maxJobs, options.Bounds.MaxPurgeBatch));
-        var purged = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        var purged = await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
 
         // When a Workflow's last member is purged, drop its now-orphaned identity row (structural edges
         // cascade via FK) so the tables never leak rows for Workflows with no surviving jobs.
@@ -2708,7 +2708,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             WHERE NOT EXISTS (SELECT 1 FROM backwave.jobs j WHERE j.workflow_id = w.workflow_id)
             """,
             connection);
-        await prune.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
 
         return purged;
     }
@@ -2740,7 +2740,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             connection, transaction))
         {
             ensure.Parameters.AddWithValue("id", request.ObserverId);
-            await ensure.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await ensure.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         long cursor;
@@ -2752,7 +2752,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             connection, transaction))
         {
             locked.Parameters.AddWithValue("id", request.ObserverId);
-            await using var reader = await locked.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await locked.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
             cursor = reader.GetInt64(0);
             leaseOwner = reader.IsDBNull(1) ? null : reader.GetString(1);
@@ -2771,7 +2771,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             sub.Parameters.AddWithValue("states", string.Join(',', states));
             sub.Parameters.Add("wire", SqlDbType.NVarChar, -1).Value = (object?)request.WireName ?? DBNull.Value;
             sub.Parameters.Add("queue", SqlDbType.NVarChar, -1).Value = (object?)request.Queue ?? DBNull.Value;
-            await sub.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await sub.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // A live Lease held by a different worker means that node is delivering — back off (§5.13).
@@ -2807,7 +2807,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             scan.Parameters.Add("wire", SqlDbType.NVarChar, -1).Value = (object?)request.WireName ?? DBNull.Value;
             scan.Parameters.Add("queue", SqlDbType.NVarChar, -1).Value = (object?)request.Queue ?? DBNull.Value;
             scan.Parameters.AddWithValue("take", Math.Max(0, request.MaxRows));
-            await using var reader = await scan.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await scan.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var nextAttemptAt = reader.IsDBNull(10) ? (DateTimeOffset?)null : reader.GetFieldValue<DateTimeOffset>(10);
@@ -2845,7 +2845,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             upsert.Parameters.AddWithValue("id", request.ObserverId);
             upsert.Parameters.AddWithValue("pos", delivery.Position);
             upsert.Parameters.AddWithValue("attempt", delivery.DeliveryAttempt);
-            await upsert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await upsert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await using (var lease = Cmd(
@@ -2855,7 +2855,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             lease.Parameters.AddWithValue("id", request.ObserverId);
             lease.Parameters.AddWithValue("worker", request.WorkerId);
             lease.Parameters.Add("expiry", SqlDbType.DateTimeOffset).Value = request.Now + request.LeaseDuration;
-            await lease.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await lease.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -2885,7 +2885,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             connection, transaction))
         {
             locked.Parameters.AddWithValue("id", report.ObserverId);
-            await using var reader = await locked.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await locked.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             found = await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
             if (found)
             {
@@ -2932,7 +2932,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             resolve.Parameters.Add("next", SqlDbType.DateTimeOffset).Value =
                 outcome.Disposition == ObserverDeliveryDisposition.Retry && outcome.NextAttemptAt is { } at
                     ? at : DBNull.Value;
-            await resolve.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await resolve.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await AdvanceObserverCursorAsync(
@@ -2972,7 +2972,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             blockCommand.Parameters.AddWithValue("cursor", cursor);
             blockCommand.Parameters.Add("wire", SqlDbType.NVarChar, -1).Value = (object?)wireName ?? DBNull.Value;
             blockCommand.Parameters.Add("queue", SqlDbType.NVarChar, -1).Value = (object?)queue ?? DBNull.Value;
-            var result = await blockCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            var result = await blockCommand.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             block = result is DBNull or null ? null : (long)result;
         }
 
@@ -2984,7 +2984,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         {
             advance.Parameters.AddWithValue("cursor", cursor);
             advance.Parameters.Add("block", SqlDbType.BigInt).Value = (object?)block ?? DBNull.Value;
-            var result = await advance.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            var result = await advance.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             newCursor = result is DBNull or null ? null : (long)result;
         }
 
@@ -3011,7 +3011,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             deadLetter.Parameters.AddWithValue("cursor", cursor);
             deadLetter.Parameters.AddWithValue("target", target);
             deadLetter.Parameters.Add("now", SqlDbType.DateTimeOffset).Value = now;
-            await deadLetter.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // The swept rows are all resolved now — drop their in-flight bookkeeping.
@@ -3021,7 +3021,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         {
             sweep.Parameters.AddWithValue("id", observerId);
             sweep.Parameters.AddWithValue("target", target);
-            await sweep.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await sweep.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await using (var move = Cmd(
@@ -3030,7 +3030,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         {
             move.Parameters.AddWithValue("id", observerId);
             move.Parameters.AddWithValue("target", target);
-            await move.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await move.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -3050,7 +3050,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         await using var command = Cmd(
             "SELECT cursor_pos FROM backwave.observers WHERE observer_id = @id", connection);
         command.Parameters.AddWithValue("id", observerId);
-        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        var result = await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
         return result is DBNull or null ? -1L : (long)result;
     }
 
@@ -3082,7 +3082,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         command.Parameters.AddWithValue("wire", (object?)request.WireName ?? DBNull.Value);
         command.Parameters.AddWithValue("queue", (object?)request.Queue ?? DBNull.Value);
 
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
         var oldest = reader.IsDBNull(2) ? (DateTimeOffset?)null : reader.GetFieldValue<DateTimeOffset>(2);
         return new ObserverLag(reader.GetInt64(0), (int)reader.GetInt64(1), oldest);
@@ -3104,7 +3104,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         command.Parameters.AddWithValue("id", observerId);
 
         var records = new List<ObserverDeadLetterRecord>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             records.Add(new ObserverDeadLetterRecord(
@@ -3173,7 +3173,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             insert.Parameters.Add("value", SqlDbType.NVarChar, 200).Value = tag.Value;
             try
             {
-                await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (SqlException exception) when (exception.Number is 2627 or 2601)
             {
@@ -3200,7 +3200,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             $"SELECT job_id, [key], [value] FROM backwave.job_tags WHERE job_id IN ({ParameterList("id", jobIds.Count)})",
             connection);
         AddIdList(command, "id", jobIds);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             var jobId = reader.GetGuid(0);
