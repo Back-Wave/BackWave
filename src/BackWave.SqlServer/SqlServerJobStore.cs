@@ -146,6 +146,40 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
     private static bool IsTransientStoreFault(Exception exception)
         => exception is DbException { IsTransient: true } or TimeoutException;
 
+    // Bounded deadlock retry for the hot-path writes. SQL Server picks one victim of a deadlock and
+    // rolls its transaction back whole, so a losing attempt leaves no effect behind and the operation
+    // can run again from the start. Every operation wrapped here opens its own connection and
+    // transaction and is fenced on the state it writes, so a replay either does the same work or
+    // reports a stale lease, which is the right answer once another node took the job over. Enqueue is
+    // not wrapped: it can join a caller's transaction, and a deadlock dooms that transaction too, so
+    // only the caller can start it over.
+    // This covers the residual risk, not the cause. A deadlock here comes from a lock footprint wider
+    // than the batch, and the statements that make the footprint are shaped to seek their own rows in
+    // §5.2, §5.5 and §5.6. What no shape controls is the plan the optimizer picks for a foreign-key
+    // check, so a rare loss can still occur, and the fleet pays milliseconds for it instead of failing
+    // a maintenance sweep. On exhaustion the last fault propagates (fail-stop preserved).
+    private const int DeadlockVictim = 1205;
+
+    private static async ValueTask<T> RetryOnDeadlockAsync<T>(
+        Func<ValueTask<T>> operation, CancellationToken cancellationToken)
+    {
+        const int maxAttempts = 4;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await operation().ConfigureAwait(false);
+            }
+            catch (SqlException exception) when (attempt < maxAttempts && exception.Number == DeadlockVictim)
+            {
+                // Count the loss that the caller never sees. The activity is null on purpose, because
+                // an attempt that goes on to succeed must not leave an error status on its span.
+                SqlServerDiagnostics.RecordStoreFault(activity: null, exception, isTransient: true);
+                await Task.Delay(TimeSpan.FromMilliseconds(5 * attempt), cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
     // ── §5.1 Enqueue ────────────────────────────────────────────────────────────
 
     /// <inheritdoc/>
@@ -334,7 +368,9 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         using var activity = SqlServerDiagnostics.StartStore("claim", JobsCollection);
         try
         {
-            var (jobs, _) = await ClaimUntracedAsync(request, computeNextDue: false, cancellationToken).ConfigureAwait(false);
+            var (jobs, _) = await RetryOnDeadlockAsync(
+                () => ClaimUntracedAsync(request, computeNextDue: false, cancellationToken), cancellationToken)
+                .ConfigureAwait(false);
             return jobs;
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
@@ -354,7 +390,9 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             // Idle-poll next-due: computed on the SAME connection right after the per-queue claims commit,
             // so it reads the post-claim committed snapshot. SQL Server has no Wake-Up Hint channel, so this
             // value is the sole latency mechanism for an idle backed-off fleet on this adapter.
-            var (jobs, nextDue) = await ClaimUntracedAsync(request, computeNextDue: true, cancellationToken).ConfigureAwait(false);
+            var (jobs, nextDue) = await RetryOnDeadlockAsync(
+                () => ClaimUntracedAsync(request, computeNextDue: true, cancellationToken), cancellationToken)
+                .ConfigureAwait(false);
             return new ClaimResult(jobs, nextDue);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
@@ -627,9 +665,10 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         using var activity = SqlServerDiagnostics.StartStore(operation, JobsCollection);
         try
         {
-            return await ReportOutcomeUntracedAsync(
-                jobId, workerId, attempt, outcome, now, failureDetail, addedTags, output, cancellationToken)
-                .ConfigureAwait(false);
+            return await RetryOnDeadlockAsync(
+                () => ReportOutcomeUntracedAsync(
+                    jobId, workerId, attempt, outcome, now, failureDetail, addedTags, output, cancellationToken),
+                cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
@@ -747,7 +786,9 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         using var activity = SqlServerDiagnostics.StartStore("report_outcomes", JobsCollection);
         try
         {
-            return await ReportOutcomesUntracedAsync(batch, now, cancellationToken).ConfigureAwait(false);
+            return await RetryOnDeadlockAsync(
+                () => ReportOutcomesUntracedAsync(batch, now, cancellationToken), cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
@@ -1106,8 +1147,9 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         using var activity = SqlServerDiagnostics.StartStore("expire_leases", JobsCollection);
         try
         {
-            return await ExpireLeasesUntracedAsync(now, maxJobs, queues, disposition, cancellationToken)
-                .ConfigureAwait(false);
+            return await RetryOnDeadlockAsync(
+                () => ExpireLeasesUntracedAsync(now, maxJobs, queues, disposition, cancellationToken),
+                cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
