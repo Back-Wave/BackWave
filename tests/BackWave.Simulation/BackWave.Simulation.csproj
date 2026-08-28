@@ -12,6 +12,9 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\BackWave\BackWave.csproj" />
+    <!-- dst-0001: the real SQLite adapter, driven by the deterministic event loop behind the
+         default-off SimulationOptions.StoreKind switch. The default run never touches it. -->
+    <ProjectReference Include="..\..\src\BackWave.Sqlite\BackWave.Sqlite.csproj" />
   </ItemGroup>
 
   <ItemGroup>

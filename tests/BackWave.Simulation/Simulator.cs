@@ -417,6 +417,15 @@ internal sealed record SimulationOptions
     /// so every existing regime stays byte-identical. Never set outside the radioactive swarm.
     /// </summary>
     public bool RadioactiveMode { get; init; }
+
+    /// <summary>
+    /// Which store the run drives (dst-0001). <see cref="SimStoreKind.InMemory"/> is the default and
+    /// is the historical path: no file, no schema migration, and no draw on any rng stream, so the
+    /// existing seed battery stays byte-identical. The SQLite kinds put the REAL adapter under the
+    /// deterministic event loop, each Simulator on its own private database. Store choice never
+    /// touches an rng stream in either direction, so it cannot perturb an interleaving.
+    /// </summary>
+    public SimStoreKind StoreKind { get; init; } = SimStoreKind.InMemory;
 }
 
 /// <summary>
@@ -651,7 +660,11 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     private IReadOnlyList<string>[] _servedSets = [];
     private Core.DispatchPolicy[] _policies = [];
     private bool _servedSetSabotaged;
-    private readonly InMemoryJobStore _store = new();
+    // dst-0001: the store the run drives, built from options.StoreKind. Typed as IJobStore so the
+    // real SQLite adapter drops in with no concrete-type coupling anywhere in the harness. The scope
+    // owns the database and releases it when Run returns.
+    private readonly SimStoreScope _storeScope = SimStoreScope.Create(options.StoreKind);
+    private IJobStore _store => _storeScope.Store;
     private readonly PriorityQueue<SimEvent, (DateTimeOffset At, long Seq)> _queue = new();
     private readonly List<Guid> _jobIds = [];
     // Minted instances, captured the step they commit (jobId → its cron tick). The tick is
@@ -952,7 +965,8 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     /// so catching that type here catches all of them, wherever in the Core they fire: the Simulator
     /// never runs the worker-group pump that would fail-stop on one, so a passing run is a run in
     /// which the halt path was never taken. The wrapper takes no draw and touches no event, which is
-    /// what keeps the seed battery byte-identical.
+    /// what keeps the seed battery byte-identical. The store scope is released in the <c>finally</c>,
+    /// so a failing seed leaves no temporary database behind either.
     /// </summary>
     public SimulationResult Run(CancellationToken cancellationToken = default)
     {
@@ -967,6 +981,10 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 false,
                 $"production halt trigger {violation.Trigger} fired: {violation.Message}");
             throw; // unreachable: Invariant(false) always throws
+        }
+        finally
+        {
+            _storeScope.Dispose();
         }
     }
 
@@ -3321,7 +3339,7 @@ internal sealed class FaultInjectingStore(IJobStore inner, Func<string, bool> sh
 /// node healed) is what lands the bad write. Every other operation, and all reads, pass straight
 /// through, so the oracle still sees committed truth. Never used in real regimes.
 /// </summary>
-internal sealed class FenceDroppingStore(InMemoryJobStore inner) : IJobStore
+internal sealed class FenceDroppingStore(IJobStore inner) : IJobStore
 {
     public bool SupportsTransactionalEnqueue => inner.SupportsTransactionalEnqueue;
 
