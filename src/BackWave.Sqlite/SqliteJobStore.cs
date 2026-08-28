@@ -1315,7 +1315,8 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
     // is the per-job max + 1; the global position (which Postgres carries on a SEQUENCE) is
     // assigned here as MAX(position)+1 over the whole table, race-free under whole-writer
     // serialization (ADR 0019). `now` is always the caller's clock. The trailing bounded delete
-    // enforces MaxTransitionsPerJob (§7). Job History Policy gates writes, not schema: Off appends
+    // enforces MaxTransitionsPerJob (§7), and it runs only when this entry put the cap in play.
+    // Job History Policy gates writes, not schema: Off appends
     // nothing; Transitions appends the row but never the detail.
     private async Task RecordTransitionAsync(
         SqliteConnection connection, SqliteTransaction transaction, Guid jobId, JobState state,
@@ -1330,12 +1331,16 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             failureDetail = null; // record the transition, but never the detail it would have carried
         }
 
+        // RETURNING the assigned ordinal lets the prune be skipped entirely (below) when the entry
+        // just written has not reached the cap - the common 2-transition job pays no DELETE.
+        long ordinal;
         await using (var insert = Cmd(
             """
             INSERT INTO backwave_job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail, position)
             SELECT $id, COALESCE(MAX(ordinal) + 1, 0), $now, $state, $attempt, $detail,
                    (SELECT COALESCE(MAX(position), 0) + 1 FROM backwave_job_transitions)
             FROM backwave_job_transitions WHERE job_id = $id
+            RETURNING ordinal
             """,
             connection, transaction))
         {
@@ -1345,10 +1350,18 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             insert.Parameters.AddWithValue("$attempt", attempt);
             insert.Parameters.AddWithValue(
                 "$detail", (object?)_options.Bounds.ClampFailureDetail(failureDetail) ?? DBNull.Value);
-            await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            ordinal = (long)(await insert.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
         }
 
-        // Per-job-life cap: keep only the newest MaxTransitionsPerJob entries, dropping oldest.
+        // Per-job-life cap (§7): skip the prune entirely unless the entry just written reached the
+        // cap - a job nowhere near MaxTransitionsPerJob never pays the DELETE. Under the cap the
+        // delete could only be a no-op: its bound is MAX(ordinal) - cap, which is negative while the
+        // newest ordinal is below the cap, and no ordinal is negative. When the entry did reach it,
+        // the bounded DELETE keeps only the newest MaxTransitionsPerJob entries, dropping oldest.
+        if (ordinal < _options.Bounds.MaxTransitionsPerJob)
+        {
+            return;
+        }
         await using var prune = Cmd(
             """
             DELETE FROM backwave_job_transitions
