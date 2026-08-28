@@ -1786,13 +1786,13 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
     }
 
     // Appends a BATCH of Transition Log entries in ONE set-based INSERT - the per-row recorder amortized
-    // for the claim and batched-report paths. JSON_TABLE unpacks the payload into a set, exactly as the
-    // SQL Server adapter uses OPENJSON; a job id travels as its ToByteArray hex, because JSON carries no
-    // RAW, and HEXTORAW turns it back. Each entry's ordinal is still the per-job MAX(ordinal)+1: a
-    // correlated scalar sub-query supplies the job's current max (read consistency keeps this statement's
-    // own rows out of it), and ROW_NUMBER over the payload order adds one per repeat, so a job appearing
-    // twice in one batch gets two consecutive ordinals rather than one duplicate. The whole insert rides
-    // the caller's transaction, so it stays atomic with the lease/outcome write.
+    // for the claim, batched-report, and lease-sweep paths. JSON_TABLE unpacks the payload into a set,
+    // exactly as the SQL Server adapter uses OPENJSON; a job id travels as its ToByteArray hex, because
+    // JSON carries no RAW, and HEXTORAW turns it back. Each entry's ordinal is still the per-job
+    // MAX(ordinal)+1: a correlated scalar sub-query supplies the job's current max (read consistency keeps
+    // this statement's own rows out of it), and ROW_NUMBER over the payload order adds one per repeat, so a
+    // job appearing twice in one batch gets two consecutive ordinals rather than one duplicate. The whole
+    // insert rides the caller's transaction, so it stays atomic with the lease/outcome write.
     //
     // Oracle rejects RETURNING on an INSERT ... SELECT, so the highest ordinal the batch assigned comes
     // back on a following read: after the insert, every job in the batch has its new entry as its own

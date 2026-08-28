@@ -1570,14 +1570,15 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
     }
 
     // Appends a BATCH of Transition Log entries (§5.12) in ONE set-based INSERT — the per-row
-    // recorder amortized for the claim and batched-report paths, where each job appears exactly once
-    // per batch so its ordinal (the per-job MAX(ordinal)+1) is well-defined. OPENJSON unpacks the
-    // payload into a set; the LEFT JOIN supplies each job's current MAX(ordinal). Runs inside the
-    // caller's transaction, so the whole batch is atomic with the lease/outcome write, exactly as
-    // the per-row calls were. The global Position rides the job_transitions sequence default, one
-    // NEXT VALUE per row. One set-based DELETE prunes the batch to MaxTransitionsPerJob (§7). Honors
-    // the history policy: Off writes nothing; Transitions writes the rows but never the detail; the
-    // full rung keeps the clamped detail. `now` is always the caller's clock.
+    // recorder amortized for the claim, batched-report, and lease-sweep paths, where each job
+    // appears exactly once per batch so its ordinal (the per-job MAX(ordinal)+1) is well-defined.
+    // OPENJSON unpacks the payload into a set; the LEFT JOIN supplies each job's current
+    // MAX(ordinal). Runs inside the caller's transaction, so the whole batch is atomic with the
+    // lease/outcome write, exactly as the per-row calls were. The global Position rides the
+    // job_transitions sequence default, one NEXT VALUE per row. One set-based DELETE prunes the
+    // batch to MaxTransitionsPerJob (§7). Honors the history policy: Off writes nothing;
+    // Transitions writes the rows but never the detail; the full rung keeps the clamped detail.
+    // `now` is always the caller's clock.
     private async Task RecordTransitionsBatchAsync(
         SqlConnection connection, SqlTransaction transaction,
         IReadOnlyList<(Guid JobId, JobState State, int Attempt, string? FailureDetail)> rows,

@@ -1376,14 +1376,15 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
     }
 
     // Appends a BATCH of Transition Log entries (§5.12) in ONE set-based INSERT — the per-row
-    // recorder amortized for the claim and batched-report paths, where each job appears exactly once
-    // per batch so its ordinal (the per-job MAX(ordinal)+1) is well-defined. The rows ride a JSON
-    // parameter unpacked by json_each; the LEFT JOIN supplies each job's current MAX(ordinal). The
-    // global position (Postgres carries it on a SEQUENCE) is assigned as the pre-batch MAX plus a
-    // per-row offset, race-free under whole-writer serialization. Runs inside the caller's
-    // transaction, so the whole batch is atomic with the lease/outcome write. One set-based DELETE
-    // prunes the batch to MaxTransitionsPerJob (§7). Honors the history policy: Off writes nothing;
-    // Transitions writes the rows but never the detail; the full rung keeps the clamped detail.
+    // recorder amortized for the claim, batched-report, and lease-sweep paths, where each job
+    // appears exactly once per batch so its ordinal (the per-job MAX(ordinal)+1) is well-defined.
+    // The rows ride a JSON parameter unpacked by json_each; the LEFT JOIN supplies each job's
+    // current MAX(ordinal). The global position (Postgres carries it on a SEQUENCE) is assigned as
+    // the pre-batch MAX plus a per-row offset, race-free under whole-writer serialization. Runs
+    // inside the caller's transaction, so the whole batch is atomic with the lease/outcome write.
+    // One set-based DELETE prunes the batch to MaxTransitionsPerJob (§7). Honors the history
+    // policy: Off writes nothing; Transitions writes the rows but never the detail; the full rung
+    // keeps the clamped detail.
     private async Task RecordTransitionsBatchAsync(
         SqliteConnection connection, SqliteTransaction transaction,
         IReadOnlyList<(Guid JobId, JobState State, int Attempt, string? FailureDetail)> rows,
