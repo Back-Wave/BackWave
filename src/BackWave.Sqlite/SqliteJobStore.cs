@@ -1056,14 +1056,18 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
 
         // Transition Log (§5.12): one entry per expired job for its resulting state — at its
         // post-claim Attempt — atomic with the disposition writes.
+        // Batched, so a wide sweep does not undo the set-based dispositions above with one
+        // insert per job. Each job appears once here (job_id is the key), so its ordinal holds.
+        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(expired.Count);
         foreach (var (jobId, attempt) in expired)
         {
             var resulting = disposition.NextAttemptAt(attempt, now) is not null
                 ? JobState.Scheduled
                 : JobState.DeadLettered;
-            await RecordTransitionAsync(connection, transaction, jobId, resulting, attempt, now, cancellationToken)
-                .ConfigureAwait(false);
+            transitions.Add((jobId, resulting, attempt, null));
         }
+        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
+            .ConfigureAwait(false);
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return expired.Count;
