@@ -32,6 +32,27 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
     /// <summary>How many times the shutdown hand-back reached the store.</summary>
     public int RelinquishCalls => Volatile.Read(ref _relinquishCalls);
 
+    /// <summary>Claims hand back their jobs rewritten into this state - the malformed-claim trigger.</summary>
+    public JobState? RewriteClaimedState { get; set; }
+
+    /// <summary>
+    /// A non-empty claim is padded out to <c>MaxJobs + this</c> rows by cloning the first claimed job under
+    /// fresh ids - the over-claim trigger.
+    /// </summary>
+    public int? OverClaimBy { get; set; }
+
+    /// <summary>Batched outcome reports come back with this many trailing rows dropped - the short-answer trigger.</summary>
+    public int? DropOutcomeResults { get; set; }
+
+    /// <summary>Batched heartbeats come back with this many trailing rows dropped - the short-answer trigger.</summary>
+    public int? DropHeartbeatResults { get; set; }
+
+    /// <summary>Workflow reads come back empty - the member-without-its-workflow trigger.</summary>
+    public bool HideWorkflows { get; set; }
+
+    /// <summary>Batched outcome reports come back rewritten to StaleLease - the fenced-out-write trigger.</summary>
+    public bool FenceOutOutcomes { get; set; }
+
     /// <summary>The next N claims throw a transient store fault, then recover — the degraded-then-healthy trigger.</summary>
     public int TransientClaimFaults
     {
@@ -71,7 +92,33 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
         {
             throw new TransientStoreException();
         }
-        return inner.ClaimAsync(request, cancellationToken);
+        if (RewriteClaimedState is null && OverClaimBy is null)
+        {
+            return inner.ClaimAsync(request, cancellationToken);
+        }
+        return MalformClaimAsync(request, cancellationToken);
+    }
+
+    private async ValueTask<IReadOnlyList<JobRecord>> MalformClaimAsync(
+        ClaimRequest request, CancellationToken cancellationToken)
+    {
+        var claimed = await inner.ClaimAsync(request, cancellationToken).ConfigureAwait(false);
+        if (claimed.Count == 0)
+        {
+            return claimed;
+        }
+
+        var jobs = RewriteClaimedState is { } state
+            ? [.. claimed.Select(job => job with { State = state })]
+            : claimed.ToList();
+        if (OverClaimBy is { } extra)
+        {
+            while (jobs.Count < request.MaxJobs + extra)
+            {
+                jobs.Add(jobs[0] with { JobId = Guid.NewGuid() });
+            }
+        }
+        return jobs;
     }
 
     public ValueTask<OutcomeResult> ReportOutcomeAsync(
@@ -106,7 +153,26 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
                 }
             }
         }
-        return inner.ReportOutcomesAsync(batch, now, cancellationToken);
+        if (DropOutcomeResults is null && !FenceOutOutcomes)
+        {
+            return inner.ReportOutcomesAsync(batch, now, cancellationToken);
+        }
+        return MalformOutcomesAsync(batch, now, cancellationToken);
+    }
+
+    private async ValueTask<IReadOnlyList<OutcomeReportResult>> MalformOutcomesAsync(
+        IReadOnlyList<OutcomeReport> batch, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var results = await inner.ReportOutcomesAsync(batch, now, cancellationToken).ConfigureAwait(false);
+        if (FenceOutOutcomes)
+        {
+            results = [.. results.Select(row => row with { Result = OutcomeResult.StaleLease })];
+        }
+        if (DropOutcomeResults is { } dropped)
+        {
+            results = [.. results.Take(Math.Max(0, results.Count - dropped))];
+        }
+        return results;
     }
 
     public ValueTask<ReadOnlyMemory<byte>?> GetJobOutputAsync(Guid jobId, CancellationToken cancellationToken = default)
@@ -117,7 +183,21 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
         CancellationToken cancellationToken = default)
     {
         ThrowIfFailing();
-        return inner.HeartbeatAsync(workerId, jobIds, leaseDuration, now, cancellationToken);
+        if (DropHeartbeatResults is null)
+        {
+            return inner.HeartbeatAsync(workerId, jobIds, leaseDuration, now, cancellationToken);
+        }
+        return MalformHeartbeatAsync(workerId, jobIds, leaseDuration, now, cancellationToken);
+    }
+
+    private async ValueTask<IReadOnlyList<HeartbeatResult>> MalformHeartbeatAsync(
+        string workerId, IReadOnlyList<Guid> jobIds, TimeSpan leaseDuration, DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var results = await inner
+            .HeartbeatAsync(workerId, jobIds, leaseDuration, now, cancellationToken).ConfigureAwait(false);
+        var dropped = DropHeartbeatResults ?? 0;
+        return [.. results.Take(Math.Max(0, results.Count - dropped))];
     }
 
     public ValueTask<int> ExpireLeasesAsync(
@@ -211,7 +291,9 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
         => inner.ListWorkflowsAsync(cancellationToken);
 
     public ValueTask<WorkflowGraph?> GetWorkflowAsync(Guid workflowId, CancellationToken cancellationToken = default)
-        => inner.GetWorkflowAsync(workflowId, cancellationToken);
+        => HideWorkflows
+            ? ValueTask.FromResult<WorkflowGraph?>(null)
+            : inner.GetWorkflowAsync(workflowId, cancellationToken);
 
     public ValueTask<IReadOnlyList<QueueSettings>> ListQueueSettingsAsync(CancellationToken cancellationToken = default)
         => inner.ListQueueSettingsAsync(cancellationToken);
