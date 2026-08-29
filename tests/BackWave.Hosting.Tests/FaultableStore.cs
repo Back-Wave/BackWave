@@ -70,6 +70,30 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
         return inner.ReportOutcomeAsync(jobId, workerId, attempt, outcome, now, failureDetail, addedTags, output, cancellationToken);
     }
 
+    /// <summary>
+    /// When set, mirrors the adapters' batch Job Output pre-scan: an over-cap row rejects the WHOLE batch
+    /// before any row is written. The In-Memory Store has no batch override and applies rows one by one, so
+    /// this is the only way to exercise the adapter shape without a live database.
+    /// </summary>
+    public int? BatchOutputCap { get; set; }
+
+    public ValueTask<IReadOnlyList<OutcomeReportResult>> ReportOutcomesAsync(
+        IReadOnlyList<OutcomeReport> batch, DateTimeOffset now, CancellationToken cancellationToken = default)
+    {
+        ThrowIfFailing();
+        if (BatchOutputCap is { } cap)
+        {
+            foreach (var row in batch)
+            {
+                if (row.Outcome is JobOutcome.Success && row.Output is { } blob && blob.Length > cap)
+                {
+                    throw new JobOutputTooLargeException(row.JobId, blob.Length, cap);
+                }
+            }
+        }
+        return inner.ReportOutcomesAsync(batch, now, cancellationToken);
+    }
+
     public ValueTask<ReadOnlyMemory<byte>?> GetJobOutputAsync(Guid jobId, CancellationToken cancellationToken = default)
         => inner.GetJobOutputAsync(jobId, cancellationToken);
 

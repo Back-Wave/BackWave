@@ -14,6 +14,13 @@ internal static partial class HostingLog
         Message = "BackWave Worker Group '{worker_group}' fail-stopped on an invariant violation; the group is halted.")]
     internal static partial void WorkerGroupFailStopped(ILogger logger, string worker_group, Exception exception);
 
+    [LoggerMessage(EventId = 2002, Level = LogLevel.Error,
+        Message = "BackWave Worker Group '{worker_group}' job {job_id} produced a Job Output of {actual_bytes} bytes, "
+            + "which exceeds the store's {max_output_bytes}-byte bound; the job is dead-lettered and the group keeps "
+            + "running. Store a reference (id, blob key) instead of the data itself.")]
+    internal static partial void JobOutputRejected(
+        ILogger logger, string worker_group, Guid job_id, int actual_bytes, int max_output_bytes);
+
     [LoggerMessage(EventId = 2101, Level = LogLevel.Error,
         Message = "BackWave Observer dispatch pump faulted on a non-cancellation error; the pump is stopping. "
             + "The cursor Lease will lapse and another node re-claims; the host keeps serving.")]

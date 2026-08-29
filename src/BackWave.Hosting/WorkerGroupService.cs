@@ -535,7 +535,7 @@ internal sealed class WorkerGroupService(
                         Output = rowHasOutput ? rowOutput : (ReadOnlyMemory<byte>?)null,
                     });
                 }
-                var batchResults = await store.ReportOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false);
+                var batchResults = await ApplyOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false);
                 foreach (var rowResult in batchResults)
                 {
                     events.TryWrite(new NodeEvent.OutcomeReported(rowResult.JobId, rowResult.Result, now));
@@ -576,6 +576,51 @@ internal sealed class WorkerGroupService(
                     catch (ObjectDisposedException) { }
                 }
                 break;
+        }
+    }
+
+    // <summary>
+    // Applies an outcome batch, dead-lettering a row whose Job Output the store rejects rather than letting
+    // that rejection reach the fail-stop catch. An over-cap blob (rejected loudly, never truncated) is a
+    // defect in ONE user handler, not an invariant violation, so it must cost that job and nothing else:
+    // the offending row is rewritten as a terminal Failure carrying the rejection as its cause and Failure
+    // Detail - with its Output dropped - and the batch is applied again. A store that pre-scans the whole
+    // batch has written nothing yet; one that applies row by row has already settled the rows ahead of the
+    // rejection, and those simply fence out as StaleLease on the re-apply, which costs a re-poll and no
+    // more. Each pass clears one distinct row's Output, so a row can never be rejected twice and the loop
+    // is bounded by the row count; anything past that bound - or a rejection naming a job this batch never
+    // sent - is unclassifiable and fail-stops the group exactly as before.
+    // </summary>
+    private async ValueTask<IReadOnlyList<OutcomeReportResult>> ApplyOutcomesAsync(
+        List<OutcomeReport> reports, DateTimeOffset now, CancellationToken stoppingToken)
+    {
+        for (var pass = 0; ; pass++)
+        {
+            try
+            {
+                return await store.ReportOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false);
+            }
+            catch (JobOutputTooLargeException rejected) when (pass < reports.Count)
+            {
+                var index = reports.FindIndex(report => report.JobId == rejected.JobId);
+                if (index < 0)
+                {
+                    throw;
+                }
+                HostingLog.JobOutputRejected(
+                    logger, options.Name, rejected.JobId, rejected.ActualBytes, rejected.MaxOutputBytes);
+                var row = reports[index];
+                reports[index] = new OutcomeReport(
+                    row.JobId, row.WorkerId, row.Attempt,
+                    new JobOutcome.Failure(
+                        null,
+                        $"Job Output rejected: {rejected.ActualBytes} bytes exceeds the "
+                            + $"{rejected.MaxOutputBytes}-byte MaxOutputBytes cap."))
+                {
+                    FailureDetail = FailureDetail(rejected),
+                    AddedTags = row.AddedTags,
+                };
+            }
         }
     }
 
