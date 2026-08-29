@@ -81,9 +81,11 @@ public sealed record WorkerGroupOptions
     /// <para>
     /// Polling stays the sole correctness mechanism: the backoff is bounded by this ceiling, so
     /// the worst-case latency for newly enqueued work is at most this value even with no hint. On a store
-    /// with a Wake-Up Hint channel (PostgreSQL, SQLite) an enqueue still wakes the group in milliseconds,
-    /// so the ceiling only affects the rare lost-hint case. On a polling-only store (SQL Server) it is the
-    /// direct latency ceiling for newly enqueued work.
+    /// with a Wake-Up Hint channel an enqueue still wakes the group in milliseconds, so the ceiling only
+    /// affects the rare lost-hint case. PostgreSQL hints across processes with no configuration. Oracle
+    /// hints across processes once <c>EnableWakeUpHints</c> is on. SQLite hints only the pumps in its own
+    /// process, so a pump in another process waits out the ceiling. On a polling-only store (SQL Server)
+    /// the ceiling is the direct latency ceiling for newly enqueued work.
     /// </para>
     /// <para>
     /// Defaults to <see cref="TimeSpan.Zero"/>, which disables idle backoff: the group polls at the fixed
