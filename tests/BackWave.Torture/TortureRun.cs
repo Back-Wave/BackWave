@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using BackWave.Diagnostics;
 using BackWave.Storage;
 
 namespace BackWave.Torture;
@@ -76,19 +77,32 @@ internal static class TortureRun
         else
         {
             Console.WriteLine($"torture: workload done — {entries.Count} journal entries; draining (bound {options.DrainBound.TotalSeconds:F0}s)…");
-            var drainSeconds = Stopwatch.StartNew();
             var drainViolations = new ViolationSink(TorturePhase.Drain);
-            var drainer = new Drainer(target.CreateStore(), keys, options, target.IsTransientFault);
-            drainViolations.AddRange(await drainer.DrainAsync(CancellationToken.None));
-            Console.WriteLine($"torture: quiescent after {drainSeconds.Elapsed.TotalSeconds:F1}s - auditing…");
-
-            var auditSeconds = Stopwatch.StartNew();
             var postDrain = new ViolationSink(TorturePhase.PostDrain);
-            auditor = new Auditor(target.CreateStore(), keys, options);
-            await auditor.AuditAsync(entries, postDrain, CancellationToken.None);
-            postDrain.AddRange(await target.RawAuditAsync(CancellationToken.None));
-            Console.WriteLine(
-                $"torture: post-drain audit - {auditor.ScannedJobs.Count} jobs in {auditSeconds.Elapsed.TotalSeconds:F1}s");
+            // The drainer and the auditor drive the same adapter the clients did, so they can trip the
+            // same production fail-stop triggers. Caught here rather than left to crash the process, so
+            // the run still reports RED naming the trigger and still writes its artifact bundle.
+            try
+            {
+                var drainSeconds = Stopwatch.StartNew();
+                var drainer = new Drainer(target.CreateStore(), keys, options, target.IsTransientFault);
+                drainViolations.AddRange(await drainer.DrainAsync(CancellationToken.None));
+                Console.WriteLine($"torture: quiescent after {drainSeconds.Elapsed.TotalSeconds:F1}s - auditing…");
+
+                var auditSeconds = Stopwatch.StartNew();
+                auditor = new Auditor(target.CreateStore(), keys, options);
+                await auditor.AuditAsync(entries, postDrain, CancellationToken.None);
+                postDrain.AddRange(await target.RawAuditAsync(CancellationToken.None));
+                Console.WriteLine(
+                    $"torture: post-drain audit - {auditor.ScannedJobs.Count} jobs in {auditSeconds.Elapsed.TotalSeconds:F1}s");
+            }
+            catch (InvariantViolationException violation)
+            {
+                postDrain.Add(new TortureViolation(
+                    TortureInvariant.HaltTriggerFired,
+                    $"Halt trigger {violation.Trigger} fired during the drain/audit - a production worker group " +
+                    $"would have fail-stopped: {violation.Message}"));
+            }
 
             violations.AddRange(drainViolations.Snapshot());
             violations.AddRange(postDrain.Snapshot());

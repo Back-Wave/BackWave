@@ -91,7 +91,9 @@ expiry (renewals can shorten a lease) — OutcomeProvenance (fence supersession)
 DuplicateEnqueueAccepted / DuplicateWorkflowAccepted (at most one `Ok` per shared key),
 EnqueueDurability (accepted ⇒ present; present ⇒ accepted), TagDurability (accepted tag writes
 survive), RawStoreException (a raw provider exception escaping the store surface is itself a
-finding), ClientCrash.
+finding), HaltTriggerFired (an adapter raised the production `InvariantViolationException`, which in
+production takes the worker group out of service; the finding names the tripped `InvariantTrigger`),
+ClientCrash.
 
 ## Mid-run audit pass
 
@@ -107,7 +109,7 @@ slot skips the next one and counts the skip.
 
 Mid-run: LegalInitialState, LegalTransition, AttemptMonotonic, AttemptCeiling, TerminalTimestamp,
 LeaseOwnerPresent/LeaseOwnerCleared, the store half of QuarantineNotExecuted, RawStoreException,
-ClientCrash, DuplicateEnqueueAccepted, DuplicateWorkflowAccepted, NoDoubleExecution,
+HaltTriggerFired, ClientCrash, DuplicateEnqueueAccepted, DuplicateWorkflowAccepted, NoDoubleExecution,
 SlotDoubleRelease, OutcomeProvenance.
 
 Held back to post-drain (each compares two sources read at different instants, and `WorkloadClient`

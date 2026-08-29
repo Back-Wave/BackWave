@@ -178,6 +178,15 @@ internal static class Checks
                 TortureInvariant.RawStoreException,
                 $"{group.Count()}× unexpected exception escaped the store surface during '{group.Key}'."));
         }
+        // A production fail-stop trigger: the adapter observed a state its own invariants forbid, which
+        // in production halts the worker group. Grouped by trigger id so the finding names the invariant.
+        foreach (var group in journal.Where(e => e.Op == Ops.InvariantViolation).GroupBy(e => e.Result))
+        {
+            sink.Add(new TortureViolation(
+                TortureInvariant.HaltTriggerFired,
+                $"Halt trigger {group.Key} fired {group.Count()} time(s) - a production worker group would have " +
+                $"fail-stopped: {group.First().Detail}"));
+        }
         foreach (var crash in journal.Where(e => e.Op == Ops.ClientCrash))
         {
             sink.Add(new TortureViolation(

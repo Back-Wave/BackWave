@@ -18,6 +18,7 @@ internal static class Ops
     public const string Resume = "resume";
     public const string Limit = "limit";
     public const string UnexpectedException = "unexpected-exception";
+    public const string InvariantViolation = "invariant-violation";
     public const string TransientFault = "transient-fault";
     public const string ClientCrash = "client-crash";
 }

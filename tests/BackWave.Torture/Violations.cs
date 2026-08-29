@@ -33,6 +33,13 @@ internal static class TortureInvariant
     public const string EnqueueDurability = "EnqueueDurability";
     public const string TagDurability = "TagDurability";
     public const string RawStoreException = "RawStoreException";
+
+    /// <summary>
+    /// A production fail-stop trigger fired: an adapter raised <c>InvariantViolationException</c>, which in
+    /// production takes the worker group out of service. The finding names the tripped
+    /// <c>InvariantTrigger</c>, so the ledger says which invariant broke and not merely that one did.
+    /// </summary>
+    public const string HaltTriggerFired = "HaltTriggerFired";
     public const string ClientCrash = "ClientCrash";
 }
 

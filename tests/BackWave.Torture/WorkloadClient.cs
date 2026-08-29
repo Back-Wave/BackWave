@@ -1,4 +1,5 @@
 using BackWave.Core;
+using BackWave.Diagnostics;
 using BackWave.Storage;
 
 namespace BackWave.Torture;
@@ -428,8 +429,9 @@ internal sealed class WorkloadClient(
 
     /// <summary>
     /// Runs one store call, journaling its entry on success, a transient-fault entry on classified
-    /// contention noise, and a RawStoreException entry — a violation — on anything else. Raw
-    /// provider exceptions escaping the store surface are exactly the 0194/0195 bug class.
+    /// contention noise, a HaltTriggerFired entry on a production fail-stop trigger, and a
+    /// RawStoreException entry — a violation — on anything else. Raw provider exceptions escaping the
+    /// store surface are exactly the 0194/0195 bug class.
     /// </summary>
     private async Task<JournalEntry?> Call(string op, Func<Task<JournalEntry?>> action)
     {
@@ -449,6 +451,19 @@ internal sealed class WorkloadClient(
         catch (JobOutputTooLargeException)
         {
             return null; // defined contract behavior, not a finding
+        }
+        catch (InvariantViolationException violation)
+        {
+            // A production fail-stop trigger. Caught ahead of the transient classifier on purpose: an
+            // adapter's classifier reads provider fault codes, and a halt trigger must never be able to
+            // be demoted to contention noise. The trigger id is journaled as the Result so the finding
+            // can name the invariant that broke.
+            journal.Record(new JournalEntry
+            {
+                Client = _client, Op = Ops.InvariantViolation, T0 = Ticks(), T1 = Ticks(),
+                Result = violation.Trigger.ToString(), Detail = $"{op}: {violation.Message}",
+            });
+            return null;
         }
         catch (Exception exception) when (IsTransient(exception))
         {
