@@ -935,7 +935,31 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         return merged;
     }
 
+    /// <summary>
+    /// Runs the simulation, with the no-halt-trigger oracle wrapped around the whole run. Every
+    /// production impossible-state check raises the one <see cref="InvariantViolationException"/>,
+    /// so catching that type here catches all of them, wherever in the Core they fire: the Simulator
+    /// never runs the worker-group pump that would fail-stop on one, so a passing run is a run in
+    /// which the halt path was never taken. The wrapper takes no draw and touches no event, which is
+    /// what keeps the seed battery byte-identical.
+    /// </summary>
     public SimulationResult Run(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return RunCore(cancellationToken);
+        }
+        catch (InvariantViolationException violation)
+        {
+            Invariant(
+                InvariantId.NoHaltTriggerFired,
+                false,
+                $"production halt trigger {violation.Trigger} fired: {violation.Message}");
+            throw; // unreachable: Invariant(false) always throws
+        }
+    }
+
+    private SimulationResult RunCore(CancellationToken cancellationToken)
     {
         _limits = EffectiveLimits();
         foreach (var (queue, limit) in _limits)

@@ -105,4 +105,15 @@ internal enum InvariantId
 
     /// <summary>Restart-Reclaim-Bound: a cleanly stopped owner's Leases come back within bound, not at Lease expiry.</summary>
     RestartReclaimBound,
+
+    // ── The production fail-stop surface ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// No production halt trigger fires: the Core's own impossible-state checks - every one of which
+    /// raises <see cref="BackWave.Diagnostics.InvariantViolationException"/> - stay silent for the whole
+    /// run. This oracle observes the production <see cref="BackWave.Diagnostics.InvariantTrigger"/>
+    /// registry and names the tripped member in its message; the two registries overlap by intent and
+    /// never by reference, because a test enum in a shipped package is the wrong dependency direction.
+    /// </summary>
+    NoHaltTriggerFired,
 }
