@@ -18,9 +18,11 @@ internal static class ArtifactWriter
         TortureOptions options,
         IReadOnlyList<JournalEntry> journal,
         IReadOnlyList<TortureViolation> violations,
-        Auditor auditor,
+        Auditor? auditor,
+        string? postDrainAbsentReason,
         ITortureTarget target,
         WorkloadStats stats,
+        MidRunAudit midRun,
         CancellationToken cancellationToken)
     {
         var dir = Path.Combine(
@@ -39,6 +41,15 @@ internal static class ArtifactWriter
             options.GovernedLimit,
             DurationSeconds = options.Duration.TotalSeconds,
             DrainBoundSeconds = options.DrainBound.TotalSeconds,
+            MidRunAudit = new
+            {
+                IntervalSeconds = midRun.Interval.TotalSeconds,
+                midRun.Passes,
+                midRun.TransitionsWalked,
+                midRun.Skips,
+                CostSeconds = midRun.Cost.TotalSeconds,
+            },
+            PostDrain = new { Present = auditor is not null, Reason = postDrainAbsentReason },
             Stats = stats.Snapshot(),
         }, Pretty), cancellationToken);
 
@@ -53,19 +64,23 @@ internal static class ArtifactWriter
         }
         await merged.WriteAsync(Path.Combine(dir, "journal.jsonl"));
 
-        await File.WriteAllTextAsync(Path.Combine(dir, "store-dump.json"), JsonSerializer.Serialize(new
-        {
-            Jobs = auditor.ScannedJobs.Select(j => new
+        // A missing section reads as an empty one, so an absent post-drain scan says so and says why.
+        var storeDump = auditor is null
+            ? JsonSerializer.Serialize(new { Present = false, Reason = postDrainAbsentReason }, Pretty)
+            : JsonSerializer.Serialize(new
             {
-                j.JobId, j.WireName, j.Queue, State = j.State.ToString(), j.Attempt,
-                j.DueTime, j.LeaseOwner, j.LeaseExpiry, j.CancelRequested, j.TerminalAt, j.TerminalCause,
-                j.ParentsRemaining, j.Sequence, j.WorkflowId,
-                Tags = j.Tags.Select(t => t.Key.Length == 0 ? t.Value : $"{t.Key}={t.Value}"),
-                History = auditor.Histories.TryGetValue(j.JobId, out var h)
-                    ? h.Select(t => new { t.Ordinal, t.Timestamp, State = t.State.ToString(), t.Attempt, t.FailureDetail })
-                    : null,
-            }),
-        }, Pretty), cancellationToken);
+                Jobs = auditor.ScannedJobs.Select(j => new
+                {
+                    j.JobId, j.WireName, j.Queue, State = j.State.ToString(), j.Attempt,
+                    j.DueTime, j.LeaseOwner, j.LeaseExpiry, j.CancelRequested, j.TerminalAt, j.TerminalCause,
+                    j.ParentsRemaining, j.Sequence, j.WorkflowId,
+                    Tags = j.Tags.Select(t => t.Key.Length == 0 ? t.Value : $"{t.Key}={t.Value}"),
+                    History = auditor.Histories.TryGetValue(j.JobId, out var h)
+                        ? h.Select(t => new { t.Ordinal, t.Timestamp, State = t.State.ToString(), t.Attempt, t.FailureDetail })
+                        : null,
+                }),
+            }, Pretty);
+        await File.WriteAllTextAsync(Path.Combine(dir, "store-dump.json"), storeDump, cancellationToken);
 
         try
         {

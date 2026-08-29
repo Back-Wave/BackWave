@@ -1,3 +1,4 @@
+using System.Data.Common;
 using System.Text.Json;
 using BackWave.Oracle;
 using BackWave.Postgres;
@@ -31,6 +32,13 @@ internal interface ITortureTarget : IAsyncDisposable
 
     /// <summary>Raw-row checks below the store surface — duplicate tag/edge rows are invisible through the set-typed reads.</summary>
     ValueTask<IReadOnlyList<TortureViolation>> RawAuditAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The change feed the mid-run audit walks: Transition Log rows past <paramref name="afterPosition"/>,
+    /// each joined to its job row inside the same statement so both halves come from one snapshot.
+    /// </summary>
+    ValueTask<IReadOnlyList<AuditRow>> ReadChangeFeedAsync(
+        long afterPosition, int maxRows, CancellationToken cancellationToken);
 
     /// <summary>Dumps raw table contents (or the raw database file) into <paramref name="dir"/> for the artifact bundle.</summary>
     ValueTask RawDumpAsync(string dir, CancellationToken cancellationToken);
@@ -115,6 +123,15 @@ internal sealed class PostgresTarget : ITortureTarget
                 return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken) ?? 0L);
             });
         return violations;
+    }
+
+    public async ValueTask<IReadOnlyList<AuditRow>> ReadChangeFeedAsync(
+        long afterPosition, int maxRows, CancellationToken cancellationToken)
+    {
+        await using var dataSource = NpgsqlDataSource.Create(ConnectionString);
+        await using var command = dataSource.CreateCommand(RelationalRawAudit.ChangeFeedSql(
+            afterPosition, "t.job_id::text", "j.terminal_at::text", top: "", tail: $" LIMIT {maxRows}"));
+        return await RelationalRawAudit.ReadFeedAsync(command, Guid.Parse, cancellationToken);
     }
 
     public async ValueTask RawDumpAsync(string dir, CancellationToken cancellationToken)
@@ -220,6 +237,19 @@ internal sealed class SqlServerTarget : ITortureTarget
             },
             tagColumns: "job_id, [key], [value]");
         return violations;
+    }
+
+    public async ValueTask<IReadOnlyList<AuditRow>> ReadChangeFeedAsync(
+        long afterPosition, int maxRows, CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = new SqlCommand(
+            RelationalRawAudit.ChangeFeedSql(
+                afterPosition, "CONVERT(nvarchar(36), t.job_id)", "CONVERT(nvarchar(40), j.terminal_at, 127)",
+                top: $"TOP ({maxRows}) ", tail: ""),
+            connection);
+        return await RelationalRawAudit.ReadFeedAsync(command, Guid.Parse, cancellationToken);
     }
 
     public async ValueTask RawDumpAsync(string dir, CancellationToken cancellationToken)
@@ -379,6 +409,21 @@ internal sealed class OracleTarget : ITortureTarget
         return violations;
     }
 
+    public async ValueTask<IReadOnlyList<AuditRow>> ReadChangeFeedAsync(
+        long afterPosition, int maxRows, CancellationToken cancellationToken)
+    {
+        await using var connection = new OracleConnection(ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = RelationalRawAudit.ChangeFeedSql(
+                afterPosition, "RAWTOHEX(t.job_id)", "TO_CHAR(j.terminal_at)",
+                top: "", tail: $" FETCH FIRST {maxRows} ROWS ONLY")
+            .Replace("backwave.", Schema + ".", StringComparison.Ordinal);
+        // RAW(16) carries the id in Guid.ToByteArray order, the same order every store bind uses.
+        return await RelationalRawAudit.ReadFeedAsync(
+            command, hex => new Guid(Convert.FromHexString(hex)), cancellationToken);
+    }
+
     public async ValueTask RawDumpAsync(string dir, CancellationToken cancellationToken)
     {
         await using var connection = new OracleConnection(ConnectionString);
@@ -495,6 +540,18 @@ internal sealed class SqliteTarget(string dbPath, bool migrate) : ITortureTarget
         return violations;
     }
 
+    public async ValueTask<IReadOnlyList<AuditRow>> ReadChangeFeedAsync(
+        long afterPosition, int maxRows, CancellationToken cancellationToken)
+    {
+        await using var connection = new SqliteConnection($"Data Source={DbPath}");
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = RelationalRawAudit.ChangeFeedSql(
+                afterPosition, "t.job_id", "CAST(j.terminal_at AS TEXT)", top: "", tail: $" LIMIT {maxRows}")
+            .Replace("backwave.", "backwave_", StringComparison.Ordinal);
+        return await RelationalRawAudit.ReadFeedAsync(command, Guid.Parse, cancellationToken);
+    }
+
     public async ValueTask RawDumpAsync(string dir, CancellationToken cancellationToken)
     {
         // Checkpoint the WAL so the copied main file is complete, then copy the raw database.
@@ -560,5 +617,51 @@ internal static class RelationalRawAudit
             violations.Add(new TortureViolation(
                 TortureInvariant.DuplicateEdgeRows, $"{duplicateEdges} duplicate (workflow_id, parent_id, child_id) edge row(s)."));
         }
+    }
+
+    /// <summary>
+    /// The mid-run change-feed read, authored once against the backwave schema. The cursor and the row
+    /// cap are inlined because the four providers spell a parameter marker three different ways, and
+    /// both values are harness-generated integers. Only the id and terminal-instant renderings differ
+    /// per dialect, so each target passes those in.
+    /// </summary>
+    public static string ChangeFeedSql(
+        long afterPosition, string jobIdExpr, string terminalAtExpr, string top, string tail)
+        => $"SELECT {top}t.position, {jobIdExpr}, t.ordinal, t.state, t.attempt, " +
+            "j.state, j.attempt, j.lease_owner, j.wire_name, " +
+            "CASE WHEN j.lease_expiry IS NULL THEN 0 ELSE 1 END, " +
+            $"{terminalAtExpr} " +
+            "FROM backwave.job_transitions t JOIN backwave.jobs j ON j.job_id = t.job_id " +
+            $"WHERE t.position > {afterPosition} ORDER BY t.position{tail}";
+
+    /// <summary>Shapes the change-feed rows. Every provider's reader derives from <see cref="DbDataReader"/>,
+    /// so one shaping pass serves all four; numerics go through <see cref="Convert"/> because the CLR type
+    /// behind an integer column differs by provider.</summary>
+    public static async Task<IReadOnlyList<AuditRow>> ReadFeedAsync(
+        DbCommand command, Func<string, Guid> toGuid, CancellationToken cancellationToken)
+    {
+        var rows = new List<AuditRow>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var jobId = toGuid(reader.GetString(1));
+            rows.Add(new AuditRow
+            {
+                Position = Convert.ToInt64(reader.GetValue(0)),
+                JobId = jobId,
+                Ordinal = Convert.ToInt64(reader.GetValue(2)),
+                State = (JobState)Convert.ToInt32(reader.GetValue(3)),
+                Attempt = Convert.ToInt32(reader.GetValue(4)),
+                Job = new JobRowFacts(
+                    jobId,
+                    (JobState)Convert.ToInt32(reader.GetValue(5)),
+                    Convert.ToInt32(reader.GetValue(6)),
+                    reader.GetString(8),
+                    await reader.IsDBNullAsync(7, cancellationToken) ? null : reader.GetString(7),
+                    Convert.ToInt32(reader.GetValue(9)) == 1,
+                    await reader.IsDBNullAsync(10, cancellationToken) ? null : reader.GetString(10)),
+            });
+        }
+        return rows;
     }
 }

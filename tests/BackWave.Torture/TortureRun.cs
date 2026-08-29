@@ -36,30 +36,65 @@ internal static class TortureRun
 
         var started = DateTimeOffset.UtcNow;
         var journal = new Journal();
+        var wall = Stopwatch.StartNew();
+
+        // One time box for the whole workload, shared by the clients, the progress line and the
+        // mid-run audit - which cancels it early on the first finding, so the store stays near the cause.
+        using var timebox = new CancellationTokenSource(options.Duration);
+        var midRunViolations = new ViolationSink(TorturePhase.Workload);
+        var midRun = new MidRunAudit(target, journal, keys, options, midRunViolations);
+        Console.WriteLine($"torture: mid-run audit every {midRun.Interval.TotalSeconds:F0}s");
+        var midRunLoop = midRun.RunAsync(timebox);
 
         if (options.Adapter == TortureAdapter.SqliteMultiProcess)
         {
-            await RunChildProcessesAsync((SqliteTarget)target, options, journal, started);
+            await RunChildProcessesAsync((SqliteTarget)target, options, journal, started, timebox.Token);
         }
         else
         {
-            await RunInProcessClientsAsync(target, keys, options, journal, started);
+            await RunInProcessClientsAsync(target, keys, options, journal, started, timebox.Token);
         }
+        await midRunLoop;
+        var workloadSeconds = wall.Elapsed.TotalSeconds;
 
         var entries = journal.Entries;
-        Console.WriteLine($"torture: workload done — {entries.Count} journal entries; draining (bound {options.DrainBound.TotalSeconds:F0}s)…");
+        var midRunPercent = workloadSeconds > 0 ? midRun.Cost.TotalSeconds / workloadSeconds * 100 : 0;
+        Console.WriteLine(
+            $"torture: mid-run audit - {midRun.Passes} pass(es), {midRun.TransitionsWalked} transition(s) walked, " +
+            $"{midRun.Skips} skip(s), {midRun.Cost.TotalSeconds:F2}s ({midRunPercent:F2}% of wall)");
 
-        var violations = new List<TortureViolation>();
-        var drainer = new Drainer(target.CreateStore(), keys, options, target.IsTransientFault);
-        violations.AddRange(await drainer.DrainAsync(CancellationToken.None));
+        var violations = new List<TortureViolation>(midRunViolations.Snapshot());
+        Auditor? auditor = null;
+        string? postDrainAbsent = null;
+        if (violations.Count > 0)
+        {
+            // Fail fast: draining first would rewrite exactly the state that explains the finding.
+            postDrainAbsent = "the mid-run audit found a violation; the drain and the post-drain audit were skipped " +
+                "so the store stays as close to the cause as the run can leave it";
+            Console.WriteLine($"torture: workload cut short - {entries.Count} journal entries; skipping the drain.");
+        }
+        else
+        {
+            Console.WriteLine($"torture: workload done — {entries.Count} journal entries; draining (bound {options.DrainBound.TotalSeconds:F0}s)…");
+            var drainSeconds = Stopwatch.StartNew();
+            var drainViolations = new ViolationSink(TorturePhase.Drain);
+            var drainer = new Drainer(target.CreateStore(), keys, options, target.IsTransientFault);
+            drainViolations.AddRange(await drainer.DrainAsync(CancellationToken.None));
+            Console.WriteLine($"torture: quiescent after {drainSeconds.Elapsed.TotalSeconds:F1}s - auditing…");
 
-        Console.WriteLine("torture: quiescent — auditing…");
-        var auditor = new Auditor(target.CreateStore(), keys, options);
-        violations.AddRange(await auditor.AuditAsync(entries, CancellationToken.None));
-        violations.AddRange(await target.RawAuditAsync(CancellationToken.None));
+            var auditSeconds = Stopwatch.StartNew();
+            var postDrain = new ViolationSink(TorturePhase.PostDrain);
+            auditor = new Auditor(target.CreateStore(), keys, options);
+            await auditor.AuditAsync(entries, postDrain, CancellationToken.None);
+            postDrain.AddRange(await target.RawAuditAsync(CancellationToken.None));
+            Console.WriteLine(
+                $"torture: post-drain audit - {auditor.ScannedJobs.Count} jobs in {auditSeconds.Elapsed.TotalSeconds:F1}s");
+
+            violations.AddRange(drainViolations.Snapshot());
+            violations.AddRange(postDrain.Snapshot());
+        }
 
         var stats = new WorkloadStats(entries, keys);
-        Console.WriteLine($"torture: coverage — {auditor.ScannedJobs.Count} jobs audited");
         Console.WriteLine(stats.Render());
 
         // Cross-run coverage ledger (the store-mode twin of VOPR's): append one line per run — clean or
@@ -69,7 +104,7 @@ internal static class TortureRun
         {
             TortureLedger.Append(ledgerPath, TortureLedger.BuildEntry(
                 options, Environment.GetEnvironmentVariable("BACKWAVE_TORTURE_SHA") ?? "",
-                entries, keys, auditor.ScannedJobs.Count, violations, (DateTimeOffset.UtcNow - started).TotalSeconds));
+                entries, keys, auditor?.ScannedJobs.Count ?? 0, violations, (DateTimeOffset.UtcNow - started).TotalSeconds));
         }
 
         if (violations.Count == 0)
@@ -93,7 +128,7 @@ internal static class TortureRun
         }
 
         var bundle = await ArtifactWriter.WriteAsync(
-            options, entries, violations, auditor, target, stats, CancellationToken.None);
+            options, entries, violations, auditor, postDrainAbsent, target, stats, midRun, CancellationToken.None);
         Console.WriteLine($"torture: artifact bundle → {bundle}");
         Console.WriteLine("torture: file the finding as torture-NNNN and distill every confirmed bug into a deterministic");
         Console.WriteLine("torture: Conformance clause (docs/adapter-concurrency-review-checklist.md, 0196 pattern).");
@@ -112,9 +147,9 @@ internal static class TortureRun
     };
 
     private static async Task RunInProcessClientsAsync(
-        ITortureTarget target, KeySpace keys, TortureOptions options, Journal journal, DateTimeOffset started)
+        ITortureTarget target, KeySpace keys, TortureOptions options, Journal journal, DateTimeOffset started,
+        CancellationToken timebox)
     {
-        using var timebox = new CancellationTokenSource(options.Duration);
         var clients = Enumerable.Range(0, options.Clients)
             .Select(i => new WorkloadClient(i, target.CreateStore(), keys, journal, options, started)
             {
@@ -122,8 +157,8 @@ internal static class TortureRun
             })
             .ToList();
 
-        var progress = ProgressAsync(() => clients.Sum(c => c.OpsIssued), timebox.Token);
-        await Task.WhenAll(clients.Select(c => Task.Run(() => c.RunAsync(timebox.Token))));
+        var progress = ProgressAsync(() => clients.Sum(c => c.OpsIssued), timebox);
+        await Task.WhenAll(clients.Select(c => Task.Run(() => c.RunAsync(timebox))));
         await progress;
     }
 
@@ -133,7 +168,8 @@ internal static class TortureRun
     /// and audits over the merged child journals.
     /// </summary>
     private static async Task RunChildProcessesAsync(
-        SqliteTarget target, TortureOptions options, Journal journal, DateTimeOffset started)
+        SqliteTarget target, TortureOptions options, Journal journal, DateTimeOffset started,
+        CancellationToken timebox)
     {
         var perChild = Math.Max(1, options.Clients / options.Processes);
         var children = new List<(Process Process, string JournalPath, int Base)>();
@@ -164,7 +200,8 @@ internal static class TortureRun
 
         foreach (var (process, journalPath, clientBase) in children)
         {
-            using var watchdog = new CancellationTokenSource(options.Duration + TimeSpan.FromSeconds(60));
+            using var watchdog = CancellationTokenSource.CreateLinkedTokenSource(timebox);
+            watchdog.CancelAfter(options.Duration + TimeSpan.FromSeconds(60));
             try
             {
                 await process.WaitForExitAsync(watchdog.Token);
@@ -172,6 +209,10 @@ internal static class TortureRun
             catch (OperationCanceledException)
             {
                 process.Kill(entireProcessTree: true);
+                if (timebox.IsCancellationRequested)
+                {
+                    continue; // the mid-run audit cut the run short; the child did nothing wrong
+                }
                 journal.Record(new JournalEntry
                 {
                     Client = $"child-{clientBase}", Op = Ops.ClientCrash,

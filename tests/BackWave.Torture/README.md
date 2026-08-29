@@ -93,11 +93,40 @@ EnqueueDurability (accepted ⇒ present; present ⇒ accepted), TagDurability (a
 survive), RawStoreException (a raw provider exception escaping the store surface is itself a
 finding), ClientCrash.
 
+## Mid-run audit pass
+
+The post-drain audit finds a violation long after its cause. A background loop in `TortureRun` also
+audits **while the workload runs**, so a finding lands near the state that produced it.
+
+There is no barrier and no quiescent point: the clients never stop. The pass therefore runs only
+the checks that stay sound against a live store - a per-row check reads one atomic row, and a
+journal-only check is monotone under append. It walks `job_transitions.position` forward with one
+joined query per pass (the transition AND its job row from a single snapshot), through raw adapter
+SQL on all four dialects. The interval is seed-derived, 5 to 20 seconds; a pass that overruns its
+slot skips the next one and counts the skip.
+
+Mid-run: LegalInitialState, LegalTransition, AttemptMonotonic, AttemptCeiling, TerminalTimestamp,
+LeaseOwnerPresent/LeaseOwnerCleared, the store half of QuarantineNotExecuted, RawStoreException,
+ClientCrash, DuplicateEnqueueAccepted, DuplicateWorkflowAccepted, NoDoubleExecution,
+SlotDoubleRelease, OutcomeProvenance.
+
+Held back to post-drain (each compares two sources read at different instants, and `WorkloadClient`
+journals *after* the store call returns): DrainLiveness, TerminalStable, NoAwaitingParentOrphan,
+EnqueueDurability, NoOverlap, ConcurrencyLimit.
+
+The pass is a net, never a replacement: the post-drain audit still runs in full and remains the
+complete one. On the first mid-run violation the run **fails fast** - the time box is cut short, the
+drain is skipped so the store stays close to the cause, and the bundle marks its post-drain section
+absent with the reason. `UpgradeRun` does not get the pass. Budget: under 5 percent of wall time,
+measured 0.34 percent over a 540 s SQLite run at the shortest interval the seed can pick (107 passes,
+50,701 transitions walked, 0 skips, 1.84 s).
+
 ## Artifact bundle
 
 On violation, `torture-artifacts/torture-<adapter>-<seed>-<utc>/` holds `run.json` (options, seed,
-coverage stats), `journal.jsonl` (merged, time-ordered), `violations.json`, `store-dump.json`
-(every job + its history + tags), and raw table dumps (`table-*.json`, or the SQLite file itself).
+coverage stats, mid-run pass counters, and whether the post-drain section is present),
+`journal.jsonl` (merged, time-ordered), `violations.json` (each finding stamped with `DetectedAt`
+and its `Phase`), `store-dump.json` (every job + its history + tags), and raw table dumps (`table-*.json`, or the SQLite file itself).
 Repro is best-effort by design — the bundle is what makes hand-diagnosis possible.
 
 ## Sabotage self-test

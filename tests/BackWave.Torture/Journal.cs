@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -63,17 +62,40 @@ internal sealed class Journal
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
 
-    private readonly ConcurrentQueue<JournalEntry> _entries = new();
+    // Append-only under a lock with a published count, so a reader takes a RANGE: the mid-run audit
+    // pass needs an O(1) watermark and a delta copy, and a queue offers neither.
+    private readonly object _gate = new();
+    private readonly List<JournalEntry> _entries = [];
+    private int _count;
 
-    public void Record(JournalEntry entry) => _entries.Enqueue(entry);
+    public void Record(JournalEntry entry)
+    {
+        lock (_gate)
+        {
+            _entries.Add(entry);
+            Volatile.Write(ref _count, _entries.Count);
+        }
+    }
 
-    public IReadOnlyList<JournalEntry> Entries => [.. _entries];
+    /// <summary>Entry count at this instant - the cheap read a mid-run pass pins its view to.</summary>
+    public int Watermark => Volatile.Read(ref _count);
+
+    public IReadOnlyList<JournalEntry> Entries => Range(0, Watermark);
+
+    /// <summary>Copies <paramref name="count"/> entries from <paramref name="start"/> - the delta read.</summary>
+    public List<JournalEntry> Range(int start, int count)
+    {
+        lock (_gate)
+        {
+            return _entries.GetRange(start, count);
+        }
+    }
 
     public async Task WriteAsync(string path)
     {
         await using var stream = File.Create(path);
         await using var writer = new StreamWriter(stream);
-        foreach (var entry in _entries)
+        foreach (var entry in Entries)
         {
             await writer.WriteLineAsync(JsonSerializer.Serialize(entry, JsonOptions));
         }

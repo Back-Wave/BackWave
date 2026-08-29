@@ -8,42 +8,26 @@ namespace BackWave.Torture;
 /// merged client observation journals. Every check is sound under wall-clock nondeterminism — the
 /// journal checks use only conservative windows (a lease was *definitely* live between the claim's
 /// return and the outcome call's start), so a torture failure is always a bug, never noise.
+/// It is the COMPLETE audit: the mid-run pass shares its check bodies (see <see cref="Checks"/>)
+/// but runs only the subset that stays sound against a live store.
 /// </summary>
 internal sealed class Auditor(IJobStore store, KeySpace keys, TortureOptions options)
 {
-    private static readonly IReadOnlySet<(JobState From, JobState To)> LegalEdges = new HashSet<(JobState, JobState)>
-    {
-        (JobState.AwaitingParent, JobState.Scheduled),
-        (JobState.AwaitingParent, JobState.Cancelled),
-        (JobState.Scheduled, JobState.Leased),
-        (JobState.Scheduled, JobState.Cancelled),
-        (JobState.Leased, JobState.Succeeded),
-        (JobState.Leased, JobState.Scheduled),
-        (JobState.Leased, JobState.DeadLettered),
-        (JobState.Leased, JobState.Cancelled),
-        (JobState.Leased, JobState.Quarantined),
-        (JobState.DeadLettered, JobState.Scheduled),
-        (JobState.Quarantined, JobState.Scheduled),
-    };
-
     public List<JobRecord> ScannedJobs { get; } = [];
 
     public Dictionary<Guid, IReadOnlyList<JobTransition>> Histories { get; } = [];
 
-    public async Task<List<TortureViolation>> AuditAsync(
-        IReadOnlyList<JournalEntry> journal, CancellationToken cancellationToken)
+    public async Task AuditAsync(
+        IReadOnlyList<JournalEntry> journal, ViolationSink violations, CancellationToken cancellationToken)
     {
-        var violations = new List<TortureViolation>();
-
         await ScanAsync(cancellationToken);
         var jobsById = ScannedJobs.ToDictionary(j => j.JobId);
 
         AuditTransitionLogs(violations);
         AuditEndState(violations);
         await AuditAwaitingParentsAsync(violations, jobsById, cancellationToken);
+        Checks.LiveJournal(journal, violations);
         AuditJournal(violations, journal, jobsById);
-
-        return violations;
     }
 
     private async Task ScanAsync(CancellationToken cancellationToken)
@@ -72,7 +56,7 @@ internal sealed class Auditor(IJobStore store, KeySpace keys, TortureOptions opt
 
     // ---- Transition Log audit -------------------------------------------------------------------
 
-    private void AuditTransitionLogs(List<TortureViolation> violations)
+    private void AuditTransitionLogs(ViolationSink violations)
     {
         foreach (var job in ScannedJobs)
         {
@@ -82,47 +66,16 @@ internal sealed class Auditor(IJobStore store, KeySpace keys, TortureOptions opt
                 continue;
             }
 
-            if (history[0].Ordinal == 0
-                && history[0].State is not (JobState.Scheduled or JobState.AwaitingParent or JobState.Cancelled))
-            {
-                violations.Add(new TortureViolation(
-                    TortureInvariant.LegalInitialState,
-                    $"Job {job.JobId} was born {history[0].State}.", job.JobId));
-            }
+            Checks.InitialTransition(job.JobId, Facts(history[0]), violations);
 
             for (var i = 1; i < history.Count; i++)
             {
-                var prev = history[i - 1];
-                var next = history[i];
-                if (next.Ordinal != prev.Ordinal + 1)
-                {
-                    continue; // aged-out gap — not a real edge
-                }
-                if (!LegalEdges.Contains((prev.State, next.State)))
-                {
-                    violations.Add(new TortureViolation(
-                        TortureInvariant.LegalTransition,
-                        $"Job {job.JobId} transitioned {prev.State} → {next.State} (ordinals {prev.Ordinal}→{next.Ordinal}).",
-                        job.JobId));
-                }
-                var requeueReset = prev.State is JobState.DeadLettered or JobState.Quarantined
-                    && next.State == JobState.Scheduled && next.Attempt == 0;
-                if (next.Attempt < prev.Attempt && !requeueReset)
-                {
-                    violations.Add(new TortureViolation(
-                        TortureInvariant.AttemptMonotonic,
-                        $"Job {job.JobId} attempt went {prev.Attempt} → {next.Attempt} on {prev.State} → {next.State}.",
-                        job.JobId));
-                }
-                if (next.Attempt > options.MaxAttempts)
-                {
-                    violations.Add(new TortureViolation(
-                        TortureInvariant.AttemptCeiling,
-                        $"Job {job.JobId} recorded attempt {next.Attempt} above the ceiling {options.MaxAttempts}.",
-                        job.JobId));
-                }
+                Checks.TransitionEdge(
+                    job.JobId, Facts(history[i - 1]), Facts(history[i]), options.MaxAttempts, violations);
             }
 
+            // TerminalStable is post-drain ONLY: it compares the log tail against the row, and mid-run
+            // a newer transition can already exist that the cursor has not reached.
             if (history[^1].State != job.State)
             {
                 violations.Add(new TortureViolation(
@@ -133,63 +86,25 @@ internal sealed class Auditor(IJobStore store, KeySpace keys, TortureOptions opt
         }
     }
 
+    private static TransitionFacts Facts(JobTransition transition)
+        => new(transition.Ordinal, transition.State, transition.Attempt);
+
     // ---- End-state audit ------------------------------------------------------------------------
 
-    private void AuditEndState(List<TortureViolation> violations)
+    private void AuditEndState(ViolationSink violations)
     {
         foreach (var job in ScannedJobs)
         {
-            var terminal = JobStates.IsTerminal(job.State);
-
-            if (terminal && job.TerminalAt is null)
-            {
-                violations.Add(new TortureViolation(
-                    TortureInvariant.TerminalTimestamp,
-                    $"Job {job.JobId} is terminal {job.State} with no TerminalAt.", job.JobId));
-            }
-            if (!terminal && job.TerminalAt is not null)
-            {
-                violations.Add(new TortureViolation(
-                    TortureInvariant.TerminalTimestamp,
-                    $"Job {job.JobId} is live {job.State} but carries TerminalAt {job.TerminalAt:O}.", job.JobId));
-            }
-
-            if (job.State == JobState.Leased)
-            {
-                if (job.LeaseOwner is null || job.LeaseExpiry is null)
-                {
-                    violations.Add(new TortureViolation(
-                        TortureInvariant.LeaseOwnerPresent,
-                        $"Job {job.JobId} is Leased with owner '{job.LeaseOwner ?? "null"}' / expiry '{job.LeaseExpiry?.ToString("O") ?? "null"}'.",
-                        job.JobId));
-                }
-            }
-            else if (job.LeaseOwner is not null)
-            {
-                violations.Add(new TortureViolation(
-                    TortureInvariant.LeaseOwnerCleared,
-                    $"Job {job.JobId} is {job.State} but still names lease owner '{job.LeaseOwner}'.", job.JobId));
-            }
-
-            if (job.Attempt > options.MaxAttempts)
-            {
-                violations.Add(new TortureViolation(
-                    TortureInvariant.AttemptCeiling,
-                    $"Job {job.JobId} ended at attempt {job.Attempt}, above the ceiling {options.MaxAttempts}.", job.JobId));
-            }
-
-            if (job.State == JobState.Quarantined && !keys.IsUnroutable(job.WireName))
-            {
-                violations.Add(new TortureViolation(
-                    TortureInvariant.QuarantineNotExecuted,
-                    $"Job {job.JobId} is Quarantined but its wire '{job.WireName}' is routable — no client ever reports " +
-                    "Unroutable for a routable wire.", job.JobId));
-            }
+            Checks.JobRow(
+                new JobRowFacts(
+                    job.JobId, job.State, job.Attempt, job.WireName, job.LeaseOwner,
+                    job.LeaseExpiry is not null, job.TerminalAt?.ToString("O")),
+                keys, options, violations);
         }
     }
 
     private async Task AuditAwaitingParentsAsync(
-        List<TortureViolation> violations, Dictionary<Guid, JobRecord> jobsById, CancellationToken cancellationToken)
+        ViolationSink violations, Dictionary<Guid, JobRecord> jobsById, CancellationToken cancellationToken)
     {
         foreach (var job in ScannedJobs.Where(j => j.State == JobState.AwaitingParent))
         {
@@ -218,49 +133,12 @@ internal sealed class Auditor(IJobStore store, KeySpace keys, TortureOptions opt
     // ---- Journal cross-check ----------------------------------------------------------------------
 
     private void AuditJournal(
-        List<TortureViolation> violations, IReadOnlyList<JournalEntry> journal, Dictionary<Guid, JobRecord> jobsById)
+        ViolationSink violations, IReadOnlyList<JournalEntry> journal, Dictionary<Guid, JobRecord> jobsById)
     {
         var enqueueOks = journal
             .Where(e => e.Op == Ops.Enqueue && e.Result == nameof(EnqueueResult.Ok) && e.JobId is { } id)
             .ToLookup(e => e.JobId!.Value);
         var claims = journal.Where(e => e.Op == Ops.Claim && e is { JobId: not null, Attempt: not null }).ToList();
-        var appliedOutcomes = journal
-            .Where(e => e.Op == Ops.Outcome && e.Result == nameof(OutcomeResult.Applied) && e is { JobId: not null, Attempt: not null })
-            .ToList();
-
-        // Raw provider exceptions and crashed clients are findings in themselves.
-        foreach (var group in journal.Where(e => e.Op == Ops.UnexpectedException).GroupBy(e => $"{e.Result}: {e.Detail}"))
-        {
-            violations.Add(new TortureViolation(
-                TortureInvariant.RawStoreException,
-                $"{group.Count()}× unexpected exception escaped the store surface during '{group.Key}'."));
-        }
-        foreach (var crash in journal.Where(e => e.Op == Ops.ClientCrash))
-        {
-            violations.Add(new TortureViolation(
-                TortureInvariant.ClientCrash, $"Client {crash.Client}: {crash.Detail}"));
-        }
-
-        // At most one accepted enqueue per JobId, ever (ids are never purged during a run).
-        foreach (var group in enqueueOks.Where(g => g.Count() > 1))
-        {
-            violations.Add(new TortureViolation(
-                TortureInvariant.DuplicateEnqueueAccepted,
-                $"JobId {group.Key} was accepted (Ok) by {group.Count()} enqueues: " +
-                $"{string.Join(", ", group.Select(e => e.Client))}.", group.Key));
-        }
-
-        foreach (var group in journal
-            .Where(e => e.Op == Ops.Workflow && e.Result == nameof(WorkflowEnqueueResult.Ok) && e.Detail == "create")
-            .GroupBy(e => e.WorkflowId))
-        {
-            if (group.Count() > 1)
-            {
-                violations.Add(new TortureViolation(
-                    TortureInvariant.DuplicateWorkflowAccepted,
-                    $"WorkflowId {group.Key} was created (Ok) {group.Count()} times."));
-            }
-        }
 
         // Every accepted enqueue must still be visible at quiescence (nothing purges during a run) —
         // and the reverse: every job in the store must trace to an accepted enqueue. A phantom row
@@ -279,68 +157,6 @@ internal sealed class Auditor(IJobStore store, KeySpace keys, TortureOptions opt
             violations.Add(new TortureViolation(
                 TortureInvariant.EnqueueDurability,
                 $"Job {job.JobId} exists in the store but no client's enqueue was accepted for it.", job.JobId));
-        }
-
-        // A Requeue resets the attempt counter to 0, so a requeued job legitimately re-runs the same
-        // attempt numbers — one extra life per successful requeue. The claim/report Effect-Once
-        // checks therefore allow (1 + requeues) occurrences per (job, attempt), not 1.
-        var requeueLives = journal
-            .Where(e => e.Op == Ops.Requeue && e.Result == nameof(RequeueResult.Requeued) && e.JobId is { } id)
-            .GroupBy(e => e.JobId!.Value)
-            .ToDictionary(g => g.Key, g => g.Count());
-
-        // NoDoubleExecution: a claim hands an attempt to exactly one worker, once per life.
-        foreach (var group in claims.GroupBy(e => (e.JobId!.Value, e.Attempt!.Value)))
-        {
-            var allowed = 1 + requeueLives.GetValueOrDefault(group.Key.Item1);
-            if (group.Count() > allowed)
-            {
-                violations.Add(new TortureViolation(
-                    TortureInvariant.NoDoubleExecution,
-                    $"Job {group.Key.Item1} attempt {group.Key.Item2} was claimed {group.Count()} times " +
-                    $"(by {string.Join(", ", group.Select(e => e.Client))}) with only {allowed} life/lives.",
-                    group.Key.Item1));
-            }
-        }
-
-        // Effect-Once on the report: at most one Applied outcome per (job, attempt) per life.
-        foreach (var group in appliedOutcomes.GroupBy(e => (e.JobId!.Value, e.Attempt!.Value)))
-        {
-            var allowed = 1 + requeueLives.GetValueOrDefault(group.Key.Item1);
-            if (group.Count() > allowed)
-            {
-                violations.Add(new TortureViolation(
-                    TortureInvariant.SlotDoubleRelease,
-                    $"Job {group.Key.Item1} attempt {group.Key.Item2} had {group.Count()} Applied outcomes " +
-                    $"with only {allowed} life/lives.", group.Key.Item1));
-            }
-        }
-
-        // Fence supersession: an outcome for attempt a must not apply after attempt a' > a was
-        // already handed out (the later claim's return proves attempt a's lease was gone).
-        var claimReturnByJobAttempt = claims
-            .GroupBy(e => (e.JobId!.Value, e.Attempt!.Value))
-            .ToDictionary(g => g.Key, g => g.Min(e => e.T1));
-        foreach (var outcome in appliedOutcomes)
-        {
-            if (requeueLives.ContainsKey(outcome.JobId!.Value))
-            {
-                continue; // lives interleave attempt numbers; the cross-life ordering is not checkable
-            }
-            var laterClaim = claimReturnByJobAttempt
-                .Where(kv => kv.Key.Item1 == outcome.JobId!.Value
-                    && kv.Key.Item2 > outcome.Attempt!.Value
-                    && kv.Value < outcome.T0)
-                .Select(kv => (KeyValuePair<(Guid, int), long>?)kv)
-                .FirstOrDefault();
-            if (laterClaim is { } later)
-            {
-                violations.Add(new TortureViolation(
-                    TortureInvariant.OutcomeProvenance,
-                    $"Job {outcome.JobId} attempt {outcome.Attempt} outcome APPLIED although attempt " +
-                    $"{later.Key.Item2} had already been claimed before the report began — the fence let a stale " +
-                    "writer through.", outcome.JobId));
-            }
         }
 
         // Conservative lease intervals: [claim return, min(first outcome call start, lease expiry,
@@ -431,7 +247,7 @@ internal sealed class Auditor(IJobStore store, KeySpace keys, TortureOptions opt
     }
 
     private void AuditCancelProvenance(
-        List<TortureViolation> violations, IReadOnlyList<JournalEntry> journal, Dictionary<Guid, JobRecord> jobsById)
+        ViolationSink violations, IReadOnlyList<JournalEntry> journal, Dictionary<Guid, JobRecord> jobsById)
     {
         var cancelRequests = journal
             .Where(e => e.Op == Ops.Cancel
@@ -486,7 +302,7 @@ internal sealed class Auditor(IJobStore store, KeySpace keys, TortureOptions opt
     }
 
     private void AuditTagDurability(
-        List<TortureViolation> violations, IReadOnlyList<JournalEntry> journal, Dictionary<Guid, JobRecord> jobsById)
+        ViolationSink violations, IReadOnlyList<JournalEntry> journal, Dictionary<Guid, JobRecord> jobsById)
     {
         var expected = new Dictionary<Guid, HashSet<string>>();
         foreach (var entry in journal)

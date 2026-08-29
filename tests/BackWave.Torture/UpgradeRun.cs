@@ -146,13 +146,16 @@ internal static class UpgradeRun
         }
 
         // 5. Drain to quiescence, then run the full oracle audit over the merged journal.
-        var violations = new List<TortureViolation>();
+        var drainViolations = new ViolationSink(TorturePhase.Drain);
         var drainer = new Drainer(store.CreateStore(), keys, options2, store.IsTransientFault);
-        violations.AddRange(await drainer.DrainAsync(cancellationToken));
+        drainViolations.AddRange(await drainer.DrainAsync(cancellationToken));
 
+        var postDrain = new ViolationSink(TorturePhase.PostDrain);
         var auditor = new Auditor(store.CreateStore(), keys, options2);
-        violations.AddRange(await auditor.AuditAsync(journal.Entries, cancellationToken));
-        violations.AddRange(await store.RawAuditAsync(cancellationToken));
+        await auditor.AuditAsync(journal.Entries, postDrain, cancellationToken);
+        postDrain.AddRange(await store.RawAuditAsync(cancellationToken));
+        var violations = new List<TortureViolation>(drainViolations.Snapshot());
+        violations.AddRange(postDrain.Snapshot());
 
         Console.WriteLine($"upgrade: v{priorVersion} audited {auditor.ScannedJobs.Count} jobs " +
             $"({journal.Entries.Count} journal entries).");
