@@ -551,6 +551,16 @@ internal sealed class WorkerGroupService(
                     BackWaveDiagnostics.RecordClaimed(claimActivity, jobs, now);
                     foreach (var job in jobs)
                     {
+                        // A claim leases a row the store matched as Scheduled and left Leased, so a terminal
+                        // state here means the row was settled behind the claim's own UPDATE. Executing it
+                        // would re-run an Attempt whose effect already landed, so halt before dispatch.
+                        if (job.State.IsTerminal())
+                        {
+                            throw new InvariantViolationException(
+                                InvariantTrigger.ClaimedJobTerminal,
+                                $"Claim for worker '{claim.WorkerId}' returned job {job.JobId} " +
+                                $"({job.WireName}, attempt {job.Attempt}) in terminal state {job.State}.");
+                        }
                         // A claim is the start of an Attempt: its Lease is now held (Trace).
                         BackWaveLog.LeaseAcquired(logger, job.JobId, job.WireName, job.Attempt, job.Queue);
                     }
@@ -602,8 +612,29 @@ internal sealed class WorkerGroupService(
                     });
                 }
                 var batchResults = await ApplyOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false);
-                foreach (var rowResult in batchResults)
+                // The Storage Contract is one result per input row, in input order, and the Driver pairs the
+                // two by position. A short or long answer means some row's outcome is silently unreported or
+                // misattributed, so stop before the Driver acts on a mispaired result.
+                if (batchResults.Count != reports.Count)
                 {
+                    throw new InvariantViolationException(
+                        InvariantTrigger.OutcomeBatchCountMismatch,
+                        $"Outcome batch of {reports.Count} row(s) came back with {batchResults.Count} result(s).");
+                }
+                for (var i = 0; i < batchResults.Count; i++)
+                {
+                    var rowResult = batchResults[i];
+                    if (rowResult.Result is OutcomeResult.StaleLease)
+                    {
+                        // The store's identity fence refused this write: the Lease had already lapsed, been
+                        // taken over, or the row had moved on. A lost race, not a broken invariant - report it
+                        // so it stops being a silent drop.
+                        Invariant.Degrade(
+                            logger,
+                            InvariantTrigger.OutcomeFenceRejected,
+                            $"Outcome {reports[i].Outcome} for job {rowResult.JobId} (attempt {reports[i].Attempt}, " +
+                            $"worker '{reports[i].WorkerId}') was refused by the store's identity fence.");
+                    }
                     events.TryWrite(new NodeEvent.OutcomeReported(rowResult.JobId, rowResult.Result, now));
                 }
                 break;
@@ -611,6 +642,15 @@ internal sealed class WorkerGroupService(
             case Command.Heartbeat heartbeat:
                 var results = await store.HeartbeatAsync(
                     heartbeat.WorkerId, heartbeat.JobIds, heartbeat.LeaseDuration, now, stoppingToken).ConfigureAwait(false);
+                // The Storage Contract is one result per requested job. A short answer would leave a job whose
+                // Lease was silently not renewed looking renewed, so the Driver would keep executing past its
+                // Lease; stop instead.
+                if (results.Count != heartbeat.JobIds.Count)
+                {
+                    throw new InvariantViolationException(
+                        InvariantTrigger.HeartbeatBatchCountMismatch,
+                        $"Heartbeat for {heartbeat.JobIds.Count} job(s) came back with {results.Count} result(s).");
+                }
                 events.TryWrite(new NodeEvent.HeartbeatCompleted(results, now));
                 break;
 
