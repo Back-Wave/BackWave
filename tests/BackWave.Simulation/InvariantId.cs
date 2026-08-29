@@ -102,4 +102,7 @@ internal enum InvariantId
 
     /// <summary>A delivered transition never also dead-letters (delivered XOR dead-lettered).</summary>
     ObserverDeliveredXorDeadLettered,
+
+    /// <summary>Restart-Reclaim-Bound: a cleanly stopped owner's Leases come back within bound, not at Lease expiry.</summary>
+    RestartReclaimBound,
 }

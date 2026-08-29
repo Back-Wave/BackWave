@@ -25,6 +25,7 @@ internal static class SwarmEnvelope
     public static readonly (double Lo, double Hi) UnroutableBand = (0.02, 0.10);
 
     public const int IsolationMax = 8;          // 1..8 healing episodes
+    public const int StopMax = 3;               // 1..3 clean stops, the N-1 budget refuses more on a 3-node cluster
     public const int OperatorMin = 5, OperatorMax = 30;
     public const int JobMin = 30, JobMax = 60;
     public const int TopologyMin = 2, TopologyMax = 3;
@@ -44,8 +45,9 @@ internal static class SwarmEnvelope
     /// Sabotage-free cluster on the converging workload/drain band, with every tuned knob clamped to its band
     /// and the structural gates enforced in precedence order <b>isolation &gt; pool &gt; limits</b>:
     /// <list type="bullet">
-    /// <item><b>Isolation</b> active ⟹ the throttling surface is cleared (single Queue, no limits, unbounded
-    /// pool): the tight Migration-Liveness bound assumes a survivor has spare capacity to re-home a lapsed Lease.</item>
+    /// <item><b>Isolation or a clean stop</b> active ⟹ the throttling surface is cleared (single Queue, no limits,
+    /// unbounded pool): the tight Migration-Liveness and Restart-Reclaim bounds both assume a survivor has spare
+    /// capacity to pick a lapsed or relinquished Lease back up.</item>
     /// <item><b>Finite pool</b> ⟹ the clean-execution single-Queue regime: no lease-loss axes (crash / heartbeat /
     /// store / ack-loss, each of which can leave a node executing a zombie past its Lease), no Recurring Schedule
     /// (a mid-run mint injects out-of-band work), and a sub-Lease execution, so real in-flight == leases ≤ pool
@@ -65,6 +67,7 @@ internal static class SwarmEnvelope
         var unroutable = ConfineProbability(scenario.UnroutableProbability, UnroutableBand);
 
         var isolation = scenario.IsolationCount <= 0 ? 0 : Math.Clamp(scenario.IsolationCount, 1, IsolationMax);
+        var stops = scenario.StopCount <= 0 ? 0 : Math.Clamp(scenario.StopCount, 1, StopMax);
         var operatorActions = scenario.OperatorActionCount <= 0
             ? 0
             : Math.Clamp(scenario.OperatorActionCount, OperatorMin, OperatorMax);
@@ -75,10 +78,11 @@ internal static class SwarmEnvelope
         var poolSize = scenario.PoolSize;
         var schedules = scenario.Schedules;
 
-        if (isolation > 0)
+        if (isolation > 0 || stops > 0)
         {
             // Isolation excludes the throttling surface entirely (multi-Queue makes ExpireLeases queue-scoped,
-            // a tight limit/pool removes sweep capacity — either can miss the tight migration bound).
+            // a tight limit/pool removes sweep capacity - either can miss the tight migration bound). A clean
+            // stop makes the same assumption for the same reason: the Restart-Reclaim bound is just as tight.
             topologyQueues = 0;
             limits = NoLimits;
             poolSize = int.MaxValue;
@@ -123,6 +127,7 @@ internal static class SwarmEnvelope
             AckLossProbability = ackLoss,
             UnroutableProbability = unroutable,
             IsolationCount = isolation,
+            StopCount = stops,
             OperatorActionCount = operatorActions,
             JobCount = jobCount,
             TopologyQueues = topologyQueues,

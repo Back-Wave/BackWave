@@ -199,6 +199,15 @@ internal static class SwarmConfig
             }
             : Array.Empty<ObserverRegistration>();
 
+        // Clean stops (the relinquish regime): how many nodes stop cleanly inside the workload window. APPENDED
+        // after every pre-existing draw, so each seed's config on every other axis stays byte-identical. Confined
+        // exactly as isolation is, and for the same reason: the Restart-Reclaim bound assumes a survivor has spare
+        // capacity to pick the relinquished work back up, so a stop is drawn only over the already-clear
+        // single-Queue, unbounded-pool shape. NodeCount is 3 and the N-1 budget refuses the stop that would take
+        // the last live node, so a band wider than 3 would mostly draw refusals; 0 stays inside the band, so a
+        // share of runs still holds the untouched path.
+        var stops = topologyQueues == 0 && !poolBounded ? rng.Next(4) : 0; // 0..3 clean stops
+
         return new SimulationOptions
         {
             Seed = seed,
@@ -215,6 +224,7 @@ internal static class SwarmConfig
             AckLossProbability = ackLoss,
             UnroutableProbability = unroutable,
             IsolationCount = isolation,
+            StopCount = stops,
             // Healing-only: never a permanent loss, so Migration-Liveness always converges inside the drain.
             PermanentLossProbability = 0.0,
             OperatorActionCount = operatorActions,

@@ -702,6 +702,30 @@ public class SimulatorTests
     }
 
     /// <summary>
+    /// Determinism guard, mirroring <see cref="IsolationCountZero_IsByteIdenticalToTheBaseline_AndNonZeroPerturbsIt"/>:
+    /// clean stops are gated behind a default-0 knob on their own rng stream, so a StopCount of 0 takes zero draws
+    /// and leaves the run byte-identical to the ungated baseline, while a non-zero count provably hands Leases
+    /// back and perturbs the run.
+    /// </summary>
+    [Theory]
+    [InlineData(1UL)]
+    [InlineData(1337UL)]
+    public void StopCountZero_IsByteIdenticalToTheBaseline_AndNonZeroPerturbsIt(ulong seed)
+    {
+        var baseline = new Simulator(new SimulationOptions { Seed = seed }).Run();
+        var stillBaseline = new Simulator(new SimulationOptions { Seed = seed, StopCount = 0 }).Run();
+
+        Assert.Equal(0, baseline.LeasesRelinquished);
+        Assert.Equal(baseline.Steps, stillBaseline.Steps);
+        Assert.Equal(baseline.FinalJobs, stillBaseline.FinalJobs);
+        Assert.Equal(baseline.StaleOutcomes, stillBaseline.StaleOutcomes);
+
+        var stopped = new Simulator(new SimulationOptions { Seed = seed, StopCount = 8 }).Run();
+        Assert.True(stopped.LeasesRelinquished > 0, $"seed {seed}: the stop knob did nothing");
+        Assert.NotEqual(baseline.FinalJobs, stopped.FinalJobs); // a different, but still-converging, run
+    }
+
+    /// <summary>
     /// Oracle self-test for the Outcome-Provenance invariant (issue 0068, ADR 0013): with
     /// SabotageOutcomeFence the store drops the (workerId, attempt) fence, so a healed node's stale
     /// ReportOutcome is forced through under the current Lease holder's identity and mutates a job it does

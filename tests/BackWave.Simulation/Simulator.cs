@@ -136,6 +136,17 @@ internal sealed record SimulationOptions
     public int IsolationCount { get; init; }
 
     /// <summary>
+    /// Clean-shutdown regime: how many nodes stop cleanly during the workload window. A stop relinquishes
+    /// the node's Leases in one store call, then takes the node down and restarts it on the crash-downtime
+    /// draw, modelling a rolling deploy. Stops are scheduled up front, like isolation episodes, and an N-1
+    /// budget refuses one that would take the last live node (a crashed node counts as not live). 0 (the
+    /// default) makes zero draws on the stop stream and schedules no stop event, so the existing seed
+    /// battery stays byte-identical. Stops draw from their own <c>Seed ^ "STOPPING"</c> stream so the main
+    /// interleaving is untouched whether the regime is on or off.
+    /// </summary>
+    public int StopCount { get; init; }
+
+    /// <summary>
     /// Oracle self-test for the Outcome-Provenance invariant (issue 0068): the store drops the
     /// (workerId, attempt) fence, so a healed node's stale ReportOutcome is forced through under the
     /// CURRENT lease holder's identity and mutates state it should not — a working oracle MUST catch the
@@ -499,6 +510,13 @@ internal sealed record SimulationResult(
     public int AckLosses { get; init; }
 
     /// <summary>
+    /// Leases handed back by a cleanly stopping node. 0 in every regime without the stop knob; a positive count
+    /// proves a stop actually reached the store rather than being refused by the N-1 budget or faulted away, so
+    /// it is the coverage signal for the Restart-Reclaim-Bound oracle.
+    /// </summary>
+    public int LeasesRelinquished { get; init; }
+
+    /// <summary>
     /// Nodes whose Worker Group runs the Weighted Dispatch Policy (issue 0075). 0 in the single-Queue world;
     /// under the Topology Generator it counts the Weighted nodes the coin (or <see
     /// cref="SimulationOptions.ForceWeightedDispatch"/>) produced — so the Weighted-under-load regime can prove
@@ -547,7 +565,7 @@ internal sealed record SimulationResult(
 /// </summary>
 internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan = null)
 {
-    private enum EventKind { Enqueue, Poll, Heartbeat, ExecutionComplete, Restart, Hint, OperatorAction, IsolationStart, IsolationHeal }
+    private enum EventKind { Enqueue, Poll, Heartbeat, ExecutionComplete, Restart, Hint, OperatorAction, IsolationStart, IsolationHeal, Stop }
 
     private sealed record SimEvent(EventKind Kind, int Node, int Epoch, JobRecord? Job, bool Fails)
     {
@@ -560,6 +578,13 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         public required NodeDriver Driver { get; set; }
         public required TimeSpan Skew { get; init; }
         public bool Crashed { get; set; }
+        // The instant this node stopped cleanly, or null while it is running. The Restart-Reclaim-Bound
+        // oracle measures its bound from here - the stop, not the relinquish commit, because that is what
+        // an operator measures from. Cleared on Restart, exactly like Crashed.
+        public DateTimeOffset? StoppedAt { get; set; }
+        // Whether the node is off the air, however it got there: a crash or a clean stop. Every handler
+        // that skips a crashed node skips a stopped one for the same reason - there is no process to drive.
+        public bool Down => Crashed || StoppedAt is not null;
         public int Epoch { get; set; }
         // The current idle poll-backoff delay, used only when the run enables adaptive polling
         // (MaxPollInterval > PollInterval). A claim outcome folds into it: work found or due-now pressure
@@ -651,6 +676,12 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     private int _isolations;
     private int _permanentLosses;
     private int _leasesExpired;
+    // Clean shutdown (the relinquish regime): stops are planned up front from their own stream, so a zero
+    // StopCount makes no draw and the determinism battery stays byte-identical. _leasesRelinquished tallies
+    // the rows the departing nodes handed back, the coverage signal that the regime actually reached the
+    // feature rather than only scheduling stops that the N-1 budget refused.
+    private readonly DeterministicRandom _stopRng = new(options.Seed ^ 0x53544F5050494E47UL); // "STOPPING": its own stream
+    private int _leasesRelinquished;
     // Ack-loss isolation (issue 0070): its own stream so a zero probability makes no draws and the battery
     // stays byte-identical. _ackLost fences the injection to once per (job, attempt) — the retry that
     // follows is a normal report the (workerId, attempt) fence must reject as stale.
@@ -955,6 +986,16 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             Schedule(episode.StartAt, new SimEvent(EventKind.IsolationStart, episode.Node, 0, null, false) { Episode = episode });
         }
 
+        // Clean stops (a rolling deploy), planned up front like isolation episodes and drawn from the
+        // dedicated stop stream so a zero count makes no draw and the determinism battery is byte-identical.
+        // The window keeps every stop inside the workload, matching the crash axis, so the drain tail is
+        // never disturbed by a node going down.
+        for (var i = 0; i < options.StopCount; i++)
+        {
+            var node = _stopRng.Next(options.NodeCount);
+            Schedule(_start + _stopRng.NextTimeSpan(options.WorkloadDuration), new SimEvent(EventKind.Stop, node, 0, null, false));
+        }
+
         while (_queue.TryDequeue(out var simEvent, out var at))
         {
             // Honor an external deadline mid-simulation (VOPR overnight runs): a single sim can grind through up
@@ -1099,6 +1140,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             PermanentLosses = _permanentLosses,
             OutcomeBufferDropped = _outcomeBufferDropped,
             LeasesExpired = _leasesExpired,
+            LeasesRelinquished = _leasesRelinquished,
             AckLosses = _ackLosses,
             WeightedNodeCount = _policies.Count(p => p is Core.DispatchPolicy.Weighted),
             LimitSaturations = _limitSaturations,
@@ -1269,7 +1311,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             case EventKind.Hint:
                 // One-shot, never rescheduled, no fault draws: a hint is only an earlier
                 // poll. A crashed node simply misses it — hints have no delivery guarantees.
-                if (!_nodes[simEvent.Node].Crashed)
+                if (!_nodes[simEvent.Node].Down)
                 {
                     TryDrive(simEvent.Node, new NodeEvent.PollDue(NodeNow(simEvent.Node)));
                 }
@@ -1277,7 +1319,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
 
             case EventKind.Poll:
                 var pollNode = _nodes[simEvent.Node];
-                if (pollNode.Crashed)
+                if (pollNode.Down)
                 {
                     break;
                 }
@@ -1304,7 +1346,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
 
             case EventKind.Heartbeat:
                 var heartbeatNode = _nodes[simEvent.Node];
-                if (heartbeatNode.Crashed)
+                if (heartbeatNode.Down)
                 {
                     break;
                 }
@@ -1325,7 +1367,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
 
             case EventKind.ExecutionComplete:
                 var execNode = _nodes[simEvent.Node];
-                if (execNode.Crashed
+                if (execNode.Down
                     || simEvent.Epoch != execNode.Epoch
                     || !execNode.Executing.ContainsKey(simEvent.Job!.JobId))
                 {
@@ -1375,9 +1417,14 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     : new NodeEvent.ExecutionSucceeded(simEvent.Job, NodeNow(simEvent.Node)));
                 break;
 
+            case EventKind.Stop:
+                Stop(simEvent.Node);
+                break;
+
             case EventKind.Restart:
                 var restarting = _nodes[simEvent.Node];
                 restarting.Crashed = false;
+                restarting.StoppedAt = null;
                 restarting.Driver = NewDriver(simEvent.Node);
                 restarting.PollDelay = options.PollInterval; // a fresh pump starts at the floor
                 restarting.IdleSince = null;
@@ -2144,6 +2191,40 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     }
 
     /// <summary>
+    /// A clean stop: the node hands its Leases back in one store call and then goes down exactly as a crash
+    /// does, restarting on the same downtime draw. The relinquish rides the shared store-fault axis and is
+    /// all-or-nothing, because the real statement is one UPDATE in one transaction; when it faults the
+    /// node's Leases simply lapse on expiry, which is the behaviour that predates the feature.
+    ///
+    /// The N-1 budget refuses a stop that would take the last live node, in the shape
+    /// <see cref="IsolationScheduler.TryBegin"/> uses: a crashed node counts as not live, so crashes and
+    /// stops share one budget. A refusal is a deterministic no-op, never a re-draw, so the stop stream
+    /// cannot branch on the live set.
+    /// </summary>
+    private void Stop(int nodeIndex)
+    {
+        var node = _nodes[nodeIndex];
+        if (node.Down || _nodes.Count(n => !n.Down) <= 1)
+        {
+            return;
+        }
+        if (!StoreShouldFault(nodeIndex, "Relinquish"))
+        {
+            _leasesRelinquished += Get(_store.RelinquishLeasesAsync($"node-{nodeIndex}", _now, _retryPolicy.ToDisposition()));
+        }
+        // A stop discards the Driver's outcome buffer for the same reason a crash does: Restart installs a
+        // fresh Driver, so anything unflushed is gone. Tally it before the buffer is.
+        if (node.Driver.BufferedOutcomeCount > 0)
+        {
+            _outcomeBufferDropped++;
+        }
+        node.StoppedAt = _now;
+        node.Epoch++;
+        node.Executing.Clear();
+        Schedule(_now + _rng.NextTimeSpan(options.MaxCrashDowntime), new SimEvent(EventKind.Restart, nodeIndex, 0, null, false));
+    }
+
+    /// <summary>
     /// The single source of truth for the legal-edge set, exposed for the Coverage tracker (issue 0090)
     /// so transition-edge coverage is measured against this denominator rather than a duplicated copy of
     /// the 11 edges. Read-only; the oracle's own membership tests still go through <see cref="LegalTransitions"/>.
@@ -2485,6 +2566,10 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             // same "a *running* survivor sweeps within a poll or two" precondition the bound is derived from:
             //   • Crashes off — with crashes on, all nodes can be transiently down (2 isolated + 1 crashed), the
             //     all-nodes-lost case the PRD scopes out of Phase 1.
+            //   • Clean stops off - a stop is a second way for a node to be off the air, so it reaches the same
+            //     all-nodes-lost shape (2 isolated + 1 stopped) with no survivor left to sweep. The stop's own
+            //     N-1 budget cannot prevent it: a node stops while the cluster is healthy and the isolation
+            //     episodes that strand it are scheduled later.
             //   • Store faults off — the survivor's reclaim is its ExpireLeases store call, and a transient store
             //     fault unwinds it to a retry on the survivor's NEXT poll (the production pump's transient
             //     handling). A run of store faults on consecutive survivor sweeps delays reclaim arbitrarily far
@@ -2499,6 +2584,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             // SabotageMigrationFaultGrace self-test restores the pre-fix (ungated) bound to prove the gate is
             // load-bearing; the SabotageMigrationSweep self-test runs store-faults-off, so it keeps full teeth.
             if (options.CrashProbabilityPerPoll == 0
+                && options.StopCount == 0
                 && (options.StoreFaultProbability == 0 || options.SabotageMigrationFaultGrace)
                 && job is { State: JobState.Leased, LeaseOwner: { } leaseOwner, LeaseExpiry: { } leaseExpiry }
                 && leaseExpiry <= _now
@@ -2509,6 +2595,24 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     _now <= leaseExpiry + MigrationBound,
                     $"migration-liveness: job {jobId} still Leased by isolated {leaseOwner} "
                     + $"{(_now - leaseExpiry).TotalSeconds:0.0}s past Lease expiry (bound {MigrationBound.TotalSeconds:0.0}s)");
+            }
+
+            // Restart-Reclaim-Bound: a node that stops cleanly hands its Leases back on the way out, so no job
+            // stays Leased by a stopped owner past RelinquishBound. Two axes disarm it. Store faults, because a
+            // faulted relinquish unwinds to the Lease lapsing on expiry, which is correct behaviour and not a
+            // violation. RadioactiveMode, because that regime maxes every axis and no bound survives it. Crashes
+            // do NOT disarm it: another node crashing has no bearing on whether this node handed its own Leases
+            // back, which is the one place this oracle is wider than Migration-Liveness.
+            if (options.StoreFaultProbability == 0
+                && !options.RadioactiveMode
+                && job is { State: JobState.Leased, LeaseOwner: { } stopOwner }
+                && IsStoppedOwner(stopOwner, out var stoppedAt))
+            {
+                Invariant(
+                    InvariantId.RestartReclaimBound,
+                    _now <= stoppedAt + RelinquishBound,
+                    $"restart-reclaim-bound: job {jobId} still Leased by stopped {stopOwner} "
+                    + $"{(_now - stoppedAt).TotalSeconds:0.0}s past the stop (bound {RelinquishBound.TotalSeconds:0.0}s)");
             }
 
             Invariant(
@@ -2641,6 +2745,33 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         => owner.StartsWith("node-", StringComparison.Ordinal)
            && int.TryParse(owner.AsSpan(5), out var node)
            && _isolation.IsIsolated(node);
+
+    /// <summary>
+    /// The Restart-Reclaim bound, derived purely from config - never a magic number. A stopping node writes the
+    /// relinquish itself, so there is no survivor sweep to wait for and none of MigrationBound's ×3 poll slack:
+    /// the store row is back at worst the node's full clock skew late, plus the one poll a survivor needs to see
+    /// it. It must NEVER contain LeaseDuration - not waiting out the Lease is the entire claim being asserted.
+    /// </summary>
+    private TimeSpan RelinquishBound => options.MaxClockSkew + options.PollInterval;
+
+    /// <summary>
+    /// Whether <paramref name="owner"/> ("node-N") is a node that is currently stopped, and if so
+    /// <paramref name="stoppedAt"/> is the instant it stopped - not the instant the relinquish committed,
+    /// which is an internal detail. Mirrors <see cref="IsIsolatedOwner"/>.
+    /// </summary>
+    private bool IsStoppedOwner(string owner, out DateTimeOffset stoppedAt)
+    {
+        stoppedAt = default;
+        if (!owner.StartsWith("node-", StringComparison.Ordinal)
+            || !int.TryParse(owner.AsSpan(5), out var node)
+            || node >= _nodes.Length
+            || _nodes[node].StoppedAt is not { } at)
+        {
+            return false;
+        }
+        stoppedAt = at;
+        return true;
+    }
 
     /// <summary>
     /// Served-set-containment oracle (issue 0071): a node only ever holds a Lease on a Queue in its DECLARED

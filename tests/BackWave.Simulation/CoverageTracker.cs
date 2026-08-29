@@ -74,6 +74,9 @@ internal enum Situation
 
     /// <summary>A node's finite Backpressure pool was full, so its next claim is blocked purely by backpressure (issue 0124).</summary>
     BackpressureIdle,
+
+    /// <summary>A cleanly stopping node handed its Leases back, so the run reached the Restart-Reclaim-Bound oracle.</summary>
+    RelinquishReclaimed,
 }
 
 /// <summary>
@@ -161,6 +164,7 @@ internal sealed class CoverageTracker
             // config-space reaches multi-Queue topologies, ConcurrencyLimits, and a finite Backpressure pool.
             [Situation.LimitSaturated] = r => r.LimitSaturations > 0,
             [Situation.BackpressureIdle] = r => r.BackpressureIdleTicks > 0,
+            [Situation.RelinquishReclaimed] = r => r.LeasesRelinquished > 0,
         };
 
     static CoverageTracker()

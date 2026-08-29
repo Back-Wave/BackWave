@@ -143,6 +143,7 @@ public sealed class CoverageTrackerTests
             AckLosses = 1,
             Isolations = 1,
             LeasesExpired = 1,
+            LeasesRelinquished = 1,
             OperatorRequeues = 1,
             CooperativeCancels = 1,
             LimitSaturations = 1,
