@@ -1,3 +1,4 @@
+using BackWave.Diagnostics;
 using BackWave.Storage;
 
 namespace BackWave.Jobs;
@@ -62,9 +63,25 @@ internal sealed class StoreDependencyResolver(IJobStore store) : IDependencyReso
         // A name resolves only against the reader's transitive ancestors inside its Workflow — a
         // non-member (or non-ancestor sibling) is unresolvable. Member names are not persisted, so
         // the stored member identity is the Wire Name; the ancestors-only walk is the scope.
-        if (reader.WorkflowId is not { } workflowId
-            || await store.GetWorkflowAsync(workflowId, cancellationToken).ConfigureAwait(false) is not { } graph)
+        if (reader.WorkflowId is not { } workflowId)
         {
+            return null;
+        }
+
+        if (await store.GetWorkflowAsync(workflowId, cancellationToken).ConfigureAwait(false) is not { } graph)
+        {
+            // Retention prunes a Workflow row only once no job references it, so a live member proves its
+            // Workflow row is still there: an absent one means the reader's whole graph - its edges, its
+            // ancestors, its gates - is gone while the reader still runs. A terminal reader is exempt: it can
+            // be purged along with its Workflow between these two un-transacted reads.
+            if (!reader.State.IsTerminal())
+            {
+                throw new InvariantViolationException(
+                    InvariantTrigger.WorkflowMemberWithoutWorkflow,
+                    $"Job {readerJobId} is a member of workflow {workflowId} in state {reader.State}, " +
+                    "but that workflow's row is absent.");
+            }
+
             return null;
         }
 
