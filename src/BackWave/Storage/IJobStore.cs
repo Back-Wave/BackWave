@@ -234,6 +234,35 @@ public interface IJobStore
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Hands back every live lease held by <paramref name="workerId"/> so a node that is stopping
+    /// cleanly returns its in-flight work at once instead of parking it for the full lease duration.
+    /// The write is fenced on the lease itself: it touches only rows whose lease owner is exactly
+    /// <paramref name="workerId"/> AND whose state is still Leased, so a job that already reported an
+    /// outcome (and therefore left the Leased state) is never revived. The Attempt is left UNCHANGED,
+    /// because the claim already counted it - relinquishing costs exactly what letting the lease lapse
+    /// costs today. Each relinquished job returns to Ready at <paramref name="now"/>, skipping the
+    /// retry backoff because a clean stop is not a failure, except that a job whose attempt ceiling is
+    /// already reached (<paramref name="disposition"/> yields no next attempt) is Dead-Lettered instead,
+    /// exactly as an expired lease would be. Implementations MUST append one transition per affected
+    /// job, at the unchanged Attempt, atomically with the state write, and MUST treat
+    /// <paramref name="disposition"/> as pure data, never as executable code.
+    /// <para>
+    /// The default implementation relinquishes nothing and returns zero, so a store that does not
+    /// override it keeps today's behavior: the leases lapse and are swept by the expiry path.
+    /// </para>
+    /// </summary>
+    /// <param name="workerId">The id of the worker giving its leases back; only rows it still owns are touched.</param>
+    /// <param name="now">The current instant, used as the returned jobs' due time and as every transition timestamp (the store must not read its own clock).</param>
+    /// <param name="disposition">Pure data describing, per Attempt, whether the attempt ceiling is reached; only the ceiling decision is consulted, never the backoff.</param>
+    /// <param name="cancellationToken">Cancels the operation.</param>
+    /// <returns>The number of leases relinquished in this call.</returns>
+    ValueTask<int> RelinquishLeasesAsync(
+        string workerId,
+        DateTimeOffset now,
+        Core.RetryDisposition disposition,
+        CancellationToken cancellationToken = default) => ValueTask.FromResult(0);
+
+    /// <summary>
     /// Requests cancellation of one job. A job not yet running (Scheduled or AwaitingParent)
     /// transitions to Cancelled immediately; a job currently leased instead has its
     /// cancellation-requested flag set and cancels cooperatively when its worker next heartbeats. A

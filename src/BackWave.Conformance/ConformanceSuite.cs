@@ -1357,6 +1357,141 @@ public abstract class ConformanceSuite
         Assert.Equal(JobState.Cancelled, (await store.GetJobAsync(childB.JobId))!.State);
     }
 
+    // ── §5.5 RelinquishLeases ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Certifies that a worker giving its leases back returns each job to Ready at that instant - no
+    /// retry backoff, because a clean stop is not a failure - while leaving the attempt the claim
+    /// already counted alone, so another node can claim the work immediately.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_5_Relinquish_ReturnsThisWorkersLeasesToReadyNow_LeavingTheAttemptUnchanged()
+    {
+        var store = await CreateStoreAsync();
+        await store.EnqueueAsync(Job(), now: T0);
+        var claimed = Assert.Single(await ClaimAsync(store, T0)); // attempt 1 of 2
+
+        var handBack = T0.AddSeconds(5);
+        Assert.Equal(1, await store.RelinquishLeasesAsync("w1", handBack, TwoAttempts));
+
+        var job = await store.GetJobAsync(claimed.JobId);
+        Assert.Equal(JobState.Scheduled, job!.State);
+        Assert.Equal(handBack, job.DueTime); // Ready now: the backoff answers a failure, and this is not one
+        Assert.Equal(1, job.Attempt); // the claim counted it; the hand-back neither charges nor refunds
+        Assert.Null(job.LeaseOwner);
+        Assert.Null(job.LeaseExpiry);
+
+        // Ready now means claimable at that very instant, by a node that is not stopping.
+        var reclaimed = Assert.Single(await ClaimAsync(store, handBack, worker: "w2"));
+        Assert.Equal(claimed.JobId, reclaimed.JobId);
+        Assert.Equal(2, reclaimed.Attempt);
+    }
+
+    /// <summary>
+    /// Certifies that the hand-back is fenced on the lease itself: it touches only jobs this worker
+    /// still holds and that are still leased, so another worker's lease, a job that never left the
+    /// queue, and a job that already reported its outcome are all untouched.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_5_Relinquish_TouchesOnlyTheCallersLiveLeases()
+    {
+        var store = await CreateStoreAsync();
+        var mine = Job();
+        var settled = Job();
+        var theirs = Job(queue: "other-node");
+        var pending = Job(dueTime: T0.AddHours(1));
+        foreach (var job in new[] { mine, settled, theirs, pending })
+        {
+            await store.EnqueueAsync(job, now: T0);
+        }
+
+        var claimed = await ClaimAsync(store, T0); // mine + settled, both due now
+        Assert.Equal(2, claimed.Count);
+        await store.ClaimAsync(new ClaimRequest("w2", ["other-node"], 32, Lease, T0));
+        // A reported outcome leaves the Leased state, so the fence can never revive completed work.
+        await store.ReportOutcomeAsync(settled.JobId, "w1", 1, new JobOutcome.Success(), T0);
+
+        var handBack = T0.AddSeconds(5);
+        Assert.Equal(1, await store.RelinquishLeasesAsync("w1", handBack, TwoAttempts));
+
+        Assert.Equal(JobState.Scheduled, (await store.GetJobAsync(mine.JobId))!.State);
+        Assert.Equal(JobState.Succeeded, (await store.GetJobAsync(settled.JobId))!.State);
+        var foreign = await store.GetJobAsync(theirs.JobId);
+        Assert.Equal(JobState.Leased, foreign!.State);
+        Assert.Equal("w2", foreign.LeaseOwner);
+        var untouched = await store.GetJobAsync(pending.JobId);
+        Assert.Equal(JobState.Scheduled, untouched!.State);
+        Assert.Equal(T0.AddHours(1), untouched.DueTime); // never pulled forward to the hand-back instant
+    }
+
+    /// <summary>
+    /// Certifies that the hand-back keeps the attempt ceiling: a job with no attempts left dead-letters
+    /// with the canonical cause instead of returning to Ready, and cascades its children's latches.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_5_Relinquish_DeadLettersAtTheAttemptCeiling_AndCascadesChildLatches()
+    {
+        var store = await CreateStoreAsync();
+        var parent = Job();
+        await store.EnqueueAsync(parent, now: T0);
+        var child = Job() with { Parents = [parent.JobId] };
+        await store.EnqueueAsync(child, now: T0);
+        Assert.Single(await ClaimAsync(store, T0)); // attempt 1 of 1: already at the ceiling
+
+        var handBack = T0.AddSeconds(5);
+        var deadLetterAtOnce = new RetryPolicy { MaxAttempts = 1 }.ToDisposition();
+        Assert.Equal(1, await store.RelinquishLeasesAsync("w1", handBack, deadLetterAtOnce));
+
+        var dead = await store.GetJobAsync(parent.JobId);
+        Assert.Equal(JobState.DeadLettered, dead!.State);
+        Assert.Equal(1, dead.Attempt);
+        Assert.Equal("Lease relinquished on attempt 1 (attempt ceiling reached).", dead.TerminalCause);
+        // The on-success child cascades off its dead-lettered parent, exactly as under expiry (I2).
+        Assert.Equal(JobState.Cancelled, (await store.GetJobAsync(child.JobId))!.State);
+    }
+
+    /// <summary>
+    /// Certifies that ONE hand-back spanning jobs at different attempts applies each job's own
+    /// disposition - the ceiling pair dead-letters while the rest return to Ready - so the set-based
+    /// path holds for batches of two or more, not just a single row.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_5_Relinquish_HandsBackAMixedBatch_AtEachJobsOwnDisposition()
+    {
+        var store = await CreateStoreAsync();
+        var atCeiling = new[] { Job(queue: "ceiling"), Job(queue: "ceiling") };
+        var fresh = new[] { Job(queue: "fresh"), Job(queue: "fresh") };
+        foreach (var job in atCeiling.Concat(fresh))
+        {
+            await store.EnqueueAsync(job, now: T0);
+        }
+
+        // Drive the ceiling pair to attempt 2 of 2 through an expiry sweep on its own Queue.
+        await store.ClaimAsync(new ClaimRequest("w1", ["ceiling"], 32, Lease, T0));
+        var afterExpiry = T0 + Lease + TimeSpan.FromSeconds(1);
+        Assert.Equal(2, await store.ExpireLeasesAsync(afterExpiry, maxJobs: 32, ["ceiling"], TwoAttempts));
+        var reclaim = afterExpiry.AddMinutes(2);
+        Assert.Equal(2, (await store.ClaimAsync(new ClaimRequest("w1", ["ceiling"], 32, Lease, reclaim))).Count);
+        Assert.Equal(2, (await store.ClaimAsync(new ClaimRequest("w1", ["fresh"], 32, Lease, reclaim))).Count);
+
+        var handBack = reclaim.AddSeconds(5);
+        Assert.Equal(4, await store.RelinquishLeasesAsync("w1", handBack, TwoAttempts));
+
+        foreach (var job in fresh)
+        {
+            var ready = await store.GetJobAsync(job.JobId);
+            Assert.Equal(JobState.Scheduled, ready!.State);
+            Assert.Equal(handBack, ready.DueTime);
+            Assert.Equal(1, ready.Attempt);
+        }
+        foreach (var job in atCeiling)
+        {
+            var dead = await store.GetJobAsync(job.JobId);
+            Assert.Equal(JobState.DeadLettered, dead!.State);
+            Assert.Equal(2, dead.Attempt);
+        }
+    }
+
     // ── §5.8 Cancel ─────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -2992,6 +3127,34 @@ public abstract class ConformanceSuite
         Assert.Equal(2, dead.Attempt); // expiry-as-Attempt
         Assert.Equal(secondExpiry, dead.Timestamp);
         _ = second;
+    }
+
+    /// <summary>
+    /// Certifies that giving a lease back appends one entry naming the state the job ends in - Ready, or
+    /// the dead-letter at the ceiling - at the attempt the claim already counted, never a state of its own.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_12_Relinquish_AppendsTheResultingState_AtTheUnchangedAttempt()
+    {
+        var store = await CreateStoreAsync();
+        await store.EnqueueAsync(Job(), now: T0);
+        var claimed = Assert.Single(await ClaimAsync(store, T0)); // attempt 1 of 2
+
+        var handBack = T0.AddSeconds(5);
+        await store.RelinquishLeasesAsync("w1", handBack, TwoAttempts);
+        var ready = (await store.GetJobHistoryAsync(claimed.JobId))[^1];
+        Assert.Equal(JobState.Scheduled, ready.State); // the resulting state, not a 'relinquished' one
+        Assert.Equal(1, ready.Attempt); // the claim's Attempt, uncharged by the hand-back
+        Assert.Equal(handBack, ready.Timestamp);
+
+        // At the ceiling the entry names the dead-letter the hand-back produced instead.
+        Assert.Single(await ClaimAsync(store, handBack)); // attempt 2 of 2
+        var secondHandBack = handBack.AddSeconds(5);
+        await store.RelinquishLeasesAsync("w1", secondHandBack, TwoAttempts);
+        var dead = (await store.GetJobHistoryAsync(claimed.JobId))[^1];
+        Assert.Equal(JobState.DeadLettered, dead.State);
+        Assert.Equal(2, dead.Attempt);
+        Assert.Equal(secondHandBack, dead.Timestamp);
     }
 
     /// <summary>

@@ -227,6 +227,13 @@ internal sealed class NodeDriver(NodeOptions options)
     }
 
     /// <summary>
+    /// Drains whatever outcomes are still buffered, for the Shell to report as this node stops. Returns
+    /// null when the buffer is empty, so a clean stop with nothing pending issues no write.
+    /// </summary>
+    internal Command.ReportOutcomeBatch? DrainBufferedOutcomes()
+        => _outcomeBuffer.Count > 0 ? DrainOutcomeBatch() : null;
+
+    /// <summary>
     /// Starts a claim pass and returns its first claim, or null when the pool is full.
     /// Backpressure lives here, not in the Shell: claims never exceed the pool's free capacity,
     /// counting work already in flight.

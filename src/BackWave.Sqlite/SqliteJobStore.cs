@@ -1073,6 +1073,116 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         return expired.Count;
     }
 
+    /// <inheritdoc/>
+    public async ValueTask<int> RelinquishLeasesAsync(
+        string workerId, DateTimeOffset now, RetryDisposition disposition,
+        CancellationToken cancellationToken = default)
+    {
+        using var activity = SqliteDiagnostics.StartStore("relinquish_leases", JobsCollection);
+        try
+        {
+            return await RelinquishLeasesUntracedAsync(workerId, now, disposition, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            SqliteDiagnostics.RecordStoreFault(activity, exception, IsTransientStoreFault(exception));
+            throw;
+        }
+    }
+
+    private async ValueTask<int> RelinquishLeasesUntracedAsync(
+        string workerId, DateTimeOffset now, RetryDisposition disposition,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = (SqliteTransaction)connection.BeginTransaction(deferred: false);
+
+        // Fenced on the lease itself: only rows this worker still holds, still Leased, so a job that
+        // already reported an outcome is never revived.
+        var held = new List<(Guid JobId, int Attempt)>();
+        await using (var select = Cmd(
+            $"""
+            SELECT job_id, attempt FROM backwave_jobs
+            WHERE state = {(int)JobState.Leased} AND lease_owner = $owner
+            """,
+            connection, transaction))
+        {
+            select.Parameters.AddWithValue("$owner", workerId);
+            await using var reader = await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                held.Add((SqliteValueCodec.ToGuid(reader.GetString(0)), reader.GetInt32(1)));
+            }
+        }
+
+        if (held.Count == 0)
+        {
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return 0;
+        }
+
+        // The claim already counted the Attempt, so the hand-back leaves it alone; a clean stop
+        // skips the backoff but not the ceiling.
+        var deadLetteredParents = new List<Guid>();
+        foreach (var (jobId, attempt) in held)
+        {
+            if (disposition.NextAttemptAt(attempt, now) is not null)
+            {
+                await using var ready = Cmd(
+                    $"""
+                    UPDATE backwave_jobs
+                    SET state = {(int)JobState.Scheduled}, due_time = $now, lease_owner = NULL, lease_expiry = NULL
+                    WHERE job_id = $id
+                    """,
+                    connection, transaction);
+                ready.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
+                ready.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
+                await ready.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                await using var deadLetter = Cmd(
+                    $"""
+                    UPDATE backwave_jobs
+                    SET state = {(int)JobState.DeadLettered}, lease_owner = NULL, lease_expiry = NULL,
+                        terminal_at = $now, terminal_cause = $cause
+                    WHERE job_id = $id
+                    """,
+                    connection, transaction);
+                deadLetter.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
+                deadLetter.Parameters.AddWithValue("$cause", $"Lease relinquished on attempt {attempt} (attempt ceiling reached).");
+                deadLetter.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
+                await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+                deadLetteredParents.Add(jobId);
+            }
+        }
+
+        foreach (var parentId in deadLetteredParents)
+        {
+            await ResolveChildLatchesAsync(connection, transaction, parentId, JobState.DeadLettered, now, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        // Transition Log (§5.12): one entry per relinquished job for its resulting state, at its
+        // unchanged Attempt, atomic with the state writes.
+        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(held.Count);
+        foreach (var (jobId, attempt) in held)
+        {
+            var resulting = disposition.NextAttemptAt(attempt, now) is not null
+                ? JobState.Scheduled
+                : JobState.DeadLettered;
+            transitions.Add((jobId, resulting, attempt, null));
+        }
+        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
+            .ConfigureAwait(false);
+
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return held.Count;
+    }
+
     // ── §5.8 Cancel ─────────────────────────────────────────────────────────────
 
     /// <inheritdoc/>

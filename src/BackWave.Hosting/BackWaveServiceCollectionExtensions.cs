@@ -223,6 +223,11 @@ public sealed class BackWaveBuilder
             throw new InvalidOperationException(
                 $"Worker Group '{options.Name}' has a {nameof(WorkerGroupOptions.MaxPollInterval)} above the supported ceiling of int.MaxValue milliseconds (~24.85 days); the idle-poll pacer cannot wait that long.");
         }
+        if (options.ShutdownBudget < TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"Worker Group '{options.Name}' has a negative {nameof(WorkerGroupOptions.ShutdownBudget)} ({options.ShutdownBudget}); use TimeSpan.Zero to skip the shutdown hand-back.");
+        }
         _workerGroups.Add(options);
         return this;
     }

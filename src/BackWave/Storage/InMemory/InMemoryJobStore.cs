@@ -898,6 +898,53 @@ public sealed class InMemoryJobStore(
     }
 
     /// <inheritdoc/>
+    public ValueTask<int> RelinquishLeasesAsync(
+        string workerId, DateTimeOffset now, Core.RetryDisposition disposition,
+        CancellationToken cancellationToken = default)
+    {
+        var relinquished = 0;
+
+        lock (_gate)
+        {
+            var held = _jobs.Values
+                .Where(j => j.State == JobState.Leased && j.LeaseOwner == workerId)
+                .OrderBy(j => j.Sequence)
+                .ToList();
+
+            foreach (var job in held)
+            {
+                // The claim already counted this Attempt, so the hand-back leaves it alone; the
+                // clean stop skips the backoff but not the ceiling.
+                var next = disposition.NextAttemptAt(job.Attempt, now) is null
+                    ? job with
+                    {
+                        State = JobState.DeadLettered,
+                        LeaseOwner = null,
+                        LeaseExpiry = null,
+                        TerminalAt = now,
+                        TerminalCause = $"Lease relinquished on attempt {job.Attempt} (attempt ceiling reached).",
+                    }
+                    : job with
+                    {
+                        State = JobState.Scheduled,
+                        DueTime = now,
+                        LeaseOwner = null,
+                        LeaseExpiry = null,
+                    };
+                _jobs[next.JobId] = next;
+                RecordTransition(next.JobId, next.State, next.Attempt, now);
+                if (next.State == JobState.DeadLettered)
+                {
+                    ResolveChildLatches(next.JobId, next.State, now);
+                }
+                relinquished++;
+            }
+        }
+
+        return ValueTask.FromResult(relinquished);
+    }
+
+    /// <inheritdoc/>
     public ValueTask<CancelResult> CancelJobAsync(
         Guid jobId, string actor, DateTimeOffset now, CancellationToken cancellationToken = default)
     {

@@ -1221,6 +1221,148 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         return expired.Count;
     }
 
+    /// <inheritdoc/>
+    public async ValueTask<int> RelinquishLeasesAsync(
+        string workerId, DateTimeOffset now, RetryDisposition disposition,
+        CancellationToken cancellationToken = default)
+    {
+        using var activity = PostgresDiagnostics.StartStore("relinquish_leases", JobsCollection);
+        try
+        {
+            return await RelinquishLeasesUntracedAsync(workerId, now, disposition, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            PostgresDiagnostics.RecordStoreFault(activity, exception, IsTransientStoreFault(exception));
+            throw;
+        }
+    }
+
+    private async ValueTask<int> RelinquishLeasesUntracedAsync(
+        string workerId, DateTimeOffset now, RetryDisposition disposition,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+        // Fenced on the lease itself: only rows this worker still holds, still Leased, so a job that
+        // already reported an outcome is never revived.
+        var held = new List<(Guid JobId, int Attempt)>();
+        await using (var select = Cmd(
+            """
+            SELECT job_id, attempt FROM backwave.jobs
+            WHERE state = 2 AND lease_owner = @owner
+            ORDER BY job_id
+            FOR UPDATE
+            """,
+            connection, transaction))
+        {
+            select.Parameters.AddWithValue("owner", workerId);
+            await using var reader = await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                held.Add((reader.GetGuid(0), reader.GetInt32(1)));
+            }
+        }
+
+        if (held.Count == 0)
+        {
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return 0;
+        }
+
+        // The claim already counted the Attempt, so the hand-back leaves it alone: a clean stop
+        // skips the backoff but not the ceiling.
+        var readyIds = new List<Guid>();
+        var deadIds = new List<Guid>();
+        var deadCauses = new List<string>();
+        foreach (var (jobId, attempt) in held)
+        {
+            if (disposition.NextAttemptAt(attempt, now) is not null)
+            {
+                readyIds.Add(jobId);
+            }
+            else
+            {
+                deadIds.Add(jobId);
+                deadCauses.Add($"Lease relinquished on attempt {attempt} (attempt ceiling reached).");
+            }
+        }
+
+        if (readyIds.Count > 0)
+        {
+            // Every relinquished job comes back due at the same instant, so the ready set needs no
+            // per-row payload: one UPDATE seeking the batch's own rows.
+            await using var ready = Cmd(
+                """
+                UPDATE backwave.jobs
+                SET state = 0, due_time = @now, lease_owner = NULL, lease_expiry = NULL
+                WHERE job_id = ANY(@ids)
+                """,
+                connection, transaction);
+            ready.Parameters.AddWithValue("now", now.ToUniversalTime());
+            ready.Parameters.AddWithValue("ids", readyIds.ToArray());
+            await ready.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        if (deadIds.Count > 0)
+        {
+            await using var deadLetter = Cmd(
+                """
+                UPDATE backwave.jobs j
+                SET state = 5, lease_owner = NULL, lease_expiry = NULL, terminal_at = @now, terminal_cause = d.cause
+                FROM unnest(@ids::uuid[], @causes::text[]) AS d(job_id, cause)
+                WHERE j.job_id = d.job_id
+                """,
+                connection, transaction);
+            deadLetter.Parameters.AddWithValue("now", now.ToUniversalTime());
+            deadLetter.Parameters.AddWithValue("ids", deadIds.ToArray());
+            deadLetter.Parameters.AddWithValue("causes", deadCauses.ToArray());
+            await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+
+            // Latch resolution touches only dead-lettered jobs that actually parent a
+            // Dependency, exactly as the expiry path does (§5.6, I2).
+            var parents = new List<Guid>();
+            await using (var withChildren = Cmd(
+                "SELECT DISTINCT parent_id FROM backwave.job_parents WHERE parent_id = ANY(@ids)",
+                connection, transaction))
+            {
+                withChildren.Parameters.AddWithValue("ids", deadIds.ToArray());
+                await using var reader = await withChildren.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    parents.Add(reader.GetGuid(0));
+                }
+            }
+            parents.Sort(); // deterministic lock order, as everywhere else (issue 0032)
+            foreach (var parentId in parents)
+            {
+                await ResolveChildLatchesAsync(connection, transaction, parentId, JobState.DeadLettered, now, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        // Transition Log (§5.12): one entry per relinquished job for its resulting state, at its
+        // unchanged Attempt, atomic with the state writes. Batched, for the same reason the expiry
+        // path batches: one insert for the whole hand-back.
+        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(held.Count);
+        foreach (var (jobId, attempt) in held)
+        {
+            var resulting = disposition.NextAttemptAt(attempt, now) is not null
+                ? JobState.Scheduled
+                : JobState.DeadLettered;
+            transitions.Add((jobId, resulting, attempt, null));
+        }
+        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
+            .ConfigureAwait(false);
+
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return held.Count;
+    }
+
     // ── §5.8 Cancel ─────────────────────────────────────────────────────────────
 
     /// <inheritdoc/>

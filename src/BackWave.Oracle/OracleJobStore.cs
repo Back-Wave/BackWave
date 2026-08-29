@@ -1509,6 +1509,160 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         return expired.Count;
     }
 
+    /// <inheritdoc/>
+    public async ValueTask<int> RelinquishLeasesAsync(
+        string workerId, DateTimeOffset now, RetryDisposition disposition,
+        CancellationToken cancellationToken = default)
+    {
+        using var activity = OracleDiagnostics.StartStore("relinquish_leases", JobsCollection);
+        try
+        {
+            return await RelinquishLeasesUntracedAsync(workerId, now, disposition, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            OracleDiagnostics.RecordStoreFault(activity, exception, IsTransientStoreFault(exception));
+            throw;
+        }
+    }
+
+    private async ValueTask<int> RelinquishLeasesUntracedAsync(
+        string workerId, DateTimeOffset now, RetryDisposition disposition,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginAsync(connection, cancellationToken).ConfigureAwait(false);
+
+        // Fenced on the lease itself: only rows this worker still holds, still Leased, so a job that
+        // already reported an outcome is never revived.
+        var held = new List<(Guid JobId, int Attempt)>();
+        await using (var select = Cmd(
+            """
+            SELECT job_id, attempt FROM backwave.jobs
+            WHERE state = 2 AND lease_owner = :owner
+            ORDER BY job_id
+            FOR UPDATE
+            """,
+            connection, transaction))
+        {
+            select.Parameters.Add(Str("owner", workerId));
+            await using var reader = (OracleDataReader)await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                held.Add((ReadGuid(reader, 0), reader.GetInt32(1)));
+            }
+        }
+
+        if (held.Count == 0)
+        {
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return 0;
+        }
+
+        // The claim already counted the Attempt, so the hand-back leaves it alone: a clean stop skips
+        // the backoff but not the ceiling.
+        var ready = new List<Guid>();
+        var deadLettered = new List<(Guid JobId, string Cause)>();
+        foreach (var (jobId, attempt) in held)
+        {
+            if (disposition.NextAttemptAt(attempt, now) is not null)
+            {
+                ready.Add(jobId);
+            }
+            else
+            {
+                deadLettered.Add((jobId, $"Lease relinquished on attempt {attempt} (attempt ceiling reached)."));
+            }
+        }
+
+        // One set-based write per branch, whatever the hand-back size, through the same JSON_TABLE shape
+        // the expiry path uses. Every row is already locked by the FOR UPDATE above and the ids are
+        // distinct, so the MERGE needs no fence of its own.
+        if (ready.Count > 0)
+        {
+            await using var restore = Cmd(
+                """
+                MERGE INTO backwave.jobs j
+                USING (SELECT HEXTORAW(d.job_hex) AS job_id, TO_TIMESTAMP_TZ(d.due, :fmt) AS due
+                       FROM JSON_TABLE(:payload, '$[*]' COLUMNS (
+                                job_hex VARCHAR2(32) PATH '$.JobHex',
+                                due VARCHAR2(40) PATH '$.Due')) d) d
+                ON (j.job_id = d.job_id)
+                WHEN MATCHED THEN UPDATE SET
+                    j.state = 0, j.due_time = d.due, j.lease_owner = NULL, j.lease_expiry = NULL
+                """,
+                connection, transaction);
+            restore.Parameters.Add(Clob("payload", JsonSerializer.Serialize(
+                ready.Select(id => new RescheduleRow(Convert.ToHexString(id.ToByteArray()), Iso(now))))));
+            restore.Parameters.Add(Str("fmt", IsoTimestampFormat));
+            await restore.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        if (deadLettered.Count > 0)
+        {
+            await using (var deadLetter = Cmd(
+                """
+                MERGE INTO backwave.jobs j
+                USING (SELECT HEXTORAW(d.job_hex) AS job_id, d.cause
+                       FROM JSON_TABLE(:payload, '$[*]' COLUMNS (
+                                job_hex VARCHAR2(32) PATH '$.JobHex',
+                                cause CLOB PATH '$.Cause')) d) d
+                ON (j.job_id = d.job_id)
+                WHEN MATCHED THEN UPDATE SET
+                    j.state = 5, j.lease_owner = NULL, j.lease_expiry = NULL,
+                    j.terminal_at = :now, j.terminal_cause = d.cause
+                """,
+                connection, transaction))
+            {
+                deadLetter.Parameters.Add(Clob("payload", JsonSerializer.Serialize(
+                    deadLettered.Select(d => new DeadLetterRow(Convert.ToHexString(d.JobId.ToByteArray()), d.Cause)))));
+                deadLetter.Parameters.Add(Tstz("now", now));
+                await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            // Latch resolution touches only dead-lettered jobs that actually parent a Dependency, exactly
+            // as the expiry path does.
+            var deadIds = deadLettered.Select(d => d.JobId).ToList();
+            var parents = new List<Guid>();
+            await using (var withChildren = Cmd(
+                $"SELECT DISTINCT parent_id FROM backwave.job_parents WHERE parent_id IN ({ParameterList("p", deadIds.Count)})",
+                connection, transaction))
+            {
+                AddIdList(withChildren, "p", deadIds);
+                await using var reader = (OracleDataReader)await withChildren.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    parents.Add(ReadGuid(reader, 0));
+                }
+            }
+            parents.Sort(); // deterministic lock order, as everywhere else
+            foreach (var parentId in parents)
+            {
+                await ResolveChildLatchesAsync(connection, transaction, parentId, JobState.DeadLettered, now, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        // Transition Log: one entry per relinquished job for its resulting state, at its unchanged
+        // Attempt, atomic with the state writes. Batched, for the same reason the expiry path batches.
+        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(held.Count);
+        foreach (var (jobId, attempt) in held)
+        {
+            var resulting = disposition.NextAttemptAt(attempt, now) is not null
+                ? JobState.Scheduled
+                : JobState.DeadLettered;
+            transitions.Add((jobId, resulting, attempt, null));
+        }
+        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
+            .ConfigureAwait(false);
+
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return held.Count;
+    }
+
     // ── §5.8 Cancel ─────────────────────────────────────────────────────────────
 
     /// <inheritdoc/>

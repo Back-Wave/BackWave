@@ -96,6 +96,18 @@ internal static partial class BackWaveLog
         Message = "Worker group '{worker_group}' reclaimed {reclaimed_count} expired lease(s) for redelivery.")]
     internal static partial void LeasesReclaimed(ILogger logger, string worker_group, int reclaimed_count);
 
+    // The clean-stop counterpart of 1204: a stopping group hands its own live leases back instead of
+    // letting them lapse. Emitted once per pump and only when it gave at least one lease back.
+    [LoggerMessage(EventId = 1205, Level = LogLevel.Information,
+        Message = "Worker group '{worker_group}' relinquished {relinquished_count} lease(s) on shutdown.")]
+    internal static partial void LeasesRelinquished(ILogger logger, string worker_group, int relinquished_count);
+
+    // The hand-back is best-effort: it never blocks the host from exiting, so a failure (including the
+    // shutdown budget running out) degrades to the leases lapsing exactly as they do today.
+    [LoggerMessage(EventId = 1206, Level = LogLevel.Warning,
+        Message = "Worker group '{worker_group}' could not give its work back on shutdown; its leases will lapse instead.")]
+    internal static partial void ShutdownHandBackFailed(ILogger logger, string worker_group, Exception exception);
+
     [LoggerMessage(EventId = 1301, Level = LogLevel.Warning,
         Message = "Worker group '{worker_group}' hit a transient store fault; retrying on the next tick.")]
     internal static partial void StoreFaultTransientRetry(ILogger logger, string worker_group, Exception exception);

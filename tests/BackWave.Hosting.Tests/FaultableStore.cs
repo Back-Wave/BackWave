@@ -14,12 +14,19 @@ public sealed class TransientStoreException() : DbException("forced transient st
 public sealed class FaultableStore(IJobStore inner) : IJobStore
 {
     private int _transientClaimFaults;
+    private int _relinquishCalls;
 
     /// <summary>Claims from this Queue throw — the targeted fail-stop trigger.</summary>
     public string? PoisonedQueue { get; set; }
 
     /// <summary>Every operation throws — a node-wide fail-stop trigger.</summary>
     public bool FailEverything { get; set; }
+
+    /// <summary>The shutdown hand-back throws - the unreachable-store-at-shutdown trigger.</summary>
+    public bool FailRelinquish { get; set; }
+
+    /// <summary>How many times the shutdown hand-back reached the store.</summary>
+    public int RelinquishCalls => Volatile.Read(ref _relinquishCalls);
 
     /// <summary>The next N claims throw a transient store fault, then recover — the degraded-then-healthy trigger.</summary>
     public int TransientClaimFaults
@@ -111,6 +118,19 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
     {
         ThrowIfFailing();
         return inner.ExpireLeasesAsync(now, maxJobs, queues, disposition, cancellationToken);
+    }
+
+    public ValueTask<int> RelinquishLeasesAsync(
+        string workerId, DateTimeOffset now, RetryDisposition disposition,
+        CancellationToken cancellationToken = default)
+    {
+        Interlocked.Increment(ref _relinquishCalls);
+        ThrowIfFailing();
+        if (FailRelinquish)
+        {
+            throw new InvalidOperationException("forced hand-back failure (FailRelinquish)");
+        }
+        return inner.RelinquishLeasesAsync(workerId, now, disposition, cancellationToken);
     }
 
     public ValueTask<CancelResult> CancelJobAsync(

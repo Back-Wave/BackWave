@@ -118,6 +118,17 @@ public sealed record WorkerGroupOptions
     public TimeSpan? HeartbeatInterval { get; init; }
 
     /// <summary>
+    /// How long the group may spend giving work back when it stops cleanly. On shutdown the group
+    /// first reports the outcomes it has buffered, then relinquishes the leases it still holds so
+    /// those jobs return to the queue at once instead of waiting out <see cref="LeaseDuration"/> on
+    /// a node that is gone. Both steps share this one budget, in that order, so the hand-back can
+    /// never outlast the host's own shutdown timeout. Whatever the budget does not cover simply
+    /// lapses as it does today, which costs latency and nothing else. Defaults to 5 seconds; set it
+    /// to <see cref="TimeSpan.Zero"/> to skip the hand-back entirely.
+    /// </summary>
+    public TimeSpan ShutdownBudget { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
     /// How failed jobs are retried: the backoff schedule and the attempt ceiling after which a job is
     /// dead-lettered. Defaults to the standard retry policy.
     /// </summary>

@@ -138,7 +138,8 @@ internal sealed class WorkerGroupService(
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
-            // Normal shutdown: in-flight Leases lapse and other nodes inherit the work.
+            // Normal shutdown: the pump hands its Leases back on the way out, so other nodes
+            // inherit the work at once instead of waiting for the Leases to lapse.
         }
         catch (Exception exception)
         {
@@ -291,10 +292,57 @@ internal sealed class WorkerGroupService(
             // Pump gone: close the channel so the tickers' writes no-op instead of
             // filling an unread buffer until host shutdown.
             events.Writer.TryComplete();
+            // The pump loop has exited, so this group claims nothing more: give back what it holds.
+            await HandBackAsync(driver, events.Writer, stoppingToken).ConfigureAwait(false);
             if (hints is not null)
             {
                 await hints.DisposeAsync().ConfigureAwait(false);
             }
+        }
+    }
+
+    // <summary>
+    // The clean-stop hand-back: report the outcomes this pump had buffered, then relinquish the
+    // Leases it still holds so their jobs return to the queue now instead of waiting out the whole
+    // Lease duration on a node that is gone. Both steps spend ONE budget, in that order - reporting
+    // first saves the most work, and two independent timeouts could sum past the host's own shutdown
+    // timeout and turn a clean stop into a kill. stoppingToken is already cancelled by the time the
+    // pump exits, so the budget is the only token that can permit this work.
+    // One attempt, no retry: any failure (the budget running out included) is logged at Warning and
+    // degrades to the Leases lapsing exactly as they do today, and never blocks the host from exiting.
+    // </summary>
+    private async Task HandBackAsync(
+        NodeDriver driver, ChannelWriter<NodeEvent> events, CancellationToken stoppingToken)
+    {
+        // Clean stops only. A pump that exits any other way is fail-stopping, and a halted pump writes
+        // nothing more to the store: its Leases lapse and healthy nodes inherit the work.
+        if (!stoppingToken.IsCancellationRequested || options.ShutdownBudget <= TimeSpan.Zero)
+        {
+            return;
+        }
+
+        using var budget = new CancellationTokenSource(options.ShutdownBudget);
+        try
+        {
+            // Through the ordinary command path, so the buffered Failure Detail, Tags, Output, and
+            // held-open spans settle exactly as they do on a poll-tick flush.
+            if (driver.DrainBufferedOutcomes() is { } pending)
+            {
+                await ExecuteAsync(pending, events, budget.Token).ConfigureAwait(false);
+            }
+
+            // Fenced store-side on this pump's worker identity and the Leased state, so anything the
+            // flush above just settled is already out of reach.
+            var relinquished = await store.RelinquishLeasesAsync(
+                _workerId, _clock.GetUtcNow(), options.RetryPolicy.ToDisposition(), budget.Token).ConfigureAwait(false);
+            if (relinquished > 0)
+            {
+                BackWaveLog.LeasesRelinquished(logger, options.Name, relinquished);
+            }
+        }
+        catch (Exception exception)
+        {
+            BackWaveLog.ShutdownHandBackFailed(logger, options.Name, exception);
         }
     }
 

@@ -218,6 +218,10 @@ _Avoid_: Plugin, widget, module
 A worker's time-bounded, heartbeat-renewed claim on a job. Expiry makes the job claimable again — the mechanism behind at-least-once delivery. Every handler may therefore run more than once; idempotency is the handler author's responsibility.
 _Avoid_: Lock (a lease expires on its own; a lock implies indefinite ownership)
 
+**Relinquish**:
+Giving a live Lease back on purpose, the clean-shutdown counterpart of expiry: a stopping worker hands its in-flight jobs to the store at once instead of parking them for the rest of the Lease duration. The job returns to Ready immediately (no retry backoff, because a clean stop is not a failure) at the Attempt the claim already charged, so relinquishing costs exactly what letting the Lease lapse costs today, and the attempt ceiling still dead-letters a job that has had enough tries. Best-effort: a failed hand-back degrades to the lapse and never blocks the host from exiting.
+_Avoid_: Release (that word belongs to the Concurrency-Limit slot), return, give up, abandon
+
 **Attempt**:
 One execution try of a job, numbered and visible to the handler. A lease expiry counts as an attempt, the same as a thrown exception.
 _Avoid_: Retry (retry is attempts after the first; counting "retries" invites off-by-one ambiguity)
