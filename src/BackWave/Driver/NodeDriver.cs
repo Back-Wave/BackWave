@@ -1,3 +1,4 @@
+using BackWave.Diagnostics;
 using BackWave.Storage;
 
 namespace BackWave.Driver;
@@ -105,7 +106,15 @@ internal sealed class NodeDriver(NodeOptions options)
 
             case NodeEvent.ClaimCompleted claim:
                 // This claim resolved (its jobs, if any, become _executing below): free the slots it reserved.
-                ReleaseClaim();
+                // The freed reservation is the bound this claim was issued under, and the pool is sized against
+                // it: more jobs back than were asked for would over-admit past PoolSize and execute work no slot
+                // was held for. (A completion with no reservation in hand carries no bound to check.)
+                if (ReleaseClaim() is { } bound && claim.Jobs.Count > bound)
+                {
+                    throw new InvariantViolationException(
+                        InvariantTrigger.ClaimBatchOverrun,
+                        $"A claim bounded at {bound} job(s) returned {claim.Jobs.Count}.");
+                }
                 var executions = new List<Command>(claim.Jobs.Count + 1);
                 foreach (var job in claim.Jobs)
                 {
@@ -299,13 +308,19 @@ internal sealed class NodeDriver(NodeOptions options)
         return batch;
     }
 
-    /// <summary>Frees the reservation of the oldest in-flight claim as its ClaimCompleted lands.</summary>
-    private void ReleaseClaim()
+    /// <summary>
+    /// Frees the reservation of the oldest in-flight claim as its ClaimCompleted lands, returning the bound
+    /// that claim was issued under, or null when no reservation is outstanding.
+    /// </summary>
+    private int? ReleaseClaim()
     {
         if (_claimsInFlight.TryDequeue(out var slots))
         {
             _reservedSlots -= slots;
+            return slots;
         }
+
+        return null;
     }
 
     /// <summary>
