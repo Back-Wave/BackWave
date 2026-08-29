@@ -1,5 +1,6 @@
 using System.Data.Common;
 using BackWave.Core;
+using BackWave.Diagnostics;
 using BackWave.Storage;
 
 namespace BackWave.Hosting.Tests;
@@ -18,6 +19,9 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
 
     /// <summary>Claims from this Queue throw — the targeted fail-stop trigger.</summary>
     public string? PoisonedQueue { get; set; }
+
+    /// <summary>Claims throw a named invariant violation carrying this trigger - the classified fail-stop.</summary>
+    public InvariantTrigger? ClaimInvariant { get; set; }
 
     /// <summary>Every operation throws — a node-wide fail-stop trigger.</summary>
     public bool FailEverything { get; set; }
@@ -55,6 +59,10 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
     public ValueTask<IReadOnlyList<JobRecord>> ClaimAsync(ClaimRequest request, CancellationToken cancellationToken = default)
     {
         ThrowIfFailing();
+        if (ClaimInvariant is { } tripped)
+        {
+            throw new InvariantViolationException(tripped, "forced named invariant violation on claim");
+        }
         if (PoisonedQueue is { } poisoned && request.Queues.Contains(poisoned))
         {
             throw new InvalidOperationException($"forced invariant violation (claim on '{poisoned}')");

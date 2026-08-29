@@ -59,7 +59,7 @@ internal static partial class BackWaveLog
 
     // ── Lifecycle events ─────────────────────────────────────────────────────────────────────────
     // EventIds are stable and grouped by phase (10xx enqueue/claim, 11xx execution, 12xx settlement,
-    // 13xx store/schema, 14xx observer, 15xx wake-up hints) so a consumer can filter on them. Parameter names are snake_case
+    // 13xx store/schema, 14xx observer, 15xx wake-up hints, 16xx invariant degrades) so a consumer can filter on them. Parameter names are snake_case
     // so the [LoggerMessage] generator maps them to the same-named template placeholders (the emitted
     // structured keys).
 
@@ -123,4 +123,13 @@ internal static partial class BackWaveLog
     [LoggerMessage(EventId = 1501, Level = LogLevel.Warning,
         Message = "Wake-Up Hint channel for {db_system} is unavailable; falling back to polling until it recovers.")]
     internal static partial void WakeHintChannelUnavailable(ILogger logger, string db_system, Exception exception);
+
+    // 16xx: impossible-state detections BELOW the Hosting boundary that degrade rather than halt - the
+    // Core and adapter sites where the observed condition is also reachable by a legal race, so it is
+    // counted and carried past instead of stopping the group. The group-altitude counterpart is
+    // HostingLog 2003. invariant_trigger is the InvariantTrigger member name, the same stable id the
+    // backwave.invariant.trigger metric tag carries, so a log filter and an alert rule match on one string.
+    [LoggerMessage(EventId = 1601, Level = LogLevel.Warning,
+        Message = "BackWave invariant '{invariant_trigger}' tripped: {detail}. The operation continues degraded.")]
+    internal static partial void InvariantDegraded(ILogger logger, string invariant_trigger, string detail);
 }

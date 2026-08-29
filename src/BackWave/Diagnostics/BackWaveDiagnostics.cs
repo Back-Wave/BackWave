@@ -156,6 +156,18 @@ public static class BackWaveDiagnostics
         "backwave.worker.slots.active", "{slot}",
         "Handler executions currently in flight in a worker group's pool; returns to zero when the pool drains.");
 
+    // Impossible-state detections, at every altitude, behind ONE instrument tagged by trigger id: one
+    // instrument per trigger would be a cardinality and a documentation problem, and a tagged counter
+    // slices the same way. The instrument NAME, the two tag KEYS, and the tag VALUES are all public API -
+    // the values included, because an alert rule binds to the value string, so a rename retires that
+    // rule silently at runtime instead of breaking a build. Both value sets are enum member names:
+    // InvariantTrigger for the trigger, InvariantAction for the action.
+    private static readonly Counter<long> InvariantViolations = Meter.CreateCounter<long>(
+        "backwave.invariant.violations", "{violation}",
+        "Impossible states BackWave detected, tagged by trigger id and by whether it halted or degraded.");
+    private const string InvariantTriggerKey = "backwave.invariant.trigger";
+    private const string InvariantActionKey = "backwave.invariant.action";
+
     private static readonly Counter<long> ObserverDeliveriesAttempted = Meter.CreateCounter<long>(
         "backwave.observer.deliveries.attempted", "{delivery}",
         "Observer callback invocations started at the delivery edge (§5.13, ADR 0017).");
@@ -821,6 +833,15 @@ public static class BackWaveDiagnostics
         string observerId, TimeSpan duration, string? wireName = null, string? queue = null)
         => ObserverDispatchDuration.Record(duration.TotalSeconds, ObserverTags(observerId, wireName, queue));
 
+    // Counts one detected impossible state behind backwave.invariant.violations. Telemetry-only: the
+    // caller still throws (Halt) or carries on (Degrade), so the count never changes what happens next.
+    // Called from both sides of the Hosting boundary - the Core, the Shells, and the adapters all reach
+    // it - which is why the trigger vocabulary lives here in the Core rather than in Hosting.
+    internal static void RecordInvariantViolation(InvariantTrigger trigger, InvariantAction action)
+        => InvariantViolations.Add(1,
+            new KeyValuePair<string, object?>(InvariantTriggerKey, trigger.ToString()),
+            new KeyValuePair<string, object?>(InvariantActionKey, action.ToString()));
+
     private static KeyValuePair<string, object?>[] ObserverTags(string observerId, string? wireName, string? queue)
         => wireName is null && queue is null
             ? [new("backwave.observer_id", observerId)]
@@ -829,4 +850,18 @@ public static class BackWaveDiagnostics
                 new("backwave.wire_name", wireName),
                 new("backwave.queue", queue),
             ];
+}
+
+// What BackWave did about a detected impossible state, and the value set of the
+// backwave.invariant.action metric tag. Two values only: a proven violation stops the group, and
+// anything a legal race can also produce is counted and carried past. The member NAMES are the tag
+// values and are public API even though the enum is internal - a check site is never consumer code,
+// but an alert rule reads what it emits.
+internal enum InvariantAction
+{
+    // The group fail-stops: an InvariantViolationException unwinds to the pump's halt.
+    Halt,
+
+    // The group keeps running: the site counts the detection and takes its existing benign branch.
+    Degrade,
 }

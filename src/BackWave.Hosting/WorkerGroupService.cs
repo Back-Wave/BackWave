@@ -148,7 +148,17 @@ internal sealed class WorkerGroupService(
             // the Leases lapse and healthy nodes inherit. The host process keeps serving.
             // One Critical log names the dead invariant (type, message, stack); the health
             // state retains the exception type, not just its message.
-            HostingLog.WorkerGroupFailStopped(logger, options.Name, exception);
+            //
+            // A named check adds its trigger id to both. The id is read off the exception on each side,
+            // so the log and the health report cannot name different invariants; a halt no check named
+            // (the negative catch-all below) reads as unclassified on both.
+            var trigger = (exception as InvariantViolationException)?.Trigger;
+            HostingLog.WorkerGroupFailStopped(
+                logger, options.Name, trigger?.ToString() ?? HostingLog.UnclassifiedTrigger, exception);
+            if (trigger is { } tripped)
+            {
+                BackWaveDiagnostics.RecordInvariantViolation(tripped, InvariantAction.Halt);
+            }
             // Per-pump health, surfaced at group altitude (ADR 0037): this Pump halts under its own
             // worker identity, so a sibling Pump's clean cycle never clears it and the group reads
             // wholly halted only once all options.Pumps Pumps are down.
@@ -274,6 +284,14 @@ internal sealed class WorkerGroupService(
                     {
                         health.ReportRecovered(options.Name, _workerId);
                     }
+                }
+                catch (InvariantViolationException)
+                {
+                    // The positive trigger set, added beside the negative catch-all below rather than
+                    // folded into it: a named check proved an invariant already broken, so no store's
+                    // own fault classifier gets a say in whether it is retryable. Rethrown to the single
+                    // halt call site in ExecuteAsync, which stops this group exactly as it does today.
+                    throw;
                 }
                 catch (Exception exception) when (IsTransientStoreFault(exception))
                 {

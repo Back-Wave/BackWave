@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.Metrics;
 using System.Net;
 using System.Text.Json.Serialization;
 using BackWave.Core;
+using BackWave.Diagnostics;
 using BackWave.Hosting;
 using BackWave.Jobs;
 using BackWave.Monitor;
@@ -336,6 +338,63 @@ public class HostingShellTests
         // Exactly one Critical entry, carrying the full exception (type, message, stack).
         var critical = Assert.Single(logs.Entries, e => e.Level == LogLevel.Critical);
         Assert.IsType<InvalidOperationException>(critical.Exception);
+
+        // No named check raised this halt, so the trigger reads as the catch-all's sentinel rather than
+        // as anything that could be mistaken for an InvariantTrigger member.
+        Assert.Contains(HostingLog.UnclassifiedTrigger, critical.Message);
+
+        await app.StopAsync();
+    }
+
+    [Fact]
+    public async Task NamedInvariantViolation_FailStops_CarriesTheTriggerIdToTheLogHealthAndMetric()
+    {
+        var store = new FaultableStore(new InMemoryJobStore())
+        {
+            ClaimInvariant = InvariantTrigger.ClaimedJobTerminal,
+        };
+        var logs = new CapturingLoggerProvider();
+
+        var violations = new ConcurrentBag<(string? Trigger, string? Action)>();
+        using var listener = new MeterListener
+        {
+            InstrumentPublished = (instrument, l) =>
+            {
+                if (instrument.Meter.Name == BackWaveDiagnostics.SourceName
+                    && instrument.Name == "backwave.invariant.violations")
+                {
+                    l.EnableMeasurementEvents(instrument);
+                }
+            },
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            var pairs = tags.ToArray();
+            violations.Add((
+                pairs.FirstOrDefault(t => t.Key == "backwave.invariant.trigger").Value as string,
+                pairs.FirstOrDefault(t => t.Key == "backwave.invariant.action").Value as string));
+        });
+        listener.Start();
+
+        await using var app = BuildHost(store, Registry(), logs, Group("workers", "default"));
+        await app.StartAsync();
+
+        var health = app.Services.GetRequiredService<BackWaveHealth>();
+        await WaitForAsync(
+            () => ValueTask.FromResult(health.HaltedGroups.ContainsKey("workers")),
+            "the Worker Group to fail-stop on the named invariant");
+
+        // One id, three surfaces, no disagreement: the halted state's typed component, the Critical halt
+        // log's invariant_trigger parameter, and the counter's trigger tag.
+        Assert.Equal(InvariantTrigger.ClaimedJobTerminal, health.HaltedGroups["workers"].Trigger);
+
+        var critical = Assert.Single(logs.Entries, e => e.Level == LogLevel.Critical);
+        Assert.Equal(2001, critical.EventId);
+        Assert.Contains(nameof(InvariantTrigger.ClaimedJobTerminal), critical.Message);
+
+        var violation = Assert.Single(violations);
+        Assert.Equal(nameof(InvariantTrigger.ClaimedJobTerminal), violation.Trigger);
+        Assert.Equal("Halt", violation.Action);
 
         await app.StopAsync();
     }

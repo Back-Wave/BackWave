@@ -1,4 +1,6 @@
+using BackWave.Diagnostics;
 using BackWave.Hosting;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 
 namespace BackWave.Hosting.Tests;
 
@@ -95,5 +97,90 @@ public sealed class BackWaveHealthTests
         Assert.True(health.DegradedGroups.ContainsKey("reports"));
         Assert.False(health.DegradedGroups.ContainsKey("emails"));
         Assert.False(health.IsHealthy); // emails is wholly halted
+    }
+
+    [Fact]
+    public void NamedInvariantHalt_CarriesTheTriggerId_WithoutPuttingItInToString()
+    {
+        var health = new BackWaveHealth();
+
+        health.ReportHalted(
+            "emails", "emails:pump-0", groupPumpCount: 1,
+            new InvariantViolationException(InvariantTrigger.ClaimedJobTerminal, "claimed a terminal job"));
+
+        // The id travels as the typed component, read off the exception so the halt log and the health
+        // report can never name different triggers.
+        var halt = health.HaltedGroups["emails"];
+        Assert.Equal(InvariantTrigger.ClaimedJobTerminal, halt.Trigger);
+
+        // ...and deliberately NOT in the rendering, which is what a probe payload may serialize. Keeping
+        // it out is what makes a trigger rename cost nothing that outlives the process.
+        Assert.DoesNotContain(nameof(InvariantTrigger.ClaimedJobTerminal), halt.ToString());
+        Assert.Equal($"{typeof(InvariantViolationException).FullName}: claimed a terminal job", halt.ToString());
+    }
+
+    [Fact]
+    public void UnnamedHalt_LeavesTheTriggerNull()
+    {
+        var health = new BackWaveHealth();
+
+        // The negative catch-all still halts on a fault no check named; there is no id to record.
+        health.ReportHalted("emails", "emails:pump-0", groupPumpCount: 1, Boom());
+
+        Assert.Null(health.HaltedGroups["emails"].Trigger);
+    }
+
+    // --- The health check's three-way result (issue dst-0011) ---
+
+    private static HealthStatus StatusOf(BackWaveHealth health) =>
+        new BackWaveHealthCheck(health)
+            .CheckHealthAsync(new HealthCheckContext()).GetAwaiter().GetResult().Status;
+
+    [Fact]
+    public void HealthCheck_CleanGroups_ReportHealthy()
+    {
+        var health = new BackWaveHealth();
+
+        health.ReportRecovered("emails", "emails:pump-0");
+
+        Assert.Equal(HealthStatus.Healthy, StatusOf(health));
+    }
+
+    [Fact]
+    public void HealthCheck_DegradedGroup_ReportsDegraded_NotHealthy()
+    {
+        var health = new BackWaveHealth();
+
+        // BREAKING behavioural change: a transient store fault used to report Healthy because the check
+        // never read DegradedGroups at all. The group is still claiming, so it is not a fail-stop either.
+        health.ReportDegraded("emails", "emails:pump-0", new TimeoutException("store blip"));
+
+        Assert.Equal(HealthStatus.Degraded, StatusOf(health));
+    }
+
+    [Fact]
+    public void HealthCheck_PartiallyHaltedGroup_ReportsDegraded()
+    {
+        var health = new BackWaveHealth();
+
+        // One Pump of two stopped; the survivor keeps the group serving, so it pages as impaired, not down.
+        health.ReportHalted("emails", "emails:pump-0", groupPumpCount: 2, Boom());
+
+        Assert.Equal(HealthStatus.Degraded, StatusOf(health));
+    }
+
+    [Fact]
+    public void HealthCheck_WhollyHaltedGroup_ReportsUnhealthy()
+    {
+        var health = new BackWaveHealth();
+
+        health.ReportHalted("emails", "emails:pump-0", groupPumpCount: 1, Boom());
+
+        // A wholly halted group stays the only Unhealthy result - the one an orchestrator takes out of
+        // rotation on. A degraded sibling never escalates it.
+        Assert.Equal(HealthStatus.Unhealthy, StatusOf(health));
+
+        health.ReportDegraded("reports", "reports:pump-0", new TimeoutException("store blip"));
+        Assert.Equal(HealthStatus.Unhealthy, StatusOf(health));
     }
 }

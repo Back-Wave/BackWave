@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using BackWave.Diagnostics;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 
 namespace BackWave.Hosting;
@@ -72,8 +73,11 @@ public sealed class BackWaveHealth
     internal void ReportHalted(string workerGroup, string pump, int groupPumpCount, Exception exception)
     {
         _groupPumpCount[workerGroup] = groupPumpCount;
+        // The trigger id is read off the exception here rather than passed in, so the halt call site
+        // cannot record one id and log another.
         _halted[(workerGroup, pump)] = new HaltState(
-            exception.GetType().FullName ?? exception.GetType().Name, exception.Message);
+            exception.GetType().FullName ?? exception.GetType().Name, exception.Message,
+            (exception as InvariantViolationException)?.Trigger);
         _degraded.TryRemove((workerGroup, pump), out _); // a halt supersedes this pump's degraded mark
     }
 
@@ -102,39 +106,86 @@ public sealed class BackWaveHealth
 
 /// <summary>
 /// The cause of a halted worker group: the full name of the exception type that stopped it, retained
-/// alongside the exception's message.
+/// alongside the exception's message and - when a named invariant check raised the halt - the stable
+/// trigger id that names which invariant broke. The trigger is optional and last, so constructing a
+/// <see cref="HaltState"/> positionally from a type and a message still compiles unchanged.
+/// <para>
+/// One source break remains, and it is deconstruction: a record's <c>Deconstruct</c> matches its
+/// primary constructor, so <c>var (type, message) = haltState;</c> now needs a third element. Read the
+/// properties instead, or discard the trigger with <c>var (type, message, _) = haltState;</c>.
+/// </para>
 /// </summary>
 /// <param name="ExceptionType">The full name of the exception type that halted the group.</param>
 /// <param name="Message">The exception's message.</param>
-public sealed record HaltState(string ExceptionType, string Message)
+/// <param name="Trigger">
+/// The invariant a named check found broken, or <see langword="null"/> when the group stopped on a
+/// fault no check named. The same id the halt log's <c>invariant_trigger</c> parameter carries.
+/// </param>
+public sealed record HaltState(string ExceptionType, string Message, InvariantTrigger? Trigger = null)
 {
     /// <summary>Renders the cause as <c>ExceptionType: Message</c>.</summary>
     /// <returns>The exception type and message joined by a colon.</returns>
+    /// <remarks>
+    /// The trigger is deliberately left out. This rendering is what the health check puts in its
+    /// description, which an operator's response writer may serialize into a probe payload; keeping it
+    /// byte-identical keeps the trigger id out of every serialized artifact, so renaming a trigger costs
+    /// one metric tag value and one log parameter and nothing that outlives the process. Read
+    /// <see cref="Trigger"/> when you want the id.
+    /// </remarks>
     public override string ToString() => $"{ExceptionType}: {Message}";
 }
 
 /// <summary>
-/// A health check that reports unhealthy once any worker group has halted. Register it with the
-/// standard health-check pipeline, for example
+/// A health check that reports unhealthy once a worker group has wholly halted, and degraded while a
+/// group is still serving but impaired - partially halted, or marked degraded by a transient store
+/// fault. Register it with the standard health-check pipeline, for example
 /// <c>services.AddHealthChecks().AddCheck&lt;BackWaveHealthCheck&gt;("backwave")</c>, so an
 /// orchestrator or load balancer can observe a fail-stop.
 /// </summary>
+/// <remarks>
+/// <b>Breaking behavioural change.</b> This check previously returned only healthy or unhealthy and
+/// never read <see cref="BackWaveHealth.DegradedGroups"/>, so a transient store fault - a connection
+/// blip, a failover, a command timeout - reported <see cref="HealthStatus.Healthy"/>. It now reports
+/// <see cref="HealthStatus.Degraded"/>. A readiness probe configured to fail on
+/// <see cref="HealthStatus.Degraded"/> will restart pods on faults it used to ride out; map degraded to
+/// success in your probe if that is not what you want. A wholly halted group is still the only
+/// <see cref="HealthStatus.Unhealthy"/> result.
+/// </remarks>
 public sealed class BackWaveHealthCheck(BackWaveHealth health) : IHealthCheck
 {
     /// <summary>
-    /// Reports healthy while every worker group is running, or unhealthy — naming each halted group
-    /// and its cause — once any group has fail-stopped.
+    /// Reports unhealthy - naming each halted group and its cause - once a group has wholly
+    /// fail-stopped; degraded while a group is partially halted or marked degraded by a transient store
+    /// fault; and healthy only when every group is running clean.
     /// </summary>
     /// <param name="context">The health-check context supplied by the pipeline.</param>
     /// <param name="cancellationToken">Unused; the check reads in-memory state and never blocks.</param>
     /// <returns>
-    /// A completed task with a healthy result when no group has halted, or an unhealthy result whose
-    /// description lists the halted groups and their causes.
+    /// A completed task with an unhealthy result whose description lists the wholly halted groups and
+    /// their causes; otherwise a degraded result naming the partially halted and degraded groups; or a
+    /// healthy result when there are none.
     /// </returns>
+    /// <remarks>
+    /// <b>Breaking behavioural change:</b> a transient store fault used to report
+    /// <see cref="HealthStatus.Healthy"/> and now reports <see cref="HealthStatus.Degraded"/>. See the
+    /// remarks on <see cref="BackWaveHealthCheck"/>.
+    /// </remarks>
     public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken = default)
-        => Task.FromResult(health.IsHealthy
-            ? HealthCheckResult.Healthy("All Worker Groups running.")
-            : HealthCheckResult.Unhealthy(
+    {
+        if (!health.IsHealthy)
+        {
+            return Task.FromResult(HealthCheckResult.Unhealthy(
                 "Worker Group fail-stop: " + string.Join("; ",
                     health.HaltedGroups.Select(g => $"{g.Key} ({g.Value})"))));
+        }
+        // Impaired but serving: a partially halted group is still claiming through its surviving pumps,
+        // and a degraded group is retrying each poll. Neither is a fail-stop, and neither is clean.
+        var impaired = health.PartiallyHaltedGroups.Select(g => $"{g.Key} ({g.Value})")
+            .Concat(health.DegradedGroups.Select(g => $"{g.Key} ({g.Value})"))
+            .ToList();
+        return Task.FromResult(impaired.Count == 0
+            ? HealthCheckResult.Healthy("All Worker Groups running.")
+            : HealthCheckResult.Degraded(
+                "Worker Group degraded: " + string.Join("; ", impaired)));
+    }
 }
