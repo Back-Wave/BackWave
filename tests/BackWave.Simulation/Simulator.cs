@@ -197,6 +197,17 @@ internal sealed record SimulationOptions
     public bool SabotageMigrationFaultGrace { get; init; }
 
     /// <summary>
+    /// Oracle self-test for the Migration-Liveness survivor grace: restores the pre-latch migration bound that
+    /// applied its tight, config-derived sweep deadline even after the world had held no live node at all. The
+    /// real oracle latches that survivorless window and stays disarmed for the rest of the run, because a Lease
+    /// stranded while every node was isolated or off the air has no survivor to sweep it and so cannot be held
+    /// to a poll-cadence bound. With this on, the tight bound applies anyway, so the un-sweepable Lease falsely
+    /// trips MigrationLiveness - proving the latch is load-bearing. Pair with isolation and a clean stop so a
+    /// survivorless window actually opens. Never set in real regimes.
+    /// </summary>
+    public bool SabotageMigrationSurvivorGrace { get; init; }
+
+    /// <summary>
     /// Ack-loss isolation (issue 0070, Phase 1.5): the per-attempt probability that a node's outcome write
     /// COMMITS to the store but its acknowledgement is lost, so the node believes the report failed and
     /// re-reports — by which point the store may have genuinely moved on. This exercises the
@@ -682,6 +693,12 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     // feature rather than only scheduling stops that the N-1 budget refused.
     private readonly DeterministicRandom _stopRng = new(options.Seed ^ 0x53544F5050494E47UL); // "STOPPING": its own stream
     private int _leasesRelinquished;
+    // The Migration-Liveness precondition latch: set the first step the world holds NO live node - every node
+    // either cut off by isolation or off the air (crashed or cleanly stopped) - which is the shape that leaves
+    // no survivor to sweep a lapsed Lease. It LATCHES and is never cleared: a Lease that lapsed inside a
+    // survivorless window keeps an invalid bound long after a node comes back. Read off the node set the
+    // oracle already walks, so it makes no draw and the determinism battery stays byte-identical.
+    private bool _survivorlessSeen;
     // Ack-loss isolation (issue 0070): its own stream so a zero probability makes no draws and the battery
     // stays byte-identical. _ackLost fences the injection to once per (job, attempt) — the retry that
     // follows is a normal report the (workerId, attempt) fence must reject as stale.
@@ -2454,6 +2471,15 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     /// <summary>The invariant oracle (runs after every step; messages carry the seed).</summary>
     private void CheckInvariants()
     {
+        // Latch the Migration-Liveness precondition before any oracle reads it: the step the world first holds
+        // no live node at all, the sweep bound below stops being valid for the rest of the run. Every move of
+        // the live set (isolate, heal, crash, stop, restart) is its own event, so a survivorless window can
+        // never open and close between two of these observations.
+        if (!_survivorlessSeen && !AnyNodeLive())
+        {
+            _survivorlessSeen = true;
+        }
+
         // Outcome-Provenance Oracle (issue 0068, ADR 0013): Effect-Once at the Storage Contract boundary.
         // A stale write from a healed isolated node — applied despite not holding the live Lease for the
         // Attempt — was captured at the report site; fail here with the seed if any was seen.
@@ -2566,10 +2592,13 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             // same "a *running* survivor sweeps within a poll or two" precondition the bound is derived from:
             //   • Crashes off — with crashes on, all nodes can be transiently down (2 isolated + 1 crashed), the
             //     all-nodes-lost case the PRD scopes out of Phase 1.
-            //   • Clean stops off - a stop is a second way for a node to be off the air, so it reaches the same
-            //     all-nodes-lost shape (2 isolated + 1 stopped) with no survivor left to sweep. The stop's own
-            //     N-1 budget cannot prevent it: a node stops while the cluster is healthy and the isolation
-            //     episodes that strand it are scheduled later.
+            //   • No survivorless window seen - a clean stop is a second way for a node to be off the air, so it
+            //     reaches the same all-nodes-lost shape (2 isolated + 1 stopped) with no survivor left to sweep.
+            //     The stop's own N-1 budget cannot prevent it: a node stops while the cluster is healthy and the
+            //     isolation episodes that strand it are scheduled later. Disarming on the StopCount knob would
+            //     be far too blunt - a stop only breaks the precondition when it takes the LAST live node - so
+            //     the _survivorlessSeen latch reads the actual live set every step instead, and stays set once
+            //     it fires: a Lease that lapsed inside that window keeps an invalid bound after a node returns.
             //   • Store faults off — the survivor's reclaim is its ExpireLeases store call, and a transient store
             //     fault unwinds it to a retry on the survivor's NEXT poll (the production pump's transient
             //     handling). A run of store faults on consecutive survivor sweeps delays reclaim arbitrarily far
@@ -2581,10 +2610,11 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             //     straight reclaim-capable sweeps, 0.2s past the bound) is exactly this false positive.
             // In either regime the end-of-run convergence check remains the backstop, catching a genuine
             // permanent stall (a never-swept Lease) that the relaxed per-step bound now lets pass. The
-            // SabotageMigrationFaultGrace self-test restores the pre-fix (ungated) bound to prove the gate is
-            // load-bearing; the SabotageMigrationSweep self-test runs store-faults-off, so it keeps full teeth.
+            // SabotageMigrationFaultGrace and SabotageMigrationSurvivorGrace self-tests each restore the ungated
+            // bound on one clause to prove that clause is load-bearing; the SabotageMigrationSweep self-test runs
+            // store-faults-off and stop-free, so it keeps full teeth.
             if (options.CrashProbabilityPerPoll == 0
-                && options.StopCount == 0
+                && (!_survivorlessSeen || options.SabotageMigrationSurvivorGrace)
                 && (options.StoreFaultProbability == 0 || options.SabotageMigrationFaultGrace)
                 && job is { State: JobState.Leased, LeaseOwner: { } leaseOwner, LeaseExpiry: { } leaseExpiry }
                 && leaseExpiry <= _now
@@ -2739,6 +2769,23 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     /// slack. A permanently-lost node's Lease that is never swept exceeds this finite bound and trips.
     /// </summary>
     private TimeSpan MigrationBound => options.MaxClockSkew + options.PollInterval * 3;
+
+    /// <summary>
+    /// Whether any node is live right now: reachable (the Isolation Scheduler has not cut it off) and running
+    /// (neither crashed nor cleanly stopped, the two ways <see cref="SimNode.Down"/> means "no process to
+    /// drive"). A world with none is the survivorless shape - nobody is left to sweep a lapsed Lease.
+    /// </summary>
+    private bool AnyNodeLive()
+    {
+        for (var n = 0; n < _nodes.Length; n++)
+        {
+            if (!_nodes[n].Down && !_isolation.IsIsolated(n))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 
     /// <summary>Whether <paramref name="owner"/> ("node-N") is a node the Isolation Scheduler currently has cut off.</summary>
     private bool IsIsolatedOwner(string owner)

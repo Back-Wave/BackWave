@@ -877,6 +877,51 @@ public class SimulatorTests
     }
 
     /// <summary>
+    /// Oracle self-test for the Migration-Liveness survivor latch: a two-node world where the one isolation
+    /// episode never heals and the other node then stops cleanly holds, for the length of that stop, NO live
+    /// node at all - so the lost node's lapsed Lease has nobody to sweep it and the tight, config-derived
+    /// bound stops describing anything real. SabotageMigrationSurvivorGrace restores the pre-latch bound that
+    /// applied the deadline anyway, and it MUST trip on that un-sweepable Lease; with the latch in place the
+    /// very same run is clean and still converges, the relinquish count proving a clean stop really did reach
+    /// the store and the expiry count proving migration really did fire. The pair is what makes the latch
+    /// load-bearing rather than decorative: it is the only thing standing between the swarm and this false
+    /// positive, exactly as SabotageMigrationFaultGrace is for the store-fault clause.
+    /// </summary>
+    [Theory]
+    [InlineData(5UL)]
+    [InlineData(48UL)]
+    [InlineData(72UL)]
+    public void MigrationLivenessSurvivorLatchSelfTest_ASurvivorlessWindow_OnlyTripsTheUngatedBound(ulong seed)
+    {
+        SimulationOptions Options(bool sabotage) => new()
+        {
+            Seed = seed,
+            NodeCount = 2,
+            JobCount = 20,
+            WorkloadDuration = TimeSpan.FromMinutes(20),
+            DrainAllowance = TimeSpan.FromMinutes(40),
+            IsolationCount = 1,
+            PermanentLossProbability = 1.0,   // the single episode never heals: one node is lost for good
+            StopCount = 3,                    // the other stops cleanly, so for a spell no node is live at all
+            CrashProbabilityPerPoll = 0,      // isolation and the clean stop are the only ways off the air
+            HeartbeatLossProbability = 0,
+            MaxExecutionDuration = TimeSpan.FromSeconds(150), // the lost node is holding work when it vanishes
+            SabotageMigrationSurvivorGrace = sabotage,
+        };
+
+        var exception = Assert.Throws<SimulationInvariantException>(() => new Simulator(Options(true)).Run());
+        Assert.Contains($"seed {seed}", exception.Message);
+        Assert.Contains("migration-liveness", exception.Message); // the pre-latch bound fired on the survivorless window
+        Assert.Equal(InvariantId.MigrationLiveness, exception.InvariantId);
+
+        var latched = new Simulator(Options(false)).Run();
+        Assert.Equal(20, latched.FinalJobs.Count);                                                    // the same run converges
+        Assert.True(latched.PermanentLosses > 0, $"seed {seed}: no node was ever permanently lost");
+        Assert.True(latched.LeasesRelinquished > 0, $"seed {seed}: no clean stop ever reached the store");
+        Assert.True(latched.LeasesExpired > 0, $"seed {seed}: no Lease ever migrated off the lost node");
+    }
+
+    /// <summary>
     /// Named scenario: ack-loss isolation (issue 0070, Phase 1.5). On a selected outcome the store write
     /// COMMITS but the node's ack is lost, so the node believes the report failed and re-reports once it is
     /// back — by which point the store has moved on (a committed Failure became due and a survivor
