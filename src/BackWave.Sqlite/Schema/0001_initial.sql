@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS backwave_jobs (
 );
 
 -- The claim path (§5.2): due Scheduled jobs per queue, oldest due first. Partial index — only
--- Scheduled rows, mirroring Postgres's WHERE state = 0.
+-- Scheduled rows, mirroring Postgres's Scheduled-only predicate.
 CREATE INDEX IF NOT EXISTS ix_backwave_jobs_claim
     ON backwave_jobs (queue, due_time, sequence) WHERE state = 0;
 
