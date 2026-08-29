@@ -118,7 +118,7 @@ public sealed class OracleConformanceTests : ConformanceSuite
 
     // Oracle folds an empty string to NULL, but key/value are NOT NULL PK columns, so an empty Tag key or
     // value is stored as the CHR(1) control character - the same encoding OracleJobStore applies.
-    private static string EncodeTag(string value) => value.Length == 0 ? "" : value;
+    private static string EncodeTag(string value) => value.Length == 0 ? "\u0001" : value;
 
     private sealed class HeldRow(OracleConnection connection, OracleTransaction transaction) : IAsyncDisposable
     {

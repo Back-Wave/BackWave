@@ -3714,9 +3714,9 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
 
     // Oracle stores an empty string as NULL, but key/value are NOT NULL PK columns, so an empty Tag key or
     // value (a Label carries an empty key) is stored as the CHR(1) control character and decoded back.
-    private static string EncodeTag(string value) => value.Length == 0 ? "" : value;
+    private static string EncodeTag(string value) => value.Length == 0 ? "\u0001" : value;
 
-    private static string DecodeTag(string value) => value == "" ? string.Empty : value;
+    private static string DecodeTag(string value) => value == "\u0001" ? string.Empty : value;
 
     // ":p0, :p1, ..." - ODP.NET has no array parameters; the lists are bounded.
     private static string ParameterList(string prefix, int count)
