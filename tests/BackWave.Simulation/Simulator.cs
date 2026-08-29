@@ -208,6 +208,15 @@ internal sealed record SimulationOptions
     public bool SabotageMigrationSurvivorGrace { get; init; }
 
     /// <summary>
+    /// Oracle self-test for the Restart-Reclaim-Bound invariant: a stopping node skips its relinquish
+    /// entirely, which is the pre-feature world where a clean stop left its Leases to lapse on expiry. The
+    /// call is treated as landed rather than faulted, so the oracle stays armed - a working oracle MUST then
+    /// flag the job still Leased by the stopped owner once RelinquishBound lapses. Pair with a clean stop and
+    /// no store faults so the oracle is armed at all. Never set in real regimes.
+    /// </summary>
+    public bool SabotageRelinquishSkip { get; init; }
+
+    /// <summary>
     /// Ack-loss isolation (issue 0070, Phase 1.5): the per-attempt probability that a node's outcome write
     /// COMMITS to the store but its acknowledgement is lost, so the node believes the report failed and
     /// re-reports — by which point the store may have genuinely moved on. This exercises the
@@ -596,6 +605,11 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         // Whether the node is off the air, however it got there: a crash or a clean stop. Every handler
         // that skips a crashed node skips a stopped one for the same reason - there is no process to drive.
         public bool Down => Crashed || StoppedAt is not null;
+        // Whether this node's relinquish actually committed on the way out. A node that stops while
+        // isolated, or whose relinquish draws a store fault, never reaches the store, so its Leases
+        // lapse on expiry exactly as they did before the feature. The Restart-Reclaim-Bound oracle
+        // reads this flag so it asserts a bound only on a stop that genuinely wrote.
+        public bool RelinquishLanded { get; set; }
         public int Epoch { get; set; }
         // The current idle poll-backoff delay, used only when the run enables adaptive polling
         // (MaxPollInterval > PollInterval). A claim outcome folds into it: work found or due-now pressure
@@ -1442,6 +1456,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 var restarting = _nodes[simEvent.Node];
                 restarting.Crashed = false;
                 restarting.StoppedAt = null;
+                restarting.RelinquishLanded = false;
                 restarting.Driver = NewDriver(simEvent.Node);
                 restarting.PollDelay = options.PollInterval; // a fresh pump starts at the floor
                 restarting.IdleSince = null;
@@ -2225,9 +2240,29 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         {
             return;
         }
-        if (!StoreShouldFault(nodeIndex, "Relinquish"))
+        // Route the relinquish through this node's own faulting store, exactly like every other call the
+        // node makes. That gate faults on a drawn store fault OR on isolation, and an isolated node cannot
+        // reach the store at all - a hand-rolled StoreShouldFault check would let it write from behind the
+        // partition. A fault leaves RelinquishLanded false and the Leases lapse, which is today's behaviour.
+        node.RelinquishLanded = false;
+        if (options.SabotageRelinquishSkip)
         {
-            _leasesRelinquished += Get(_store.RelinquishLeasesAsync($"node-{nodeIndex}", _now, _retryPolicy.ToDisposition()));
+            // The pre-feature world: the stop writes nothing and the Leases lapse on expiry. The call counts
+            // as landed, not faulted, because the oracle disarms on a faulted relinquish and this self-test
+            // needs it armed. Guarded so the knob takes no draw and the determinism battery holds.
+            node.RelinquishLanded = true;
+        }
+        else
+        {
+            try
+            {
+                _leasesRelinquished += Get(_nodeFaulty[nodeIndex].RelinquishLeasesAsync(
+                    $"node-{nodeIndex}", _now, _retryPolicy.ToDisposition()));
+                node.RelinquishLanded = true;
+            }
+            catch (SimTransientFault)
+            {
+            }
         }
         // A stop discards the Driver's outcome buffer for the same reason a crash does: Restart installs a
         // fresh Driver, so anything unflushed is gone. Tally it before the buffer is.
@@ -2628,15 +2663,18 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             }
 
             // Restart-Reclaim-Bound: a node that stops cleanly hands its Leases back on the way out, so no job
-            // stays Leased by a stopped owner past RelinquishBound. Two axes disarm it. Store faults, because a
+            // stays Leased by a stopped owner past RelinquishBound. Three axes disarm it. Store faults, because a
             // faulted relinquish unwinds to the Lease lapsing on expiry, which is correct behaviour and not a
-            // violation. RadioactiveMode, because that regime maxes every axis and no bound survives it. Crashes
+            // violation. RadioactiveMode, because that regime maxes every axis and no bound survives it. And an
+            // owner whose relinquish never committed, which at zero store-fault probability means it stopped
+            // while isolated - it could not reach the store, so its Leases lapse and no bound applies. Crashes
             // do NOT disarm it: another node crashing has no bearing on whether this node handed its own Leases
             // back, which is the one place this oracle is wider than Migration-Liveness.
             if (options.StoreFaultProbability == 0
                 && !options.RadioactiveMode
                 && job is { State: JobState.Leased, LeaseOwner: { } stopOwner }
-                && IsStoppedOwner(stopOwner, out var stoppedAt))
+                && IsStoppedOwner(stopOwner, out var stoppedAt, out var relinquishLanded)
+                && relinquishLanded)
             {
                 Invariant(
                     InvariantId.RestartReclaimBound,
@@ -2804,11 +2842,13 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     /// <summary>
     /// Whether <paramref name="owner"/> ("node-N") is a node that is currently stopped, and if so
     /// <paramref name="stoppedAt"/> is the instant it stopped - not the instant the relinquish committed,
-    /// which is an internal detail. Mirrors <see cref="IsIsolatedOwner"/>.
+    /// which is an internal detail - and <paramref name="relinquishLanded"/> says whether that relinquish
+    /// reached the store at all. Mirrors <see cref="IsIsolatedOwner"/>.
     /// </summary>
-    private bool IsStoppedOwner(string owner, out DateTimeOffset stoppedAt)
+    private bool IsStoppedOwner(string owner, out DateTimeOffset stoppedAt, out bool relinquishLanded)
     {
         stoppedAt = default;
+        relinquishLanded = false;
         if (!owner.StartsWith("node-", StringComparison.Ordinal)
             || !int.TryParse(owner.AsSpan(5), out var node)
             || node >= _nodes.Length
@@ -2817,6 +2857,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             return false;
         }
         stoppedAt = at;
+        relinquishLanded = _nodes[node].RelinquishLanded;
         return true;
     }
 
@@ -3055,6 +3096,17 @@ internal sealed class FaultInjectingStore(IJobStore inner, Func<string, bool> sh
     {
         MaybeFault("ExpireLeases");
         return inner.ExpireLeasesAsync(now, maxJobs, queues, disposition, cancellationToken);
+    }
+
+    // Without this override the default interface body wins and a relinquish silently returns zero,
+    // which reads as "this store does not support it" rather than "the call faulted". Every write the
+    // Simulator makes on a node's behalf must pass through one fault gate, and this is that gate.
+    public ValueTask<int> RelinquishLeasesAsync(
+        string workerId, DateTimeOffset now, RetryDisposition disposition,
+        CancellationToken cancellationToken = default)
+    {
+        MaybeFault("Relinquish");
+        return inner.RelinquishLeasesAsync(workerId, now, disposition, cancellationToken);
     }
 
     public ValueTask<int> MintDueAsync(IReadOnlyList<MintDecision> decisions, CancellationToken cancellationToken = default)

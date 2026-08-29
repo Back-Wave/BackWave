@@ -922,6 +922,41 @@ public class SimulatorTests
     }
 
     /// <summary>
+    /// Oracle self-test for the Restart-Reclaim-Bound invariant: with SabotageRelinquishSkip a node that
+    /// stops cleanly writes nothing on the way out, which is the pre-feature world where its Leases simply
+    /// lapsed on expiry. A job then sits Leased by an owner that is gone for the full Lease duration, which
+    /// is the exact durability-to-availability gap the relinquish feature closes. A live oracle MUST flag
+    /// that job once RelinquishBound lapses, and fail with the replay seed. The unsabotaged run of the same
+    /// seed is clean and relinquishes for real, so the pair proves the oracle is armed rather than dead -
+    /// a bounded-time liveness oracle that never fires is indistinguishable from one that is not there.
+    /// </summary>
+    [Theory]
+    [InlineData(1UL)]
+    [InlineData(3UL)]
+    [InlineData(6UL)]
+    public void RestartReclaimBoundSelfTest_AStopThatWritesNothing_FailsTheRun_AndPrintsTheSeed(ulong seed)
+    {
+        SimulationOptions Options(bool sabotage) => new()
+        {
+            Seed = seed,
+            StopCount = 3,                 // a clean stop is the only thing this oracle speaks about
+            CrashProbabilityPerPoll = 0,   // a crash is not a clean stop, so keep the two apart
+            HeartbeatLossProbability = 0,
+            StoreFaultProbability = 0,     // a faulted relinquish disarms the oracle by design
+            SabotageRelinquishSkip = sabotage,
+        };
+
+        var exception = Assert.Throws<SimulationInvariantException>(() => new Simulator(Options(true)).Run());
+        Assert.Contains($"seed {seed}", exception.Message);
+        Assert.Equal(InvariantId.RestartReclaimBound, exception.InvariantId);
+
+        var relinquished = new Simulator(Options(false)).Run();
+        Assert.True(relinquished.LeasesRelinquished > 0, $"seed {seed}: no clean stop ever reached the store");
+        Assert.Equal(200, relinquished.Succeeded + relinquished.DeadLettered
+            + relinquished.Cancelled + relinquished.Quarantined);
+    }
+
+    /// <summary>
     /// Named scenario: ack-loss isolation (issue 0070, Phase 1.5). On a selected outcome the store write
     /// COMMITS but the node's ack is lost, so the node believes the report failed and re-reports once it is
     /// back — by which point the store has moved on (a committed Failure became due and a survivor
@@ -1648,5 +1683,39 @@ public class SimulatorTests
         Assert.NotEqual(baseline.FinalJobs, weighted.FinalJobs);
         Assert.Equal(weighted.FinalJobs, new Simulator(weightedOptions).Run().FinalJobs); // deterministic replay
         Assert.Equal(200, weighted.Succeeded + weighted.DeadLettered + weighted.Cancelled + weighted.Quarantined);
+    }
+
+    /// <summary>
+    /// Model-fidelity guard on the fault gate. Every store call a node makes goes through
+    /// <c>FaultInjectingStore</c>, which is what gives isolation and the store-fault axis their teeth. A
+    /// method the wrapper does not declare falls through to the interface default body instead, so the
+    /// fault gate never runs and the wrapper silently stops modelling that operation.
+    /// <c>RelinquishLeasesAsync</c> shipped exactly that way: a default body returning zero and no
+    /// override here, so an isolated node handed its Leases back from behind the partition.
+    ///
+    /// Reflection over the interface map catches the next one, because a default body leaves the target
+    /// method declared on the interface rather than on the wrapper. Three members are inherited on
+    /// purpose and are named here, so adding a fourth fails this test and forces the choice to be
+    /// deliberate.
+    /// </summary>
+    [Fact]
+    public void FaultInjectingStore_DeclaresEveryFaultableJobStoreMember_SoNoDefaultBodyBypassesTheFaultGate()
+    {
+        // HistoryPolicy and Bounds are capability descriptors, not store round-trips, so there is nothing
+        // to fault. ReportOutcomesAsync is safe for a different reason: its default body delegates to
+        // ReportOutcomeAsync, which this wrapper does override, so every row still passes the gate. That
+        // makes the model fault per row where the real adapter writes the batch in one statement - a
+        // known and deliberately kept difference, because a per-row fault is the stricter of the two.
+        string[] deliberatelyInherited = ["get_HistoryPolicy", "get_Bounds", "ReportOutcomesAsync"];
+
+        var map = typeof(FaultInjectingStore).GetInterfaceMap(typeof(IJobStore));
+
+        var inherited = map.InterfaceMethods
+            .Where((_, i) => map.TargetMethods[i].DeclaringType != typeof(FaultInjectingStore))
+            .Select(m => m.Name)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+        Assert.Equal(deliberatelyInherited.Order(StringComparer.Ordinal), inherited);
     }
 }

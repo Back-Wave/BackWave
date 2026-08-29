@@ -143,6 +143,7 @@ internal static class SwarmEnvelope
             SabotageMigrationSweep = false,
             SabotageMigrationFaultGrace = false,
             SabotageMigrationSurvivorGrace = false,
+            SabotageRelinquishSkip = false,
             SabotagePausedClaim = false,
             SabotageCancelProvenance = false,
             SabotageLegalTransition = false,

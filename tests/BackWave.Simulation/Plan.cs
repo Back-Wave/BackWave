@@ -70,6 +70,8 @@ internal sealed record Scenario
     public bool SabotageMigrationSweep { get; init; }
     public bool SabotageMigrationFaultGrace { get; init; }
     public bool SabotageMigrationSurvivorGrace { get; init; }
+
+    public bool SabotageRelinquishSkip { get; init; }
     public bool SabotagePausedClaim { get; init; }
     public bool SabotageCancelProvenance { get; init; }
     public bool SabotageLegalTransition { get; init; }
@@ -126,6 +128,7 @@ internal sealed record Scenario
         SabotageMigrationSweep = o.SabotageMigrationSweep,
         SabotageMigrationFaultGrace = o.SabotageMigrationFaultGrace,
         SabotageMigrationSurvivorGrace = o.SabotageMigrationSurvivorGrace,
+        SabotageRelinquishSkip = o.SabotageRelinquishSkip,
         SabotagePausedClaim = o.SabotagePausedClaim,
         SabotageCancelProvenance = o.SabotageCancelProvenance,
         SabotageLegalTransition = o.SabotageLegalTransition,
@@ -180,6 +183,7 @@ internal sealed record Scenario
         SabotageMigrationSweep = SabotageMigrationSweep,
         SabotageMigrationFaultGrace = SabotageMigrationFaultGrace,
         SabotageMigrationSurvivorGrace = SabotageMigrationSurvivorGrace,
+        SabotageRelinquishSkip = SabotageRelinquishSkip,
         SabotagePausedClaim = SabotagePausedClaim,
         SabotageCancelProvenance = SabotageCancelProvenance,
         SabotageLegalTransition = SabotageLegalTransition,
