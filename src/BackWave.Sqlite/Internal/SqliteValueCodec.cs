@@ -1,3 +1,5 @@
+using BackWave.Diagnostics;
+
 namespace BackWave.Sqlite.Internal;
 
 /// <summary>
@@ -32,5 +34,14 @@ internal static class SqliteValueCodec
 
     /// <summary>Decodes an int to an enum value.</summary>
     public static TEnum ToEnum<TEnum>(long value) where TEnum : struct, Enum
-        => (TEnum)Enum.ToObject(typeof(TEnum), value);
+    {
+        var decoded = (TEnum)Enum.ToObject(typeof(TEnum), value);
+        if (!Enum.IsDefined(decoded))
+        {
+            throw new InvariantViolationException(
+                InvariantTrigger.UndefinedEnumValueStored,
+                $"A stored column holds {value}, which is not a defined {typeof(TEnum).Name}.");
+        }
+        return decoded;
+    }
 }

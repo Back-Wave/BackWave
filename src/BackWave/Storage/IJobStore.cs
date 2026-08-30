@@ -637,6 +637,22 @@ public interface IJobStore
         ObserverDeliveryReport report, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Reports delivery outcomes exactly as <see cref="ReportObserverDeliveriesAsync"/> does, and also
+    /// tells the caller what the store did with the report. The fence refusal is a lost race, not a
+    /// fault, so it is reported rather than thrown; without this return a refused report is
+    /// indistinguishable from an applied one.
+    /// </summary>
+    /// <param name="report">The per-row delivery results for the claimed batch, carrying the claim lease that fences the write.</param>
+    /// <param name="cancellationToken">Cancels the operation.</param>
+    /// <returns>Whether the report was applied, refused by the fence, or named an unknown observer.</returns>
+    async ValueTask<ObserverReportOutcome> TryReportObserverDeliveriesAsync(
+        ObserverDeliveryReport report, CancellationToken cancellationToken = default)
+    {
+        await ReportObserverDeliveriesAsync(report, cancellationToken).ConfigureAwait(false);
+        return ObserverReportOutcome.Unreported;
+    }
+
+    /// <summary>
     /// Reads an observer's durable delivery cursor, for monitoring — the global log position up to
     /// and including which every matching row has been delivered or dead-lettered. This is read-only
     /// and never moves the cursor.

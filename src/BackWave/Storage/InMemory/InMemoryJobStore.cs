@@ -1,4 +1,5 @@
 using System.Data.Common;
+using BackWave.Diagnostics;
 
 namespace BackWave.Storage.InMemory;
 
@@ -1248,21 +1249,29 @@ public sealed class InMemoryJobStore(
     }
 
     /// <inheritdoc/>
-    public ValueTask ReportObserverDeliveriesAsync(
+    public async ValueTask ReportObserverDeliveriesAsync(
+        ObserverDeliveryReport report, CancellationToken cancellationToken = default)
+        => await TryReportObserverDeliveriesAsync(report, cancellationToken).ConfigureAwait(false);
+
+    /// <inheritdoc/>
+    public ValueTask<ObserverReportOutcome> TryReportObserverDeliveriesAsync(
         ObserverDeliveryReport report, CancellationToken cancellationToken = default)
     {
         lock (_gate)
         {
             if (!_observers.TryGetValue(report.ObserverId, out var observer))
             {
-                return ValueTask.CompletedTask;
+                return ValueTask.FromResult(ObserverReportOutcome.UnknownObserver);
             }
             // Fence (§5.13): only the live claim-Lease holder may resolve deliveries and advance the
             // cursor. A stale survivor of a lapsed claim reports into the void — at-least-once intact.
             if (!string.Equals(observer.LeaseOwner, report.WorkerId, StringComparison.Ordinal)
                 || observer.LeaseExpiry <= report.Now)
             {
-                return ValueTask.CompletedTask;
+                Invariant.Degrade(
+                    null, InvariantTrigger.ObserverReportFenceRejected,
+                    $"Observer '{report.ObserverId}': worker '{report.WorkerId}' no longer holds the claim lease, so its report changed nothing.");
+                return ValueTask.FromResult(ObserverReportOutcome.FenceRejected);
             }
 
             foreach (var outcome in report.Outcomes)
@@ -1284,7 +1293,7 @@ public sealed class InMemoryJobStore(
             }
 
             AdvanceObserverCursor(observer, report.Now);
-            return ValueTask.CompletedTask;
+            return ValueTask.FromResult(ObserverReportOutcome.Applied);
         }
     }
 

@@ -51,6 +51,9 @@ public enum InvariantTrigger
     /// <summary>A claimed row came back that is not Leased to the claiming worker.</summary>
     ClaimedRowNotLeasedToWorker,
 
+    /// <summary>A claim's candidate row came back in a state the claim's own SQL predicate excludes.</summary>
+    ClaimedRowNotEligible,
+
     /// <summary>A workflow member's enqueue was rejected inside the transaction that validated it.</summary>
     WorkflowMemberEnqueueRejected,
 
@@ -80,4 +83,7 @@ public enum InvariantTrigger
 
     /// <summary>A leased-count aggregate came back NULL, which a COUNT never returns.</summary>
     LeasedCountAggregateNull,
+
+    /// <summary>An observer delivery report was refused by the claim-lease fence, so it changed nothing.</summary>
+    ObserverReportFenceRejected,
 }

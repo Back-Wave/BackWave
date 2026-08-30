@@ -107,6 +107,26 @@ public sealed record ObserverDeliveryReport(
     string ObserverId, string WorkerId, IReadOnlyList<ObserverDeliveryOutcome> Outcomes, DateTimeOffset Now);
 
 /// <summary>
+/// What a store did with a delivery report. The report is fenced by the claim lease, so a worker that
+/// no longer holds the live lease - or that names an observer with no row - changes nothing and gets
+/// told so, instead of the write vanishing silently.
+/// </summary>
+public enum ObserverReportOutcome
+{
+    /// <summary>The store did not say. Returned only by implementations that predate this channel.</summary>
+    Unreported,
+
+    /// <summary>The report held the live claim lease, so its outcomes and cursor advance were applied.</summary>
+    Applied,
+
+    /// <summary>The named observer has no row, so there was nothing to resolve.</summary>
+    UnknownObserver,
+
+    /// <summary>The reporting worker no longer holds the live claim lease, so the store refused the write.</summary>
+    FenceRejected,
+}
+
+/// <summary>
 /// A request to read one observer's delivery lag — how far its durable cursor trails behind the
 /// matching transitions in the log. Carries the same subscription filter as a claim (the
 /// <see cref="States"/> plus optional <see cref="WireName"/> and <see cref="Queue"/>) so the store

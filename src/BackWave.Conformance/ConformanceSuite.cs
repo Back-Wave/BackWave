@@ -4030,6 +4030,47 @@ public abstract class ConformanceSuite
         Assert.Equal(-1, await store.GetObserverCursorAsync("obs-empty"));
     }
 
+    /// <summary>
+    /// Certifies that a delivery report tells its caller what the store did with it: applied under the
+    /// live claim lease, refused by the fence, or aimed at an observer that has no row. A fenced report
+    /// changes nothing, and the caller can now see that instead of guessing.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_13_ReportObserverDeliveries_ReportsItsOwnOutcome_AppliedFencedOrUnknown()
+    {
+        var store = await CreateStoreAsync();
+        await SucceedAsync(store, T0);
+
+        // An observer with no row cannot resolve anything, and says so.
+        Assert.Equal(
+            ObserverReportOutcome.UnknownObserver,
+            await store.TryReportObserverDeliveriesAsync(
+                new ObserverDeliveryReport(
+                    "never-claimed", "node-a", [new ObserverDeliveryOutcome(0, ObserverDeliveryDisposition.Delivered)], T0)));
+
+        var claim = await ClaimObsAsync(store, "obs", [JobState.Succeeded], T0, worker: "node-a");
+        var delivery = Assert.Single(claim.Deliveries);
+
+        // A worker whose claim lease has lapsed is refused by the fence, and is told so.
+        var afterLapse = T0 + Lease + TimeSpan.FromSeconds(1);
+        Assert.Equal(
+            ObserverReportOutcome.FenceRejected,
+            await store.TryReportObserverDeliveriesAsync(
+                new ObserverDeliveryReport(
+                    "obs", "node-a", [new ObserverDeliveryOutcome(delivery.Position, ObserverDeliveryDisposition.Delivered)], afterLapse)));
+        Assert.Equal(-1, await store.GetObserverCursorAsync("obs"));
+
+        // The live claim-lease holder is applied, and the cursor moves.
+        var reclaim = await ClaimObsAsync(store, "obs", [JobState.Succeeded], afterLapse, worker: "node-b");
+        var again = Assert.Single(reclaim.Deliveries);
+        Assert.Equal(
+            ObserverReportOutcome.Applied,
+            await store.TryReportObserverDeliveriesAsync(
+                new ObserverDeliveryReport(
+                    "obs", "node-b", [new ObserverDeliveryOutcome(again.Position, ObserverDeliveryDisposition.Delivered)], afterLapse)));
+        Assert.Equal(again.Position, await store.GetObserverCursorAsync("obs"));
+    }
+
     // ── ADR 0022 Job Tags ────────────────────────────────────────────────────────
 
     /// <summary>

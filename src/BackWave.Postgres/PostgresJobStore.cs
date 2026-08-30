@@ -436,7 +436,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     "SELECT count(*) FROM backwave.jobs WHERE queue = @queue AND state = 2",
                     connection, transaction);
                 leased.Parameters.AddWithValue("queue", queue);
-                var inUse = (long)(await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
+                if (await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not long inUse)
+                {
+                    throw new InvariantViolationException(
+                        InvariantTrigger.LeasedCountAggregateNull,
+                        $"The leased-count aggregate for queue '{queue}' returned no value; COUNT(*) always returns one.");
+                }
                 slots = limitValue - (int)inUse;
             }
             if (slots <= 0)
@@ -482,6 +487,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     var job = ReadJob(reader);
+                    if (job.State != JobState.Leased || !string.Equals(job.LeaseOwner, request.WorkerId, StringComparison.Ordinal))
+                    {
+                        throw new InvariantViolationException(
+                            InvariantTrigger.ClaimedRowNotLeasedToWorker,
+                            $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
+                    }
                     // Column 18 is the correlated tag aggregate (json or NULL when the job has none).
                     if (!reader.IsDBNull(18))
                     {
@@ -907,8 +918,14 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             parents.Sort(); // deterministic lock order, as everywhere else (issue 0032)
             foreach (var parentId in parents)
             {
+                if (!matched.TryGetValue(parentId, out var parentState))
+                {
+                    throw new InvariantViolationException(
+                        InvariantTrigger.ParentJobMissingFromBatch,
+                        $"Parent job {parentId} came back from a lookup restricted to this batch's own terminal ids, yet it is absent from that batch.");
+                }
                 await ResolveChildLatchesAsync(
-                    connection, transaction, parentId, (JobState)matched[parentId], now, cancellationToken)
+                    connection, transaction, parentId, (JobState)parentState, now, cancellationToken)
                     .ConfigureAwait(false);
             }
         }
@@ -971,7 +988,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     await using var reader = await child.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     {
-                        continue;
+                        throw new InvariantViolationException(
+                            InvariantTrigger.DanglingGatingEdge,
+                            $"Gating edge {currentParent} -> {childId} named a child job row that does not exist; the job_parents foreign key forbids it.");
                     }
                     (childState, remaining, mode, childAttempt) =
                         (reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetInt32(3));
@@ -993,7 +1012,13 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     cancel.Parameters.AddWithValue("id", childId);
                     cancel.Parameters.AddWithValue("now", now.ToUniversalTime());
                     cancel.Parameters.AddWithValue("cause", ParentFailureCause(currentState));
-                    await cancel.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+                    var cancelled = await cancel.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+                    if (cancelled != 1)
+                    {
+                        throw new InvariantViolationException(
+                            InvariantTrigger.UnexpectedAffectedRowCount,
+                            $"Cancelling gated child {childId} affected {cancelled} rows; the row is locked FOR UPDATE by this transaction, so exactly 1 is the only possible count.");
+                    }
                     await RecordTransitionAsync(connection, transaction, childId, JobState.Cancelled, childAttempt, now, cancellationToken)
                         .ConfigureAwait(false);
                     work.Push((childId, JobState.Cancelled)); // cascade
@@ -1014,7 +1039,13 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 {
                     resolve.Parameters.AddWithValue("now", now.ToUniversalTime());
                 }
-                await resolve.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+                var resolved = await resolve.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+                if (resolved != 1)
+                {
+                    throw new InvariantViolationException(
+                        InvariantTrigger.UnexpectedAffectedRowCount,
+                        $"Resolving the latch on gated child {childId} affected {resolved} rows; the row is locked FOR UPDATE by this transaction, so exactly 1 is the only possible count.");
+                }
                 // Only the latch RELEASE (last parent terminal → Scheduled) is a state change worth
                 // a transition; a mere decrement keeps the child in AwaitingParent (§5.12).
                 if (remaining - 1 <= 0)
@@ -2463,8 +2494,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
             if (applied != EnqueueResult.Ok) // always-on assertion: everything else validated above
             {
-                throw new InvalidOperationException(
-                    $"Workflow enqueue commit failed for member {member.JobId}: {applied}.");
+                throw new InvariantViolationException(
+                    InvariantTrigger.WorkflowMemberEnqueueRejected,
+                    $"Workflow enqueue rejected member {member.JobId} with {applied} inside the transaction that had already validated it.");
             }
         }
 
@@ -2805,7 +2837,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         {
             locked.Parameters.AddWithValue("id", request.ObserverId);
             await using var reader = await locked.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
-            await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                throw new InvariantViolationException(
+                    InvariantTrigger.GuaranteedRowAbsent,
+                    $"Observer '{request.ObserverId}' has no row immediately after this transaction ensured one.");
+            }
             cursor = reader.GetInt64(0);
             leaseOwner = reader.IsDBNull(1) ? null : reader.GetString(1);
             leaseExpiry = reader.IsDBNull(2) ? null : reader.GetFieldValue<DateTimeOffset>(2);
@@ -2917,6 +2954,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     /// <inheritdoc/>
     public async ValueTask ReportObserverDeliveriesAsync(
         ObserverDeliveryReport report, CancellationToken cancellationToken = default)
+        => await TryReportObserverDeliveriesAsync(report, cancellationToken).ConfigureAwait(false);
+
+    /// <inheritdoc/>
+    public async ValueTask<ObserverReportOutcome> TryReportObserverDeliveriesAsync(
+        ObserverDeliveryReport report, CancellationToken cancellationToken = default)
     {
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
 
@@ -2954,7 +2996,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         if (!found)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            return; // unknown Observer — nothing claimed, nothing to resolve
+            return ObserverReportOutcome.UnknownObserver; // nothing claimed, nothing to resolve
         }
 
         // Fence (§5.13): only the live claim-Lease holder may resolve deliveries and advance the
@@ -2962,7 +3004,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         if (!string.Equals(leaseOwner, report.WorkerId, StringComparison.Ordinal) || leaseExpiry <= report.Now)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            return;
+            Invariant.Degrade(
+                null, InvariantTrigger.ObserverReportFenceRejected,
+                $"Observer '{report.ObserverId}': worker '{report.WorkerId}' no longer holds the claim lease, so its report changed nothing.");
+            return ObserverReportOutcome.FenceRejected;
         }
 
         foreach (var outcome in report.Outcomes)
@@ -2991,6 +3036,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             .ConfigureAwait(false);
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return ObserverReportOutcome.Applied;
     }
 
     /// <summary>
@@ -3040,6 +3086,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             newCursor = result is DBNull or null ? null : (long)result;
         }
 
+        if (newCursor is { } regressed && regressed < cursor)
+        {
+            throw new InvariantViolationException(
+                InvariantTrigger.ObserverCursorRegressed,
+                $"Observer '{observerId}' would move its cursor from {cursor} back to {regressed}; the advance selects MAX(position) strictly greater than the cursor.");
+        }
         if (newCursor is not { } target || target <= cursor)
         {
             return; // nothing to sweep — the block (or the absence of new rows) holds the cursor
@@ -3081,7 +3133,13 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         {
             move.Parameters.AddWithValue("id", observerId);
             move.Parameters.AddWithValue("target", target);
-            await move.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+            var moved = await move.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+            if (moved != 1)
+            {
+                throw new InvariantViolationException(
+                    InvariantTrigger.UnexpectedAffectedRowCount,
+                    $"Moving the cursor of observer '{observerId}' affected {moved} rows; the row is locked FOR UPDATE by this transaction, so exactly 1 is the only possible count.");
+            }
         }
     }
 
@@ -3132,7 +3190,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         command.Parameters.AddWithValue("queue", (object?)request.Queue ?? DBNull.Value);
 
         await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
-        await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            throw new InvariantViolationException(
+                InvariantTrigger.GuaranteedRowAbsent,
+                $"The lag aggregate for observer '{request.ObserverId}' returned no row; an ungrouped aggregate always returns exactly one.");
+        }
         var oldest = reader.IsDBNull(2) ? (DateTimeOffset?)null : reader.GetFieldValue<DateTimeOffset>(2);
         return new ObserverLag(reader.GetInt64(0), (int)reader.GetInt64(1), oldest);
     }
@@ -3245,27 +3308,44 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         "cancel_requested, terminal_at, terminal_cause, schedule_id, parents_remaining, mode, trace_context, " +
         "sequence, workflow_id";
 
-    private static JobRecord ReadJob(NpgsqlDataReader reader) => new()
+    private static JobRecord ReadJob(NpgsqlDataReader reader)
     {
-        JobId = reader.GetGuid(0),
-        WireName = reader.GetString(1),
-        Payload = reader.GetFieldValue<byte[]>(2),
-        Queue = reader.GetString(3),
-        State = (JobState)reader.GetInt32(4),
-        DueTime = reader.GetFieldValue<DateTimeOffset>(5),
-        Attempt = reader.GetInt32(6),
-        LeaseOwner = reader.IsDBNull(7) ? null : reader.GetString(7),
-        LeaseExpiry = reader.IsDBNull(8) ? null : reader.GetFieldValue<DateTimeOffset>(8),
-        CancelRequested = reader.GetBoolean(9),
-        TerminalAt = reader.IsDBNull(10) ? null : reader.GetFieldValue<DateTimeOffset>(10),
-        TerminalCause = reader.IsDBNull(11) ? null : reader.GetString(11),
-        ScheduleId = reader.IsDBNull(12) ? null : reader.GetString(12),
-        ParentsRemaining = reader.GetInt32(13),
-        Mode = (DependencyMode)reader.GetInt32(14),
-        TraceContext = reader.IsDBNull(15) ? null : reader.GetString(15),
-        Sequence = reader.GetInt64(16),
-        WorkflowId = reader.IsDBNull(17) ? null : reader.GetGuid(17),
-    };
+        var storedState = reader.GetInt32(4);
+        if (!Enum.IsDefined((JobState)storedState))
+        {
+            throw new InvariantViolationException(
+                InvariantTrigger.UndefinedEnumValueStored,
+                $"Job {reader.GetGuid(0)} stores state {storedState}, which is not a defined JobState.");
+        }
+        var storedMode = reader.GetInt32(14);
+        if (!Enum.IsDefined((DependencyMode)storedMode))
+        {
+            throw new InvariantViolationException(
+                InvariantTrigger.UndefinedEnumValueStored,
+                $"Job {reader.GetGuid(0)} stores dependency mode {storedMode}, which is not a defined DependencyMode.");
+        }
+        return new()
+        {
+            JobId = reader.GetGuid(0),
+            WireName = reader.GetString(1),
+            Payload = reader.GetFieldValue<byte[]>(2),
+            Queue = reader.GetString(3),
+            State = (JobState)storedState,
+            DueTime = reader.GetFieldValue<DateTimeOffset>(5),
+            Attempt = reader.GetInt32(6),
+            LeaseOwner = reader.IsDBNull(7) ? null : reader.GetString(7),
+            LeaseExpiry = reader.IsDBNull(8) ? null : reader.GetFieldValue<DateTimeOffset>(8),
+            CancelRequested = reader.GetBoolean(9),
+            TerminalAt = reader.IsDBNull(10) ? null : reader.GetFieldValue<DateTimeOffset>(10),
+            TerminalCause = reader.IsDBNull(11) ? null : reader.GetString(11),
+            ScheduleId = reader.IsDBNull(12) ? null : reader.GetString(12),
+            ParentsRemaining = reader.GetInt32(13),
+            Mode = (DependencyMode)storedMode,
+            TraceContext = reader.IsDBNull(15) ? null : reader.GetString(15),
+            Sequence = reader.GetInt64(16),
+            WorkflowId = reader.IsDBNull(17) ? null : reader.GetGuid(17),
+        };
+    }
 
     // ── Job Tags (ADR 0022) ─────────────────────────────────────────────────────
 
