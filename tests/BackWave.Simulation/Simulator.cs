@@ -3225,6 +3225,16 @@ internal sealed class FaultInjectingStore(IJobStore inner, Func<string, bool> sh
         return inner.ReportObserverDeliveriesAsync(report, cancellationToken);
     }
 
+    // Same round trip, same fault key. Declared rather than inherited because the interface's default
+    // body reports the outcome as Unreported, so a model caller would read a value the inner store never
+    // returned - and the fault gate would not run at all.
+    public ValueTask<ObserverReportOutcome> TryReportObserverDeliveriesAsync(
+        ObserverDeliveryReport report, CancellationToken cancellationToken = default)
+    {
+        MaybeFault("ReportObserver");
+        return inner.TryReportObserverDeliveriesAsync(report, cancellationToken);
+    }
+
     public ValueTask<long> GetObserverCursorAsync(string observerId, CancellationToken cancellationToken = default)
         => inner.GetObserverCursorAsync(observerId, cancellationToken);
 
