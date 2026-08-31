@@ -35,16 +35,10 @@ public enum InvariantTrigger
     /// <summary>A claim returned more jobs than the batch bound the Driver put on it.</summary>
     ClaimBatchOverrun,
 
-    /// <summary>A claim handed back a job the Driver already believes it is executing.</summary>
-    DuplicateExecutingJob,
-
     // ── Dependency resolution and gating ─────────────────────────────────────────────────────────
 
     /// <summary>A live workflow member names a workflow whose row is absent.</summary>
     WorkflowMemberWithoutWorkflow,
-
-    /// <summary>A gate read an ancestor still AwaitingParent, so it evaluated before that ancestor ran.</summary>
-    GateAncestorNotRun,
 
     // ── Storage adapters ─────────────────────────────────────────────────────────────────────────
 
