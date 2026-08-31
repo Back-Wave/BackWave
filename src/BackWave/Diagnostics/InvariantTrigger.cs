@@ -86,4 +86,9 @@ public enum InvariantTrigger
 
     /// <summary>An observer delivery report was refused by the claim-lease fence, so it changed nothing.</summary>
     ObserverReportFenceRejected,
+
+    /// <summary>A workflow's members hold a dependency cycle, so no insertion order puts every member
+    /// after its own parents. The builder rejects a cycle before this point, so reaching it means the
+    /// graph was never validated.</summary>
+    WorkflowMemberCycle,
 }

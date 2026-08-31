@@ -2591,7 +2591,21 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 }
             }
         }
-        return ordered.Count == members.Count ? ordered : members;
+        if (ordered.Count != members.Count)
+        {
+            // Kahn's algorithm drains every member unless a cycle holds some of them back, and the
+            // builder rejects a cycle long before this point, so a shortfall means the graph reached the
+            // store unvalidated. The old fallback inserted in the caller's order instead, which put a
+            // member ahead of its own parent and had the insert refused a few lines below - naming the
+            // member as the problem rather than the cycle that is the actual cause. Raise here, at the
+            // only point that can still tell the two apart, and before any row is written.
+            throw new InvariantViolationException(
+                InvariantTrigger.WorkflowMemberCycle,
+                $"A workflow of {members.Count} member(s) ordered only {ordered.Count} of them, " +
+                "so its in-batch dependency edges hold a cycle.");
+        }
+
+        return ordered;
     }
 
     /// <inheritdoc/>

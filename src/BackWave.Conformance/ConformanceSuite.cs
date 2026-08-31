@@ -1,4 +1,5 @@
 using BackWave.Core;
+using BackWave.Diagnostics;
 using BackWave.Storage;
 
 namespace BackWave.Conformance;
@@ -5176,6 +5177,29 @@ public abstract class ConformanceSuite
             await store.EnqueueWorkflowAsync(Workflow(workflowId, [leaf, root]), T0));
         Assert.Equal(JobState.AwaitingParent, (await store.GetJobAsync(leaf.JobId))!.State);
         Assert.Equal(JobState.Scheduled, (await store.GetJobAsync(root.JobId))!.State);
+    }
+
+    /// <summary>
+    /// Certifies that a member cycle raises <see cref="InvariantViolationException"/> carrying
+    /// <see cref="InvariantTrigger.WorkflowMemberCycle"/>, instead of falling back to insertion order.
+    /// The builder rejects a cycle, so one here proves the graph reached the store unvalidated. The
+    /// fallback still failed, but as a refused member insert, which names the symptom and not the cause.
+    /// </summary>
+    [Fact]
+    public async Task Clause_Workflow_MemberCycle_RaisesTheInvariant_AndInsertsNothing()
+    {
+        var store = await CreateStoreAsync();
+        var workflowId = Guid.NewGuid();
+        var first = WorkflowMember("first");
+        var second = WorkflowMember("second") with { Parents = [first.JobId] };
+        var cyclic = first with { Parents = [second.JobId] };
+
+        var violation = await Assert.ThrowsAsync<InvariantViolationException>(
+            () => store.EnqueueWorkflowAsync(Workflow(workflowId, [cyclic, second]), T0).AsTask());
+
+        Assert.Equal(InvariantTrigger.WorkflowMemberCycle, violation.Trigger);
+        Assert.Null(await store.GetJobAsync(first.JobId));
+        Assert.Null(await store.GetJobAsync(second.JobId));
     }
 
     /// <summary>
