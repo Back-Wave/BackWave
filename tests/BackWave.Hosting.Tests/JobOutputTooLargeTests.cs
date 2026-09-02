@@ -69,11 +69,12 @@ public sealed class SequencedOutputHandler(SequenceGate gate) : IJobHandler<Outp
 /// Worker Group - every healthy job on it stranded. It must dead-letter the offending job with a clear
 /// cause and leave the group claiming and executing.
 /// <para>
-/// Both store shapes are covered, because the rejection has two throw sites: the per-row check on the
-/// success-path output write (the In-Memory Store applies a batch row by row through it, so rows ahead of
-/// the offender are already written when it throws) and the adapters' whole-batch pre-scan (which rejects
-/// every row before writing any). A third test pins the row-by-row ordering rather than leaving it to a
-/// race, because the re-apply of an already-settled row is the one that comes back fenced out.
+/// Both store shapes are covered, because the rejection has two throw sites. The whole-batch pre-scan
+/// rejects every row before writing any, and every store that knows its own cap uses it - the four SQL
+/// adapters and the In-Memory Store. The per-row check on the success-path output write is what the
+/// interface default reaches, so rows ahead of the offender are already settled when it throws. A third
+/// test pins that row-by-row ordering rather than leaving it to a race, because the re-apply of an
+/// already-settled row is the one that comes back fenced out.
 /// </para>
 /// </summary>
 public class JobOutputTooLargeTests
@@ -87,10 +88,10 @@ public class JobOutputTooLargeTests
     private const int FencedOutEventId = 1208;
 
     [Fact]
-    public async Task OversizedOutput_OnThePerRowCheck_DeadLettersTheJobAndLeavesTheGroupHealthy()
+    public async Task OversizedOutput_AgainstTheStoresOwnCap_DeadLettersTheJobAndLeavesTheGroupHealthy()
     {
-        // The In-Memory Store has no batch override, so the batch applies row by row and the rejection
-        // comes from the per-row check that guards the success-path output write.
+        // The real store against its real bounds, with no test double in the path: the In-Memory Store
+        // pre-scans the batch against its own MaxOutputBytes and rejects every row before writing any.
         var store = new InMemoryJobStore(bounds: new StoreBounds { MaxOutputBytes = OutputCap });
         var barrier = new Barrier(2);
         await using var app = await StartGroupAsync(store, barrier, poolSize: 2);

@@ -146,8 +146,8 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
 
     /// <summary>
     /// When set, mirrors the adapters' batch Job Output pre-scan: an over-cap row rejects the WHOLE batch
-    /// before any row is written. The In-Memory Store has no batch override and applies rows one by one, so
-    /// this is the only way to exercise the adapter shape without a live database.
+    /// before any row is written. The In-Memory Store now pre-scans too, so this cap is for a test that
+    /// needs the shape without the store's own bounds - a cap the store does not know about.
     /// </summary>
     public int? BatchOutputCap { get; set; }
 
