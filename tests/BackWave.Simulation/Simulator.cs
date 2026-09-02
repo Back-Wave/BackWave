@@ -516,8 +516,14 @@ internal sealed record SimulationResult(
     /// <summary>Episodes that began as a never-healing permanent loss (issue 0069); a subset of Isolations.</summary>
     public int PermanentLosses { get; init; }
 
-    /// <summary>Crashes that discarded a non-empty outcome buffer — the buffer-loss-on-crash window (ADR 0035).</summary>
+    /// <summary>
+    /// Node exits that lost a non-empty outcome buffer - the buffer-loss window (ADR 0035). A crash always
+    /// loses one; a clean stop only when its hand-back flush faulted partway, since the stop flushes first.
+    /// </summary>
     public int OutcomeBufferDropped { get; init; }
+
+    /// <summary>Clean stops whose hand-back flushed a non-empty outcome buffer before relinquishing (ADR 0035).</summary>
+    public int OutcomeBufferFlushed { get; init; }
 
     /// <summary>
     /// Leases swept by ExpireLeases over the run — the migration mechanism. In an isolation regime with
@@ -796,9 +802,14 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     private long _steps;
     private int _crashes;
     private int _staleOutcomes;
-    // Crashes that discarded a non-empty outcome buffer (ADR 0035): the buffer-loss-on-crash window. Tallied
-    // off the Driver's buffered count at crash time — no rng, no hot-path instrumentation, battery untouched.
+    // Node exits that lost a non-empty outcome buffer (ADR 0035): the buffer-loss window. Every crash with a
+    // buffer, plus a clean stop whose hand-back flush faulted partway - both leave rows the fresh Driver will
+    // never see. Tallied off the Driver's buffered count at exit time - no rng, no hot-path instrumentation.
     private int _outcomeBufferDropped;
+    // Clean stops whose hand-back flushed a non-empty outcome buffer through the ordinary command path. The
+    // twin of the tally above: together they say whether the stop path's flush is actually being exercised,
+    // which a run with stops but no buffered rows would otherwise look identical to.
+    private int _outcomeBufferFlushed;
     private long? _mintScanCursor;
     private bool _schedulesRemoved;
     private IReadOnlyList<ScheduleSnapshot> _finalSchedules = [];
@@ -1194,6 +1205,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             Isolations = _isolations,
             PermanentLosses = _permanentLosses,
             OutcomeBufferDropped = _outcomeBufferDropped,
+            OutcomeBufferFlushed = _outcomeBufferFlushed,
             LeasesExpired = _leasesExpired,
             LeasesRelinquished = _leasesRelinquished,
             AckLosses = _ackLosses,
@@ -1739,6 +1751,15 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             // absorbed like any Drive so it neither aborts a sibling re-poll nor masks the cascade's fault.
             while (_pendingRePolls.TryDequeue(out var rp))
             {
+                // A node that went down DURING the cascade never obeys the re-poll it asked for: both pumps
+                // complete the event channel before the hand-back, so a re-poll queued behind a shutdown
+                // flush is never read. Only the clean stop can reach here (it is the one caller that drives
+                // a node it has just marked down), so this is a no-op for every other cascade - without it,
+                // a stopping node's flush would answer its own OutcomeReported by claiming fresh work.
+                if (_nodes[rp.Node].Down)
+                {
+                    continue;
+                }
                 try
                 {
                     DriveInner(rp.Node, new NodeEvent.PollDue(rp.At));
@@ -1885,28 +1906,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     break;
 
                 case Command.ReportOutcomeBatch batch:
-                    // Core-side coalescing (ADR 0035): the Driver buffered terminal outcomes and flushes
-                    // them as ONE command. The harness vectorizes the singular report — per row a pre-state
-                    // read, the per-(workerId, attempt) fence verdict, the Outcome-Provenance assertion, the
-                    // slot-release detection, then Drive(OutcomeReported). Each row consults the per-node
-                    // faulty store on the same "ReportOutcome" axis, so the store-fault stream is keyed
-                    // exactly as it was per single report (the buffer adds no draws); a row that faults
-                    // aborts the rest of the batch, and those leases lapse and reclaim (At-Least-Once, the
-                    // buffer-loss window modeled for free). The batch is applied synchronously — no new
-                    // SimEvent, so the determinism boundary is unchanged.
-                    //
-                    // SabotageBatchFence self-test (ADR 0035): model a native batch impl that fences single
-                    // reports correctly but applies a MULTI-row batch as a whole — without re-checking the
-                    // (workerId, attempt) fence per row. Drop the fence for every row of a >1 batch so a
-                    // stale row riding alongside live ones lands; the Outcome-Provenance oracle must catch it,
-                    // proving the vectorized fence is enforced per row. Single-row batches stay fenced, so
-                    // this is strictly the batched-path twin of the single-report SabotageOutcomeFence.
-                    var dropBatchFence = options.SabotageBatchFence && batch.Outcomes.Count > 1;
-                    foreach (var outcome in batch.Outcomes)
-                    {
-                        ReportOneOutcome(nodeIndex, outcome.JobId, outcome.WorkerId, outcome.Attempt,
-                            outcome.Outcome, dropFence: dropBatchFence);
-                    }
+                    RunOutcomeBatch(nodeIndex, batch);
                     break;
 
                 case Command.Heartbeat heartbeat:
@@ -1995,6 +1995,37 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 Drive(nodeIndex, new NodeEvent.ExecutionUnroutable(
                     job, "unroutable: no handler for sim-job", NodeNow(nodeIndex)));
             }
+        }
+    }
+
+    /// <summary>
+    /// Core-side coalescing (ADR 0035): the Driver buffered terminal outcomes and flushes them as ONE
+    /// command. The harness vectorizes the singular report — per row a pre-state read, the
+    /// per-(workerId, attempt) fence verdict, the Outcome-Provenance assertion, the slot-release detection,
+    /// then Drive(OutcomeReported). Each row consults the per-node faulty store on the same "ReportOutcome"
+    /// axis, so the store-fault stream is keyed exactly as it was per single report (the buffer adds no
+    /// draws); a row that faults aborts the rest of the batch, and those leases lapse and reclaim
+    /// (At-Least-Once, the buffer-loss window modeled for free). The batch is applied synchronously — no new
+    /// SimEvent, so the determinism boundary is unchanged.
+    ///
+    /// Its own method because the clean-stop hand-back in <see cref="Stop"/> flushes through it too, exactly
+    /// as production's HandBackAsync flushes through the ordinary command path rather than a shutdown-only
+    /// one - a shutdown flush that skipped the fence, the oracles or the fault gate would be a second, weaker
+    /// report path the sim would then be silently blessing.
+    ///
+    /// SabotageBatchFence self-test (ADR 0035): model a native batch impl that fences single reports
+    /// correctly but applies a MULTI-row batch as a whole — without re-checking the (workerId, attempt) fence
+    /// per row. Drop the fence for every row of a >1 batch so a stale row riding alongside live ones lands;
+    /// the Outcome-Provenance oracle must catch it, proving the vectorized fence is enforced per row.
+    /// Single-row batches stay fenced, so this is strictly the batched-path twin of SabotageOutcomeFence.
+    /// </summary>
+    private void RunOutcomeBatch(int nodeIndex, Command.ReportOutcomeBatch batch)
+    {
+        var dropBatchFence = options.SabotageBatchFence && batch.Outcomes.Count > 1;
+        foreach (var outcome in batch.Outcomes)
+        {
+            ReportOneOutcome(nodeIndex, outcome.JobId, outcome.WorkerId, outcome.Attempt,
+                outcome.Outcome, dropFence: dropBatchFence);
         }
     }
 
@@ -2234,7 +2265,9 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         var node = _nodes[nodeIndex];
         // The crash discards the Driver's outcome buffer (Restart installs a fresh Driver): if it held
         // unflushed outcomes, this is the buffer-loss-on-crash window (those leases lapse and reclaim —
-        // At-Least-Once). Tally it for the coverage Situation before the buffer is gone.
+        // At-Least-Once). Tally it for the coverage Situation before the buffer is gone. This is the DISCARD
+        // path and stays one: a crashed process gets no hand-back, which is the whole difference between it
+        // and the clean stop in Stop.
         if (node.Driver.BufferedOutcomeCount > 0)
         {
             _outcomeBufferDropped++;
@@ -2247,10 +2280,25 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     }
 
     /// <summary>
-    /// A clean stop: the node hands its Leases back in one store call and then goes down exactly as a crash
-    /// does, restarting on the same downtime draw. The relinquish rides the shared store-fault axis and is
-    /// all-or-nothing, because the real statement is one UPDATE in one transaction; when it faults the
-    /// node's Leases simply lapse on expiry, which is the behaviour that predates the feature.
+    /// A clean stop: the node runs production's hand-back - flush the Driver's buffered outcomes, THEN
+    /// relinquish the Leases it still holds - and then goes down exactly as a crash does, restarting on the
+    /// same downtime draw. The order is the whole point and is why the flush cannot be modelled as a crash:
+    /// relinquishing first would clear the very Leases the buffered rows are fenced on, so every one of them
+    /// would land StaleLease and the work would be redone. Both steps spend one shutdown budget in
+    /// production; the sim has no budget to run out, so it models the sequence, not the clock.
+    ///
+    /// What is NOT modelled: production also waits for in-flight executions between the two steps. The sim
+    /// drops in-flight work at the stop (<c>Executing.Clear()</c>) exactly as it always has - the relinquish
+    /// hands those Leases straight back, which is the stronger, earlier reclaim, so the oracles' bounds still
+    /// hold and no liveness claim rests on the wait.
+    ///
+    /// Both steps ride this node's own faulting store, exactly like every other call the node makes. That
+    /// gate faults on a drawn store fault OR on isolation, and an isolated node cannot reach the store at
+    /// all - a hand-rolled StoreShouldFault check would let it write from behind the partition. A faulted
+    /// flush loses the rows behind it (the Driver's buffer is already drained and Restart installs a fresh
+    /// one), which is the same buffer-loss window a crash opens and the same At-Least-Once reclaim closes; a
+    /// faulted relinquish leaves RelinquishLanded false and the Leases lapse, the behaviour that predates the
+    /// feature.
     ///
     /// The N-1 budget refuses a stop that would take the last live node, in the shape
     /// <see cref="IsolationScheduler.TryBegin"/> uses: a crashed node counts as not live, so crashes and
@@ -2264,16 +2312,44 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         {
             return;
         }
-        // Route the relinquish through this node's own faulting store, exactly like every other call the
-        // node makes. That gate faults on a drawn store fault OR on isolation, and an isolated node cannot
-        // reach the store at all - a hand-rolled StoreShouldFault check would let it write from behind the
-        // partition. A fault leaves RelinquishLanded false and the Leases lapse, which is today's behaviour.
+        // Down BEFORE the hand-back, not after. The flush drives OutcomeReported back into the Driver, which
+        // answers an applied row with a re-poll; production never obeys that one, because the pump completes
+        // its event channel before HandBackAsync. Marking the node down first is what makes the sim's re-poll
+        // drain drop it, so a stopping node cannot claim fresh work on its way out the door.
+        node.StoppedAt = _now;
+        node.Epoch++;
+        node.Executing.Clear();
+
+        // 1. The buffered outcomes, through the ordinary command path (RunOutcomeBatch), so the fence, the
+        //    Outcome-Provenance oracle and the slot-release detector all see them exactly as they see a
+        //    poll-tick flush. Reporting first is what saves the work: these rows are terminal, and a Lease
+        //    handed back before them would fence every one of them out.
+        if (node.Driver.DrainBufferedOutcomes() is { } pending)
+        {
+            try
+            {
+                RunOutcomeBatch(nodeIndex, pending);
+                _outcomeBufferFlushed++;
+            }
+            catch (SimTransientFault)
+            {
+                // The rows behind the faulted one are gone with the Driver - the buffer-loss window, reached
+                // by a clean stop this time rather than a crash. Same tally, same At-Least-Once reclaim.
+                _outcomeBufferDropped++;
+            }
+        }
+
+        // 2. The relinquish. Fenced store-side on this node's worker identity and the Leased state, so
+        //    anything the flush just settled is already out of its reach - the same reason production runs
+        //    them in this order.
         node.RelinquishLanded = false;
         if (options.SabotageRelinquishSkip)
         {
             // The pre-feature world: the stop writes nothing and the Leases lapse on expiry. The call counts
             // as landed, not faulted, because the oracle disarms on a faulted relinquish and this self-test
-            // needs it armed. Guarded so the knob takes no draw and the determinism battery holds.
+            // needs it armed. Guarded so the knob takes no draw and the determinism battery holds. It skips
+            // the relinquish only - the flush above is a different production step, and suppressing it too
+            // would make the self-test prove something wider than the bound it is aimed at.
             node.RelinquishLanded = true;
         }
         else
@@ -2288,15 +2364,6 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             {
             }
         }
-        // A stop discards the Driver's outcome buffer for the same reason a crash does: Restart installs a
-        // fresh Driver, so anything unflushed is gone. Tally it before the buffer is.
-        if (node.Driver.BufferedOutcomeCount > 0)
-        {
-            _outcomeBufferDropped++;
-        }
-        node.StoppedAt = _now;
-        node.Epoch++;
-        node.Executing.Clear();
         Schedule(_now + _rng.NextTimeSpan(options.MaxCrashDowntime), new SimEvent(EventKind.Restart, nodeIndex, 0, null, false));
     }
 

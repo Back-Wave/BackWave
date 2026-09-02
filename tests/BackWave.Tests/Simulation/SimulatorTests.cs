@@ -957,6 +957,45 @@ public class SimulatorTests
     }
 
     /// <summary>
+    /// The clean stop models production's hand-back, and the ORDER is the claim: flush the Driver's
+    /// buffered outcomes first, relinquish the Leases second. Relinquishing first would clear the very
+    /// Leases those buffered rows are fenced on, so every one of them would come back StaleLease and the
+    /// work would be redone - which is why the pump spends one budget on the two steps in this order.
+    ///
+    /// Pinned with the loss axes off: no crashes and no store faults means nothing may be lost on the way
+    /// out, so a flush that happened and a drop tally of zero together say the buffered rows LANDED rather
+    /// than merely being drained. Reported outcomes are not distinguishable by count alone, hence the pair.
+    ///
+    /// Hand-picked seeds because the window is genuinely narrow: the Driver only holds outcomes while other
+    /// executions are still in flight and only until the next poll tick, so a stop has to land inside a
+    /// sub-second gap. Frequent stops over a dense ten-minute workload make it reachable at all - of the
+    /// first twelve seeds exactly these four stop inside it. Any of them losing its flush means the model
+    /// moved, which is the whole point of naming them.
+    /// </summary>
+    [Theory]
+    [InlineData(1UL)]
+    [InlineData(3UL)]
+    [InlineData(4UL)]
+    [InlineData(7UL)]
+    public void CleanStop_FlushesTheOutcomeBuffer_BeforeItRelinquishes(ulong seed)
+    {
+        var result = new Simulator(new SimulationOptions
+        {
+            Seed = seed,
+            StopCount = 40,                                    // stop often; the flush window is narrow
+            WorkloadDuration = TimeSpan.FromMinutes(10),       // and dense work is what keeps rows buffered
+            CrashProbabilityPerPoll = 0,   // a crash is the DISCARD path, the opposite of the one under test
+            HeartbeatLossProbability = 0,
+            StoreFaultProbability = 0,     // a faulted flush loses rows by design; keep that axis out
+        }).Run();
+
+        Assert.True(result.OutcomeBufferFlushed > 0, $"seed {seed}: no clean stop ever flushed a buffered outcome");
+        Assert.Equal(0, result.OutcomeBufferDropped);          // nothing may be lost with both loss axes off
+        Assert.True(result.LeasesRelinquished > 0, $"seed {seed}: no clean stop ever reached the store");
+        Assert.Equal(200, result.Succeeded + result.DeadLettered + result.Cancelled + result.Quarantined);
+    }
+
+    /// <summary>
     /// Named scenario: ack-loss isolation (issue 0070, Phase 1.5). On a selected outcome the store write
     /// COMMITS but the node's ack is lost, so the node believes the report failed and re-reports once it is
     /// back — by which point the store has moved on (a committed Failure became due and a survivor
