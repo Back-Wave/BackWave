@@ -108,6 +108,26 @@ internal static partial class BackWaveLog
         Message = "Worker group '{worker_group}' could not give its work back on shutdown; its leases will lapse instead.")]
     internal static partial void ShutdownHandBackFailed(ILogger logger, string worker_group, Exception exception);
 
+    // The hand-back waits out the executions still running before it relinquishes their leases, so a
+    // handler that ignores its cancellation token cannot still be running while another node takes the
+    // job over. This is the wait not finishing inside the budget: named at Warning because it points at
+    // a handler that does not honor its token, and best-effort like the rest of the hand-back - the
+    // leases are relinquished anyway.
+    [LoggerMessage(EventId = 1207, Level = LogLevel.Warning,
+        Message = "Worker group '{worker_group}' still had {running_count} execution(s) running when its shutdown "
+            + "budget ran out; relinquishing their leases anyway.")]
+    internal static partial void ShutdownDrainIncomplete(
+        ILogger logger, string worker_group, int running_count, Exception exception);
+
+    // An outcome the store's identity fence refused on a lease this pump had already watched lapse, or on
+    // a row a Job Output re-apply had settled on an earlier pass. Both are ordinary races, so this is
+    // Debug and carries no invariant counter; the fence answer that CONTRADICTS a lease the pump still
+    // believes live is the impossible state, and that one degrades through Invariant instead.
+    [LoggerMessage(EventId = 1208, Level = LogLevel.Debug,
+        Message = "Outcome for job {job_id} (attempt {attempt}) was fenced out by the store; its lease was no "
+            + "longer this worker's to report on.")]
+    internal static partial void OutcomeFencedOut(ILogger logger, Guid job_id, int attempt);
+
     [LoggerMessage(EventId = 1301, Level = LogLevel.Warning,
         Message = "Worker group '{worker_group}' hit a transient store fault; retrying on the next tick.")]
     internal static partial void StoreFaultTransientRetry(ILogger logger, string worker_group, Exception exception);
