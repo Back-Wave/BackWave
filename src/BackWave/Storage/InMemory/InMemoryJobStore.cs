@@ -826,6 +826,37 @@ public sealed class InMemoryJobStore(
     }
 
     /// <inheritdoc/>
+    public async ValueTask<IReadOnlyList<OutcomeReportResult>> ReportOutcomesAsync(
+        IReadOnlyList<OutcomeReport> batch, DateTimeOffset now, CancellationToken cancellationToken = default)
+    {
+        // The override buys no throughput here - it buys the batch SHAPE. Job Output over MaxOutputBytes
+        // (ADR 0026) is the one per-row failure that throws instead of reporting a result, and this store
+        // knows its own cap, so the Storage Contract holds it to the strict shape: scan EVERY row before
+        // touching anything, so a rejected batch leaves nothing applied. That matches the four SQL
+        // adapters; only the interface default, which cannot learn a store's cap without attempting the
+        // write, settles the rows ahead of the offending one.
+        foreach (var row in batch)
+        {
+            if (row.Outcome is JobOutcome.Success && row.Output is { } blob
+                && blob.Length > _bounds.MaxOutputBytes)
+            {
+                throw new JobOutputTooLargeException(row.JobId, blob.Length, _bounds.MaxOutputBytes);
+            }
+        }
+
+        var results = new OutcomeReportResult[batch.Count];
+        for (var i = 0; i < batch.Count; i++)
+        {
+            var row = batch[i];
+            var result = await ReportOutcomeAsync(
+                row.JobId, row.WorkerId, row.Attempt, row.Outcome, now,
+                row.FailureDetail, row.AddedTags, row.Output, cancellationToken).ConfigureAwait(false);
+            results[i] = new OutcomeReportResult(row.JobId, result);
+        }
+        return results;
+    }
+
+    /// <inheritdoc/>
     public ValueTask<IReadOnlyList<HeartbeatResult>> HeartbeatAsync(
         string workerId,
         IReadOnlyList<Guid> jobIds,

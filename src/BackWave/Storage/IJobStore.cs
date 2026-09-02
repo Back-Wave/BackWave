@@ -169,12 +169,26 @@ public interface IJobStore
     /// in a single fenced round-trip for throughput, provided it preserves the per-row fence and per-row
     /// semantics verbatim. An empty batch applies nothing and returns an empty list.
     /// </para>
+    /// <para>
+    /// Over-cap output is the one per-row failure that surfaces as a THROW instead of a per-row result, so
+    /// the contract fixes what the REST of the batch sees. A store that can spot the over-cap row before
+    /// writing - it knows its own output cap - MUST pre-scan the whole batch and throw before applying ANY
+    /// row, leaving the store untouched; every shipped store does this. The default implementation cannot:
+    /// it has no way to learn a store's output cap short of attempting the write, so it applies the rows
+    /// ahead of the offending one and throws on reaching it. Applied there means applied in full - state
+    /// written, transition appended, tags unioned, output persisted, child latches resolved - and each of
+    /// those rows has spent its <c>(WorkerId, Attempt)</c> fence, so re-reporting one comes back
+    /// <see cref="OutcomeResult.StaleLease"/> rather than applying a second time. Both shapes are legal, so
+    /// a caller that catches <see cref="JobOutputTooLargeException"/> MUST tolerate a partially applied
+    /// batch: it may re-submit the batch with the offending row corrected, but MUST read a returned
+    /// <see cref="OutcomeResult.StaleLease"/> as already settled, never as lost.
+    /// </para>
     /// </summary>
     /// <param name="batch">The outcome rows to apply, each carrying its own job id, worker id, attempt, outcome, and optional failure detail, tag delta, and output.</param>
     /// <param name="now">The current instant, used for every transition timestamp and any time-dependent decision (the store must not read its own clock).</param>
     /// <param name="cancellationToken">Cancels the operation.</param>
     /// <returns>One result per input row, in the same order, each pairing the row's job id with whether its outcome was <see cref="OutcomeResult.Applied"/> or fenced out as <see cref="OutcomeResult.StaleLease"/>.</returns>
-    /// <exception cref="JobOutputTooLargeException">A success row carried output larger than the store's output cap; that write is rejected, never truncated.</exception>
+    /// <exception cref="JobOutputTooLargeException">A success row carried output larger than the store's output cap; that write is rejected, never truncated. Whether the rows ahead of it in the batch were already applied depends on the store - see the batch-shape rule above.</exception>
     async ValueTask<IReadOnlyList<OutcomeReportResult>> ReportOutcomesAsync(
         IReadOnlyList<OutcomeReport> batch, DateTimeOffset now, CancellationToken cancellationToken = default)
     {

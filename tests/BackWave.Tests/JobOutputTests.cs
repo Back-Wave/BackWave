@@ -139,6 +139,47 @@ public class JobOutputTests
         Assert.Null(await store.GetJobOutputAsync(claimed.JobId));
     }
 
+    /// <summary>
+    /// The batch shape of the same rejection (§5.6b): this store knows its own cap, so it pre-scans the
+    /// WHOLE batch and throws before touching anything, the strict shape the four SQL adapters take. The
+    /// row ahead of the offender must come out UNSETTLED - still Leased, its (worker, attempt) fence
+    /// unspent, so re-reporting it applies rather than coming back StaleLease. Only the interface default,
+    /// which cannot learn a store's cap without attempting the write, settles the earlier rows.
+    /// </summary>
+    [Fact]
+    public async Task OverMaxOutputBytes_InABatch_LeavesTheRowsAheadOfItUnsettled()
+    {
+        var store = new InMemoryJobStore(bounds: new StoreBounds { MaxOutputBytes = 16 });
+        Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(Job(), T0));
+        Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(Job(), T0));
+        var claimed = await store.ClaimAsync(Claim("w1", T0));
+        Assert.Equal(2, claimed.Count);
+
+        // Row 0 is clean; row 1 blows the cap.
+        OutcomeReport[] batch =
+        [
+            new(claimed[0].JobId, "w1", claimed[0].Attempt, new JobOutcome.Success()),
+            new(claimed[1].JobId, "w1", claimed[1].Attempt, new JobOutcome.Success())
+            {
+                Output = new ReadOnlyMemory<byte>(new byte[17]),
+            },
+        ];
+
+        var ex = await Assert.ThrowsAsync<JobOutputTooLargeException>(async () =>
+            await store.ReportOutcomesAsync(batch, T0));
+        Assert.Equal(claimed[1].JobId, ex.JobId);
+
+        Assert.Equal(JobState.Leased, (await store.GetJobAsync(claimed[0].JobId))!.State);
+        Assert.Equal(JobState.Leased, (await store.GetJobAsync(claimed[1].JobId))!.State);
+        Assert.Null(await store.GetJobOutputAsync(claimed[0].JobId));
+
+        // The unspent fence, proven: row 0 still applies on a re-report.
+        Assert.Equal(
+            OutcomeResult.Applied,
+            await store.ReportOutcomeAsync(
+                claimed[0].JobId, "w1", claimed[0].Attempt, new JobOutcome.Success(), T0));
+    }
+
     [Fact]
     public async Task OutputAtExactBound_IsAccepted()
     {
