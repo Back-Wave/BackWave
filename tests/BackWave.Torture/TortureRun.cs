@@ -55,7 +55,20 @@ internal static class TortureRun
         {
             await RunInProcessClientsAsync(target, keys, options, journal, started, timebox.Token);
         }
-        await midRunLoop;
+        // The mid-run pass drives the same adapter the clients do, so its own reads can trip the same
+        // production fail-stop triggers. Caught here for the same reason the drain and the audit below are:
+        // an unguarded await would crash the process and the run would report nothing and write no bundle.
+        try
+        {
+            await midRunLoop;
+        }
+        catch (InvariantViolationException violation)
+        {
+            midRunViolations.Add(new TortureViolation(
+                TortureInvariant.HaltTriggerFired,
+                $"Halt trigger {violation.Trigger} fired during the mid-run audit - a production worker group " +
+                $"would have fail-stopped: {violation.Message}"));
+        }
         var workloadSeconds = wall.Elapsed.TotalSeconds;
 
         var entries = journal.Entries;
