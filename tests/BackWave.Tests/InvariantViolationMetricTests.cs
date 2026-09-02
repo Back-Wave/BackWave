@@ -13,9 +13,15 @@ namespace BackWave.Tests;
 /// </summary>
 public class InvariantViolationMetricTests
 {
+    /// <summary>
+    /// One row per action, each pinned to a trigger a real site raises THAT way: the Worker Group pump
+    /// halts on <see cref="InvariantTrigger.ClaimedJobTerminal"/>, and every adapter's observer-report
+    /// fence degrades on <see cref="InvariantTrigger.ObserverReportFenceRejected"/>. A hand-picked pairing
+    /// no site produces would pin only the tag encoding while reading like a claim about the product.
+    /// </summary>
     [Theory]
     [InlineData(InvariantTrigger.ClaimedJobTerminal, "Halt")]
-    [InlineData(InvariantTrigger.ObserverCursorRegressed, "Degrade")]
+    [InlineData(InvariantTrigger.ObserverReportFenceRejected, "Degrade")]
     public void RecordInvariantViolation_CountsOne_TaggedByTriggerNameAndAction(
         InvariantTrigger trigger, string action)
     {
