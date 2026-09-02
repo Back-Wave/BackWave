@@ -219,8 +219,8 @@ A worker's time-bounded, heartbeat-renewed claim on a job. Expiry makes the job 
 _Avoid_: Lock (a lease expires on its own; a lock implies indefinite ownership)
 
 **Relinquish**:
-Giving a live Lease back on purpose, the clean-shutdown counterpart of expiry: a stopping worker hands its in-flight jobs to the store at once instead of parking them for the rest of the Lease duration. The job returns to Ready immediately (no retry backoff, because a clean stop is not a failure) at the Attempt the claim already charged, so relinquishing costs exactly what letting the Lease lapse costs today, and the attempt ceiling still dead-letters a job that has had enough tries. Best-effort: a failed hand-back degrades to the lapse and never blocks the host from exiting.
-_Avoid_: Release (that word belongs to the Concurrency-Limit slot), return, give up, abandon
+Giving a live Lease back on purpose, the clean-shutdown counterpart of expiry: a stopping worker hands its in-flight jobs to the store at once instead of parking them for the rest of the Lease duration. The job returns to Scheduled immediately (no retry backoff, because a clean stop is not a failure) at the Attempt the claim already charged, so relinquishing costs exactly what letting the Lease lapse costs today, and the attempt ceiling still dead-letters a job that has had enough tries. Best-effort: a failed hand-back degrades to the lapse and never blocks the host from exiting.
+_Avoid_: Release (that word belongs to the Concurrency-Limit slot), return the Lease (only the act is off-limits - the job itself still returns to Scheduled, as a requeued job does), give up, abandon
 
 **Attempt**:
 One execution try of a job, numbered and visible to the handler. A lease expiry counts as an attempt, the same as a thrown exception.

@@ -240,7 +240,7 @@ public interface IJobStore
     /// <paramref name="workerId"/> AND whose state is still Leased, so a job that already reported an
     /// outcome (and therefore left the Leased state) is never revived. The Attempt is left UNCHANGED,
     /// because the claim already counted it - relinquishing costs exactly what letting the lease lapse
-    /// costs today. Each relinquished job returns to Ready at <paramref name="now"/>, skipping the
+    /// costs today. Each relinquished job returns to Scheduled at <paramref name="now"/>, skipping the
     /// retry backoff because a clean stop is not a failure, except that a job whose attempt ceiling is
     /// already reached (<paramref name="disposition"/> yields no next attempt) is Dead-Lettered instead,
     /// exactly as an expired lease would be. Implementations MUST append one transition per affected
