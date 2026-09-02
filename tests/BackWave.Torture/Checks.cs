@@ -159,6 +159,29 @@ internal static class Checks
     }
 
     /// <summary>
+    /// The Degrade half of the fail-stop vocabulary: counted, not thrown. <see cref="DegradeWatch"/>
+    /// subscribes to <c>backwave.invariant.violations</c> and journals each one, because that counter is the
+    /// only surface a degraded trigger reaches. Grouped by trigger id for the same reason the halt check is -
+    /// a finding must name the invariant that broke, not merely say that one did.
+    ///
+    /// Deliberately NOT part of <see cref="LiveJournal"/>: a run calls this once, over the whole journal, at
+    /// the very end. Folding it in would report the same degrade twice (the mid-run pass and the post-drain
+    /// audit both run LiveJournal over their own prefix) and would still miss the two windows that matter -
+    /// a run cut short by a mid-run finding never audits, and the audit's view is pinned before the drain, so
+    /// a trigger degraded BY the drain or the audit falls outside it.
+    /// </summary>
+    public static void DegradedTriggers(IReadOnlyList<JournalEntry> journal, ViolationSink sink)
+    {
+        foreach (var group in journal.Where(e => e.Op == Ops.InvariantDegrade).GroupBy(e => e.Result))
+        {
+            sink.Add(new TortureViolation(
+                TortureInvariant.DegradeTriggerFired,
+                $"Degrade trigger {group.Key} fired {group.Count()} time(s) - a production worker group would " +
+                "have counted it and stayed in service, but the state it names must not have been reachable."));
+        }
+    }
+
+    /// <summary>
     /// The journal-only checks. They read nothing but the journal, and the journal only ever grows,
     /// so a verdict taken over a prefix stays true - which is what makes them safe to run mid-run.
     /// The checks that compare the journal against separately-read store state are NOT here; they

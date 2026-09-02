@@ -93,7 +93,16 @@ EnqueueDurability (accepted ⇒ present; present ⇒ accepted), TagDurability (a
 survive), RawStoreException (a raw provider exception escaping the store surface is itself a
 finding), HaltTriggerFired (an adapter raised the production `InvariantViolationException`, which in
 production takes the worker group out of service; the finding names the tripped `InvariantTrigger`),
-ClientCrash.
+DegradeTriggerFired, ClientCrash.
+
+The Degrade half of the fail-stop vocabulary throws nothing — the site counts the impossible state and
+carries on down its benign branch — and every adapter site passes a null logger, so the
+`backwave.invariant.violations` counter is the only surface it reaches. `DegradeWatch` subscribes to that
+counter (in the parent and in each SQLite child process, whose journal is merged home) and journals every
+Degrade measurement by trigger id; the run sweeps the whole journal for them once, at the end, and goes RED.
+Degrading keeps a production node in service; it does not make the state legal, and the suite has no benign
+branch. Halt measurements are ignored there on purpose: they are emitted by the Hosting pump, which no
+torture process runs, and the throw that provoked them is already journaled by the client that saw it.
 
 ## Mid-run audit pass
 
@@ -114,7 +123,9 @@ SlotDoubleRelease, OutcomeProvenance.
 
 Held back to post-drain (each compares two sources read at different instants, and `WorkloadClient`
 journals *after* the store call returns): DrainLiveness, TerminalStable, NoAwaitingParentOrphan,
-EnqueueDurability, NoOverlap, ConcurrencyLimit.
+EnqueueDurability, NoOverlap, ConcurrencyLimit. DegradeTriggerFired is held back for a different reason: it
+is swept once over the whole journal at the end, so it cannot be double-reported by two passes over
+overlapping prefixes, and so the drain and the audit are themselves covered.
 
 The pass is a net, never a replacement: the post-drain audit still runs in full and remains the
 complete one. On the first mid-run violation the run **fails fast** - the time box is cut short, the

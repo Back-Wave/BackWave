@@ -94,6 +94,10 @@ internal static class UpgradeRun
         }
 
         var journal = new Journal();
+        // A degraded trigger throws nothing and no adapter site holds a logger, so the
+        // backwave.invariant.violations counter is its only surface. Armed from the migration onward: an
+        // upgraded store serving live traffic is exactly where an impossible state would first show up.
+        using var degrades = new DegradeWatch(journal, "upgrade-run");
         var populator = new UpgradePopulator(store, keys);
         await populator.PopulateAsync(priorVersion, journal, cancellationToken);
 
@@ -154,6 +158,7 @@ internal static class UpgradeRun
         var auditor = new Auditor(store.CreateStore(), keys, options2);
         await auditor.AuditAsync(journal.Entries, postDrain, cancellationToken);
         postDrain.AddRange(await store.RawAuditAsync(cancellationToken));
+        Checks.DegradedTriggers(journal.Entries, postDrain);
         var violations = new List<TortureViolation>(drainViolations.Snapshot());
         violations.AddRange(postDrain.Snapshot());
 

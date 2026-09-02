@@ -37,6 +37,10 @@ internal static class TortureRun
 
         var started = DateTimeOffset.UtcNow;
         var journal = new Journal();
+        // Nothing else in this process can see a degraded trigger: it throws nothing and every adapter site
+        // passes a null logger, so the backwave.invariant.violations counter is its only surface. Subscribed
+        // for the whole run - the drain and the audit included, since those drive the adapter too.
+        using var degrades = new DegradeWatch(journal, "torture-run");
         var wall = Stopwatch.StartNew();
 
         // One time box for the whole workload, shared by the clients, the progress line and the
@@ -121,6 +125,14 @@ internal static class TortureRun
             violations.AddRange(postDrain.Snapshot());
         }
 
+        // The Degrade sweep, once, over the WHOLE journal - this process's counted triggers and every child
+        // process's alike. It runs on both branches and after the drain on purpose: the fail-fast branch
+        // never reaches an audit, and the audit's journal view is pinned before the drain, so a trigger
+        // degraded by the drain or the audit itself would be invisible to either.
+        var degradeFindings = new ViolationSink(TorturePhase.PostDrain);
+        Checks.DegradedTriggers(journal.Entries, degradeFindings);
+        violations.AddRange(degradeFindings.Snapshot());
+
         var stats = new WorkloadStats(entries, keys);
         Console.WriteLine(stats.Render());
 
@@ -154,8 +166,10 @@ internal static class TortureRun
             }
         }
 
+        // journal.Entries, not the pinned `entries`: the bundle should carry everything recorded, including a
+        // trigger degraded during the drain or the audit, whose finding is in violations.json either way.
         var bundle = await ArtifactWriter.WriteAsync(
-            options, entries, violations, auditor, postDrainAbsent, target, stats, midRun, CancellationToken.None);
+            options, journal.Entries, violations, auditor, postDrainAbsent, target, stats, midRun, CancellationToken.None);
         Console.WriteLine($"torture: artifact bundle → {bundle}");
         Console.WriteLine("torture: file the finding as torture-NNNN and distill every confirmed bug into a deterministic");
         Console.WriteLine("torture: Conformance clause (docs/adapter-concurrency-review-checklist.md, 0196 pattern).");
@@ -284,6 +298,9 @@ internal static class TortureRun
         var keys = new KeySpace(seed);
         var started = new DateTimeOffset(startedTicks, TimeSpan.Zero);
         var journal = new Journal();
+        // The counter is per-process, so the parent's watch cannot see this process's degraded triggers.
+        // Journaling them here is what carries them home: this journal is merged into the parent's.
+        using var degrades = new DegradeWatch(journal, $"child-{clientBase}");
         await using var target = new SqliteTarget(dbPath, migrate: false);
 
         try

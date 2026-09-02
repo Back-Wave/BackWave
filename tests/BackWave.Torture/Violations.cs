@@ -40,6 +40,15 @@ internal static class TortureInvariant
     /// <c>InvariantTrigger</c>, so the ledger says which invariant broke and not merely that one did.
     /// </summary>
     public const string HaltTriggerFired = "HaltTriggerFired";
+
+    /// <summary>
+    /// The Degrade half of the same vocabulary: a site detected a state its invariants forbid, counted it
+    /// and carried on down its benign branch. Nothing is thrown and no adapter site holds a logger, so
+    /// <see cref="DegradeWatch"/> reads the <c>backwave.invariant.violations</c> counter for it. Degrading
+    /// keeps a production node in service; it does not make the state legal, and the suite has no benign
+    /// branch - the finding names the tripped <c>InvariantTrigger</c> just as the halt one does.
+    /// </summary>
+    public const string DegradeTriggerFired = "DegradeTriggerFired";
     public const string ClientCrash = "ClientCrash";
 }
 
