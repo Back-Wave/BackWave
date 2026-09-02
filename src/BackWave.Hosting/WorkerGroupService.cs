@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Data.Common;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Threading.Channels;
 using BackWave.Diagnostics;
 using BackWave.Driver;
@@ -9,6 +10,7 @@ using BackWave.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace BackWave.Hosting;
 
@@ -26,7 +28,8 @@ internal sealed class WorkerGroupService(
     IServiceScopeFactory scopeFactory,
     BackWaveHealth health,
     ILogger<WorkerGroupService> logger,
-    TimeProvider? clock = null) : BackgroundService
+    TimeProvider? clock = null,
+    IOptions<HostOptions>? hostOptions = null) : BackgroundService
 {
     // The pump owns the clock (§1): every instant stamped onto a Command (Claim, Heartbeat,
     // ExpireLeases, outcome reports) and every tick timestamp comes from here, so a host-registered
@@ -42,6 +45,33 @@ internal sealed class WorkerGroupService(
         // terminal Cancelled. Every other cancellation is a failure or a lapsed Lease.
         // </summary>
         public volatile bool OperatorCancelRequested;
+
+        // <summary>
+        // The fire-and-forget task running this Attempt, assigned the instant Task.Run hands it back (the
+        // task closes over this record, so it cannot be a ctor argument). The clean-stop hand-back awaits
+        // these under its budget before relinquishing, so a handler that does not honor its cancellation
+        // token cannot still be running while another node claims the very job it is running. The run
+        // task owns every failure path itself, so this only ever completes - awaiting it is a wait, not
+        // a rethrow. Written and read on the pump loop alone.
+        // </summary>
+        public Task Execution = Task.CompletedTask;
+
+        // <summary>
+        // The instant this pump believes its Lease on the job runs until: the expiry the claim handed
+        // back, pushed out again by every renewed heartbeat. Written on the pump loop (claim, heartbeat)
+        // and read on the threadpool as the execution settles, so it is held in ticks - a long reads and
+        // writes atomically where a 16-byte DateTimeOffset would tear. Zero means the claim named no
+        // expiry, which reads as "no belief" at the fence check: only a positive belief can contradict.
+        // </summary>
+        private long _leaseExpiryTicks = Job.LeaseExpiry?.UtcTicks ?? 0;
+
+        public DateTimeOffset? LeaseExpiry
+        {
+            get => Volatile.Read(ref _leaseExpiryTicks) is var ticks and not 0
+                ? new DateTimeOffset(ticks, TimeSpan.Zero)
+                : null;
+            set => Volatile.Write(ref _leaseExpiryTicks, value?.UtcTicks ?? 0);
+        }
     }
 
     private readonly ConcurrentDictionary<Guid, InFlight> _inFlight = new();
@@ -79,12 +109,14 @@ internal sealed class WorkerGroupService(
     // The pending settlement of each in-flight Attempt's process telemetry, keyed by (JobId, Attempt)
     // like the buffers above: its held-open process span (possibly null - the dead-letter METRIC is
     // independent of tracing, so an entry is stashed even with no ActivityListener) plus the Wire Name
-    // and Queue the settling report needs to tag the dead-letter counter. The settling outcome lands a
-    // retry-scheduled / dead-lettered event on the span before it stops. Stashed only when an outcome
-    // WILL report; an abandoned Attempt (a lost Lease, which reports nothing) closes its own span in the
-    // execution task with a lease-lost event instead. Drained by ReportOutcome so the map never leaks.
+    // and Queue the settling report needs to tag the dead-letter counter, plus the Lease expiry this pump
+    // still believed the Attempt held as it settled (the fence check at the report edge reads it). The
+    // settling outcome lands a retry-scheduled / dead-lettered event on the span before it stops. Stashed
+    // only when an outcome WILL report; an abandoned Attempt (a lost Lease, which reports nothing) closes
+    // its own span in the execution task with a lease-lost event instead. Drained by ReportOutcome so the
+    // map never leaks.
     // </summary>
-    private readonly ConcurrentDictionary<(Guid JobId, int Attempt), (Activity? Span, string WireName, string Queue)> _pendingProcessOutcomes = new();
+    private readonly ConcurrentDictionary<(Guid JobId, int Attempt), (Activity? Span, string WireName, string Queue, DateTimeOffset? LeaseExpiry)> _pendingProcessOutcomes = new();
     private readonly string _workerId = $"{Environment.MachineName}:{options.Name}:{Guid.NewGuid():N}";
 
     // <summary>0 = no poll pending, 1 = one queued; coalesces timer + hint polls (issue 0039).</summary>
@@ -112,6 +144,24 @@ internal sealed class WorkerGroupService(
     // Adaptive backoff runs only when a strictly larger ceiling is set: at or below the floor,
     // the fixed-cadence ticker governs polling exactly as before.
     private bool AdaptivePoll => options.MaxPollInterval > options.PollInterval;
+
+    // <summary>
+    // What the hand-back may actually spend: the configured ShutdownBudget, clamped so it cannot eat the
+    // host's whole stop window. HostOptions.ShutdownTimeout is how long the host waits for its hosted
+    // services to stop before it stops waiting - a hand-back that spends all of it turns the clean stop
+    // it exists to serve into a kill, mid-relinquish. Four fifths of the host's window is the ceiling,
+    // leaving the last fifth for the host to finish its own shutdown after the leases are given back.
+    // Absent the option (a pump constructed directly, as the tests do) the configured budget stands.
+    // </summary>
+    private TimeSpan EffectiveShutdownBudget
+    {
+        get
+        {
+            var hostTimeout = hostOptions?.Value.ShutdownTimeout ?? TimeSpan.Zero;
+            var ceiling = hostTimeout > TimeSpan.Zero ? hostTimeout * 0.8 : TimeSpan.MaxValue;
+            return options.ShutdownBudget < ceiling ? options.ShutdownBudget : ceiling;
+        }
+    }
 
     // <summary>
     // The classification boundary (ADR-0007 amendment): a transient store fault retries, an
@@ -305,13 +355,26 @@ internal sealed class WorkerGroupService(
                 }
             }
         }
+        catch (ChannelClosedException closed) when (closed.InnerException is { } carried)
+        {
+            // The event channel is how a fault raised OFF the pump loop reaches it: a dead ticker, a dead
+            // pacer, and an invariant violation thrown inside a handler all complete the writer with their
+            // own exception, and the reader raises it here once the queued events ahead of it have drained.
+            // The channel wraps it, but the halt site in ExecuteAsync - and the health report it writes -
+            // both read the trigger off the exception's own type, so unwrap it: left wrapped, every fault
+            // carried this way would read as unclassified on both surfaces.
+            ExceptionDispatchInfo.Capture(carried).Throw();
+        }
         finally
         {
+            // The pump loop has exited, so this group claims nothing more: give back what it holds. This
+            // runs BEFORE the writer is completed, because the hand-back flushes the Driver's buffered
+            // outcomes through the ordinary command path, which writes their OutcomeReported events to
+            // this very writer - a completed writer would refuse every one of them.
+            await HandBackAsync(driver, events.Writer, stoppingToken).ConfigureAwait(false);
             // Pump gone: close the channel so the tickers' writes no-op instead of
             // filling an unread buffer until host shutdown.
             events.Writer.TryComplete();
-            // The pump loop has exited, so this group claims nothing more: give back what it holds.
-            await HandBackAsync(driver, events.Writer, stoppingToken).ConfigureAwait(false);
             if (hints is not null)
             {
                 await hints.DisposeAsync().ConfigureAwait(false);
@@ -320,12 +383,14 @@ internal sealed class WorkerGroupService(
     }
 
     // <summary>
-    // The clean-stop hand-back: report the outcomes this pump had buffered, then relinquish the
-    // Leases it still holds so their jobs return to the queue now instead of waiting out the whole
-    // Lease duration on a node that is gone. Both steps spend ONE budget, in that order - reporting
-    // first saves the most work, and two independent timeouts could sum past the host's own shutdown
-    // timeout and turn a clean stop into a kill. stoppingToken is already cancelled by the time the
-    // pump exits, so the budget is the only token that can permit this work.
+    // The clean-stop hand-back: report the outcomes this pump had buffered, wait out the executions it
+    // still has running, then relinquish the Leases it still holds so their jobs return to the queue now
+    // instead of waiting out the whole Lease duration on a node that is gone. All three steps spend ONE
+    // budget, in that order - reporting first saves the most work, waiting comes before the relinquish so
+    // no job is handed to another node while this one is still running it, and three independent timeouts
+    // could sum past the host's own shutdown timeout and turn a clean stop into a kill. stoppingToken is
+    // already cancelled by the time the pump exits, so the budget is the only token that can permit this
+    // work.
     // One attempt, no retry: any failure (the budget running out included) is logged at Warning and
     // degrades to the Leases lapsing exactly as they do today, and never blocks the host from exiting.
     // </summary>
@@ -334,12 +399,13 @@ internal sealed class WorkerGroupService(
     {
         // Clean stops only. A pump that exits any other way is fail-stopping, and a halted pump writes
         // nothing more to the store: its Leases lapse and healthy nodes inherit the work.
-        if (!stoppingToken.IsCancellationRequested || options.ShutdownBudget <= TimeSpan.Zero)
+        var allowance = EffectiveShutdownBudget;
+        if (!stoppingToken.IsCancellationRequested || allowance <= TimeSpan.Zero)
         {
             return;
         }
 
-        using var budget = new CancellationTokenSource(options.ShutdownBudget);
+        using var budget = new CancellationTokenSource(allowance);
         try
         {
             // Through the ordinary command path, so the buffered Failure Detail, Tags, Output, and
@@ -348,6 +414,8 @@ internal sealed class WorkerGroupService(
             {
                 await ExecuteAsync(pending, events, budget.Token).ConfigureAwait(false);
             }
+
+            await DrainInFlightAsync(budget.Token).ConfigureAwait(false);
 
             // Fenced store-side on this pump's worker identity and the Leased state, so anything the
             // flush above just settled is already out of reach.
@@ -358,9 +426,46 @@ internal sealed class WorkerGroupService(
                 BackWaveLog.LeasesRelinquished(logger, options.Name, relinquished);
             }
         }
+        catch (InvariantViolationException)
+        {
+            // Ahead of the blanket catch below, exactly as in the pump loop: a named check proved an
+            // impossible state while giving the work back - every adapter raises one out of the
+            // relinquish path - and no store's fault classifier gets a say in whether that is retryable.
+            // Swallowed below it would read as a routine shutdown hiccup, leave the group green, and lose
+            // the trigger nothing else records. Thrown from this finally it supersedes the shutdown
+            // cancellation the pump was unwinding and reaches the one halt call site in ExecuteAsync,
+            // which classifies it off the exception exactly as it does an in-cycle violation.
+            throw;
+        }
         catch (Exception exception)
         {
             BackWaveLog.ShutdownHandBackFailed(logger, options.Name, exception);
+        }
+    }
+
+    // <summary>
+    // Wait out the executions this pump still has in flight, under the hand-back's budget. Their tokens
+    // are linked to stoppingToken, so the handlers were signalled the instant the stop began - but until
+    // now nothing waited for them, and a handler that does not honor its token would still be running
+    // while the relinquish below hands its job to another node, which would then run the same Attempt
+    // concurrently instead of after the Lease lapsed.
+    // Best-effort, like the rest of the hand-back: a handler that outlasts the budget is logged and its
+    // Lease relinquished anyway - today's behaviour - so this can never hold the host open past it.
+    // </summary>
+    private async Task DrainInFlightAsync(CancellationToken budget)
+    {
+        var running = _inFlight.Values.Select(flight => flight.Execution).ToArray();
+        if (running.Length == 0)
+        {
+            return;
+        }
+        try
+        {
+            await Task.WhenAll(running).WaitAsync(budget).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            BackWaveLog.ShutdownDrainIncomplete(logger, options.Name, running.Length, exception);
         }
     }
 
@@ -589,6 +694,11 @@ internal sealed class WorkerGroupService(
                 // independently; the store returns one result per row, and the Driver re-polls on each
                 // applied outcome (a released Dependency may be due this instant).
                 var reports = new List<OutcomeReport>(batch.Outcomes.Count);
+                // The Lease expiry this pump still believed each row held as its execution settled, kept
+                // positionally alongside the report it belongs to (the Storage Contract pairs results to
+                // reports by position too). Null where the pump had no belief to contradict. Read only by
+                // the fence check below.
+                var believedLeases = new DateTimeOffset?[batch.Outcomes.Count];
                 foreach (var outcome in batch.Outcomes)
                 {
                     _failureDetail.TryRemove((outcome.JobId, outcome.Attempt), out var rowDetail);
@@ -598,6 +708,9 @@ internal sealed class WorkerGroupService(
                     // (the disposition the Driver computed into this row's next-due time), then it stops.
                     if (_pendingProcessOutcomes.TryRemove((outcome.JobId, outcome.Attempt), out var span))
                     {
+                        // Indexed by reports.Count, which is this row's position the instant before it is
+                        // appended below.
+                        believedLeases[reports.Count] = span.LeaseExpiry;
                         BackWaveDiagnostics.CompleteProcess(span.Span, outcome.Outcome, span.WireName, span.Queue);
                         LogSettlement(outcome, span.WireName, span.Queue);
                     }
@@ -611,7 +724,7 @@ internal sealed class WorkerGroupService(
                         Output = rowHasOutput ? rowOutput : (ReadOnlyMemory<byte>?)null,
                     });
                 }
-                var batchResults = await ApplyOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false);
+                var (batchResults, reApplied) = await ApplyOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false);
                 // The Storage Contract is one result per input row, in input order, and the Driver pairs the
                 // two by position. A short or long answer means some row's outcome is silently unreported or
                 // misattributed, so stop before the Driver acts on a mispaired result.
@@ -626,14 +739,38 @@ internal sealed class WorkerGroupService(
                     var rowResult = batchResults[i];
                     if (rowResult.Result is OutcomeResult.StaleLease)
                     {
-                        // The store's identity fence refused this write: the Lease had already lapsed, been
-                        // taken over, or the row had moved on. A lost race, not a broken invariant - report it
-                        // so it stops being a silent drop.
-                        Invariant.Degrade(
-                            logger,
-                            InvariantTrigger.OutcomeFenceRejected,
-                            $"Outcome {reports[i].Outcome} for job {rowResult.JobId} (attempt {reports[i].Attempt}, " +
-                            $"worker '{reports[i].WorkerId}') was refused by the store's identity fence.");
+                        // The store's identity fence refused this write. Two ordinary races end here and
+                        // neither is a broken invariant: a Lease that lapsed before its outcome could be
+                        // reported (another node has since taken the job over, or this pump's own sweep
+                        // expired it), and a Job Output re-apply, where the rows the store already settled
+                        // on the rejected pass are fenced out by design. Both are logged at Debug and
+                        // counted nowhere - the invariant ledger is the surface a promotion rule reads FOR
+                        // ZEROS, so a healthy fleet that increments it makes the trigger meaningless.
+                        //
+                        // What no legal race produces is a fence that refuses a Lease this pump still
+                        // believes it holds: the store answered "not this worker's" about a Lease whose
+                        // expiry - as the claim set it and every renewed heartbeat pushed it out - is still
+                        // in the future by the pump's own clock. Only that contradiction is counted. The
+                        // belief is a lower bound (it advances only on renewals this pump saw), so the test
+                        // errs toward silence and never toward a false alarm.
+                        if (!reApplied && believedLeases[i] is { } until && now < until)
+                        {
+                            var detail =
+                                $"Outcome {reports[i].Outcome} for job {rowResult.JobId} (attempt {reports[i].Attempt}, " +
+                                $"worker '{reports[i].WorkerId}') was refused by the store's identity fence, but this " +
+                                $"pump's Lease on it runs to {until:o} and it is only {now:o}.";
+                            // Both events fire, and neither is redundant: 2003 is the only one that names
+                            // the worker group (nothing puts it on a log scope), and Invariant.Degrade is
+                            // the only thing that welds the 1601 log to the counter - a group-altitude site
+                            // that hand-rolled the pair is exactly the omission it exists to prevent.
+                            HostingLog.WorkerGroupDegradedByInvariant(
+                                logger, options.Name, InvariantTrigger.OutcomeFenceRejected.ToString(), detail);
+                            Invariant.Degrade(logger, InvariantTrigger.OutcomeFenceRejected, detail);
+                        }
+                        else
+                        {
+                            BackWaveLog.OutcomeFencedOut(logger, rowResult.JobId, reports[i].Attempt);
+                        }
                     }
                     events.TryWrite(new NodeEvent.OutcomeReported(rowResult.JobId, rowResult.Result, now));
                 }
@@ -650,6 +787,17 @@ internal sealed class WorkerGroupService(
                     throw new InvariantViolationException(
                         InvariantTrigger.HeartbeatBatchCountMismatch,
                         $"Heartbeat for {heartbeat.JobIds.Count} job(s) came back with {results.Count} result(s).");
+                }
+                foreach (var renewal in results)
+                {
+                    // Keep this pump's belief about its own Leases current: a renewed heartbeat pushed the
+                    // store-side expiry out by the duration it just asked for. The outcome fence check
+                    // reads this to tell an ordinary lapsed Lease from one it still holds; without it, a
+                    // job that outlives its original Lease window would look lapsed to us the whole time.
+                    if (renewal.Renewed && _inFlight.TryGetValue(renewal.JobId, out var renewed))
+                    {
+                        renewed.LeaseExpiry = now + heartbeat.LeaseDuration;
+                    }
                 }
                 events.TryWrite(new NodeEvent.HeartbeatCompleted(results, now));
                 break;
@@ -696,15 +844,17 @@ internal sealed class WorkerGroupService(
     // more. Each pass clears one distinct row's Output, so a row can never be rejected twice and the loop
     // is bounded by the row count; anything past that bound - or a rejection naming a job this batch never
     // sent - is unclassifiable and fail-stops the group exactly as before.
+    // ReApplied says whether any pass beyond the first ran, so the caller's fence check knows the
+    // StaleLease answers it is looking at are the ones this method's own re-apply produced.
     // </summary>
-    private async ValueTask<IReadOnlyList<OutcomeReportResult>> ApplyOutcomesAsync(
+    private async ValueTask<(IReadOnlyList<OutcomeReportResult> Results, bool ReApplied)> ApplyOutcomesAsync(
         List<OutcomeReport> reports, DateTimeOffset now, CancellationToken stoppingToken)
     {
         for (var pass = 0; ; pass++)
         {
             try
             {
-                return await store.ReportOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false);
+                return (await store.ReportOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false), pass > 0);
             }
             catch (JobOutputTooLargeException rejected) when (pass < reports.Count)
             {
@@ -746,7 +896,12 @@ internal sealed class WorkerGroupService(
                 // released in the run task below once the execution ends by any path. Tagged with this
                 // group's name so active joins to the per-group capacity gauge for headroom.
                 BackWaveDiagnostics.RecordWorkerSlotOccupied(job, options.Name);
-                _ = Task.Run(async () =>
+                // Kept on the flight so the clean-stop hand-back can wait this execution out before it
+                // relinquishes the Lease. Assigned right after Task.Run hands the task back rather than
+                // before the _inFlight insert above, because the task closes over the flight record - the
+                // sliver between the two leaves a hand-back that lands inside it waiting on nothing, which
+                // is exactly today's behaviour and no worse.
+                flight.Execution = Task.Run(async () =>
                 {
                     // Assigned inside the try below: the job is already in _inFlight, so anything that
                     // throws before the try (even telemetry) would skip the failure path, leak the pool
@@ -848,6 +1003,26 @@ internal sealed class WorkerGroupService(
                                     ? null
                                     : new NodeEvent.ExecutionFailed(job, cancelled.Message, _clock.GetUtcNow());
                         }
+                        catch (InvariantViolationException violation)
+                        {
+                            // Ahead of the catch-all, because this one is not a handler exception that
+                            // becomes job data: a named check proved an impossible state INSIDE the
+                            // handler's call - a Dependency read whose workflow row is gone, an enqueue the
+                            // store refused as cyclic. No Attempt of this job, or any other, can be trusted
+                            // afterwards and no retry can fix it, so it halts the group (ADR-0007) instead
+                            // of degrading into one more failed Attempt.
+                            //
+                            // The run is fire-and-forget, so a faulted task would reach nobody. The event
+                            // channel is the carrier, exactly as it already is for a dead ticker or a dead
+                            // pacer: completing the writer with the violation makes the pump's own read
+                            // throw it, and PumpAsync unwraps it to the one halt call site in ExecuteAsync
+                            // with its trigger intact. Events already queued drain ahead of it, so outcomes
+                            // this pump had in hand still settle. This Attempt reports nothing - the group
+                            // is halting and its Leases lapse - and the outer finally still releases the
+                            // worker slot and disposes the linked CTS.
+                            events.TryComplete(violation);
+                            outcome = null;
+                        }
                         catch (Exception exception)
                         {
                             // The execution boundary: handler exceptions become data here.
@@ -898,7 +1073,11 @@ internal sealed class WorkerGroupService(
                             // Wire Name and Queue alongside so the dead-letter counter can tag the destination at
                             // the report edge. Stashed even when the span is null (no ActivityListener): the
                             // dead-letter METRIC is independent of tracing, so the report edge must still reach it.
-                            _pendingProcessOutcomes[(job.JobId, job.Attempt)] = (activity, job.WireName, job.Queue);
+                            // The Lease expiry travels with it: the report edge needs what this pump
+                            // believed about its own Lease as the Attempt settled, and the flight record
+                            // that holds that belief is removed just above.
+                            _pendingProcessOutcomes[(job.JobId, job.Attempt)] =
+                                (activity, job.WireName, job.Queue, flight.LeaseExpiry);
                             events.TryWrite(outcome); // abandoned executions report nothing - the fence would reject them
                         }
                         else

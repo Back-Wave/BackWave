@@ -194,8 +194,12 @@ public sealed class BackWaveBuilder
     /// </param>
     /// <returns>The same builder, so calls can be chained.</returns>
     /// <exception cref="InvalidOperationException">
-    /// A worker group with the same <see cref="WorkerGroupOptions.Name"/> was already added, or the
-    /// group's <see cref="WorkerGroupOptions.Pumps"/> count is less than one.
+    /// A worker group with the same <see cref="WorkerGroupOptions.Name"/> was already added; the
+    /// group's <see cref="WorkerGroupOptions.Pumps"/> count is less than one; its
+    /// <see cref="WorkerGroupOptions.MaxPollInterval"/> exceeds int.MaxValue milliseconds (about
+    /// 24.85 days), which the idle-poll pacer cannot wait out; or its
+    /// <see cref="WorkerGroupOptions.ShutdownBudget"/> is negative (use
+    /// <see cref="TimeSpan.Zero"/> to skip the shutdown hand-back).
     /// </exception>
     /// <example>
     /// <code>
@@ -366,7 +370,12 @@ public sealed class BackWaveBuilder
                     // Same clock contract as the client and operator: a host-registered TimeProvider
                     // (e.g. two offset clocks modelling cross-node skew) governs the pump's stamps;
                     // absent one, the ctor defaults to TimeProvider.System and behavior is unchanged.
-                    sp.GetService<TimeProvider>()));
+                    sp.GetService<TimeProvider>(),
+                    // The host's own stop window, so the pump can clamp its ShutdownBudget against it:
+                    // a hand-back that spends the whole window turns the clean stop it exists to serve
+                    // into a kill. Always registered by the generic host; resolved optionally so a
+                    // directly-constructed pump (the unit tests) keeps working without it.
+                    sp.GetService<Microsoft.Extensions.Options.IOptions<Microsoft.Extensions.Hosting.HostOptions>>()));
             }
         }
 

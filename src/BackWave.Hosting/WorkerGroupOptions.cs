@@ -119,12 +119,15 @@ public sealed record WorkerGroupOptions
 
     /// <summary>
     /// How long the group may spend giving work back when it stops cleanly. On shutdown the group
-    /// first reports the outcomes it has buffered, then relinquishes the leases it still holds so
-    /// those jobs return to the queue at once instead of waiting out <see cref="LeaseDuration"/> on
-    /// a node that is gone. Both steps share this one budget, in that order, so the hand-back can
-    /// never outlast the host's own shutdown timeout. Whatever the budget does not cover simply
-    /// lapses as it does today, which costs latency and nothing else. Defaults to 5 seconds; set it
-    /// to <see cref="TimeSpan.Zero"/> to skip the hand-back entirely.
+    /// first reports the outcomes it has buffered, then waits out the jobs it still has running, then
+    /// relinquishes the leases it still holds so those jobs return to the queue at once instead of
+    /// waiting out <see cref="LeaseDuration"/> on a node that is gone. All three steps share this one
+    /// budget, in that order. The budget is also clamped at four fifths of the host's own
+    /// <see cref="Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout"/>, so a hand-back can
+    /// never consume the whole window the host allows for stopping and leave the host to kill it
+    /// mid-relinquish. Whatever the budget does not cover simply lapses as it does today, which costs
+    /// latency and nothing else. Defaults to 5 seconds; set it to <see cref="TimeSpan.Zero"/> to skip
+    /// the hand-back entirely.
     /// </summary>
     public TimeSpan ShutdownBudget { get; init; } = TimeSpan.FromSeconds(5);
 

@@ -24,6 +24,10 @@
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="$(ExtensionsVersion)" />
     <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions" Version="$(ExtensionsVersion)" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="$(ExtensionsVersion)" />
+    <!-- HostOptions (the host's own ShutdownTimeout, which the worker groups clamp their shutdown budget
+         against) lives in the implementation package, not Abstractions. Every consumer already has it -
+         a BackgroundService needs a host to run in - so this names a dependency that was always present. -->
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="$(ExtensionsVersion)" />
   </ItemGroup>
 
   <ItemGroup>
