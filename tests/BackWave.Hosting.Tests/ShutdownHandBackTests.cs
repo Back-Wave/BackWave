@@ -22,11 +22,52 @@ public class ShutdownHandBackTests
 
     private const int LeasesRelinquishedEventId = 1205;
     private const int HandBackFailedEventId = 1206;
+    private const int DrainIncompleteEventId = 1207;
 
     private static readonly JobRegistry BlockingRegistry = new(
     [
         JobRegistration.Create<PingJob, RecoveryHandler>("ping", HostingJsonContext.Default.PingJob),
     ]);
+
+    // A second registry, because a host takes exactly one: same wire name, a handler that ignores its
+    // cancellation token instead of honouring it.
+    private static readonly JobRegistry StubbornRegistry = new(
+    [
+        JobRegistration.Create<PingJob, StubbornHandler>("ping", HostingJsonContext.Default.PingJob),
+    ]);
+
+    private static WebApplication BuildStubbornHost(
+        IJobStore store,
+        StubbornGate gate,
+        ILoggerProvider loggerProvider,
+        TimeSpan shutdownBudget,
+        TimeSpan? hostShutdownTimeout = null)
+    {
+        var builder = WebApplication.CreateBuilder();
+        builder.WebHost.UseTestServer();
+        builder.Logging.AddProvider(loggerProvider);
+        if (hostShutdownTimeout is { } timeout)
+        {
+            // Registered after the web host's own, so this one wins - the window the group clamps against.
+            builder.Services.Configure<Microsoft.Extensions.Hosting.HostOptions>(
+                host => host.ShutdownTimeout = timeout);
+        }
+
+        builder.Services.AddSingleton(gate);
+        builder.Services.AddTransient<IJobHandler<PingJob>, StubbornHandler>();
+        builder.Services.AddBackWave(backwave => backwave
+            .UseStore(store)
+            .UseRegistry(StubbornRegistry)
+            .AddWorkerGroup(new WorkerGroupOptions
+            {
+                Name = "workers",
+                Policy = new DispatchPolicy.Strict(["default"]),
+                PollInterval = FastPoll,
+                LeaseDuration = TimeSpan.FromMinutes(5),
+                ShutdownBudget = shutdownBudget,
+            }));
+        return builder.Build();
+    }
 
     private static WebApplication BuildHost(
         IJobStore store, RecoveryGate gate, ILoggerProvider? loggerProvider = null, TimeSpan? shutdownBudget = null)
@@ -145,6 +186,90 @@ public class ShutdownHandBackTests
     }
 
     [Fact]
+    public async Task CleanStop_WaitsOutAHandlerThatIgnoresItsToken_BeforeRelinquishingItsLease()
+    {
+        // Nothing used to wait for the executions, so a handler that does not honor its cancellation token
+        // was still running while the relinquish handed its job to another node - which would then run the
+        // very same Attempt concurrently instead of after the Lease lapsed. The hand-back waits first.
+        var store = new FaultableStore(new InMemoryJobStore());
+        var gate = new StubbornGate { Hold = TimeSpan.FromMilliseconds(500) };
+        var logs = new CapturingLoggerProvider();
+        await using var app = BuildStubbornHost(store, gate, logs, shutdownBudget: TimeSpan.FromSeconds(10));
+        await app.StartAsync();
+
+        var client = app.Services.GetRequiredService<BackWaveClient>();
+        var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
+        var jobId = await client.EnqueueAsync(new PingJob("stubborn"), dueTime: DateTimeOffset.UtcNow);
+        await gate.Started.Task.WaitAsync(TestTimeout);
+
+        await app.StopAsync();
+
+        Assert.NotNull(gate.FinishedAt);
+        Assert.NotNull(store.RelinquishedAt);
+        Assert.True(
+            gate.FinishedAt <= store.RelinquishedAt,
+            $"the handler finished at {gate.FinishedAt:o} but its Lease was relinquished at {store.RelinquishedAt:o}");
+        Assert.DoesNotContain(logs.Entries, entry => entry.EventId == DrainIncompleteEventId);
+        Assert.Equal(JobState.Scheduled, (await monitor.GetJobAsync(jobId))!.State);
+    }
+
+    [Fact]
+    public async Task AHandlerThatOutlastsTheBudget_IsLoggedAndItsLeaseRelinquishedAnyway()
+    {
+        // Best-effort, like the rest of the hand-back: the wait is bounded by the same one budget, so a
+        // handler that never returns degrades to today's behaviour rather than holding the host open.
+        var store = new FaultableStore(new InMemoryJobStore());
+        var gate = new StubbornGate { Hold = TimeSpan.FromSeconds(2) };
+        var logs = new CapturingLoggerProvider();
+        await using var app = BuildStubbornHost(store, gate, logs, shutdownBudget: TimeSpan.FromMilliseconds(250));
+        await app.StartAsync();
+
+        var client = app.Services.GetRequiredService<BackWaveClient>();
+        var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
+        var jobId = await client.EnqueueAsync(new PingJob("never-returns"), dueTime: DateTimeOffset.UtcNow);
+        await gate.Started.Task.WaitAsync(TestTimeout);
+
+        await app.StopAsync().WaitAsync(TestTimeout);
+
+        var warning = Assert.Single(logs.Entries, entry => entry.EventId == DrainIncompleteEventId);
+        Assert.Equal(LogLevel.Warning, warning.Level);
+        Assert.Contains("1 execution(s) running", warning.Message);
+        Assert.Null(gate.FinishedAt);  // it really had not finished
+        Assert.Equal(1, store.RelinquishCalls);  // and its Lease was given back regardless
+        Assert.Equal(JobState.Scheduled, (await monitor.GetJobAsync(jobId))!.State);
+    }
+
+    [Fact]
+    public async Task AShutdownBudgetLongerThanTheHostAllows_IsClampedBelowTheHostsOwnTimeout()
+    {
+        // The budget is documented as clamped against HostOptions.ShutdownTimeout, and now is: without the
+        // clamp this hand-back would spend a minute while the host stops waiting after two and a half
+        // seconds, so the relinquish this test asserts on would not have happened yet when StopAsync
+        // returned - the mid-relinquish kill the clamp exists to prevent.
+        var store = new FaultableStore(new InMemoryJobStore());
+        var gate = new StubbornGate { Hold = TimeSpan.FromSeconds(30) };
+        var logs = new CapturingLoggerProvider();
+        await using var app = BuildStubbornHost(
+            store, gate, logs,
+            shutdownBudget: TimeSpan.FromMinutes(1),
+            hostShutdownTimeout: TimeSpan.FromMilliseconds(2500));
+        await app.StartAsync();
+
+        var client = app.Services.GetRequiredService<BackWaveClient>();
+        var jobId = await client.EnqueueAsync(new PingJob("clamped"), dueTime: DateTimeOffset.UtcNow);
+        await gate.Started.Task.WaitAsync(TestTimeout);
+
+        await app.StopAsync().WaitAsync(TestTimeout);
+
+        // Four fifths of the host's window, so the relinquish lands with the last fifth to spare.
+        Assert.Single(logs.Entries, entry => entry.EventId == DrainIncompleteEventId);
+        Assert.Equal(1, store.RelinquishCalls);
+        Assert.Equal(
+            JobState.Scheduled,
+            (await app.Services.GetRequiredService<BackWaveMonitor>().GetJobAsync(jobId))!.State);
+    }
+
+    [Fact]
     public async Task FailStoppedGroup_HandsNothingBack_BecauseAHaltedPumpWritesNoMore()
     {
         var store = new FaultableStore(new InMemoryJobStore());
@@ -170,5 +295,34 @@ public class ShutdownHandBackTests
 
         Assert.Equal(0, store.RelinquishCalls);
         Assert.Equal(JobState.Leased, (await monitor.GetJobAsync(jobId))!.State);
+    }
+}
+
+/// <summary>
+/// What a handler that does not honor its cancellation token looks like: it runs out a fixed hold no
+/// matter what the token says, and stamps the instant it finally returned so a test can order that
+/// against the hand-back's relinquish.
+/// </summary>
+public sealed class StubbornGate
+{
+    /// <summary>Completes once the handler is genuinely running, so a test can stop into a live execution.</summary>
+    public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>How long the handler runs, measured from the moment it starts.</summary>
+    public TimeSpan Hold { get; init; } = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>When the handler returned, or <see langword="null"/> if it never has.</summary>
+    public DateTimeOffset? FinishedAt { get; set; }
+}
+
+/// <summary>Runs out its gate's hold with the cancellation token ignored entirely.</summary>
+public sealed class StubbornHandler(StubbornGate gate) : IJobHandler<PingJob>
+{
+    /// <inheritdoc/>
+    public async Task HandleAsync(PingJob job, JobContext context, CancellationToken cancellationToken)
+    {
+        gate.Started.TrySetResult();
+        await Task.Delay(gate.Hold, CancellationToken.None);
+        gate.FinishedAt = DateTimeOffset.UtcNow;
     }
 }

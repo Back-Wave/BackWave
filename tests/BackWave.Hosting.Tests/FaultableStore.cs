@@ -16,6 +16,8 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
 {
     private int _transientClaimFaults;
     private int _relinquishCalls;
+    private int _reportOutcomesCalls;
+    private int _rowsSettledBeforeRejection;
 
     /// <summary>Claims from this Queue throw — the targeted fail-stop trigger.</summary>
     public string? PoisonedQueue { get; set; }
@@ -29,8 +31,18 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
     /// <summary>The shutdown hand-back throws - the unreachable-store-at-shutdown trigger.</summary>
     public bool FailRelinquish { get; set; }
 
+    /// <summary>
+    /// The shutdown hand-back throws a named invariant violation carrying this trigger - what every real
+    /// adapter does when its relinquish path proves an impossible state (a dangling gating edge, a row
+    /// count no legal write produces).
+    /// </summary>
+    public InvariantTrigger? RelinquishInvariant { get; set; }
+
     /// <summary>How many times the shutdown hand-back reached the store.</summary>
     public int RelinquishCalls => Volatile.Read(ref _relinquishCalls);
+
+    /// <summary>When the shutdown hand-back FIRST reached the store, so a test can order it against its handlers.</summary>
+    public DateTimeOffset? RelinquishedAt { get; private set; }
 
     /// <summary>Claims hand back their jobs rewritten into this state - the malformed-claim trigger.</summary>
     public JobState? RewriteClaimedState { get; set; }
@@ -139,9 +151,26 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
     /// </summary>
     public int? BatchOutputCap { get; set; }
 
+    /// <summary>
+    /// The other store shape: rows are applied ONE AT A TIME, so an over-cap row rejects the batch only
+    /// after every row ahead of it is already settled. That is what the Shell's re-apply meets in the
+    /// wild - rows the store has already written, which fence out as StaleLease on the second pass.
+    /// </summary>
+    public int? RowOutputCap { get; set; }
+
+    /// <summary>How many batched outcome reports reached the store - one per re-apply pass.</summary>
+    public int ReportOutcomesCalls => Volatile.Read(ref _reportOutcomesCalls);
+
+    /// <summary>
+    /// How many rows the <see cref="RowOutputCap"/> rejection had already settled when it threw, so a test
+    /// can prove it exercised the settled-rows-ahead shape rather than passing on the trivial one.
+    /// </summary>
+    public int RowsSettledBeforeRejection => Volatile.Read(ref _rowsSettledBeforeRejection);
+
     public ValueTask<IReadOnlyList<OutcomeReportResult>> ReportOutcomesAsync(
         IReadOnlyList<OutcomeReport> batch, DateTimeOffset now, CancellationToken cancellationToken = default)
     {
+        Interlocked.Increment(ref _reportOutcomesCalls);
         ThrowIfFailing();
         if (BatchOutputCap is { } cap)
         {
@@ -152,6 +181,10 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
                     throw new JobOutputTooLargeException(row.JobId, blob.Length, cap);
                 }
             }
+        }
+        if (RowOutputCap is { } rowCap)
+        {
+            return ApplyRowByRowAsync(batch, now, rowCap, cancellationToken);
         }
         if (DropOutcomeResults is null && !FenceOutOutcomes)
         {
@@ -171,6 +204,23 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
         if (DropOutcomeResults is { } dropped)
         {
             results = [.. results.Take(Math.Max(0, results.Count - dropped))];
+        }
+        return results;
+    }
+
+    private async ValueTask<IReadOnlyList<OutcomeReportResult>> ApplyRowByRowAsync(
+        IReadOnlyList<OutcomeReport> batch, DateTimeOffset now, int cap, CancellationToken cancellationToken)
+    {
+        var results = new List<OutcomeReportResult>(batch.Count);
+        foreach (var row in batch)
+        {
+            if (row.Outcome is JobOutcome.Success && row.Output is { } blob && blob.Length > cap)
+            {
+                Volatile.Write(ref _rowsSettledBeforeRejection, results.Count);
+                throw new JobOutputTooLargeException(row.JobId, blob.Length, cap);
+            }
+            results.AddRange(
+                await inner.ReportOutcomesAsync([row], now, cancellationToken).ConfigureAwait(false));
         }
         return results;
     }
@@ -212,8 +262,15 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
         string workerId, DateTimeOffset now, RetryDisposition disposition,
         CancellationToken cancellationToken = default)
     {
-        Interlocked.Increment(ref _relinquishCalls);
+        if (Interlocked.Increment(ref _relinquishCalls) == 1)
+        {
+            RelinquishedAt = DateTimeOffset.UtcNow;
+        }
         ThrowIfFailing();
+        if (RelinquishInvariant is { } tripped)
+        {
+            throw new InvariantViolationException(tripped, "forced named invariant violation on relinquish");
+        }
         if (FailRelinquish)
         {
             throw new InvalidOperationException("forced hand-back failure (FailRelinquish)");

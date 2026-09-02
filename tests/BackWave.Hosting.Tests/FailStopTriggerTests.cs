@@ -50,6 +50,45 @@ public sealed class PullingHandler : IJobHandler<PullingJob>
 internal sealed partial class FailStopJsonContext : JsonSerializerContext;
 
 /// <summary>
+/// Collects the action tag of every violation counted under one trigger, and only that one. File-scope
+/// rather than nested, because the Job Output tests assert on this same ledger's ZEROS: the fence check
+/// they exercise must count nothing at all.
+/// </summary>
+public sealed class ViolationRecorder : IDisposable
+{
+    private readonly MeterListener _listener;
+
+    public ViolationRecorder(InvariantTrigger trigger)
+    {
+        _listener = new MeterListener
+        {
+            InstrumentPublished = (instrument, l) =>
+            {
+                if (instrument.Meter.Name == BackWaveDiagnostics.SourceName
+                    && instrument.Name == "backwave.invariant.violations")
+                {
+                    l.EnableMeasurementEvents(instrument);
+                }
+            },
+        };
+        _listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            var pairs = tags.ToArray();
+            if (pairs.FirstOrDefault(t => t.Key == "backwave.invariant.trigger").Value as string
+                == trigger.ToString())
+            {
+                Measurements.Add(pairs.FirstOrDefault(t => t.Key == "backwave.invariant.action").Value as string);
+            }
+        });
+        _listener.Start();
+    }
+
+    public ConcurrentBag<string?> Measurements { get; } = [];
+
+    public void Dispose() => _listener.Dispose();
+}
+
+/// <summary>
 /// The armed impossible-state checks, each driven through the real hosted pump against a store that
 /// answers the way only a broken store could. Every check is asserted on all three of its surfaces: the
 /// halted group's typed trigger, the Critical halt log, and the tagged violation counter.
@@ -149,7 +188,8 @@ public class FailStopTriggerTests
             () => ValueTask.FromResult(!violations.Measurements.IsEmpty),
             "the fenced-out outcome to be counted");
 
-        // A lost race, not a broken invariant: counted and logged at Warning, and the group stays up.
+        // Not a lost race: the Lease this pump believes it holds runs for another five seconds, so a store
+        // answering "not this worker's" contradicts it. Counted and logged at Warning, group stays up.
         var violation = Assert.Single(violations.Measurements);
         Assert.Equal("Degrade", violation);
         var warning = Assert.Single(
@@ -157,6 +197,12 @@ public class FailStopTriggerTests
             e => e.EventId == 1601 && e.Message.Contains(nameof(InvariantTrigger.OutcomeFenceRejected)));
         Assert.Equal(LogLevel.Warning, warning.Level);
         Assert.Contains(jobId.ToString(), warning.Message);
+        // The group-altitude counterpart (2003), the only one of the pair that names the worker group -
+        // nothing puts the group on a log scope. Both fire; the counter stays welded to 1601.
+        var atGroupAltitude = Assert.Single(logs.Entries, e => e.EventId == 2003);
+        Assert.Equal(LogLevel.Warning, atGroupAltitude.Level);
+        Assert.Contains("workers", atGroupAltitude.Message);
+        Assert.Contains(nameof(InvariantTrigger.OutcomeFenceRejected), atGroupAltitude.Message);
         Assert.Empty(app.Services.GetRequiredService<BackWaveHealth>().HaltedGroups);
         Assert.Equal(
             HttpStatusCode.OK, (await app.GetTestClient().GetAsync("/health")).StatusCode);
@@ -204,11 +250,14 @@ public class FailStopTriggerTests
     }
 
     [Fact]
-    public async Task WorkflowMemberWithoutWorkflow_FailsTheJob_ButNotTheGroup()
+    public async Task WorkflowMemberWithoutWorkflow_RaisedInsideAHandler_FailStopsTheGroup()
     {
-        // The resolver runs above the execution boundary, where every handler throw becomes job data. The
-        // trigger therefore ends the Attempt loudly rather than halting the group - it never reaches the
-        // halt call site, so no Halt is counted and the group keeps serving.
+        // The resolver runs above the execution boundary, where every OTHER handler throw becomes job
+        // data. This one may not: a live member whose Workflow row is gone proves an impossible state no
+        // retry can fix, so it must reach the group's halt site rather than degrade into one more failed
+        // Attempt. The execution is fire-and-forget, so the event channel carries it: the run completes
+        // the writer with the violation, the pump's own read throws it, and the halt site classifies it
+        // off the exception's own type exactly as it does an in-cycle one.
         var store = new FaultableStore(new InMemoryJobStore());
         var logs = new CapturingLoggerProvider();
         using var violations = new ViolationRecorder(InvariantTrigger.WorkflowMemberWithoutWorkflow);
@@ -223,24 +272,78 @@ public class FailStopTriggerTests
         await using var app = BuildHost(store, logs, Group("workers"));
         await app.StartAsync();
 
+        await AssertHaltedAsync(app, logs, violations, InvariantTrigger.WorkflowMemberWithoutWorkflow);
+
+        // The halting Attempt reports nothing - a halted pump writes no more to the store - so the member
+        // stays Leased and lapses for a healthy node to inherit, exactly as every other halt leaves it.
         var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
-        await WaitForAsync(
-            async () => (await monitor.GetJobHistoryAsync(member.JobId))
-                .Any(t => t.FailureDetail?.Contains(nameof(InvariantViolationException)) == true),
-            "the member's Attempt to fail on the raised invariant");
-
-        // The id itself is deliberately absent from the message, so this site names the condition in the
-        // failure detail and reaches none of the three trigger-id surfaces.
-        var failed = Assert.Single(
-            await monitor.GetJobHistoryAsync(member.JobId),
-            t => t.FailureDetail?.Contains(nameof(InvariantViolationException)) == true);
-        var detail = failed.FailureDetail;
-        Assert.Contains("workflow's row is absent", detail);
-        Assert.DoesNotContain(nameof(InvariantTrigger.WorkflowMemberWithoutWorkflow), detail);
-
-        Assert.Empty(app.Services.GetRequiredService<BackWaveHealth>().HaltedGroups);
-        Assert.Empty(violations.Measurements);
+        Assert.Equal(JobState.Leased, (await monitor.GetJobAsync(member.JobId))!.State);
         await app.StopAsync();
+    }
+
+    [Fact]
+    public async Task FenceRefusingALeaseThisPumpWatchedLapse_IsNotCounted_AndLogsAtDebug()
+    {
+        // The benign half of the fence answer, and the one a healthy fleet actually produces: the Lease
+        // lapsed before its outcome could be reported, so another node owns the job now and the store is
+        // right to refuse the write. The invariant ledger is the surface a promotion rule reads FOR ZEROS,
+        // so this path must leave it untouched.
+        var store = new FaultableStore(new InMemoryJobStore()) { FenceOutOutcomes = true };
+        var logs = new CapturingLoggerProvider();
+        using var violations = new ViolationRecorder(InvariantTrigger.OutcomeFenceRejected);
+        var gate = new ExecutionGate();
+
+        // A Lease shorter than the handler parks for, with no heartbeat to renew it, so the pump has
+        // already watched its own belief expire by the time the outcome settles.
+        var group = Group("workers") with { LeaseDuration = TimeSpan.FromMilliseconds(50) };
+        await using var app = BuildHost(store, logs, group, gate);
+        await app.StartAsync();
+        var jobId = await app.Services.GetRequiredService<BackWaveClient>()
+            .EnqueueAsync(new ParkedJob("lapsed"), dueTime: DateTimeOffset.UtcNow);
+
+        await gate.Entered.Task.WaitAsync(TestTimeout);
+        await Task.Delay(200);  // outlive the Lease, then let the outcome report against the lapsed belief
+        gate.Released.SetResult();
+
+        await WaitForAsync(
+            () => ValueTask.FromResult(logs.Entries.Any(e => e.EventId == 1208)),
+            "the fenced-out outcome to be logged at Debug");
+
+        var debug = Assert.Single(logs.Entries, e => e.EventId == 1208);
+        Assert.Equal(LogLevel.Debug, debug.Level);
+        Assert.Contains(jobId.ToString(), debug.Message);
+        Assert.Empty(violations.Measurements);
+        Assert.DoesNotContain(logs.Entries, e => e.EventId is 1601 or 2003);
+        Assert.Empty(app.Services.GetRequiredService<BackWaveHealth>().HaltedGroups);
+
+        await app.StopAsync();
+    }
+
+    [Fact]
+    public async Task InvariantRaisedByTheShutdownHandBack_FailStops_InsteadOfReadingAsAHiccup()
+    {
+        // Every adapter can raise a named check out of its relinquish path, and the hand-back's blanket
+        // catch would have logged that as a routine shutdown hiccup, left the group green, and lost the
+        // trigger nothing else records. It has to reach the halt site like any other proven violation.
+        var store = new FaultableStore(new InMemoryJobStore())
+        {
+            RelinquishInvariant = InvariantTrigger.DanglingGatingEdge,
+        };
+        var logs = new CapturingLoggerProvider();
+        using var violations = new ViolationRecorder(InvariantTrigger.DanglingGatingEdge);
+        var gate = new ExecutionGate();  // parked, so the pump still holds a Lease to hand back
+
+        await using var app = BuildHost(store, logs, Group("workers"), gate);
+        await app.StartAsync();
+        await app.Services.GetRequiredService<BackWaveClient>()
+            .EnqueueAsync(new ParkedJob("held"), dueTime: DateTimeOffset.UtcNow);
+        await gate.Entered.Task.WaitAsync(TestTimeout);
+
+        await app.StopAsync().WaitAsync(TestTimeout);  // a halt still never blocks the host from exiting
+
+        Assert.Equal(1, store.RelinquishCalls);
+        await AssertHaltedAsync(app, logs, violations, InvariantTrigger.DanglingGatingEdge);
+        Assert.DoesNotContain(logs.Entries, e => e.EventId == 1206);  // NOT the shutdown-hiccup warning
     }
 
     // --- harness ---------------------------------------------------------------------------------
@@ -262,41 +365,6 @@ public class FailStopTriggerTests
         Assert.Equal(2001, critical.EventId);
         Assert.Contains(expected.ToString(), critical.Message);
         Assert.Equal("Halt", Assert.Single(violations.Measurements));
-    }
-
-    /// <summary>Collects the action tag of every violation counted under one trigger, and only that one.</summary>
-    private sealed class ViolationRecorder : IDisposable
-    {
-        private readonly MeterListener _listener;
-
-        public ViolationRecorder(InvariantTrigger trigger)
-        {
-            _listener = new MeterListener
-            {
-                InstrumentPublished = (instrument, l) =>
-                {
-                    if (instrument.Meter.Name == BackWaveDiagnostics.SourceName
-                        && instrument.Name == "backwave.invariant.violations")
-                    {
-                        l.EnableMeasurementEvents(instrument);
-                    }
-                },
-            };
-            _listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
-            {
-                var pairs = tags.ToArray();
-                if (pairs.FirstOrDefault(t => t.Key == "backwave.invariant.trigger").Value as string
-                    == trigger.ToString())
-                {
-                    Measurements.Add(pairs.FirstOrDefault(t => t.Key == "backwave.invariant.action").Value as string);
-                }
-            });
-            _listener.Start();
-        }
-
-        public ConcurrentBag<string?> Measurements { get; } = [];
-
-        public void Dispose() => _listener.Dispose();
     }
 
     private static WorkerGroupOptions Group(string name) => new()
@@ -322,6 +390,7 @@ public class FailStopTriggerTests
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
         builder.Logging.AddProvider(logs);
+        builder.Logging.SetMinimumLevel(LogLevel.Debug);  // the benign fence path logs there and nowhere else
         builder.Services.AddSingleton(gate ?? new ExecutionGate());
         builder.Services.AddTransient<IJobHandler<ParkedJob>, ParkedHandler>();
         builder.Services.AddTransient<IJobHandler<PullingJob>, PullingHandler>();
