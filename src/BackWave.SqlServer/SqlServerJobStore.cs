@@ -148,11 +148,15 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
 
     // Bounded deadlock retry for the hot-path writes. SQL Server picks one victim of a deadlock and
     // rolls its transaction back whole, so a losing attempt leaves no effect behind and the operation
-    // can run again from the start. Every operation wrapped here opens its own connection and
-    // transaction and is fenced on the state it writes, so a replay either does the same work or
-    // reports a stale lease, which is the right answer once another node took the job over. Enqueue is
-    // not wrapped: it can join a caller's transaction, and a deadlock dooms that transaction too, so
-    // only the caller can start it over.
+    // can run again from the start. What is wrapped here is always exactly ONE transaction, fenced on
+    // the state it writes, so a replay either does the same work or reports a stale lease, which is the
+    // right answer once another node took the job over. ReportOutcome, ReportOutcomes, ExpireLeases and
+    // RelinquishLeases each open their own connection for that one transaction; Claim commits once per
+    // Queue, so its unit is ClaimQueueAsync - a single Queue's transaction on a connection the claim
+    // keeps open across the Queues - and NOT the whole claim, which would re-run the Queues that already
+    // committed and strand their jobs Leased until the lease expired. Enqueue is not wrapped: it can
+    // join a caller's transaction, and a deadlock dooms that transaction too, so only the caller can
+    // start it over.
     // This covers the residual risk, not the cause. A deadlock here comes from a lock footprint wider
     // than the batch, and the statements that make the footprint are shaped to seek their own rows in
     // §5.2, §5.5 and §5.6. What no shape controls is the plan the optimizer picks for a foreign-key
@@ -417,121 +421,18 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 break;
             }
 
-            await using var transaction = (SqlTransaction)await connection
-                .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-
-            // Concurrency Limit (I3) and Paused flag (§5.8) live in one row: lock it so concurrent
-            // claimers of a limited Queue serialize on the slot count and a concurrent Pause is observed
-            // atomically. A Queue recently observed unlimited AND unpaused skips this round-trip and the
-            // lock entirely (issue 0170) — the common case pays nothing; see _unlimitedQueues.
-            var slots = int.MaxValue;
-            var paused = false;
-            int? configured = null;
-            if (!IsCachedUnlimited(queue))
-            {
-                // Serialize claim-vs-first-config on a key that exists BEFORE the row does (issue 0193):
-                // the UPDLOCK below does not reliably serialize against the FIRST pause/limit when no
-                // queue_limits row exists yet, so an in-flight claim could over-claim past a first-ever
-                // limit or slip past a first-ever pause. The app lock (below) is taken by both this read
-                // path and the operator setters, so they serialize with no row present. Scoped to the
-                // read path: a cached unlimited, unpaused Queue (issue 0170) skips this block and pays nothing.
-                await AcquireQueueConfigLockAsync(connection, transaction, queue, cancellationToken).ConfigureAwait(false);
-                // Capture the generation BEFORE the read so a concurrent operator change (which bumps it)
-                // is detected when we go to publish the stamp below (issue 0170).
-                var generation = Interlocked.Read(ref _queueConfigGeneration);
-                await using (var limit = Cmd(
-                    "SELECT max_concurrent, paused FROM backwave.queue_limits WITH (UPDLOCK, ROWLOCK) WHERE queue = @queue",
-                    connection, transaction))
-                {
-                    limit.Parameters.AddWithValue("queue", queue);
-                    await using var reader = await limit.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
-                    if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                    {
-                        configured = reader.IsDBNull(0) ? null : reader.GetInt32(0);
-                        paused = reader.GetBoolean(1);
-                    }
-                }
-                CacheQueueConfig(queue, configured, paused, generation);
-            }
-            if (paused)
-            {
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                continue; // a Paused Queue yields nothing to Claim (§5.8)
-            }
-            if (configured is { } limitValue)
-            {
-                await using var leased = Cmd(
-                    "SELECT count(*) FROM backwave.jobs WHERE queue = @queue AND state = 2",
-                    connection, transaction);
-                leased.Parameters.AddWithValue("queue", queue);
-                if (await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not int inUse)
-                {
-                    throw new InvariantViolationException(
-                        InvariantTrigger.LeasedCountAggregateNull,
-                        $"The leased-count aggregate for queue '{queue}' returned no value; COUNT(*) always returns one.");
-                }
-                slots = limitValue - inUse;
-            }
-            if (slots <= 0)
-            {
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                continue;
-            }
-
-            // The single contended operation: UPDLOCK/READPAST is the dialect's skip-locked.
-            await using var claim = Cmd(
-                """
-                WITH candidates AS (
-                    SELECT TOP (@take) job_id
-                    FROM backwave.jobs WITH (UPDLOCK, READPAST, ROWLOCK)
-                    WHERE queue = @queue AND state = 0 AND due_time <= @now
-                    ORDER BY due_time, [sequence]
-                )
-                UPDATE j
-                SET state = 2, attempt = j.attempt + 1, lease_owner = @worker, lease_expiry = @expiry
-                OUTPUT inserted.job_id, inserted.wire_name, inserted.payload, inserted.queue,
-                       inserted.state, inserted.due_time, inserted.attempt, inserted.lease_owner,
-                       inserted.lease_expiry, inserted.cancel_requested, inserted.terminal_at,
-                       inserted.terminal_cause, inserted.schedule_id, inserted.parents_remaining,
-                       inserted.mode, inserted.trace_context, inserted.[sequence], inserted.workflow_id
-                FROM backwave.jobs j
-                INNER JOIN candidates c ON j.job_id = c.job_id
-                """,
-                connection, transaction);
-            claim.Parameters.AddWithValue("queue", queue);
-            claim.Parameters.AddWithValue("now", request.Now);
-            claim.Parameters.AddWithValue("take", Math.Min(maxJobs - claimed.Count, slots));
-            claim.Parameters.AddWithValue("worker", request.WorkerId);
-            claim.Parameters.AddWithValue("expiry", request.Now + request.LeaseDuration);
-            var queueClaims = new List<JobRecord>();
-            await using (var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
-            {
-                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                {
-                    var job = ReadJob(reader);
-                    if (job.State != JobState.Leased || !string.Equals(job.LeaseOwner, request.WorkerId, StringComparison.Ordinal))
-                    {
-                        throw new InvariantViolationException(
-                            InvariantTrigger.ClaimedRowNotLeasedToWorker,
-                            $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
-                    }
-                    queueClaims.Add(job);
-                }
-            }
-            // Crash after the lease write, before commit: rollback must un-lease every row (issue 0034).
-            await FailpointAsync("claim", cancellationToken).ConfigureAwait(false);
-            // Transition Log (§5.12): one Leased entry per claimed job at its post-claim Attempt, in
-            // ONE set-based INSERT in this same transaction (atomic with the lease write).
-            await RecordTransitionsBatchAsync(
-                connection, transaction,
-                [.. queueClaims.Select(j => (j.JobId, JobState.Leased, j.Attempt, (string?)null))],
-                request.Now, cancellationToken).ConfigureAwait(false);
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-
-            // OUTPUT does not guarantee order; the contract's per-Queue (DueTime, enqueue
-            // order) does (§5.2). Never re-sort across Queues — orderedCandidateQueues
-            // is the Dispatch Policy's decision, already final.
-            claimed.AddRange(queueClaims.OrderBy(j => j.DueTime).ThenBy(j => j.Sequence));
+            // The retry unit is ONE Queue's transaction, never the whole loop. A claim commits per Queue,
+            // so replaying the loop would re-run the Queues that already committed and throw away the
+            // records they returned - those jobs stay Leased to this worker with their Attempt spent,
+            // nothing executes them until the lease expires, and they keep counting against their Queue's
+            // Concurrency Limit the whole time. Replaying only the transaction that lost costs the fleet
+            // milliseconds instead.
+            // The take is fixed here, BEFORE the attempt, so a replay asks for exactly what the lost
+            // attempt asked for; a lost attempt commits nothing, so claimed is the same list either way.
+            var take = maxJobs - claimed.Count;
+            claimed.AddRange(await RetryOnDeadlockAsync(
+                () => ClaimQueueAsync(connection, request, queue, take, cancellationToken), cancellationToken)
+                .ConfigureAwait(false));
         }
 
         // Tags hydrate in one batched round-trip (ADR 0022) — but only when tags are actually in
@@ -548,6 +449,136 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             ? await NextDueAsync(connection, request, cancellationToken).ConfigureAwait(false)
             : null;
         return (tagged, nextDue);
+    }
+
+    // One Queue's claim, from the config read to the commit: the single transaction the bounded deadlock
+    // retry replays. It runs on the caller's connection rather than opening its own, which a deadlock
+    // leaves usable: SQL Server rolls the victim's transaction back whole and leaves its session open, the
+    // driver zombies the SqlTransaction, and the await using scopes below close the reader and that
+    // transaction before any replay begins - so the next attempt only has to begin a new transaction on a
+    // connection that is still Open. Opening a fresh connection per Queue instead would charge every claim
+    // in the fleet for a fault that is rare by construction.
+    // Returns the Queue's claims in the contract's per-Queue (DueTime, enqueue) order; empty when the
+    // Queue is Paused, has no free slot, or simply had nothing due.
+    private async ValueTask<List<JobRecord>> ClaimQueueAsync(
+        SqlConnection connection, ClaimRequest request, string queue, int take,
+        CancellationToken cancellationToken)
+    {
+        await using var transaction = (SqlTransaction)await connection
+            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+        // Concurrency Limit (I3) and Paused flag (§5.8) live in one row: lock it so concurrent
+        // claimers of a limited Queue serialize on the slot count and a concurrent Pause is observed
+        // atomically. A Queue recently observed unlimited AND unpaused skips this round-trip and the
+        // lock entirely (issue 0170) — the common case pays nothing; see _unlimitedQueues.
+        var slots = int.MaxValue;
+        var paused = false;
+        int? configured = null;
+        if (!IsCachedUnlimited(queue))
+        {
+            // Serialize claim-vs-first-config on a key that exists BEFORE the row does (issue 0193):
+            // the UPDLOCK below does not reliably serialize against the FIRST pause/limit when no
+            // queue_limits row exists yet, so an in-flight claim could over-claim past a first-ever
+            // limit or slip past a first-ever pause. The app lock (below) is taken by both this read
+            // path and the operator setters, so they serialize with no row present. Scoped to the
+            // read path: a cached unlimited, unpaused Queue (issue 0170) skips this block and pays nothing.
+            await AcquireQueueConfigLockAsync(connection, transaction, queue, cancellationToken).ConfigureAwait(false);
+            // Capture the generation BEFORE the read so a concurrent operator change (which bumps it)
+            // is detected when we go to publish the stamp below (issue 0170).
+            var generation = Interlocked.Read(ref _queueConfigGeneration);
+            await using (var limit = Cmd(
+                "SELECT max_concurrent, paused FROM backwave.queue_limits WITH (UPDLOCK, ROWLOCK) WHERE queue = @queue",
+                connection, transaction))
+            {
+                limit.Parameters.AddWithValue("queue", queue);
+                await using var reader = await limit.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+                if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    configured = reader.IsDBNull(0) ? null : reader.GetInt32(0);
+                    paused = reader.GetBoolean(1);
+                }
+            }
+            CacheQueueConfig(queue, configured, paused, generation);
+        }
+        if (paused)
+        {
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return []; // a Paused Queue yields nothing to Claim (§5.8)
+        }
+        if (configured is { } limitValue)
+        {
+            await using var leased = Cmd(
+                "SELECT count(*) FROM backwave.jobs WHERE queue = @queue AND state = 2",
+                connection, transaction);
+            leased.Parameters.AddWithValue("queue", queue);
+            if (await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not int inUse)
+            {
+                throw new InvariantViolationException(
+                    InvariantTrigger.LeasedCountAggregateNull,
+                    $"The leased-count aggregate for queue '{queue}' returned no value; COUNT(*) always returns one.");
+            }
+            slots = limitValue - inUse;
+        }
+        if (slots <= 0)
+        {
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return [];
+        }
+
+        // The single contended operation: UPDLOCK/READPAST is the dialect's skip-locked.
+        await using var claim = Cmd(
+            """
+            WITH candidates AS (
+                SELECT TOP (@take) job_id
+                FROM backwave.jobs WITH (UPDLOCK, READPAST, ROWLOCK)
+                WHERE queue = @queue AND state = 0 AND due_time <= @now
+                ORDER BY due_time, [sequence]
+            )
+            UPDATE j
+            SET state = 2, attempt = j.attempt + 1, lease_owner = @worker, lease_expiry = @expiry
+            OUTPUT inserted.job_id, inserted.wire_name, inserted.payload, inserted.queue,
+                   inserted.state, inserted.due_time, inserted.attempt, inserted.lease_owner,
+                   inserted.lease_expiry, inserted.cancel_requested, inserted.terminal_at,
+                   inserted.terminal_cause, inserted.schedule_id, inserted.parents_remaining,
+                   inserted.mode, inserted.trace_context, inserted.[sequence], inserted.workflow_id
+            FROM backwave.jobs j
+            INNER JOIN candidates c ON j.job_id = c.job_id
+            """,
+            connection, transaction);
+        claim.Parameters.AddWithValue("queue", queue);
+        claim.Parameters.AddWithValue("now", request.Now);
+        claim.Parameters.AddWithValue("take", Math.Min(take, slots));
+        claim.Parameters.AddWithValue("worker", request.WorkerId);
+        claim.Parameters.AddWithValue("expiry", request.Now + request.LeaseDuration);
+        var queueClaims = new List<JobRecord>();
+        await using (var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
+        {
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var job = ReadJob(reader);
+                if (job.State != JobState.Leased || !string.Equals(job.LeaseOwner, request.WorkerId, StringComparison.Ordinal))
+                {
+                    throw new InvariantViolationException(
+                        InvariantTrigger.ClaimedRowNotLeasedToWorker,
+                        $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
+                }
+                queueClaims.Add(job);
+            }
+        }
+        // Crash after the lease write, before commit: rollback must un-lease every row (issue 0034).
+        await FailpointAsync("claim", cancellationToken).ConfigureAwait(false);
+        // Transition Log (§5.12): one Leased entry per claimed job at its post-claim Attempt, in
+        // ONE set-based INSERT in this same transaction (atomic with the lease write).
+        await RecordTransitionsBatchAsync(
+            connection, transaction,
+            [.. queueClaims.Select(j => (j.JobId, JobState.Leased, j.Attempt, (string?)null))],
+            request.Now, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+        // OUTPUT does not guarantee order; the contract's per-Queue (DueTime, enqueue
+        // order) does (§5.2). Never re-sort across Queues — orderedCandidateQueues
+        // is the Dispatch Policy's decision, already final.
+        return [.. queueClaims.OrderBy(j => j.DueTime).ThenBy(j => j.Sequence)];
     }
 
     // The earliest future instant a currently-empty claim could begin returning work through time alone,
