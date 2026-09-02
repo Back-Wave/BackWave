@@ -195,10 +195,30 @@ internal sealed class ObserverDispatchService : BackgroundService
                 }
                 try
                 {
-                    await _store.ReportObserverDeliveriesAsync(
+                    // Take the store's answer, not its silence: the void report cannot tell a write the
+                    // claim-Lease fence refused from one it applied, and the two leave the cursor in
+                    // opposite places. Unreported is not a refusal - it is the default implementation of a
+                    // store that predates this channel, reporting normally and then declining to say so -
+                    // so it stays on the applied path and such a store behaves exactly as it did before.
+                    var reported = await _store.TryReportObserverDeliveriesAsync(
                         new ObserverDeliveryReport(report.ObserverId, report.WorkerId, report.Outcomes, now),
                         stoppingToken).ConfigureAwait(false);
-                    events.TryWrite(new ObserverEvent.BatchReported(report.ObserverId, now));
+                    if (reported is ObserverReportOutcome.FenceRejected or ObserverReportOutcome.UnknownObserver)
+                    {
+                        // The report changed nothing: this worker no longer holds the claim Lease, or the
+                        // Observer has no row to resolve at all. Either way the cursor stands un-advanced and
+                        // the claimed rows redeliver on a later claim - the same at-least-once model the catch
+                        // below documents, reached without a fault. A lost race is not ours to re-raise: the
+                        // store already counted the refusal as a Degrade at the site that detected it, and a
+                        // second count here would double every refusal. Abort rather than report, because
+                        // BatchReported tells the Core a batch drained and earns an immediate re-poll - here
+                        // that would only re-claim a Lease this node has already lost.
+                        events.TryWrite(new ObserverEvent.DeliveryAborted(report.ObserverId, now));
+                    }
+                    else
+                    {
+                        events.TryWrite(new ObserverEvent.BatchReported(report.ObserverId, now));
+                    }
                 }
                 catch (Exception exception) when (!stoppingToken.IsCancellationRequested)
                 {

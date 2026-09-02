@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.Metrics;
 using BackWave.Core;
+using BackWave.Diagnostics;
 using BackWave.Jobs;
 using BackWave.Monitor;
 using BackWave.Observers;
@@ -333,6 +335,78 @@ public class ObserverDispatchIsolationTests
     }
 
     [Fact]
+    public async Task SlowCallback_OutlivingItsClaimLease_HasItsReportFenced_WhichEarnsNoRePoll_AndRedelivers()
+    {
+        // A callback slower than its own claim Lease turns the pump into a stale survivor of a lapsed claim,
+        // so the store's fence refuses its report - the one production path that reaches
+        // InvariantTrigger.ObserverReportFenceRejected. The pump must act on that answer rather than discard
+        // it: a refused report drained no batch, so it earns no immediate re-poll, and the rows it left
+        // unresolved simply redeliver on the next scheduled claim.
+        var store = new InMemoryJobStore();
+        var gated = new GatedObserver();
+        var logs = new CapturingLoggerProvider();
+        using var refusals = new ViolationRecorder(InvariantTrigger.ObserverReportFenceRejected);
+        await using var app = BuildHost(
+            store,
+            o =>
+            {
+                // A poll interval far longer than a claim-report round trip, so "waited for the next poll"
+                // and "re-polled at once" are seconds apart rather than milliseconds.
+                o.PollInterval = TimeSpan.FromSeconds(3);
+                o.LeaseDuration = TimeSpan.FromMilliseconds(200);
+                o.DeliveryTimeout = TimeSpan.FromSeconds(10); // long: a slow callback, not a hung one.
+            },
+            logs,
+            new ObserverSpec("fenced", new ObserverSubscription([JobState.Succeeded]) { WireName = "ping" }, gated));
+        await app.StartAsync();
+
+        var client = app.Services.GetRequiredService<BackWaveClient>();
+        var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
+        await client.EnqueueAsync(new PingJob("observed"), dueTime: DateTimeOffset.UtcNow);
+
+        // Hold the first delivery past its claim Lease, then release it so the pump reports into a Lease it
+        // no longer holds. Overshooting the Lease only makes the refusal more certain.
+        await gated.Entered.Task.WaitAsync(TestTimeout);
+        await Task.Delay(400);
+        gated.Release.TrySetResult();
+        await WaitForAsync(
+            () => !refusals.Actions.IsEmpty, "the lapsed-Lease report to be refused by the store's fence");
+
+        // Taking the refusal for an applied write would tell the Core a batch drained, which re-polls AT ONCE
+        // and redelivers within milliseconds. A second of quiet is the assertion: the pump waits for its next
+        // scheduled poll instead of re-claiming a Lease it has just lost, and nothing durable moved.
+        var quietUntil = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(1);
+        while (DateTimeOffset.UtcNow < quietUntil)
+        {
+            Assert.Equal(1, Volatile.Read(ref gated.Completed));
+            Assert.Equal(-1, await monitor.GetObserverCursorAsync("fenced"));
+            await Task.Delay(25);
+        }
+
+        // At-least-once is intact: the next scheduled poll re-claims the row the refused report left
+        // unresolved, and the cursor advances once a report finally lands inside its Lease.
+        await WaitForAsync(
+            () => monitor.GetObserverCursorAsync("fenced").AsTask().GetAwaiter().GetResult() >= 0,
+            "the fenced-out delivery to redeliver on the next poll and advance the cursor");
+        var delivered = Volatile.Read(ref gated.Completed);
+        Assert.True(delivered >= 2, $"the fenced-out row must redeliver; it was delivered {delivered} time(s)");
+
+        // One report round trip per delivery, and every one but the last was refused. Each refusal is counted
+        // exactly once, by the store site that detected it - a pump that re-raised the trigger would double
+        // the count and leave an InvariantDegraded (1601) log behind it.
+        Assert.Equal(delivered - 1, refusals.Actions.Count);
+        Assert.All(refusals.Actions, action => Assert.Equal("Degrade", action));
+        Assert.DoesNotContain(logs.Entries, e => e.EventId == 1601);
+
+        // And a refusal is not a fault: the report-faulted path (2103) stays untouched and no group halted -
+        // nothing here is an error, just a Lease this node no longer held.
+        Assert.DoesNotContain(logs.Entries, e => e.EventId == 2103);
+        Assert.Empty(app.Services.GetRequiredService<BackWaveHealth>().HaltedGroups);
+
+        await app.StopAsync();
+    }
+
+    [Fact]
     public async Task DeliveryTimeout_IsConfigurableViaConfigurePump_AndNeverReachesTheCore()
     {
         // The Core run config (ObserverDispatchOptions) carries no DeliveryTimeout — it is a Shell-only
@@ -366,5 +440,40 @@ public class ObserverDispatchIsolationTests
             "the short DeliveryTimeout to abandon the hung callback and advance the cursor");
 
         await app.StopAsync();
+    }
+
+    /// <summary>Collects the action tag of every violation counted under one trigger, and only that one.</summary>
+    private sealed class ViolationRecorder : IDisposable
+    {
+        private readonly MeterListener _listener;
+
+        public ViolationRecorder(InvariantTrigger trigger)
+        {
+            _listener = new MeterListener
+            {
+                InstrumentPublished = (instrument, l) =>
+                {
+                    if (instrument.Meter.Name == BackWaveDiagnostics.SourceName
+                        && instrument.Name == "backwave.invariant.violations")
+                    {
+                        l.EnableMeasurementEvents(instrument);
+                    }
+                },
+            };
+            _listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+            {
+                var pairs = tags.ToArray();
+                if (pairs.FirstOrDefault(t => t.Key == "backwave.invariant.trigger").Value as string
+                    == trigger.ToString())
+                {
+                    Actions.Add(pairs.FirstOrDefault(t => t.Key == "backwave.invariant.action").Value as string);
+                }
+            });
+            _listener.Start();
+        }
+
+        public ConcurrentBag<string?> Actions { get; } = [];
+
+        public void Dispose() => _listener.Dispose();
     }
 }
