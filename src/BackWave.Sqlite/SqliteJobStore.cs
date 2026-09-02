@@ -1082,8 +1082,9 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
 
         // Transition Log (§5.12): one entry per expired job for its resulting state — at its
         // post-claim Attempt — atomic with the disposition writes.
-        // Batched, so a wide sweep does not undo the set-based dispositions above with one
-        // insert per job. Each job appears once here (job_id is the key), so its ordinal holds.
+        // Batched into one insert, so a wide sweep does not add an insert per job on top of the
+        // dispositions above. Those stay a row at a time: a reschedule and a dead-letter write
+        // different columns. Each job appears once here (job_id is the key), so its ordinal holds.
         var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(expired.Count);
         foreach (var (jobId, attempt) in expired)
         {
@@ -1127,12 +1128,16 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         await using var transaction = (SqliteTransaction)connection.BeginTransaction(deferred: false);
 
         // Fenced on the lease itself: only rows this worker still holds, still Leased, so a job that
-        // already reported an outcome is never revived.
+        // already reported an outcome is never revived. Whole-writer serialization already rules out
+        // the lock ordering the other adapters order for, but the batch below assigns each Transition
+        // Log position by this list's index, so an unordered read would give one hand-back a different
+        // observer stream order on every replay.
         var held = new List<(Guid JobId, int Attempt)>();
         await using (var select = Cmd(
             $"""
             SELECT job_id, attempt FROM backwave_jobs
             WHERE state = {(int)JobState.Leased} AND lease_owner = $owner
+            ORDER BY job_id
             """,
             connection, transaction))
         {
