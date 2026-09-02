@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using BackWave.Storage;
 using OpenTelemetry;
@@ -20,15 +21,23 @@ namespace BackWave.SqlServer.Tests;
 public sealed class SqlServerInstrumentationRegistrationTests
 {
     private static readonly DateTimeOffset T0 = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    private const string RootSourceName = "BackWave.SqlServer.Tests.InstrumentationDriftGuard";
+    private static readonly ActivitySource RootSource = new(RootSourceName);
 
     [Fact]
     public async Task The_package_registration_captures_a_real_sqlserver_store_span()
     {
-        var exported = new List<Activity>();
+        var exported = new ConcurrentBag<Activity>();
         using var provider = Sdk.CreateTracerProviderBuilder()
             .AddBackWaveSqlServerInstrumentation()
-            .AddInMemoryExporter(exported)
+            .AddSource(RootSourceName)
+            .AddProcessor(new BagProcessor(exported))
             .Build()!;
+
+        // Roots this test's own trace, so the span below inherits its TraceId and is separable
+        // from the identical spans the rest of the suite emits into this same provider.
+        using var root = RootSource.StartActivity("drift-guard");
+        Assert.NotNull(root);
 
         var store = await SqlServerTestDatabase.CreateFreshStoreAsync();
         await store.EnqueueAsync(new NewJob(Guid.NewGuid(), "drift-guard", default, "default", T0), T0);
@@ -37,6 +46,16 @@ public sealed class SqlServerInstrumentationRegistrationTests
 
         // If the registered name ever drifts from the adapter's own SourceName, nothing lands here.
         Assert.Contains(exported, span =>
-            span.OperationName == "enqueue" && (string?)span.GetTagItem("db.system") == "mssql");
+            span.TraceId == root.TraceId
+            && span.OperationName == "enqueue"
+            && (string?)span.GetTagItem("db.system") == "mssql");
+    }
+
+    // The SDK appends from whichever thread ended the span, so the sink must tolerate a concurrent
+    // add during the read. A ConcurrentBag enumerates a snapshot; the in-memory exporter's ICollection
+    // contract cannot take one.
+    private sealed class BagProcessor(ConcurrentBag<Activity> bag) : BaseProcessor<Activity>
+    {
+        public override void OnEnd(Activity data) => bag.Add(data);
     }
 }
