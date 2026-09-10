@@ -154,9 +154,13 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
     // RelinquishLeases each open their own connection for that one transaction; Claim commits once per
     // Queue, so its unit is ClaimQueueAsync - a single Queue's transaction on a connection the claim
     // keeps open across the Queues - and NOT the whole claim, which would re-run the Queues that already
-    // committed and strand their jobs Leased until the lease expired. Enqueue is not wrapped: it can
-    // join a caller's transaction, and a deadlock dooms that transaction too, so only the caller can
-    // start it over.
+    // committed and strand their jobs Leased until the lease expired. Nothing wraps a claim as a whole,
+    // and nothing needs to: the only work outside the per-Queue loop is the one-time schema check, the
+    // Tag-presence probe, the Tag hydration and the next-due read, and every one of those is a hint-free
+    // read issued with no transaction open. The schema turns RCSI on, so those reads are served from row
+    // versions instead of taking shared locks, which leaves them nothing to be deadlocked over.
+    // Enqueue is not wrapped: it can join a caller's transaction, and a deadlock dooms that transaction
+    // too, so only the caller can start it over.
     // This covers the residual risk, not the cause. A deadlock here comes from a lock footprint wider
     // than the batch, and the statements that make the footprint are shaped to seek their own rows in
     // §5.2, §5.5 and §5.6. What no shape controls is the plan the optimizer picks for a foreign-key
@@ -372,8 +376,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         using var activity = SqlServerDiagnostics.StartStore("claim", JobsCollection);
         try
         {
-            var (jobs, _) = await RetryOnDeadlockAsync(
-                () => ClaimUntracedAsync(request, computeNextDue: false, cancellationToken), cancellationToken)
+            var (jobs, _) = await ClaimUntracedAsync(request, computeNextDue: false, cancellationToken)
                 .ConfigureAwait(false);
             return jobs;
         }
@@ -394,8 +397,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             // Idle-poll next-due: computed on the SAME connection right after the per-queue claims commit,
             // so it reads the post-claim committed snapshot. SQL Server has no Wake-Up Hint channel, so this
             // value is the sole latency mechanism for an idle backed-off fleet on this adapter.
-            var (jobs, nextDue) = await RetryOnDeadlockAsync(
-                () => ClaimUntracedAsync(request, computeNextDue: true, cancellationToken), cancellationToken)
+            var (jobs, nextDue) = await ClaimUntracedAsync(request, computeNextDue: true, cancellationToken)
                 .ConfigureAwait(false);
             return new ClaimResult(jobs, nextDue);
         }
