@@ -145,6 +145,13 @@ internal sealed class WorkerGroupService(
     // the fixed-cadence ticker governs polling exactly as before.
     private bool AdaptivePoll => options.MaxPollInterval > options.PollInterval;
 
+    // How far ahead of this pump another node's clock can run before the outcome fence calls a rejection
+    // a contradiction rather than a lapse. The fleet shares no time source, so a peer that expires a
+    // Lease legally can leave this pump reading an expiry that is still in the future. Anything inside
+    // this window is ordinary skew and is counted nowhere. Thirty seconds is far wider than a fleet on
+    // NTP ever drifts, and far narrower than the shortest Lease a Worker Group takes.
+    private static readonly TimeSpan ClockSkewAllowance = TimeSpan.FromSeconds(30);
+
     // <summary>
     // What the hand-back may actually spend: the configured ShutdownBudget, clamped so it cannot eat the
     // host's whole stop window. HostOptions.ShutdownTimeout is how long the host waits for its hosted
@@ -820,7 +827,14 @@ internal sealed class WorkerGroupService(
                         // in the future by the pump's own clock. Only that contradiction is counted. The
                         // belief is a lower bound (it advances only on renewals this pump saw), so the test
                         // errs toward silence and never toward a false alarm.
-                        if (!reApplied && believedLeases[i] is { } until && now < until)
+                        //
+                        // The clocks are the other reason it errs toward silence. The expiry is stamped
+                        // from THIS pump's clock and compared against it, but the node that expired the
+                        // Lease read its own, and the fleet is bound to no common time source. A peer that
+                        // runs a few seconds ahead expires a lapsed Lease legally, and this pump still sees
+                        // a future expiry. Only a window wider than any credible skew is a contradiction,
+                        // so one skewed node cannot make the zero-counter non-zero on a healthy fleet.
+                        if (!reApplied && believedLeases[i] is { } until && now + ClockSkewAllowance < until)
                         {
                             var detail =
                                 $"Outcome {reports[i].Outcome} for job {rowResult.JobId} (attempt {reports[i].Attempt}, " +

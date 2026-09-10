@@ -26,8 +26,10 @@ public enum InvariantTrigger
     /// <summary>A claim handed back a job that is already in a terminal state, so it must not execute.</summary>
     ClaimedJobTerminal,
 
-    /// <summary>The store's identity fence refused an outcome write, so that Lease was no longer this
-    /// worker's to report on. A lost race, not a broken invariant: it is logged and counted, never halted on.</summary>
+    /// <summary>The store's identity fence refused an outcome write while the reporting pump still believed
+    /// its Lease was live, by more than the clock skew a fleet can carry. A Lease that simply lapsed is the
+    /// ordinary end of an Attempt: another node inherits the job, and it raises nothing here. Only the
+    /// contradiction is logged and counted, and neither one is ever halted on.</summary>
     OutcomeFenceRejected,
 
     // ── Node Driver ──────────────────────────────────────────────────────────────────────────────
