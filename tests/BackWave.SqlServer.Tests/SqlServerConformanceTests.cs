@@ -93,6 +93,19 @@ public sealed class SqlServerConformanceTests : ConformanceSuite
         return new HeldRow(connection, transaction);
     }
 
+    // Rewrites one job's state column out of band, past every path the store owns, so the read
+    // meets a value outside JobState. Only an external writer can produce that value.
+    protected override async ValueTask<bool> TryStoreUndefinedJobStateAsync(Guid jobId, int state)
+    {
+        await using var connection = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await connection.OpenAsync();
+        await using var update = new SqlCommand(
+            "UPDATE backwave.jobs SET state = @state WHERE job_id = @id", connection);
+        update.Parameters.AddWithValue("state", state);
+        update.Parameters.AddWithValue("id", jobId);
+        return await update.ExecuteNonQueryAsync() == 1;
+    }
+
     private sealed class HeldRow(SqlConnection connection, SqlTransaction transaction) : IAsyncDisposable
     {
         public async ValueTask DisposeAsync()

@@ -55,6 +55,20 @@ public sealed class SqliteConformanceTests : ConformanceSuite, IAsyncLifetime
         return new(store);
     }
 
+    // Rewrites one job's state column out of band, past every path the store owns, so the read
+    // meets a value outside JobState. Only an external writer can produce that value.
+    protected override async ValueTask<bool> TryStoreUndefinedJobStateAsync(Guid jobId, int state)
+    {
+        await using var connection = new SqliteConnection(ConnectionString);
+        await connection.OpenAsync();
+        await using var update = connection.CreateCommand();
+        update.CommandText = "UPDATE backwave_jobs SET state = $state WHERE job_id = $id";
+        update.Parameters.AddWithValue("$state", state);
+        // The store writes the job id as canonical lowercase "D" text (SqliteValueCodec.ToText).
+        update.Parameters.AddWithValue("$id", jobId.ToString("D"));
+        return await update.ExecuteNonQueryAsync() == 1;
+    }
+
     protected override DbTransaction BeginTransaction(IJobStore store)
     {
         // The caller's own ADO.NET transaction on the caller's own connection to the same file.

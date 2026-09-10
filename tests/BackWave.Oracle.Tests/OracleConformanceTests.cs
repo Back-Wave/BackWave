@@ -107,6 +107,19 @@ public sealed class OracleConformanceTests : ConformanceSuite
         return new HeldRow(connection, transaction);
     }
 
+    // Rewrites one job's state column out of band, past every path the store owns, so the read
+    // meets a value outside JobState. Only an external writer can produce that value.
+    protected override async ValueTask<bool> TryStoreUndefinedJobStateAsync(Guid jobId, int state)
+    {
+        await using var connection = new OracleConnection(OracleTestDatabase.ConnectionString);
+        await connection.OpenAsync();
+        await using var update = new OracleCommand { Connection = connection, BindByName = true };
+        update.CommandText = "UPDATE backwave.jobs SET state = :state WHERE job_id = :id";
+        update.Parameters.Add(new OracleParameter("state", OracleDbType.Int32) { Value = state });
+        update.Parameters.Add(new OracleParameter("id", OracleDbType.Raw) { Size = 16, Value = jobId.ToByteArray() });
+        return await update.ExecuteNonQueryAsync() == 1;
+    }
+
     protected override DbTransaction BeginTransaction(IJobStore store)
     {
         // The caller's own ADO.NET transaction on the caller's own connection - exactly the shape

@@ -2027,6 +2027,31 @@ public abstract class ConformanceSuite
         Assert.Empty((await store.GetDependencyEdgesAsync(child.JobId)).GatingParents);
     }
 
+    /// <summary>
+    /// Certifies that a job row holding a state value outside <see cref="JobState"/> surfaces as a
+    /// named <see cref="InvariantViolationException"/>, never as a cast that hands the caller an
+    /// undefined enum value.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_9_AnUndefinedStoredState_RaisesTheNamedViolation_NotACastValue()
+    {
+        // A stored state outside the enum is the one fail-stop trigger that a legal caller cannot
+        // produce and an out-of-band write can: an older or newer node, a migration, or an operator
+        // UPDATE. Every other read-path guard tests a value the same transaction just wrote or holds
+        // locked, so no row edit reaches it. This clause pins the one that a row edit does reach.
+        var store = await CreateStoreAsync();
+        var job = Job();
+        await store.EnqueueAsync(job, now: T0);
+        if (!await TryStoreUndefinedJobStateAsync(job.JobId, 99))
+        {
+            return; // 5.9: the store keeps no integer state column an out-of-band write can reach
+        }
+
+        var violation = await Assert.ThrowsAsync<InvariantViolationException>(
+            async () => await store.GetJobAsync(job.JobId));
+        Assert.Equal(InvariantTrigger.UndefinedEnumValueStored, violation.Trigger);
+    }
+
     // ── §5.11 Retention sweep ───────────────────────────────────────────────────
 
     /// <summary>
@@ -2157,6 +2182,19 @@ public abstract class ConformanceSuite
     /// <returns>A handle whose disposal commits the held row, or null when the race is not simulable on this store.</returns>
     protected virtual ValueTask<IAsyncDisposable?> HoldEdgeRowAsync(Guid workflowId, Guid parentId, Guid childId)
         => new((IAsyncDisposable?)null);
+
+    /// <summary>
+    /// Writes <paramref name="state"/> straight into the given job's state column, out of band, past
+    /// every path the store owns. A value outside <see cref="JobState"/> is a state no caller can
+    /// reach, and a store must meet it with a named violation instead of a raw cast. The default
+    /// returns false, meaning the store keeps no integer state column that an out-of-band write can
+    /// reach - an in-memory store holds the enum itself - and the test returns early.
+    /// </summary>
+    /// <param name="jobId">The already-enqueued job whose state column the write overwrites.</param>
+    /// <param name="state">The raw integer to store, chosen outside the defined <see cref="JobState"/> values.</param>
+    /// <returns>True when the write landed, false when the store has no such column.</returns>
+    protected virtual ValueTask<bool> TryStoreUndefinedJobStateAsync(Guid jobId, int state)
+        => new(false);
 
     /// <summary>
     /// Certifies that a claim interrupted before commit rolls back whole: no lease bookkeeping
