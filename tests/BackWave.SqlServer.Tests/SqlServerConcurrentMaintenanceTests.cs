@@ -211,11 +211,137 @@ public sealed class SqlServerConcurrentMaintenanceTests
         Assert.Equal(0, faults.Terminal);
     }
 
+    // The claim commits once per Queue, so the unit its bounded retry replays must be ONE Queue's
+    // transaction. A wrap around the whole loop would re-run the Queues that already committed, and
+    // their rows are Leased by then: the replay claims nothing for them, the caller never receives the
+    // records, and the jobs sit Leased with their Attempt spent until the lease expires. That is the
+    // defect this test pins, and nothing pinned it before.
+    //
+    // The cycle. The Queue transaction takes the queue-config application lock, then reads the
+    // queue_limits row under UPDLOCK. A rival session holds X on that row, so the read blocks. The rival
+    // then asks for the same application lock, which the store holds. Neither can move. The rival runs at
+    // DEADLOCK_PRIORITY HIGH, so SQL Server kills the store with error 1205.
+    //
+    // The failpoint counts the Queue transactions that reach their commit. The first Queue reaches it
+    // once, the second Queue dies before it and reaches it once on the replay. A whole-loop retry makes
+    // that count three.
+    [Fact]
+    public async Task A_deadlocked_queue_replays_alone_and_the_queue_before_it_stays_claimed_once()
+    {
+        const string First = "alpha", Second = "beta";
+        var firstJob = Guid.NewGuid();
+        var secondJob = Guid.NewGuid();
+        var commits = 0;
+
+        await SqlServerTestDatabase.CreateFreshStoreAsync();
+        var store = new SqlServerJobStore(new SqlServerStoreOptions
+        {
+            ConnectionString = SqlServerTestDatabase.ConnectionString,
+            FaultHook = (name, _) =>
+            {
+                if (name == "claim")
+                {
+                    Interlocked.Increment(ref commits);
+                }
+                return Task.CompletedTask;
+            },
+        });
+
+        await store.EnqueueAsync(new NewJob(firstJob, "t", "{}"u8.ToArray(), First, T0), T0);
+        await store.EnqueueAsync(new NewJob(secondJob, "t", "{}"u8.ToArray(), Second, T0), T0);
+        // The row the rival locks. Without a limit the Queue has no queue_limits row to read, and the
+        // store skips both the lock and the read that the cycle needs.
+        await store.SetConcurrencyLimitAsync(Second, 10, "test", T0);
+
+        await using var rival = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await rival.OpenAsync();
+        await Execute(rival, null, "SET DEADLOCK_PRIORITY HIGH");
+        var rivalSession = (short)(await Scalar(rival, null, "SELECT @@SPID"))!;
+        await using var rivalTx = (SqlTransaction)await rival.BeginTransactionAsync();
+        await Execute(rivalTx.Connection, rivalTx,
+            $"UPDATE backwave.queue_limits SET max_concurrent = max_concurrent WHERE queue = '{Second}'");
+
+        using var faults = new StoreFaultCounter();
+        var claim = Task.Run(() => store
+            .ClaimAsync(new ClaimRequest("w", [First, Second], 10, Lease, T0)).AsTask());
+
+        try
+        {
+            await WaitUntilBlockedBy(rivalSession);
+            // Issued, deliberately not awaited: it blocks on the application lock the store took just
+            // before it stalled on the row above, which closes the cycle.
+            var rivalBlocked = Execute(rivalTx.Connection, rivalTx,
+                """
+                DECLARE @resource nvarchar(64) = CONVERT(nvarchar(64), HASHBYTES('SHA2_256', @queue), 2);
+                DECLARE @rc int;
+                EXEC @rc = sp_getapplock @Resource = @resource, @LockMode = 'Exclusive', @LockOwner = 'Transaction';
+                """,
+                queue: Second);
+            await rivalBlocked.WaitAsync(TimeSpan.FromSeconds(60)); // granted once SQL Server kills the store
+        }
+        finally
+        {
+            // Whatever went wrong above, the replay must not stay blocked on this transaction forever.
+            await rivalTx.RollbackAsync();
+        }
+
+        var result = await claim.WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.Equal(1, faults.Absorbed);
+        Assert.Equal(0, faults.Terminal);
+        Assert.Equal(2, Volatile.Read(ref commits));
+        // Both Queues come back, each exactly once. Single throws on a duplicate and on an absence.
+        Assert.Equal(2, result.Count);
+        Assert.Equal(1, result.Single(job => job.JobId == firstJob).Attempt);
+        Assert.Equal(1, result.Single(job => job.JobId == secondJob).Attempt);
+        // The Transition Log is the record the caller cannot fake: one Leased entry means one claim.
+        await using var reader = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await reader.OpenAsync();
+        Assert.Equal(1, (int)(await Scalar(reader, null,
+            "SELECT count(*) FROM backwave.job_transitions WHERE job_id = @id AND state = 2", firstJob))!);
+    }
+
     // ── harness ─────────────────────────────────────────────────────────────────
 
     // One statement on the rival session. The Task comes back so a caller can issue a statement WITHOUT
     // awaiting it, which is how the blocked half of the cycle above is set up.
     private static async Task Execute(
+        SqlConnection connection, SqlTransaction? transaction, string sql, Guid? id = null, string? queue = null)
+    {
+        await using var command = new SqlCommand(sql, connection, transaction);
+        if (id is { } value)
+        {
+            command.Parameters.AddWithValue("id", value);
+        }
+        if (queue is not null)
+        {
+            command.Parameters.AddWithValue("queue", queue);
+        }
+        await command.ExecuteNonQueryAsync();
+    }
+
+    // Polls until one session waits on a lock that <paramref name="session"/> holds. The rival closes the
+    // deadlock cycle only after the store is already blocked, so this order is the whole setup.
+    private static async Task WaitUntilBlockedBy(short session)
+    {
+        await using var watcher = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await watcher.OpenAsync();
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(30);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var blocked = (int)(await Scalar(watcher, null,
+                $"SELECT count(*) FROM sys.dm_exec_requests WHERE blocking_session_id = {session}"))!;
+            if (blocked > 0)
+            {
+                return;
+            }
+            await Task.Delay(25);
+        }
+        Assert.Fail($"No session blocked on {session} within 30 s, so the deadlock cycle was never set up.");
+    }
+
+    // One scalar query on a caller's session.
+    private static async Task<object?> Scalar(
         SqlConnection connection, SqlTransaction? transaction, string sql, Guid? id = null)
     {
         await using var command = new SqlCommand(sql, connection, transaction);
@@ -223,7 +349,7 @@ public sealed class SqlServerConcurrentMaintenanceTests
         {
             command.Parameters.AddWithValue("id", value);
         }
-        await command.ExecuteNonQueryAsync();
+        return await command.ExecuteScalarAsync();
     }
 
     /// <summary>
