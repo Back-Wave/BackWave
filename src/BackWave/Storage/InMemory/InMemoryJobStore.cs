@@ -1309,13 +1309,27 @@ public sealed class InMemoryJobStore(
                 return ValueTask.FromResult(ObserverReportOutcome.UnknownObserver);
             }
             // Fence (§5.13): only the live claim-Lease holder may resolve deliveries and advance the
-            // cursor. A stale survivor of a lapsed claim reports into the void — at-least-once intact.
+            // cursor. Two shapes are refused here and only one of them is a broken invariant.
+            //
+            // A stale survivor of a lapsed claim reports into the void - its claim Lease simply ran out
+            // before the report arrived, so the report changes nothing and at-least-once stays intact.
+            // That race is ordinary, so it is counted nowhere: the invariant ledger is the surface a
+            // promotion rule reads FOR ZEROS, and a healthy fleet that increments it makes the trigger
+            // meaningless.
+            //
+            // What no legal race produces is a report from a worker that is not the owner while the claim
+            // Lease is still LIVE: the store holds an unexpired Lease for somebody else, so two workers
+            // believe they hold the same observer claim at once. Only that contradiction is counted.
             if (!string.Equals(observer.LeaseOwner, report.WorkerId, StringComparison.Ordinal)
                 || observer.LeaseExpiry <= report.Now)
             {
-                Invariant.Degrade(
-                    null, InvariantTrigger.ObserverReportFenceRejected,
-                    $"Observer '{report.ObserverId}': worker '{report.WorkerId}' no longer holds the claim lease, so its report changed nothing.");
+                if (observer.LeaseExpiry > report.Now)
+                {
+                    Invariant.Degrade(
+                        null, InvariantTrigger.ObserverReportFenceRejected,
+                        $"Observer '{report.ObserverId}': worker '{report.WorkerId}' reported against a claim lease " +
+                        $"still held by '{observer.LeaseOwner}' until {observer.LeaseExpiry:o}, and it is only {report.Now:o}.");
+                }
                 return ValueTask.FromResult(ObserverReportOutcome.FenceRejected);
             }
 
