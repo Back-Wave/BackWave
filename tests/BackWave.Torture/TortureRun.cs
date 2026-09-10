@@ -37,9 +37,9 @@ internal static class TortureRun
 
         var started = DateTimeOffset.UtcNow;
         var journal = new Journal();
-        // Nothing else in this process can see a degraded trigger: it throws nothing and every adapter site
-        // passes a null logger, so the backwave.invariant.violations counter is its only surface. Subscribed
-        // for the whole run - the drain and the audit included, since those drive the adapter too.
+        // Nothing else in this process can see a degraded trigger: it throws nothing, and a torture process
+        // registers no log provider, so the backwave.invariant.violations counter is its only surface here.
+        // Subscribed for the whole run - the drain and the audit included, since those drive the adapter too.
         using var degrades = new DegradeWatch(journal, "torture-run");
         var wall = Stopwatch.StartNew();
 
@@ -223,6 +223,8 @@ internal static class TortureRun
             {
                 RedirectStandardError = true,
                 RedirectStandardOutput = true,
+                // The stop is ASKED for, not forced: closing this pipe is the signal the child watches.
+                RedirectStandardInput = true,
             };
             info.ArgumentList.Add("client");
             info.ArgumentList.Add("--db"); info.ArgumentList.Add(target.DbPath);
@@ -239,10 +241,40 @@ internal static class TortureRun
         }
         Console.WriteLine($"torture: spawned {children.Count} child processes × {perChild} clients on {target.DbPath}");
 
+        // A kill never reaches a finally, and the child writes its journal in one, so the parent ASKS
+        // first and kills only what will not go. The ask is the close of the child's stdin, which lands
+        // the moment the time box ends - at the end of the run, or early when the mid-run audit found
+        // something. Each child then stops its clients, writes its journal file, and exits on its own.
+        using var watchdog = new CancellationTokenSource();
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, timebox);
+            }
+            catch (OperationCanceledException)
+            {
+                // The time box ended, which is the only reason this wait ever returns.
+            }
+            foreach (var (process, _, _) in children)
+            {
+                AskChildToStop(process);
+            }
+            try
+            {
+                // The kill clock starts only once every child was asked, so the grace window is the
+                // same for all of them whether the run ended on its time box or on a finding.
+                watchdog.CancelAfter(ChildStopGrace);
+            }
+            catch (ObjectDisposedException)
+            {
+                // Every child already exited and the loop below returned. Nothing left to kill.
+            }
+        });
+
         foreach (var (process, journalPath, clientBase) in children)
         {
-            using var watchdog = CancellationTokenSource.CreateLinkedTokenSource(timebox);
-            watchdog.CancelAfter(options.Duration + TimeSpan.FromSeconds(60));
+            var killed = false;
             try
             {
                 await process.WaitForExitAsync(watchdog.Token);
@@ -250,19 +282,16 @@ internal static class TortureRun
             catch (OperationCanceledException)
             {
                 process.Kill(entireProcessTree: true);
-                if (timebox.IsCancellationRequested)
-                {
-                    continue; // the mid-run audit cut the run short; the child did nothing wrong
-                }
+                killed = true;
                 journal.Record(new JournalEntry
                 {
                     Client = $"child-{clientBase}", Op = Ops.ClientCrash,
                     T0 = DateTimeOffset.UtcNow.UtcTicks, T1 = DateTimeOffset.UtcNow.UtcTicks,
-                    Detail = "child process hung past the time box and was killed",
+                    Detail = $"child did not exit within {ChildStopGrace.TotalSeconds:F0}s of the stop request " +
+                        "and was killed; its journal may be short",
                 });
-                continue;
             }
-            if (process.ExitCode != 0)
+            if (!killed && process.ExitCode != 0)
             {
                 var stderr = await process.StandardError.ReadToEndAsync();
                 journal.Record(new JournalEntry
@@ -272,6 +301,8 @@ internal static class TortureRun
                     Detail = $"child exited {process.ExitCode}: {stderr[..Math.Min(stderr.Length, 2000)]}",
                 });
             }
+            // Merged whatever happened. A killed child still flushed part of its journal, and a run that
+            // ended on a finding is exactly the run whose evidence matters most.
             if (File.Exists(journalPath))
             {
                 foreach (var entry in await Journal.ReadAsync(journalPath))
@@ -280,6 +311,22 @@ internal static class TortureRun
                 }
                 File.Delete(journalPath);
             }
+        }
+    }
+
+    /// <summary>How long a child has to land its journal and exit after the parent asked it to stop.</summary>
+    private static readonly TimeSpan ChildStopGrace = TimeSpan.FromSeconds(60);
+
+    /// <summary>Closes the child's stdin, which is the stop signal it watches. A child already gone needs none.</summary>
+    private static void AskChildToStop(Process process)
+    {
+        try
+        {
+            process.StandardInput.Close();
+        }
+        catch (Exception)
+        {
+            // The child exited on its own time box and closed the pipe first. Nothing to ask.
         }
     }
 
@@ -306,6 +353,7 @@ internal static class TortureRun
         try
         {
             using var timebox = new CancellationTokenSource(duration);
+            WatchForParentStop(timebox);
             var workers = Enumerable.Range(clientBase, clients)
                 .Select(i => new WorkloadClient(i, target.CreateStore(), keys, journal, options, started)
                 {
@@ -329,6 +377,41 @@ internal static class TortureRun
         {
             await journal.WriteAsync(journalPath);
         }
+    }
+
+    /// <summary>
+    /// Ends this child's time box when the parent closes its stdin. The parent asks that way when the run
+    /// ends, and early when its mid-run audit found something, so the child lands the journal its finally
+    /// writes instead of dying to a kill that no finally survives. The duration still ends a child whose
+    /// parent asks for nothing.
+    /// </summary>
+    private static void WatchForParentStop(CancellationTokenSource timebox)
+    {
+        // Nothing waits on this: it blocks on a pipe the parent may never close, and the run must not.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await using var stdin = Console.OpenStandardInput();
+                var buffer = new byte[1];
+                while (await stdin.ReadAsync(buffer) > 0)
+                {
+                    // The parent sends no data. Only the close of the pipe means anything.
+                }
+            }
+            catch (Exception)
+            {
+                // No stdin at all, or a pipe torn down under us. Either reads as the same request.
+            }
+            try
+            {
+                await timebox.CancelAsync();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The duration ended the run first and the caller already disposed the source.
+            }
+        });
     }
 
     private static async Task ProgressAsync(Func<long> ops, CancellationToken cancellationToken)
