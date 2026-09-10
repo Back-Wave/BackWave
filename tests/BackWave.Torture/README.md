@@ -96,8 +96,8 @@ production takes the worker group out of service; the finding names the tripped 
 DegradeTriggerFired, ClientCrash.
 
 The Degrade half of the fail-stop vocabulary throws nothing — the site counts the impossible state and
-carries on down its benign branch — and every adapter site passes a null logger, so the
-`backwave.invariant.violations` counter is the only surface it reaches. `DegradeWatch` subscribes to that
+carries on down its benign branch — and a torture process registers no log provider, so the
+`backwave.invariant.violations` counter is the only surface it reaches here. `DegradeWatch` subscribes to that
 counter (in the parent and in each SQLite child process, whose journal is merged home) and journals every
 Degrade measurement by trigger id; the run sweeps the whole journal for them once, at the end, and goes RED.
 Degrading keeps a production node in service; it does not make the state legal, and the suite has no benign
