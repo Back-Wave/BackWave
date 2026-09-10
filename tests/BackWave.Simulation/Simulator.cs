@@ -526,12 +526,12 @@ internal sealed record SimulationResult(
     public int PermanentLosses { get; init; }
 
     /// <summary>
-    /// Node exits that lost a non-empty outcome buffer - the buffer-loss window (ADR 0035). A crash always
+    /// Node exits that lost a non-empty outcome buffer - the buffer-loss window. A crash always
     /// loses one; a clean stop only when its hand-back flush faulted partway, since the stop flushes first.
     /// </summary>
     public int OutcomeBufferDropped { get; init; }
 
-    /// <summary>Clean stops whose hand-back flushed a non-empty outcome buffer before relinquishing (ADR 0035).</summary>
+    /// <summary>Clean stops whose hand-back flushed a non-empty outcome buffer before relinquishing.</summary>
     public int OutcomeBufferFlushed { get; init; }
 
     /// <summary>
@@ -815,7 +815,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     private long _steps;
     private int _crashes;
     private int _staleOutcomes;
-    // Node exits that lost a non-empty outcome buffer (ADR 0035): the buffer-loss window. Every crash with a
+    // Node exits that lost a non-empty outcome buffer: the buffer-loss window. Every crash with a
     // buffer, plus a clean stop whose hand-back flush faulted partway - both leave rows the fresh Driver will
     // never see. Tallied off the Driver's buffered count at exit time - no rng, no hot-path instrumentation.
     private int _outcomeBufferDropped;
@@ -2017,7 +2017,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     }
 
     /// <summary>
-    /// Core-side coalescing (ADR 0035): the Driver buffered terminal outcomes and flushes them as ONE
+    /// Core-side coalescing: the Driver buffered terminal outcomes and flushes them as ONE
     /// command. The harness vectorizes the singular report — per row a pre-state read, the
     /// per-(workerId, attempt) fence verdict, the Outcome-Provenance assertion, the slot-release detection,
     /// then Drive(OutcomeReported). Each row consults the per-node faulty store on the same "ReportOutcome"
@@ -2031,7 +2031,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     /// one - a shutdown flush that skipped the fence, the oracles or the fault gate would be a second, weaker
     /// report path the sim would then be silently blessing.
     ///
-    /// SabotageBatchFence self-test (ADR 0035): model a native batch impl that fences single reports
+    /// SabotageBatchFence self-test: model a native batch impl that fences single reports
     /// correctly but applies a MULTI-row batch as a whole — without re-checking the (workerId, attempt) fence
     /// per row. Drop the fence for every row of a >1 batch so a stale row riding alongside live ones lands;
     /// the Outcome-Provenance oracle must catch it, proving the vectorized fence is enforced per row.

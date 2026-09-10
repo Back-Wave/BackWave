@@ -1009,7 +1009,7 @@ internal sealed class WorkerGroupService(
                             // becomes job data: a named check proved an impossible state INSIDE the
                             // handler's call - a Dependency read whose workflow row is gone, an enqueue the
                             // store refused as cyclic. No Attempt of this job, or any other, can be trusted
-                            // afterwards and no retry can fix it, so it halts the group (ADR-0007) instead
+                            // afterwards and no retry can fix it, so it halts the group instead
                             // of degrading into one more failed Attempt.
                             //
                             // The run is fire-and-forget, so a faulted task would reach nobody. The event
