@@ -1,4 +1,5 @@
 using BackWave.Core;
+using BackWave.Diagnostics;
 using BackWave.Jobs;
 using BackWave.Monitor;
 using BackWave.Storage;
@@ -300,6 +301,40 @@ public class ShutdownHandBackTests
         Assert.Equal(0, store.RelinquishCalls);
         Assert.Equal(JobState.Leased, (await monitor.GetJobAsync(jobId))!.State);
     }
+
+    [Fact]
+    public async Task AViolationRaisedWhileTheHandBackDrains_HaltsTheGroup_AndHandsNothingBack()
+    {
+        // A named check trips inside a handler that is still running when the stop begins. The pump loop
+        // that would have raised it is already gone, so the violation sits in the completed channel with
+        // nobody reading. Unread it would be lost entirely: the group would report green, the trigger
+        // nothing else records would vanish, and the relinquish would hand back rows a halted group must
+        // leave alone.
+        var store = new FaultableStore(new InMemoryJobStore());
+        var gate = new StubbornGate
+        {
+            Hold = TimeSpan.FromMilliseconds(300),
+            Violation = InvariantTrigger.WorkflowMemberWithoutWorkflow,
+        };
+        var logs = new CapturingLoggerProvider();
+        await using var app = BuildStubbornHost(store, gate, logs, shutdownBudget: TimeSpan.FromSeconds(10));
+        await app.StartAsync();
+
+        var client = app.Services.GetRequiredService<BackWaveClient>();
+        await client.EnqueueAsync(new PingJob("violate-mid-drain"), dueTime: DateTimeOffset.UtcNow);
+        await gate.Started.Task.WaitAsync(TestTimeout);
+
+        await app.StopAsync().WaitAsync(TestTimeout);
+
+        var health = app.Services.GetRequiredService<BackWaveHealth>();
+        Assert.False(health.IsHealthy);
+        var halt = Assert.Contains("workers", health.HaltedGroups);
+        Assert.Equal(InvariantTrigger.WorkflowMemberWithoutWorkflow, halt.Trigger);
+        var critical = Assert.Single(logs.Entries, entry => entry.EventId == 2001);
+        Assert.Equal(LogLevel.Critical, critical.Level);
+        Assert.Contains(nameof(InvariantTrigger.WorkflowMemberWithoutWorkflow), critical.Message);
+        Assert.Equal(0, store.RelinquishCalls); // a halting group writes nothing more to the store
+    }
 }
 
 /// <summary>
@@ -317,6 +352,9 @@ public sealed class StubbornGate
 
     /// <summary>When the handler returned, or <see langword="null"/> if it never has.</summary>
     public DateTimeOffset? FinishedAt { get; set; }
+
+    /// <summary>When set, the handler raises a named violation at the end of its hold instead of returning.</summary>
+    public InvariantTrigger? Violation { get; init; }
 }
 
 /// <summary>Runs out its gate's hold with the cancellation token ignored entirely.</summary>
@@ -328,5 +366,9 @@ public sealed class StubbornHandler(StubbornGate gate) : IJobHandler<PingJob>
         gate.Started.TrySetResult();
         await Task.Delay(gate.Hold, CancellationToken.None);
         gate.FinishedAt = DateTimeOffset.UtcNow;
+        if (gate.Violation is { } trigger)
+        {
+            throw new InvariantViolationException(trigger, "forced named violation from inside a handler");
+        }
     }
 }

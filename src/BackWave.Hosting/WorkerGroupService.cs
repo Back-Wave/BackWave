@@ -372,13 +372,24 @@ internal sealed class WorkerGroupService(
             // executions are still writing and flushes the Driver's buffered outcomes through the
             // ordinary command path, which writes their OutcomeReported events back to this very
             // channel - a completed writer would refuse every one of them.
-            await HandBackAsync(driver, events, stoppingToken).ConfigureAwait(false);
-            // Pump gone: close the channel so the tickers' writes no-op instead of
-            // filling an unread buffer until host shutdown.
-            events.Writer.TryComplete();
-            if (hints is not null)
+            try
             {
-                await hints.DisposeAsync().ConfigureAwait(false);
+                await HandBackAsync(driver, events, stoppingToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                // Its own finally, because the hand-back rethrows a named violation on its way out. Left in
+                // the same block, that throw would skip both lines below: the channel would stay open for
+                // the tickers to fill until host shutdown, and the Wake-Up Hint subscription would leak on
+                // exactly the path - a halt - that most needs the process left tidy.
+                //
+                // Pump gone: close the channel so the tickers' writes no-op instead of
+                // filling an unread buffer until host shutdown.
+                events.Writer.TryComplete();
+                if (hints is not null)
+                {
+                    await hints.DisposeAsync().ConfigureAwait(false);
+                }
             }
         }
     }
@@ -449,6 +460,18 @@ internal sealed class WorkerGroupService(
                 {
                     await ExecuteAsync(command, events.Writer, budget.Token).ConfigureAwait(false);
                 }
+            }
+
+            // A handler that raised a named violation while the wait above ran completed the writer with
+            // that exception, and the pump loop that would have raised it exited before this method
+            // started: nothing else reads the channel now. Read the completion here, so a violation
+            // during the drain reaches the same halt site as one raised in cycle instead of being lost.
+            // Ahead of the flush and the relinquish, because a halting group writes nothing more to the
+            // store - the same reason the in-cycle path never flushes the buffer after a violation.
+            if (events.Reader.Completion is { IsFaulted: true } completion
+                && completion.Exception?.InnerException is { } carried)
+            {
+                ExceptionDispatchInfo.Capture(carried).Throw();
             }
 
             // Through the ordinary command path too, so the buffered Failure Detail, Tags, Output, and
