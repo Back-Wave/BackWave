@@ -387,10 +387,11 @@ internal sealed class WorkerGroupService(
     // The clean-stop hand-back: wait out the executions this pump still has running, settle whatever
     // those executions wrote on their way out, report the outcomes the Driver had buffered, then
     // relinquish the Leases it still holds so their jobs return to the queue now instead of waiting out
-    // the whole Lease duration on a node that is gone. All four steps spend ONE budget, in that order -
+    // the whole Lease duration on a node that is gone. All four steps spend ONE allowance, in that order -
     // four independent timeouts could sum past the host's own shutdown timeout and turn a clean stop
-    // into a kill. stoppingToken is already cancelled by the time the pump exits, so the budget is the
-    // only token that can permit this work.
+    // into a kill - and the allowance is split so the relinquish keeps a reserved slice of it.
+    // stoppingToken is already cancelled by the time the pump exits, so these budgets are the
+    // only tokens that can permit this work.
     // The wait comes FIRST, and the drain of the event channel immediately after it, because a handler
     // that finishes during the wait writes its outcome to a channel the pump loop has already stopped
     // reading: nothing else would ever take it, and the relinquish below would then return a job that
@@ -411,7 +412,15 @@ internal sealed class WorkerGroupService(
             return;
         }
 
-        using var budget = new CancellationTokenSource(allowance);
+        // The relinquish gets a slice of the allowance that no step before it can spend. Those steps wait
+        // on work this pump does not govern - a handler that ignores its token eats every millisecond it
+        // is given - and the relinquish is the one step the whole hand-back exists to perform. On one
+        // shared token an unresponsive handler starves it, the store call gets an already-cancelled
+        // token, and the Leases lapse: precisely the outcome this feature removes. The reserve is one
+        // fifth, so the drain still keeps the bulk, and its clock starts only when the drain is over, so
+        // the two together can never exceed the allowance.
+        var reserve = allowance / 5;
+        using var budget = new CancellationTokenSource(allowance - reserve);
         try
         {
             await DrainInFlightAsync(budget.Token).ConfigureAwait(false);
@@ -452,8 +461,9 @@ internal sealed class WorkerGroupService(
 
             // Fenced store-side on this pump's worker identity and the Leased state, so anything the
             // flush above just settled is already out of reach.
+            using var relinquishBudget = new CancellationTokenSource(reserve);
             var relinquished = await store.RelinquishLeasesAsync(
-                _workerId, _clock.GetUtcNow(), options.RetryPolicy.ToDisposition(), budget.Token)
+                _workerId, _clock.GetUtcNow(), options.RetryPolicy.ToDisposition(), relinquishBudget.Token)
                 .ConfigureAwait(false);
             if (relinquished > 0)
             {
