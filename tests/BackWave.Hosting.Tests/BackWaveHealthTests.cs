@@ -133,8 +133,11 @@ public sealed class BackWaveHealthTests
     // --- The health check's three-way result (issue dst-0011) ---
 
     private static HealthStatus StatusOf(BackWaveHealth health) =>
+        ResultOf(health).Status;
+
+    private static HealthCheckResult ResultOf(BackWaveHealth health) =>
         new BackWaveHealthCheck(health)
-            .CheckHealthAsync(new HealthCheckContext()).GetAwaiter().GetResult().Status;
+            .CheckHealthAsync(new HealthCheckContext()).GetAwaiter().GetResult();
 
     [Fact]
     public void HealthCheck_CleanGroups_ReportHealthy()
@@ -182,5 +185,27 @@ public sealed class BackWaveHealthTests
 
         health.ReportDegraded("reports", "reports:pump-0", new TimeoutException("store blip"));
         Assert.Equal(HealthStatus.Unhealthy, StatusOf(health));
+    }
+
+    [Fact]
+    public void HealthCheck_DegradedDescription_NamesTheGroupAndTheTypeButNotTheProviderMessage()
+    {
+        var health = new BackWaveHealth();
+
+        // A provider's fault message names the host, the database and the login it could not reach.
+        // The check's description reaches an unauthenticated probe through a stock response writer.
+        health.ReportDegraded("emails", "emails:pump-0", new TimeoutException(
+            "Login failed for user 'bw_app' on server 'prod-sql-01.internal' database 'backwave'."));
+        health.ReportHalted("reports", "reports:pump-0", groupPumpCount: 2, Boom("lease owner 'node-7' is not this worker"));
+
+        var description = ResultOf(health).Description!;
+
+        Assert.Contains("emails (TimeoutException)", description);
+        Assert.Contains("reports (System.InvalidOperationException)", description);
+        Assert.DoesNotContain("prod-sql-01.internal", description);
+        Assert.DoesNotContain("node-7", description);
+
+        // The full message is still there for an operator reading the state in process.
+        Assert.Contains("prod-sql-01.internal", health.DegradedGroups["emails"]);
     }
 }

@@ -23,7 +23,7 @@ public sealed class BackWaveHealth
     // partially halted — still serving through its surviving Pumps. A single-Pump group (the default)
     // has exactly one Pump, so a halt is always a whole-group halt: behaviour is unchanged from one Pump.
     private readonly ConcurrentDictionary<(string Group, string Pump), HaltState> _halted = new();
-    private readonly ConcurrentDictionary<(string Group, string Pump), string> _degraded = new();
+    private readonly ConcurrentDictionary<(string Group, string Pump), DegradedState> _degraded = new();
     private readonly ConcurrentDictionary<string, int> _groupPumpCount = new(StringComparer.Ordinal);
 
     /// <summary>
@@ -62,9 +62,27 @@ public sealed class BackWaveHealth
         get
         {
             var byGroup = new Dictionary<string, string>(StringComparer.Ordinal);
-            foreach (var (key, description) in _degraded)
+            foreach (var (key, state) in _degraded)
             {
-                byGroup.TryAdd(key.Group, description);
+                byGroup.TryAdd(key.Group, $"{state.ExceptionType}: {state.Message}");
+            }
+            return byGroup;
+        }
+    }
+
+    // The same groups, carrying the exception TYPE name alone. The health check renders this one,
+    // because a provider's message names the host, the database and the login that failed, and a
+    // description-rendering response writer puts a health-check description on an unauthenticated
+    // probe endpoint. The message stays available through DegradedGroups, which an operator reads
+    // in process rather than over the wire.
+    internal IReadOnlyDictionary<string, string> DegradedGroupTypes
+    {
+        get
+        {
+            var byGroup = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var (key, state) in _degraded)
+            {
+                byGroup.TryAdd(key.Group, state.ExceptionType);
             }
             return byGroup;
         }
@@ -84,10 +102,13 @@ public sealed class BackWaveHealth
     }
 
     internal void ReportDegraded(string workerGroup, string pump, Exception exception) =>
-        _degraded[(workerGroup, pump)] = $"{exception.GetType().Name}: {exception.Message}";
+        _degraded[(workerGroup, pump)] = new DegradedState(exception.GetType().Name, exception.Message);
 
     internal void ReportRecovered(string workerGroup, string pump) =>
         _degraded.TryRemove((workerGroup, pump), out _); // clears only this pump's mark, never a sibling's
+
+    /// <summary>One pump's transient-fault mark, split so the health check can render the type alone.</summary>
+    private sealed record DegradedState(string ExceptionType, string Message);
 
     private bool IsWhollyHalted(string group) =>
         _halted.Count(k => k.Key.Group == group) >= _groupPumpCount.GetValueOrDefault(group, 1);
@@ -168,8 +189,8 @@ public sealed class BackWaveHealthCheck(BackWaveHealth health) : IHealthCheck
     /// <param name="cancellationToken">Unused; the check reads in-memory state and never blocks.</param>
     /// <returns>
     /// A completed task with an unhealthy result whose description lists the wholly halted groups and
-    /// their causes; otherwise a degraded result naming the partially halted and degraded groups; or a
-    /// healthy result when there are none.
+    /// their causes; otherwise a degraded result naming the partially halted and degraded groups with
+    /// their exception TYPE names only; or a healthy result when there are none.
     /// </returns>
     /// <remarks>
     /// <b>Breaking behavioural change:</b> a transient store fault used to report
@@ -186,8 +207,12 @@ public sealed class BackWaveHealthCheck(BackWaveHealth health) : IHealthCheck
         }
         // Impaired but serving: a partially halted group is still claiming through its surviving pumps,
         // and a degraded group is retrying each poll. Neither is a fail-stop, and neither is clean.
-        var impaired = health.PartiallyHaltedGroups.Select(g => $"{g.Key} ({g.Value})")
-            .Concat(health.DegradedGroups.Select(g => $"{g.Key} ({g.Value})"))
+        // The group name and the exception TYPE name only. This description is what a stock
+        // response writer serializes onto a probe endpoint, and a provider's message carries the host,
+        // the database and the login it failed to reach. HaltedGroups, PartiallyHaltedGroups and
+        // DegradedGroups still carry the full message for an operator reading them in process.
+        var impaired = health.PartiallyHaltedGroups.Select(g => $"{g.Key} ({g.Value.ExceptionType})")
+            .Concat(health.DegradedGroupTypes.Select(g => $"{g.Key} ({g.Value})"))
             .ToList();
         return Task.FromResult(impaired.Count == 0
             ? HealthCheckResult.Healthy("All Worker Groups running.")
