@@ -243,10 +243,31 @@ internal static class Checks
         // A Requeue resets the attempt counter to 0, so a requeued job legitimately re-runs the same
         // attempt numbers — one extra life per successful requeue. The claim/report Effect-Once
         // checks therefore allow (1 + requeues) occurrences per (job, attempt), not 1.
+        //
+        // An UNANSWERED request counts as a life too. The client journals its request before the store
+        // call and the result after it, so a prefix can hold a claim of the reset attempt while the
+        // requeue that permitted it is still in flight - and a fault entry answers a request that the
+        // store may well have committed. Counting the gap as a life can only hide a finding. Counting it
+        // as nothing would invent one, and the mid-run audit reads exactly these prefixes. Every request
+        // is answered by the time the post-drain pass runs, so that pass loses no precision at all.
         var requeueLives = journal
             .Where(e => e.Op == Ops.Requeue && e.Result == nameof(RequeueResult.Requeued) && e.JobId is not null)
             .GroupBy(e => e.JobId!.Value)
             .ToDictionary(g => g.Key, g => g.Count());
+        var requeueAnswers = journal
+            .Where(e => e.Op == Ops.Requeue && e.JobId is not null)
+            .GroupBy(e => e.JobId!.Value)
+            .ToDictionary(g => g.Key, g => g.Count());
+        foreach (var group in journal
+            .Where(e => e.Op == Ops.RequeueRequested && e.JobId is not null)
+            .GroupBy(e => e.JobId!.Value))
+        {
+            var inFlight = group.Count() - requeueAnswers.GetValueOrDefault(group.Key);
+            if (inFlight > 0)
+            {
+                requeueLives[group.Key] = requeueLives.GetValueOrDefault(group.Key) + inFlight;
+            }
+        }
 
         // NoDoubleExecution: a claim hands an attempt to exactly one worker, once per life.
         foreach (var group in claims.GroupBy(e => (e.JobId!.Value, e.Attempt!.Value)))

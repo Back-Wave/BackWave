@@ -14,6 +14,10 @@ internal static class Ops
     public const string Expire = "expire";
     public const string Cancel = "cancel";
     public const string Requeue = "requeue";
+
+    /// <summary>Journaled BEFORE the requeue store call, so a prefix never holds the claim of a reset
+    /// attempt without the life that permits it. Answered by exactly one <see cref="Requeue"/> entry.</summary>
+    public const string RequeueRequested = "requeue-requested";
     public const string Pause = "pause";
     public const string Resume = "resume";
     public const string Limit = "limit";

@@ -312,10 +312,22 @@ internal sealed class WorkloadClient(
         });
 
     private Task RequeueAsync()
-        => Call(Ops.Requeue, async () =>
+    {
+        var jobId = PickKnownJobId();
+        var t0 = Ticks();
+        // The request is journaled BEFORE the store call, and the result entry after it, as every other
+        // op does. A Requeue resets the attempt counter, so another client can claim the reset attempt
+        // and journal that claim while this method is still between the store's commit and its own
+        // Record. A mid-run watermark taken inside that gap sees two claims against one life and reports
+        // a NoDoubleExecution that never happened. The oracle counts an unanswered request as a life, so
+        // a prefix taken in that gap can only hide a finding, never invent one, and the answer below
+        // settles the count exactly for the post-drain pass.
+        journal.Record(new JournalEntry
         {
-            var jobId = PickKnownJobId();
-            var t0 = Ticks();
+            Client = _client, Op = Ops.RequeueRequested, T0 = t0, T1 = t0, JobId = jobId,
+        });
+        return Call(Ops.Requeue, async () =>
+        {
             var result = await store.RequeueAsync(jobId, _workerId, Now());
             return new JournalEntry
             {
@@ -323,6 +335,7 @@ internal sealed class WorkloadClient(
                 JobId = jobId, Result = result.ToString(),
             };
         });
+    }
 
     private Task PauseOrResumeAsync()
     {
