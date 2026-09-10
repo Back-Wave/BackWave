@@ -86,6 +86,39 @@ public class InvariantViolationMetricTests
         Assert.Equal(nameof(InvariantAction.Degrade), measurement.Action);
     }
 
+    /// <summary>
+    /// The whole trigger set, by name. An operator's alert rule matches the
+    /// <c>backwave.invariant.trigger</c> tag against a literal string, so renaming a member silently
+    /// breaks that rule in the field - nothing in the compiler or the suite would say a word. This test
+    /// says it. Adding a member is a normal change: put the new name in the list. Renaming or removing
+    /// one is a breaking change to a shipped surface, and the release notes have to carry it.
+    /// <para>
+    /// Only the NAMES are pinned. The ordinals are deliberately unpinned - the tag carries the name, and
+    /// nothing durable stores the number - so the list is compared as a set, in sorted order.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void InvariantTrigger_CarriesExactlyThesePublishedNames()
+    {
+        string[] published =
+        [
+            "OutcomeBatchCountMismatch", "HeartbeatBatchCountMismatch",
+            "ClaimedJobTerminal", "OutcomeFenceRejected",
+            "ClaimBatchOverrun", "WorkflowMemberWithoutWorkflow",
+            "ClaimedRowNotLeasedToWorker", "ClaimedRowNotEligible",
+            "WorkflowMemberEnqueueRejected", "DanglingGatingEdge",
+            "UnexpectedAffectedRowCount", "GuaranteedRowAbsent",
+            "ParentJobMissingFromBatch", "UndefinedEnumValueStored",
+            "ObserverCursorRegressed", "ApplicationLockNotAcquired",
+            "QueueConfigLockNotAcquired", "LeasedCountAggregateNull",
+            "ObserverReportFenceRejected", "WorkflowMemberCycle",
+        ];
+
+        var actual = Enum.GetNames<InvariantTrigger>();
+
+        Assert.Equal(published.Order(StringComparer.Ordinal), actual.Order(StringComparer.Ordinal));
+    }
+
     private static readonly DateTimeOffset T0 = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
     private static readonly TimeSpan Lease = TimeSpan.FromMinutes(1);
 
