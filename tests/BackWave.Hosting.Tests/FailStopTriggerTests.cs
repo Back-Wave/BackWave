@@ -179,7 +179,10 @@ public class FailStopTriggerTests
         var gate = new ExecutionGate();
         gate.Released.SetResult();
 
-        await using var app = BuildHost(store, logs, Group("workers"), gate);
+        // A Lease that outlives the clock-skew allowance the pump carries. Inside that allowance the
+        // pump reads a peer's legal expiry, not a contradiction, so the ledger must stay untouched.
+        var group = Group("workers") with { LeaseDuration = TimeSpan.FromMinutes(2) };
+        await using var app = BuildHost(store, logs, group, gate);
         await app.StartAsync();
         var jobId = await app.Services.GetRequiredService<BackWaveClient>()
             .EnqueueAsync(new ParkedJob("fenced"), dueTime: DateTimeOffset.UtcNow);
@@ -188,7 +191,7 @@ public class FailStopTriggerTests
             () => ValueTask.FromResult(!violations.Measurements.IsEmpty),
             "the fenced-out outcome to be counted");
 
-        // Not a lost race: the Lease this pump believes it holds runs for another five seconds, so a store
+        // Not a lost race: the Lease this pump believes it holds runs for another two minutes, so a store
         // answering "not this worker's" contradicts it. Counted and logged at Warning, group stays up.
         var violation = Assert.Single(violations.Measurements);
         Assert.Equal("Degrade", violation);
