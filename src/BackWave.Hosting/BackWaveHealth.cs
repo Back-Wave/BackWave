@@ -76,8 +76,10 @@ public sealed class BackWaveHealth
         // The trigger id is read off the exception here rather than passed in, so the halt call site
         // cannot record one id and log another.
         _halted[(workerGroup, pump)] = new HaltState(
-            exception.GetType().FullName ?? exception.GetType().Name, exception.Message,
-            (exception as InvariantViolationException)?.Trigger);
+            exception.GetType().FullName ?? exception.GetType().Name, exception.Message)
+        {
+            Trigger = (exception as InvariantViolationException)?.Trigger,
+        };
         _degraded.TryRemove((workerGroup, pump), out _); // a halt supersedes this pump's degraded mark
     }
 
@@ -107,22 +109,26 @@ public sealed class BackWaveHealth
 /// <summary>
 /// The cause of a halted worker group: the full name of the exception type that stopped it, retained
 /// alongside the exception's message and - when a named invariant check raised the halt - the stable
-/// trigger id that names which invariant broke. The trigger is optional and last, so constructing a
-/// <see cref="HaltState"/> positionally from a type and a message still compiles unchanged.
+/// trigger id that names which invariant broke.
 /// <para>
-/// One source break remains, and it is deconstruction: a record's <c>Deconstruct</c> matches its
-/// primary constructor, so <c>var (type, message) = haltState;</c> now needs a third element. Read the
-/// properties instead, or discard the trigger with <c>var (type, message, _) = haltState;</c>.
+/// <see cref="Trigger"/> is an init property and NOT a third constructor parameter. The package ships
+/// on nuget.org, and a record's constructor, its <c>Deconstruct</c>, and its <c>Equals</c> all follow
+/// the primary-constructor list, so adding a parameter there breaks every compiled caller at load
+/// time. An init property adds the value and keeps the two-element constructor and deconstruction
+/// binary-compatible: <c>new HaltState(type, message)</c> and <c>var (type, message) = haltState;</c>
+/// both still work.
 /// </para>
 /// </summary>
 /// <param name="ExceptionType">The full name of the exception type that halted the group.</param>
 /// <param name="Message">The exception's message.</param>
-/// <param name="Trigger">
-/// The invariant a named check found broken, or <see langword="null"/> when the group stopped on a
-/// fault no check named. The same id the halt log's <c>invariant_trigger</c> parameter carries.
-/// </param>
-public sealed record HaltState(string ExceptionType, string Message, InvariantTrigger? Trigger = null)
+public sealed record HaltState(string ExceptionType, string Message)
 {
+    /// <summary>
+    /// The invariant a named check found broken, or <see langword="null"/> when the group stopped on a
+    /// fault no check named. The same id the halt log's <c>invariant_trigger</c> parameter carries.
+    /// </summary>
+    public InvariantTrigger? Trigger { get; init; }
+
     /// <summary>Renders the cause as <c>ExceptionType: Message</c>.</summary>
     /// <returns>The exception type and message joined by a colon.</returns>
     /// <remarks>
