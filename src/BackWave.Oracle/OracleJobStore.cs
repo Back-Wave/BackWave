@@ -3446,7 +3446,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             if (leaseExpiry > report.Now)
             {
                 Invariant.Degrade(
-                    null, InvariantTrigger.ObserverReportFenceRejected,
+                    _logger, InvariantTrigger.ObserverReportFenceRejected,
                     $"Observer '{report.ObserverId}': worker '{report.WorkerId}' reported against a claim lease " +
                     $"still held by '{leaseOwner}' until {leaseExpiry:o}, and it is only {report.Now:o}.");
             }

@@ -830,7 +830,7 @@ public sealed class InMemoryJobStore(
         IReadOnlyList<OutcomeReport> batch, DateTimeOffset now, CancellationToken cancellationToken = default)
     {
         // The override buys no throughput here - it buys the batch SHAPE. Job Output over MaxOutputBytes
-        // (ADR 0026) is the one per-row failure that throws instead of reporting a result, and this store
+        // is the one per-row failure that throws instead of reporting a result, and this store
         // knows its own cap, so the Storage Contract holds it to the strict shape: scan EVERY row before
         // touching anything, so a rejected batch leaves nothing applied. That matches the four SQL
         // adapters; only the interface default, which cannot learn a store's cap without attempting the
@@ -1325,6 +1325,10 @@ public sealed class InMemoryJobStore(
             {
                 if (observer.LeaseExpiry > report.Now)
                 {
+                    // No logger, unlike the four SQL adapters. This store takes no logging
+                    // configuration at all, and adding one to its constructor would break every
+                    // already-compiled caller of a shipped type for a message that only a
+                    // development or test host ever sees. The metric still counts the trigger.
                     Invariant.Degrade(
                         null, InvariantTrigger.ObserverReportFenceRejected,
                         $"Observer '{report.ObserverId}': worker '{report.WorkerId}' reported against a claim lease " +

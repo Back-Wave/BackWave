@@ -6,6 +6,7 @@ using BackWave.Core;
 using BackWave.Diagnostics;
 using BackWave.Storage;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace BackWave.SqlServer;
@@ -57,6 +58,13 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
     // a single cheap EXISTS probe runs at most once per TagsProbeRefreshMs, amortized across every
     // claim in the window (never per claim). A stale true merely restores the old unconditional
     // round-trip, so the latch never has to be cleared.
+    // One logger for the whole store, resolved once from the configured factory (a no-op logger when
+    // none is supplied). The invariant-degrade sites need it: the metric counts every trigger, but the
+    // message that names the observer, the real lease owner and the two timestamps only reaches an
+    // operator through the log.
+    private readonly ILogger _logger =
+        options.LoggerFactory?.CreateLogger(SqlServerDiagnostics.SourceName) ?? NullLogger.Instance;
+
     private const long TagsProbeRefreshMs = 5_000;
     private volatile bool _tagsInUse;
     private long _tagsProbeTicks;
@@ -109,8 +117,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             if (options.AutoMigrate)
             {
                 await SqlServerMigrator.MigrateAsync(options.ConnectionString, options.SchemaName, options.CoordinateMigration, cancellationToken).ConfigureAwait(false);
-                BackWaveLog.MigrationApplied(
-                    options.LoggerFactory?.CreateLogger(SqlServerDiagnostics.SourceName) ?? NullLogger.Instance, "mssql");
+                BackWaveLog.MigrationApplied(_logger, "mssql");
             }
             await SqlServerMigrator.VerifySchemaVersionAsync(options.ConnectionString, options.SchemaName, cancellationToken).ConfigureAwait(false);
             _ready = true;
@@ -3241,7 +3248,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             if (leaseExpiry > report.Now)
             {
                 Invariant.Degrade(
-                    null, InvariantTrigger.ObserverReportFenceRejected,
+                    _logger, InvariantTrigger.ObserverReportFenceRejected,
                     $"Observer '{report.ObserverId}': worker '{report.WorkerId}' reported against a claim lease " +
                     $"still held by '{leaseOwner}' until {leaseExpiry:o}, and it is only {report.Now:o}.");
             }

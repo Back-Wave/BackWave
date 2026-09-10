@@ -4,6 +4,7 @@ using System.Text.Json;
 using BackWave.Core;
 using BackWave.Diagnostics;
 using BackWave.Storage;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
 
@@ -23,6 +24,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 {
     private readonly NpgsqlDataSource _dataSource;
     private readonly PostgresStoreOptions _options;
+
+    // One logger for the whole store, resolved once from the configured factory (a no-op logger when
+    // none is supplied). The invariant-degrade sites need it: the metric counts every trigger, but the
+    // message that names the observer, the real lease owner and the two timestamps only reaches an
+    // operator through the log.
+    private readonly ILogger _logger;
 
     // Swaps the canonical 'backwave' schema qualifier for the configured SchemaName in every query
     // and DDL script (ADR 0040). The default schema is a zero-cost passthrough.
@@ -79,6 +86,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     public PostgresJobStore(PostgresStoreOptions options)
     {
         _options = options;
+        _logger = options.LoggerFactory?.CreateLogger(PostgresDiagnostics.SourceName) ?? NullLogger.Instance;
         _schema = new SchemaRewriter(options.SchemaName);
         _historyPolicy = JobHistoryPolicyResolver.Resolve(options.HistoryPolicy);
         _dataSource = NpgsqlDataSource.Create(options.ConnectionString);
@@ -122,7 +130,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 await PostgresMigrator.MigrateAsync(
                     _dataSource, _options.SchemaName, _options.CoordinateMigration, cancellationToken).ConfigureAwait(false);
                 BackWaveLog.MigrationApplied(
-                    _options.LoggerFactory?.CreateLogger(PostgresDiagnostics.SourceName) ?? NullLogger.Instance, "postgresql");
+                    _logger, "postgresql");
             }
             await PostgresMigrator.VerifySchemaVersionAsync(_dataSource, _options.SchemaName, cancellationToken).ConfigureAwait(false);
             _ready = true;
@@ -3031,7 +3039,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             if (leaseExpiry > report.Now)
             {
                 Invariant.Degrade(
-                    null, InvariantTrigger.ObserverReportFenceRejected,
+                    _logger, InvariantTrigger.ObserverReportFenceRejected,
                     $"Observer '{report.ObserverId}': worker '{report.WorkerId}' reported against a claim lease " +
                     $"still held by '{leaseOwner}' until {leaseExpiry:o}, and it is only {report.Now:o}.");
             }

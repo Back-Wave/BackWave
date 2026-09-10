@@ -5,6 +5,7 @@ using BackWave.Diagnostics;
 using BackWave.Sqlite.Internal;
 using BackWave.Storage;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace BackWave.Sqlite;
@@ -77,6 +78,12 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
     private readonly SqliteStoreOptions _options;
     private readonly string _connectionString;
 
+    // One logger for the whole store, resolved once from the configured factory (a no-op logger when
+    // none is supplied). The invariant-degrade sites need it: the metric counts every trigger, but the
+    // message that names the observer, the real lease owner and the two timestamps only reaches an
+    // operator through the log.
+    private readonly ILogger _logger;
+
     // Swaps the canonical 'backwave' table-name prefix for the configured TablePrefix in every query
     // and DDL script (ADR 0040). The default prefix is a zero-cost passthrough.
     private readonly SchemaRewriter _schema;
@@ -111,6 +118,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
     {
         ArgumentNullException.ThrowIfNull(options);
         _options = options;
+        _logger = options.LoggerFactory?.CreateLogger(SqliteDiagnostics.SourceName) ?? NullLogger.Instance;
         _schema = new SchemaRewriter(options.TablePrefix);
         _connectionString = SqliteConnectionStringNormalizer.Normalize(options.ConnectionString, options.BusyTimeout);
         _historyPolicy = JobHistoryPolicyResolver.Resolve(options.HistoryPolicy);
@@ -2812,7 +2820,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             if (leaseExpiry > report.Now)
             {
                 Invariant.Degrade(
-                    null, InvariantTrigger.ObserverReportFenceRejected,
+                    _logger, InvariantTrigger.ObserverReportFenceRejected,
                     $"Observer '{report.ObserverId}': worker '{report.WorkerId}' reported against a claim lease " +
                     $"still held by '{leaseOwner}' until {leaseExpiry:o}, and it is only {report.Now:o}.");
             }
@@ -3242,7 +3250,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             {
                 await SqliteMigrator.MigrateAsync(_connectionString, _options.TablePrefix, _options.CoordinateMigration, cancellationToken).ConfigureAwait(false);
                 BackWaveLog.MigrationApplied(
-                    _options.LoggerFactory?.CreateLogger(SqliteDiagnostics.SourceName) ?? NullLogger.Instance, "sqlite");
+                    _logger, "sqlite");
             }
             await SqliteMigrator.VerifySchemaVersionAsync(_connectionString, _options.TablePrefix, cancellationToken).ConfigureAwait(false);
             _ready = true;
