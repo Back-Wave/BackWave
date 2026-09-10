@@ -38,6 +38,12 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
     /// </summary>
     public InvariantTrigger? RelinquishInvariant { get; set; }
 
+    /// <summary>
+    /// The shutdown hand-back waits this long inside the store before it does the work. A slow store
+    /// rather than a broken one, which is the shape the hand-back's own budget is written against.
+    /// </summary>
+    public TimeSpan RelinquishDelay { get; set; }
+
     /// <summary>How many times the shutdown hand-back reached the store.</summary>
     public int RelinquishCalls => Volatile.Read(ref _relinquishCalls);
 
@@ -161,6 +167,10 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
     /// <summary>How many batched outcome reports reached the store - one per re-apply pass.</summary>
     public int ReportOutcomesCalls => Volatile.Read(ref _reportOutcomesCalls);
 
+    /// <summary>When the LAST batched outcome report reached the store, so a test can order the buffer
+    /// flush against the relinquish that follows it.</summary>
+    public DateTimeOffset? LastOutcomeReportAt { get; private set; }
+
     /// <summary>
     /// How many rows the <see cref="RowOutputCap"/> rejection had already settled when it threw, so a test
     /// can prove it exercised the settled-rows-ahead shape rather than passing on the trivial one.
@@ -171,6 +181,7 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
         IReadOnlyList<OutcomeReport> batch, DateTimeOffset now, CancellationToken cancellationToken = default)
     {
         Interlocked.Increment(ref _reportOutcomesCalls);
+        LastOutcomeReportAt = DateTimeOffset.UtcNow;
         ThrowIfFailing();
         if (BatchOutputCap is { } cap)
         {
@@ -275,7 +286,22 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
         {
             throw new InvalidOperationException("forced hand-back failure (FailRelinquish)");
         }
+        if (RelinquishDelay > TimeSpan.Zero)
+        {
+            return SlowRelinquishAsync(workerId, now, disposition, cancellationToken);
+        }
         return inner.RelinquishLeasesAsync(workerId, now, disposition, cancellationToken);
+    }
+
+    // The wait honors the token, as every real adapter's command does. A hand-back that runs out of
+    // budget therefore meets the cancellation from INSIDE the store, which is where it meets it in the
+    // wild - not at the call site, and not before the store was ever reached.
+    private async ValueTask<int> SlowRelinquishAsync(
+        string workerId, DateTimeOffset now, RetryDisposition disposition, CancellationToken cancellationToken)
+    {
+        await Task.Delay(RelinquishDelay, cancellationToken).ConfigureAwait(false);
+        return await inner
+            .RelinquishLeasesAsync(workerId, now, disposition, cancellationToken).ConfigureAwait(false);
     }
 
     public ValueTask<CancelResult> CancelJobAsync(

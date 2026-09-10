@@ -303,6 +303,85 @@ public class ShutdownHandBackTests
     }
 
     [Fact]
+    public async Task CleanStop_ReportsTheBufferedOutcome_BeforeItReachesTheRelinquish()
+    {
+        // The order of the two store calls, not the state they leave behind. A flush that lands AFTER the
+        // relinquish writes into rows the relinquish already handed back, so every outcome in it fences
+        // out as StaleLease and the work is silently re-run. The final state alone cannot tell the two
+        // orders apart, which is how the loss this test now pins survived review.
+        var store = new FaultableStore(new InMemoryJobStore());
+        var gate = new StubbornGate { Hold = TimeSpan.FromMilliseconds(500) };
+        var logs = new CapturingLoggerProvider();
+        await using var app = BuildStubbornHost(store, gate, logs, shutdownBudget: TimeSpan.FromSeconds(10));
+        await app.StartAsync();
+
+        var client = app.Services.GetRequiredService<BackWaveClient>();
+        var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
+        var jobId = await client.EnqueueAsync(new PingJob("flush-first"), dueTime: DateTimeOffset.UtcNow);
+        await gate.Started.Task.WaitAsync(TestTimeout);
+
+        await app.StopAsync();
+
+        Assert.NotNull(store.LastOutcomeReportAt);
+        Assert.NotNull(store.RelinquishedAt);
+        Assert.True(
+            store.LastOutcomeReportAt <= store.RelinquishedAt,
+            $"the buffer flushed at {store.LastOutcomeReportAt:o}, after the relinquish at {store.RelinquishedAt:o}");
+        Assert.Equal(1, store.RelinquishCalls);
+        Assert.Equal(JobState.Succeeded, (await monitor.GetJobAsync(jobId))!.State);
+    }
+
+    [Fact]
+    public async Task AStoreTooSlowForItsReservedSlice_IsCancelledInside_AndTheFailureIsLogged()
+    {
+        // The other end of the budget: the store is reachable and simply slow. Its own token expires with
+        // the call still open, so the hand-back degrades to today's lapse rather than holding the host.
+        // Nothing but a store that honors its token can reach this branch, which is why it was untested.
+        var store = new FaultableStore(new InMemoryJobStore()) { RelinquishDelay = TimeSpan.FromSeconds(5) };
+        var gate = new RecoveryGate();
+        var logs = new CapturingLoggerProvider();
+        await using var app = BuildHost(store, gate, logs, shutdownBudget: TimeSpan.FromMilliseconds(500));
+        await app.StartAsync();
+
+        var client = app.Services.GetRequiredService<BackWaveClient>();
+        var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
+        var jobId = await client.EnqueueAsync(new PingJob("slow-store"), dueTime: DateTimeOffset.UtcNow);
+        await gate.FirstAttemptStarted.Task.WaitAsync(TestTimeout);
+
+        await app.StopAsync().WaitAsync(TestTimeout);
+
+        var warning = Assert.Single(logs.Entries, entry => entry.EventId == HandBackFailedEventId);
+        Assert.Equal(LogLevel.Warning, warning.Level);
+        Assert.Equal(1, store.RelinquishCalls); // it was reached, and it ran out of its slice inside
+        Assert.DoesNotContain(logs.Entries, entry => entry.EventId == LeasesRelinquishedEventId);
+        Assert.Equal(JobState.Leased, (await monitor.GetJobAsync(jobId))!.State);
+    }
+
+    [Fact]
+    public async Task AnAdapterBuiltBeforeTheRelinquish_KeepsTodaysLapse_AndStopsCleanly()
+    {
+        // The N-1 half of a rolling deploy: a newer Shell over an adapter that never implemented the
+        // relinquish. The default body on IJobStore answers zero, so the Leases lapse and the expiry path
+        // sweeps them - the behaviour that shipped before this feature - and nothing is logged as failed.
+        var store = new PreRelinquishStore(new InMemoryJobStore());
+        var gate = new RecoveryGate();
+        var logs = new CapturingLoggerProvider();
+        await using var app = BuildHost(store, gate, logs);
+        await app.StartAsync();
+
+        var client = app.Services.GetRequiredService<BackWaveClient>();
+        var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
+        var jobId = await client.EnqueueAsync(new PingJob("older-adapter"), dueTime: DateTimeOffset.UtcNow);
+        await gate.FirstAttemptStarted.Task.WaitAsync(TestTimeout);
+
+        await app.StopAsync().WaitAsync(TestTimeout);
+
+        Assert.DoesNotContain(logs.Entries, entry => entry.EventId == LeasesRelinquishedEventId);
+        Assert.DoesNotContain(logs.Entries, entry => entry.EventId == HandBackFailedEventId);
+        Assert.Equal(JobState.Leased, (await monitor.GetJobAsync(jobId))!.State);
+    }
+
+    [Fact]
     public async Task AViolationRaisedWhileTheHandBackDrains_HaltsTheGroup_AndHandsNothingBack()
     {
         // A named check trips inside a handler that is still running when the stop begins. The pump loop
