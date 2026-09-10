@@ -210,7 +210,11 @@ public class ShutdownHandBackTests
             gate.FinishedAt <= store.RelinquishedAt,
             $"the handler finished at {gate.FinishedAt:o} but its Lease was relinquished at {store.RelinquishedAt:o}");
         Assert.DoesNotContain(logs.Entries, entry => entry.EventId == DrainIncompleteEventId);
-        Assert.Equal(JobState.Scheduled, (await monitor.GetJobAsync(jobId))!.State);
+        // Succeeded, not Scheduled. The handler completed during the wait, so its outcome was written to a
+        // channel the pump loop had already stopped reading. The hand-back drains that channel before it
+        // relinquishes, so the success is reported. Left undrained, the relinquish would return a job that
+        // had genuinely succeeded to Scheduled at the same Attempt, and a healthy node would run it again.
+        Assert.Equal(JobState.Succeeded, (await monitor.GetJobAsync(jobId))!.State);
     }
 
     [Fact]

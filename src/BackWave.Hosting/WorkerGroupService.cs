@@ -368,10 +368,11 @@ internal sealed class WorkerGroupService(
         finally
         {
             // The pump loop has exited, so this group claims nothing more: give back what it holds. This
-            // runs BEFORE the writer is completed, because the hand-back flushes the Driver's buffered
-            // outcomes through the ordinary command path, which writes their OutcomeReported events to
-            // this very writer - a completed writer would refuse every one of them.
-            await HandBackAsync(driver, events.Writer, stoppingToken).ConfigureAwait(false);
+            // runs BEFORE the writer is completed, because the hand-back reads the events the stopping
+            // executions are still writing and flushes the Driver's buffered outcomes through the
+            // ordinary command path, which writes their OutcomeReported events back to this very
+            // channel - a completed writer would refuse every one of them.
+            await HandBackAsync(driver, events, stoppingToken).ConfigureAwait(false);
             // Pump gone: close the channel so the tickers' writes no-op instead of
             // filling an unread buffer until host shutdown.
             events.Writer.TryComplete();
@@ -383,19 +384,24 @@ internal sealed class WorkerGroupService(
     }
 
     // <summary>
-    // The clean-stop hand-back: report the outcomes this pump had buffered, wait out the executions it
-    // still has running, then relinquish the Leases it still holds so their jobs return to the queue now
-    // instead of waiting out the whole Lease duration on a node that is gone. All three steps spend ONE
-    // budget, in that order - reporting first saves the most work, waiting comes before the relinquish so
-    // no job is handed to another node while this one is still running it, and three independent timeouts
-    // could sum past the host's own shutdown timeout and turn a clean stop into a kill. stoppingToken is
-    // already cancelled by the time the pump exits, so the budget is the only token that can permit this
-    // work.
+    // The clean-stop hand-back: wait out the executions this pump still has running, settle whatever
+    // those executions wrote on their way out, report the outcomes the Driver had buffered, then
+    // relinquish the Leases it still holds so their jobs return to the queue now instead of waiting out
+    // the whole Lease duration on a node that is gone. All four steps spend ONE budget, in that order -
+    // four independent timeouts could sum past the host's own shutdown timeout and turn a clean stop
+    // into a kill. stoppingToken is already cancelled by the time the pump exits, so the budget is the
+    // only token that can permit this work.
+    // The wait comes FIRST, and the drain of the event channel immediately after it, because a handler
+    // that finishes during the wait writes its outcome to a channel the pump loop has already stopped
+    // reading: nothing else would ever take it, and the relinquish below would then return a job that
+    // had genuinely succeeded to Scheduled at the same Attempt, so it runs a second time. Waiting also
+    // has to precede the relinquish for the older reason - no job may be handed to another node while
+    // this one is still running it.
     // One attempt, no retry: any failure (the budget running out included) is logged at Warning and
     // degrades to the Leases lapsing exactly as they do today, and never blocks the host from exiting.
     // </summary>
     private async Task HandBackAsync(
-        NodeDriver driver, ChannelWriter<NodeEvent> events, CancellationToken stoppingToken)
+        NodeDriver driver, Channel<NodeEvent> events, CancellationToken stoppingToken)
     {
         // Clean stops only. A pump that exits any other way is fail-stopping, and a halted pump writes
         // nothing more to the store: its Leases lapse and healthy nodes inherit the work.
@@ -408,19 +414,47 @@ internal sealed class WorkerGroupService(
         using var budget = new CancellationTokenSource(allowance);
         try
         {
-            // Through the ordinary command path, so the buffered Failure Detail, Tags, Output, and
-            // held-open spans settle exactly as they do on a poll-tick flush.
-            if (driver.DrainBufferedOutcomes() is { } pending)
+            await DrainInFlightAsync(budget.Token).ConfigureAwait(false);
+
+            // Everything those executions wrote as they finished, through the ordinary command path, so
+            // an outcome that landed after the pump loop exited settles exactly as one that landed a
+            // millisecond earlier. Each execution writes its event BEFORE its task completes, so the wait
+            // above is what guarantees they are all sitting in the reader by the time this loop starts.
+            //
+            // Only the four terminal execution events are stepped. Every other event the channel still
+            // holds is DISCARDED, because the Driver answers most of them by starting work this pump must
+            // not start: a ClaimCompleted returns one ExecuteJob per claimed job and can issue the next
+            // weighted ClaimBatch behind it, SchedulesLoaded mints, PurgeCompleted re-sweeps, and a poll or
+            // heartbeat tick claims or renews. Stepping those would run new Attempts after the wait that
+            // was supposed to end them, and each new Attempt would write another event to step. Discarding
+            // a ClaimCompleted strands nothing: its jobs are Leased to this worker and untouched, so the
+            // relinquish below is exactly what hands them back.
+            while (events.Reader.TryRead(out var nodeEvent))
             {
-                await ExecuteAsync(pending, events, budget.Token).ConfigureAwait(false);
+                if (nodeEvent is not (NodeEvent.ExecutionSucceeded or NodeEvent.ExecutionFailed
+                    or NodeEvent.ExecutionCancelled or NodeEvent.ExecutionUnroutable))
+                {
+                    continue;
+                }
+                foreach (var command in driver.Step(nodeEvent))
+                {
+                    await ExecuteAsync(command, events.Writer, budget.Token).ConfigureAwait(false);
+                }
             }
 
-            await DrainInFlightAsync(budget.Token).ConfigureAwait(false);
+            // Through the ordinary command path too, so the buffered Failure Detail, Tags, Output, and
+            // held-open spans settle exactly as they do on a poll-tick flush. Last, because the drain
+            // above is what puts the final outcomes into the Driver's buffer in the first place.
+            if (driver.DrainBufferedOutcomes() is { } pending)
+            {
+                await ExecuteAsync(pending, events.Writer, budget.Token).ConfigureAwait(false);
+            }
 
             // Fenced store-side on this pump's worker identity and the Leased state, so anything the
             // flush above just settled is already out of reach.
             var relinquished = await store.RelinquishLeasesAsync(
-                _workerId, _clock.GetUtcNow(), options.RetryPolicy.ToDisposition(), budget.Token).ConfigureAwait(false);
+                _workerId, _clock.GetUtcNow(), options.RetryPolicy.ToDisposition(), budget.Token)
+                .ConfigureAwait(false);
             if (relinquished > 0)
             {
                 BackWaveLog.LeasesRelinquished(logger, options.Name, relinquished);
