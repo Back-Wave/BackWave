@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using BackWave.Diagnostics;
 
 namespace BackWave.Torture;
 
@@ -59,7 +60,44 @@ internal sealed class MidRunAudit(
                     await Task.Delay(wait, timebox.Token);
                 }
 
-                await PassAsync(timebox.Token);
+                try
+                {
+                    await PassAsync(timebox.Token);
+                }
+                catch (OperationCanceledException) when (timebox.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (InvariantViolationException)
+                {
+                    // A production fail-stop trigger, which the caller turns into a finding. Rethrown
+                    // ahead of every classifier below on purpose: an adapter's classifier reads provider
+                    // fault codes, and a halt trigger must never be demoted to contention noise.
+                    throw;
+                }
+                catch (Exception exception) when (target.IsTransientFault(exception))
+                {
+                    // The audit drives the same adapter the clients do, under the same contention, so it
+                    // meets the same deadlocks and timeouts they do. That is noise, not evidence: journal
+                    // it and take the next pass. Nothing propagates, because an escape here would skip the
+                    // artifact bundle the whole run exists to produce.
+                    journal.Record(new JournalEntry
+                    {
+                        Client = "mid-run-audit", Op = Ops.TransientFault,
+                        T0 = DateTimeOffset.UtcNow.UtcTicks, T1 = DateTimeOffset.UtcNow.UtcTicks,
+                        Result = "audit-pass", Detail = exception.GetType().Name,
+                    });
+                }
+                catch (Exception exception)
+                {
+                    // A raw provider exception out of the store surface is itself a finding, so it is
+                    // recorded as one instead of ending the run. The check below then cuts the time box,
+                    // which is the same path every other mid-run finding takes.
+                    violations.Add(new TortureViolation(
+                        TortureInvariant.RawStoreException,
+                        $"The mid-run audit read threw {exception.GetType().FullName} out of the store " +
+                        $"surface: {exception.Message}"));
+                }
                 if (violations.Count > 0)
                 {
                     Console.WriteLine("torture: mid-run audit found a violation - cutting the time box short.");

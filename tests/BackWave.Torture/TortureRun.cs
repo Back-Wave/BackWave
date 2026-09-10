@@ -73,6 +73,15 @@ internal static class TortureRun
                 $"Halt trigger {violation.Trigger} fired during the mid-run audit - a production worker group " +
                 $"would have fail-stopped: {violation.Message}"));
         }
+        catch (Exception exception)
+        {
+            // The loop handles its own faults per pass, so reaching this is a defect in the harness rather
+            // than in the product. It is caught all the same: everything below writes the artifact bundle,
+            // and an overnight run that dies here reports nothing at all.
+            midRunViolations.Add(new TortureViolation(
+                TortureInvariant.RawStoreException,
+                $"The mid-run audit loop ended on {exception.GetType().FullName}: {exception.Message}"));
+        }
         var workloadSeconds = wall.Elapsed.TotalSeconds;
 
         var entries = journal.Entries;
