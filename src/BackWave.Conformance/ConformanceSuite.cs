@@ -1358,15 +1358,15 @@ public abstract class ConformanceSuite
         Assert.Equal(JobState.Cancelled, (await store.GetJobAsync(childB.JobId))!.State);
     }
 
-    // ── §5.5 RelinquishLeases ───────────────────────────────────────────────────
+    // ── §5.5.1 RelinquishLeases ───────────────────────────────────────────────────
 
     /// <summary>
-    /// Certifies that a worker giving its leases back returns each job to Ready at that instant - no
+    /// Certifies that a worker giving its leases back returns each job to Scheduled at that instant - no
     /// retry backoff, because a clean stop is not a failure - while leaving the attempt the claim
     /// already counted alone, so another node can claim the work immediately.
     /// </summary>
     [Fact]
-    public async Task Clause_5_5_Relinquish_ReturnsThisWorkersLeasesToReadyNow_LeavingTheAttemptUnchanged()
+    public async Task Clause_5_5_1_Relinquish_ReturnsThisWorkersLeasesToScheduledNow_LeavingTheAttemptUnchanged()
     {
         var store = await CreateStoreAsync();
         await store.EnqueueAsync(Job(), now: T0);
@@ -1377,12 +1377,12 @@ public abstract class ConformanceSuite
 
         var job = await store.GetJobAsync(claimed.JobId);
         Assert.Equal(JobState.Scheduled, job!.State);
-        Assert.Equal(handBack, job.DueTime); // Ready now: the backoff answers a failure, and this is not one
+        Assert.Equal(handBack, job.DueTime); // due now: the backoff answers a failure, and this is not one
         Assert.Equal(1, job.Attempt); // the claim counted it; the hand-back neither charges nor refunds
         Assert.Null(job.LeaseOwner);
         Assert.Null(job.LeaseExpiry);
 
-        // Ready now means claimable at that very instant, by a node that is not stopping.
+        // Due now means claimable at that very instant, by a node that is not stopping.
         var reclaimed = Assert.Single(await ClaimAsync(store, handBack, worker: "w2"));
         Assert.Equal(claimed.JobId, reclaimed.JobId);
         Assert.Equal(2, reclaimed.Attempt);
@@ -1394,7 +1394,7 @@ public abstract class ConformanceSuite
     /// queue, and a job that already reported its outcome are all untouched.
     /// </summary>
     [Fact]
-    public async Task Clause_5_5_Relinquish_TouchesOnlyTheCallersLiveLeases()
+    public async Task Clause_5_5_1_Relinquish_TouchesOnlyTheCallersLiveLeases()
     {
         var store = await CreateStoreAsync();
         var mine = Job();
@@ -1427,10 +1427,10 @@ public abstract class ConformanceSuite
 
     /// <summary>
     /// Certifies that the hand-back keeps the attempt ceiling: a job with no attempts left dead-letters
-    /// with the canonical cause instead of returning to Ready, and cascades its children's latches.
+    /// with the canonical cause instead of returning to Scheduled, and cascades its children's latches.
     /// </summary>
     [Fact]
-    public async Task Clause_5_5_Relinquish_DeadLettersAtTheAttemptCeiling_AndCascadesChildLatches()
+    public async Task Clause_5_5_1_Relinquish_DeadLettersAtTheAttemptCeiling_AndCascadesChildLatches()
     {
         var store = await CreateStoreAsync();
         var parent = Job();
@@ -1453,11 +1453,11 @@ public abstract class ConformanceSuite
 
     /// <summary>
     /// Certifies that ONE hand-back spanning jobs at different attempts applies each job's own
-    /// disposition - the ceiling pair dead-letters while the rest return to Ready - so the set-based
+    /// disposition - the ceiling pair dead-letters while the rest return to Scheduled - so the set-based
     /// path holds for batches of two or more, not just a single row.
     /// </summary>
     [Fact]
-    public async Task Clause_5_5_Relinquish_HandsBackAMixedBatch_AtEachJobsOwnDisposition()
+    public async Task Clause_5_5_1_Relinquish_HandsBackAMixedBatch_AtEachJobsOwnDisposition()
     {
         var store = await CreateStoreAsync();
         var atCeiling = new[] { Job(queue: "ceiling"), Job(queue: "ceiling") };
@@ -3131,7 +3131,7 @@ public abstract class ConformanceSuite
     }
 
     /// <summary>
-    /// Certifies that giving a lease back appends one entry naming the state the job ends in - Ready, or
+    /// Certifies that giving a lease back appends one entry naming the state the job ends in - Scheduled, or
     /// the dead-letter at the ceiling - at the attempt the claim already counted, never a state of its own.
     /// </summary>
     [Fact]
