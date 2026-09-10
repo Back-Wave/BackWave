@@ -80,7 +80,9 @@ public enum InvariantTrigger
     /// <summary>A leased-count aggregate came back NULL, which a COUNT never returns.</summary>
     LeasedCountAggregateNull,
 
-    /// <summary>An observer delivery report was refused by the claim-lease fence, so it changed nothing.</summary>
+    /// <summary>An observer delivery report was refused by the claim-lease fence while that Lease was still
+    /// LIVE, so two workers believed they held one observer claim at once. A Lease that simply lapsed is the
+    /// ordinary end of a delivery attempt: at-least-once redelivers it, and it raises nothing here.</summary>
     ObserverReportFenceRejected,
 
     /// <summary>A workflow's members hold a dependency cycle, so no insertion order puts every member

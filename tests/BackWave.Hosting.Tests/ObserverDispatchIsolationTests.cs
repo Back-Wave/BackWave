@@ -338,10 +338,12 @@ public class ObserverDispatchIsolationTests
     public async Task SlowCallback_OutlivingItsClaimLease_HasItsReportFenced_WhichEarnsNoRePoll_AndRedelivers()
     {
         // A callback slower than its own claim Lease turns the pump into a stale survivor of a lapsed claim,
-        // so the store's fence refuses its report - the one production path that reaches
-        // InvariantTrigger.ObserverReportFenceRejected. The pump must act on that answer rather than discard
-        // it: a refused report drained no batch, so it earns no immediate re-poll, and the rows it left
+        // so the store's fence refuses its report. The pump must act on that answer rather than discard it:
+        // a refused report drained no batch, so it earns no immediate re-poll, and the rows it left
         // unresolved simply redeliver on the next scheduled claim.
+        // A lapse is also the ORDINARY end of a delivery attempt, so it raises no trigger. Only a report
+        // against a claim Lease that is still live reaches InvariantTrigger.ObserverReportFenceRejected,
+        // and no legal race produces one: the recorder below must stay empty for the whole run.
         var store = new InMemoryJobStore();
         var gated = new GatedObserver();
         var logs = new CapturingLoggerProvider();
@@ -370,7 +372,8 @@ public class ObserverDispatchIsolationTests
         await Task.Delay(400);
         gated.Release.TrySetResult();
         await WaitForAsync(
-            () => !refusals.Actions.IsEmpty, "the lapsed-Lease report to be refused by the store's fence");
+            () => Volatile.Read(ref gated.Completed) >= 1,
+            "the slow callback to return and report into the claim Lease it no longer holds");
 
         // Taking the refusal for an applied write would tell the Core a batch drained, which re-polls AT ONCE
         // and redelivers within milliseconds. A second of quiet is the assertion: the pump waits for its next
@@ -391,11 +394,11 @@ public class ObserverDispatchIsolationTests
         var delivered = Volatile.Read(ref gated.Completed);
         Assert.True(delivered >= 2, $"the fenced-out row must redeliver; it was delivered {delivered} time(s)");
 
-        // One report round trip per delivery, and every one but the last was refused. Each refusal is counted
-        // exactly once, by the store site that detected it - a pump that re-raised the trigger would double
-        // the count and leave an InvariantDegraded (1601) log behind it.
-        Assert.Equal(delivered - 1, refusals.Actions.Count);
-        Assert.All(refusals.Actions, action => Assert.Equal("Degrade", action));
+        // One report round trip per delivery, and every one but the last was refused on a LAPSED Lease. Not
+        // one of them is counted: the invariant ledger is the surface a promotion rule reads for zeros, and
+        // a healthy fleet with a slow observer would otherwise increment it on every redelivery. The 1601
+        // log is welded to that counter, so its absence says the same thing a second way.
+        Assert.Empty(refusals.Actions);
         Assert.DoesNotContain(logs.Entries, e => e.EventId == 1601);
 
         // And a refusal is not a fault: the report-faulted path (2103) stays untouched and no group halted -
