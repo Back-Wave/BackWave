@@ -4110,6 +4110,53 @@ public abstract class ConformanceSuite
         Assert.Equal(again.Position, await store.GetObserverCursorAsync("obs"));
     }
 
+    /// <summary>
+    /// Certifies the fence against the two reports that reach its contradiction branch - the branch every
+    /// adapter writes and no adapter case used to enter. A report carries the expiry its own claim granted
+    /// it, so the store can tell a stale survivor of a lapsed lease from a worker that still believed the
+    /// lease was its own. Both are refused and both leave the cursor alone; only the second is a
+    /// contradiction, and the counting rule for it is pinned in the Core suite, where the process-global
+    /// violation counter can be read without a neighboring test writing to it.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_13_ReportObserverDeliveries_RefusesAReportTheReporterBelievedWasLive()
+    {
+        var store = await CreateStoreAsync();
+        await SucceedAsync(store, T0);
+
+        var claim = await ClaimObsAsync(store, "obs", [JobState.Succeeded], T0, worker: "node-a");
+        var delivery = Assert.Single(claim.Deliveries);
+
+        // The contradiction: node-b never held this claim, yet reports while believing its own lease on it
+        // runs a full minute out. node-a's lease is still live, so two workers believed they held one claim.
+        Assert.Equal(
+            ObserverReportOutcome.FenceRejected,
+            await store.TryReportObserverDeliveriesAsync(
+                new ObserverDeliveryReport(
+                    "obs", "node-b", [new ObserverDeliveryOutcome(delivery.Position, ObserverDeliveryDisposition.Delivered)],
+                    T0 + TimeSpan.FromSeconds(1))
+                {
+                    BelievedLeaseExpiry = T0 + Lease,
+                }));
+        Assert.Equal(-1, await store.GetObserverCursorAsync("obs"));
+
+        // The ordinary lapse, after a peer already reclaimed: the ROW now carries node-b's future expiry,
+        // but node-a says it knew its own lease was gone. Refused all the same, and nothing is contradicted.
+        var afterLapse = T0 + Lease + TimeSpan.FromSeconds(1);
+        var reclaim = await ClaimObsAsync(store, "obs", [JobState.Succeeded], afterLapse, worker: "node-b");
+        Assert.Single(reclaim.Deliveries);
+        Assert.Equal(
+            ObserverReportOutcome.FenceRejected,
+            await store.TryReportObserverDeliveriesAsync(
+                new ObserverDeliveryReport(
+                    "obs", "node-a", [new ObserverDeliveryOutcome(delivery.Position, ObserverDeliveryDisposition.Delivered)],
+                    afterLapse + TimeSpan.FromSeconds(1))
+                {
+                    BelievedLeaseExpiry = T0 + Lease,
+                }));
+        Assert.Equal(-1, await store.GetObserverCursorAsync("obs"));
+    }
+
     // ── ADR 0022 Job Tags ────────────────────────────────────────────────────────
 
     /// <summary>

@@ -1,0 +1,46 @@
+name: Soak
+
+# The soak battery is excluded from PR CI by Category=Soak, so this is the only place it runs.
+# SoakTests draws fresh entropy on every run and RealSqliteStoreSoakTests replays the pinned
+# battery against the real adapter, which costs about 49 times a reference-store run.
+on:
+  schedule:
+    # 04:10 UTC daily, off the hour so it does not queue behind the top-of-hour rush.
+    - cron: '10 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: soak
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: Simulator soak battery
+    runs-on: ubuntu-latest
+    # A seed that hangs must fail the run rather than burn the runner budget.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/Directory.Packages.props', '**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+      - name: Restore
+        run: dotnet restore
+      - name: Build
+        run: dotnet build --no-restore -c Release
+      # Detailed verbosity keeps every printed seed in the log. A failing soak is only useful if
+      # the seed that found it can be pinned as a new InlineData, and the seed is printed, not asserted.
+      - name: Test (Soak category only)
+        run: |
+          dotnet test tests/BackWave.Tests --no-build -c Release \
+            --filter "Category=Soak" \
+            --logger "console;verbosity=detailed"

@@ -34,8 +34,18 @@ internal abstract record ObserverCommand
     /// Report the batch's per-row outcomes to the store, fenced by the claim Lease. The
     /// Shell appends the instant to form an <see cref="ObserverDeliveryReport"/>.
     /// </summary>
+    /// <param name="ObserverId">The Observer whose batch is being reported.</param>
+    /// <param name="WorkerId">The worker reporting, which the store's fence tests against the claim Lease.</param>
+    /// <param name="Outcomes">The per-row outcomes the Core decided.</param>
+    /// <param name="BelievedLeaseExpiry">
+    /// The instant this node believes its claim Lease runs until, as the claim granted it. Null only when
+    /// the report follows no claim this Core saw. The store counts a refused report as a broken invariant
+    /// ONLY against this, never against the row's current expiry - a peer that reclaimed the Observer after
+    /// a lapse leaves its own future expiry there, and that race is legal.
+    /// </param>
     public sealed record ReportBatch(
-        string ObserverId, string WorkerId, IReadOnlyList<ObserverDeliveryOutcome> Outcomes) : ObserverCommand;
+        string ObserverId, string WorkerId, IReadOnlyList<ObserverDeliveryOutcome> Outcomes,
+        DateTimeOffset? BelievedLeaseExpiry) : ObserverCommand;
 
     /// <summary>Re-poll now: a batch just drained, so more rows may be claimable this instant.</summary>
     public sealed record RequestPoll(DateTimeOffset Now) : ObserverCommand;

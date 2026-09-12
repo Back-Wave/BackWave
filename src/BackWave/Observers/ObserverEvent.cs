@@ -15,9 +15,19 @@ internal abstract record ObserverEvent
     /// <summary>Timer tick: time to claim each Observer's next undelivered batch.</summary>
     public sealed record PollDue(DateTimeOffset Now) : ObserverEvent;
 
-    /// <summary>The store returned a claimed batch (empty when another node holds the Lease, or nothing is due).</summary>
+    /// <summary>
+    /// The store returned a claimed batch (empty when another node holds the Lease, or nothing is due).
+    /// <para>
+    /// <c>LeaseExpiry</c> is the instant this node's claim Lease runs until, which the Shell forms as the
+    /// claim's instant plus the Lease duration it asked for - the store stamps the row from those same two
+    /// values and never reads its own clock, so the two agree exactly. Carried so the report can tell the
+    /// store what this node BELIEVED, which is the only evidence that separates a contradiction from an
+    /// ordinary lapse when the fence refuses the report.
+    /// </para>
+    /// </summary>
     public sealed record BatchClaimed(
-        string ObserverId, IReadOnlyList<ObserverClaimedDelivery> Deliveries, DateTimeOffset Now) : ObserverEvent;
+        string ObserverId, IReadOnlyList<ObserverClaimedDelivery> Deliveries, DateTimeOffset Now,
+        DateTimeOffset LeaseExpiry) : ObserverEvent;
 
     /// <summary>The Shell finished invoking the callback for each claimed row; carries per-row results.</summary>
     public sealed record BatchInvoked(

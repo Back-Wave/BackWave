@@ -182,153 +182,20 @@ internal static class Checks
     }
 
     /// <summary>
-    /// The journal-only checks. They read nothing but the journal, and the journal only ever grows,
-    /// so a verdict taken over a prefix stays true - which is what makes them safe to run mid-run.
-    /// The checks that compare the journal against separately-read store state are NOT here; they
-    /// stay in the post-drain audit.
+    /// The journal-only checks over a whole journal. They read nothing but the journal, and the journal
+    /// only ever grows, so a verdict taken over a prefix stays true - which is what makes them safe to
+    /// run mid-run. The checks that compare the journal against separately-read store state are NOT here;
+    /// they stay in the post-drain audit.
+    /// <para>
+    /// This is the one-shot form, for the post-drain pass that reads the finished journal once. The
+    /// mid-run pass holds a <see cref="JournalOracle"/> of its own and feeds it deltas, because a pass
+    /// that re-reads the whole journal costs the run its own length, squared.
+    /// </para>
     /// </summary>
     public static void LiveJournal(IReadOnlyList<JournalEntry> journal, ViolationSink sink)
     {
-        var claims = journal.Where(e => e.Op == Ops.Claim && e is { JobId: not null, Attempt: not null }).ToList();
-        var appliedOutcomes = journal
-            .Where(e => e.Op == Ops.Outcome && e.Result == nameof(OutcomeResult.Applied) && e is { JobId: not null, Attempt: not null })
-            .ToList();
-
-        // Raw provider exceptions and crashed clients are findings in themselves.
-        foreach (var group in journal.Where(e => e.Op == Ops.UnexpectedException).GroupBy(e => $"{e.Result}: {e.Detail}"))
-        {
-            sink.Add(new TortureViolation(
-                TortureInvariant.RawStoreException,
-                $"{group.Count()}× unexpected exception escaped the store surface during '{group.Key}'."));
-        }
-        // A production fail-stop trigger: the adapter observed a state its own invariants forbid, which
-        // in production halts the worker group. Grouped by trigger id so the finding names the invariant.
-        foreach (var group in journal.Where(e => e.Op == Ops.InvariantViolation).GroupBy(e => e.Result))
-        {
-            sink.Add(new TortureViolation(
-                TortureInvariant.HaltTriggerFired,
-                $"Halt trigger {group.Key} fired {group.Count()} time(s) - a production worker group would have " +
-                $"fail-stopped: {group.First().Detail}"));
-        }
-        foreach (var crash in journal.Where(e => e.Op == Ops.ClientCrash))
-        {
-            sink.Add(new TortureViolation(
-                TortureInvariant.ClientCrash, $"Client {crash.Client}: {crash.Detail}"));
-        }
-
-        // At most one accepted enqueue per JobId, ever (ids are never purged during a run).
-        foreach (var group in journal
-            .Where(e => e.Op == Ops.Enqueue && e.Result == nameof(EnqueueResult.Ok) && e.JobId is not null)
-            .GroupBy(e => e.JobId!.Value)
-            .Where(g => g.Count() > 1))
-        {
-            sink.Add(new TortureViolation(
-                TortureInvariant.DuplicateEnqueueAccepted,
-                $"JobId {group.Key} was accepted (Ok) by {group.Count()} enqueues: " +
-                $"{string.Join(", ", group.Select(e => e.Client))}.", group.Key));
-        }
-
-        foreach (var group in journal
-            .Where(e => e.Op == Ops.Workflow && e.Result == nameof(WorkflowEnqueueResult.Ok) && e.Detail == "create")
-            .GroupBy(e => e.WorkflowId))
-        {
-            if (group.Count() > 1)
-            {
-                sink.Add(new TortureViolation(
-                    TortureInvariant.DuplicateWorkflowAccepted,
-                    $"WorkflowId {group.Key} was created (Ok) {group.Count()} times."));
-            }
-        }
-
-        // A Requeue resets the attempt counter to 0, so a requeued job legitimately re-runs the same
-        // attempt numbers — one extra life per successful requeue. The claim/report Effect-Once
-        // checks therefore allow (1 + requeues) occurrences per (job, attempt), not 1.
-        //
-        // An UNANSWERED request counts as a life too. The client journals its request before the store
-        // call and the result after it, so a prefix can hold a claim of the reset attempt while the
-        // requeue that permitted it is still in flight - and a fault entry answers a request that the
-        // store may well have committed. Counting the gap as a life can only hide a finding. Counting it
-        // as nothing would invent one, and the mid-run audit reads exactly these prefixes. Every request
-        // is answered by the time the post-drain pass runs, so that pass loses no precision at all.
-        var requeueLives = journal
-            .Where(e => e.Op == Ops.Requeue && e.Result == nameof(RequeueResult.Requeued) && e.JobId is not null)
-            .GroupBy(e => e.JobId!.Value)
-            .ToDictionary(g => g.Key, g => g.Count());
-        var requeueAnswers = journal
-            .Where(e => e.Op == Ops.Requeue && e.JobId is not null)
-            .GroupBy(e => e.JobId!.Value)
-            .ToDictionary(g => g.Key, g => g.Count());
-        foreach (var group in journal
-            .Where(e => e.Op == Ops.RequeueRequested && e.JobId is not null)
-            .GroupBy(e => e.JobId!.Value))
-        {
-            var inFlight = group.Count() - requeueAnswers.GetValueOrDefault(group.Key);
-            if (inFlight > 0)
-            {
-                requeueLives[group.Key] = requeueLives.GetValueOrDefault(group.Key) + inFlight;
-            }
-        }
-
-        // NoDoubleExecution: a claim hands an attempt to exactly one worker, once per life.
-        foreach (var group in claims.GroupBy(e => (e.JobId!.Value, e.Attempt!.Value)))
-        {
-            var allowed = 1 + requeueLives.GetValueOrDefault(group.Key.Item1);
-            if (group.Count() > allowed)
-            {
-                sink.Add(new TortureViolation(
-                    TortureInvariant.NoDoubleExecution,
-                    $"Job {group.Key.Item1} attempt {group.Key.Item2} was claimed {group.Count()} times " +
-                    $"(by {string.Join(", ", group.Select(e => e.Client))}) with only {allowed} life/lives.",
-                    group.Key.Item1));
-            }
-        }
-
-        // Effect-Once on the report: at most one Applied outcome per (job, attempt) per life.
-        foreach (var group in appliedOutcomes.GroupBy(e => (e.JobId!.Value, e.Attempt!.Value)))
-        {
-            var allowed = 1 + requeueLives.GetValueOrDefault(group.Key.Item1);
-            if (group.Count() > allowed)
-            {
-                sink.Add(new TortureViolation(
-                    TortureInvariant.SlotDoubleRelease,
-                    $"Job {group.Key.Item1} attempt {group.Key.Item2} had {group.Count()} Applied outcomes " +
-                    $"with only {allowed} life/lives.", group.Key.Item1));
-            }
-        }
-
-        // Fence supersession: an outcome for attempt a must not apply after attempt a' > a was
-        // already handed out (the later claim's return proves attempt a's lease was gone). Keyed by
-        // job, because the mid-run pass re-runs this and a flat (job, attempt) map would make the
-        // lookup a scan of every claim group in the journal.
-        var claimReturns = claims
-            .GroupBy(e => e.JobId!.Value)
-            .ToDictionary(
-                g => g.Key,
-                g => g.GroupBy(e => e.Attempt!.Value)
-                    .Select(a => (Attempt: a.Key, Returned: a.Min(e => e.T1)))
-                    .ToList());
-        foreach (var outcome in appliedOutcomes)
-        {
-            if (requeueLives.ContainsKey(outcome.JobId!.Value))
-            {
-                continue; // lives interleave attempt numbers; the cross-life ordering is not checkable
-            }
-            if (!claimReturns.TryGetValue(outcome.JobId!.Value, out var perAttempt))
-            {
-                continue;
-            }
-            foreach (var (attempt, returned) in perAttempt)
-            {
-                if (attempt > outcome.Attempt!.Value && returned < outcome.T0)
-                {
-                    sink.Add(new TortureViolation(
-                        TortureInvariant.OutcomeProvenance,
-                        $"Job {outcome.JobId} attempt {outcome.Attempt} outcome APPLIED although attempt " +
-                        $"{attempt} had already been claimed before the report began — the fence let a stale " +
-                        "writer through.", outcome.JobId));
-                    break;
-                }
-            }
-        }
+        var oracle = new JournalOracle();
+        oracle.Absorb(journal);
+        oracle.Evaluate(sink);
     }
 }

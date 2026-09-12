@@ -2158,12 +2158,16 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             {
                 case ObserverCommand.ClaimBatch claim:
                     var subscription = claim.Subscription;
+                    // One read of this node's clock for the whole round-trip. The store never reads a
+                    // clock of its own, so this instant plus the requested duration IS the lease expiry
+                    // the claim stamped - the belief the report carries back to the fence.
+                    var claimNow = NodeNow(nodeIndex);
                     ObserverClaim batch;
                     try
                     {
                         batch = Get(_nodeFaulty[nodeIndex].ClaimObserverDeliveriesAsync(new ObserverClaimRequest(
                             claim.ObserverId, subscription.States, subscription.WireName, subscription.Queue,
-                            claim.WorkerId, claim.MaxRows, claim.LeaseDuration, NodeNow(nodeIndex))));
+                            claim.WorkerId, claim.MaxRows, claim.LeaseDuration, claimNow)));
                     }
                     catch (SimTransientFault)
                     {
@@ -2173,7 +2177,8 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                         DriveObservers(nodeIndex, new ObserverEvent.DeliveryAborted(claim.ObserverId, NodeNow(nodeIndex)));
                         break;
                     }
-                    DriveObservers(nodeIndex, new ObserverEvent.BatchClaimed(claim.ObserverId, batch.Deliveries, NodeNow(nodeIndex)));
+                    DriveObservers(nodeIndex, new ObserverEvent.BatchClaimed(
+                        claim.ObserverId, batch.Deliveries, claimNow, claimNow + claim.LeaseDuration));
                     break;
 
                 case ObserverCommand.InvokeBatch invoke:
@@ -2221,7 +2226,10 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     try
                     {
                         Get2(_nodeFaulty[nodeIndex].ReportObserverDeliveriesAsync(new ObserverDeliveryReport(
-                            report.ObserverId, report.WorkerId, report.Outcomes, NodeNow(nodeIndex))));
+                            report.ObserverId, report.WorkerId, report.Outcomes, NodeNow(nodeIndex))
+                        {
+                            BelievedLeaseExpiry = report.BelievedLeaseExpiry,
+                        }));
                     }
                     catch (SimTransientFault)
                     {

@@ -130,6 +130,136 @@ public sealed class SqlServerConcurrentMaintenanceTests
         Assert.Equal(0, faults.Terminal);
     }
 
+    // The hand-back a node runs on a clean stop, raced against the claims its peers still make. The
+    // relinquish selects by lease_owner, which no index covers, so its UPDLOCK scan can hold locks on
+    // rows outside its own batch. A claim that reaches for a Scheduled row inside that footprint then
+    // closes a cycle. Expiry never reaches this window - it takes only Leases that already lapsed, which
+    // no live claimer races - so the hand-back is the one maintenance path the two pins above leave
+    // uncovered.
+    //
+    // Each worker revokes its NEIGHBOR's Leases, never its own, so every hand-back lands on a worker that
+    // is mid-claim. MaxAttempts equals Passes, so the early passes reach the ready UPDATE and the last
+    // pass reaches the dead-letter UPDATE with its per-row cause.
+    [Theory]
+    [InlineData(JobHistoryPolicy.TransitionsAndFailureDetail)]
+    [InlineData(JobHistoryPolicy.Off)]
+    public async Task Concurrent_relinquishes_and_claims_never_deadlock(JobHistoryPolicy policy)
+    {
+        const int Rounds = 10, Jobs = 96, Workers = 6, Batch = 16, Passes = 4, Ballast = 5000;
+        var disposition = new RetryPolicy { MaxAttempts = Passes, Backoff = _ => TimeSpan.FromMinutes(1) }
+            .ToDisposition();
+        using var faults = new StoreFaultCounter();
+        var escaped = 0;
+
+        for (var round = 0; round < Rounds; round++)
+        {
+            var store = await SqlServerTestDatabase.CreateFreshStoreAsync(policy);
+            await AddBallast(Ballast);
+            for (var i = 0; i < Jobs; i++)
+            {
+                await store.EnqueueAsync(new NewJob(Guid.NewGuid(), "t", "{}"u8.ToArray(), "default", T0), T0);
+            }
+
+            var results = await Task.WhenAll(Enumerable.Range(0, Workers).Select(w => Task.Run(async () =>
+            {
+                var owner = $"w{w}";
+                var neighbor = $"w{(w + 1) % Workers}";
+                var lost = 0;
+                for (var pass = 0; pass < Passes; pass++)
+                {
+                    try
+                    {
+                        await store.ClaimAsync(new ClaimRequest(owner, ["default"], Batch, Lease, T0));
+                        await store.RelinquishLeasesAsync(neighbor, T0, disposition);
+                    }
+                    catch (SqlException e) when (e.Number == 1205)
+                    {
+                        lost++;
+                    }
+                }
+                return lost;
+            })));
+            escaped += results.Sum();
+        }
+
+        // The hand-back writes the Transition Log before either disposition UPDATE, the same order the
+        // sweep uses, so the pin is zero losses and not merely zero escapes. Off is here because it takes
+        // the Transition Log out of the round entirely, which leaves the hand-back's own read as the only
+        // thing left that can lock past its batch.
+        Assert.Equal(0, faults.Absorbed);
+        Assert.Equal(0, escaped);
+        Assert.Equal(0, faults.Terminal);
+    }
+
+    // The pin above is a race: the plan has to lose it for the counter to move. This one is
+    // deterministic, and it names the mechanism the race is made of - a hand-back must never take a
+    // lock on a row it does not hand back.
+    //
+    // One worker holds a single Lease. A bystander worker holds every other Lease in the store. A rival
+    // session takes an X lock on ONE bystander row and keeps it for the whole call. The hand-back for
+    // the first worker then runs alone. A read that seeks ix_backwave_jobs_lease_owner never reads the
+    // bystander row and returns at once. A read that scans the live Leases under UPDLOCK asks for a U
+    // lock on that row and waits - the oversized footprint the deadlock is built from, caught here with
+    // one writer and no timing window.
+    [Fact]
+    public async Task A_hand_back_never_locks_a_row_it_does_not_hand_back()
+    {
+        const int Bystanders = 200;
+        var disposition = new RetryPolicy { MaxAttempts = 5, Backoff = _ => TimeSpan.FromMinutes(1) }.ToDisposition();
+        var store = await SqlServerTestDatabase.CreateFreshStoreAsync();
+        for (var i = 0; i <= Bystanders; i++)
+        {
+            await store.EnqueueAsync(new NewJob(Guid.NewGuid(), "t", "{}"u8.ToArray(), "default", T0), T0);
+        }
+
+        // The claim hands out oldest due first, so the bystander takes every job but the last one. It
+        // takes them in passes, because one claim never returns more than Bounds.MaxClaimBatch rows.
+        var bystanderLeases = new List<JobRecord>();
+        while (bystanderLeases.Count < Bystanders)
+        {
+            var pass = await store.ClaimAsync(
+                new ClaimRequest("bystander", ["default"], Bystanders - bystanderLeases.Count, Lease, T0));
+            Assert.NotEmpty(pass);
+            bystanderLeases.AddRange(pass);
+        }
+
+        var mine = await store.ClaimAsync(new ClaimRequest("mine", ["default"], 1, Lease, T0));
+        Assert.Equal(Bystanders, bystanderLeases.Count);
+        Assert.Single(mine);
+
+        await using var rival = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await rival.OpenAsync();
+        await using var rivalTx = (SqlTransaction)await rival.BeginTransactionAsync();
+
+        Task<int> handBack;
+        bool finishedWhileHeld;
+        try
+        {
+            // XLOCK on one clustered row and nothing else, so the rival can never be half of a cycle.
+            // The hand-back either avoids this row or waits on it, and waiting is the whole finding.
+            await Execute(
+                rival, rivalTx,
+                "SELECT job_id FROM backwave.jobs WITH (XLOCK, ROWLOCK) WHERE job_id = @id",
+                bystanderLeases[^1].JobId);
+
+            handBack = Task.Run(() => store.RelinquishLeasesAsync("mine", T0, disposition).AsTask());
+            finishedWhileHeld = await Task.WhenAny(handBack, Task.Delay(TimeSpan.FromSeconds(10))) == handBack;
+        }
+        finally
+        {
+            // Release the hostage whatever happened, so a blocked hand-back can finish and be awaited.
+            await rivalTx.RollbackAsync();
+        }
+
+        var relinquished = await handBack.WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.True(
+            finishedWhileHeld,
+            "The hand-back waited on a Lease held by another worker, so its UPDLOCK read reached past its "
+            + "own batch. ix_backwave_jobs_lease_owner (schema v2) is missing, or the relinquish read no "
+            + "longer seeks it.");
+        Assert.Equal(1, relinquished);
+    }
+
     // The two pins above are worth nothing unless a real absorbed deadlock would move the counter. This
     // provokes one deterministically and walks the whole chain: SQL Server picks the store's transaction
     // as the victim, the bounded retry replays it, StoreFaultCounter sees the loss, and the caller still
@@ -306,7 +436,8 @@ public sealed class SqlServerConcurrentMaintenanceTests
     // One statement on the rival session. The Task comes back so a caller can issue a statement WITHOUT
     // awaiting it, which is how the blocked half of the cycle above is set up.
     private static async Task Execute(
-        SqlConnection connection, SqlTransaction? transaction, string sql, Guid? id = null, string? queue = null)
+        SqlConnection connection, SqlTransaction? transaction, string sql, Guid? id = null, string? queue = null,
+        int? count = null)
     {
         await using var command = new SqlCommand(sql, connection, transaction);
         if (id is { } value)
@@ -317,7 +448,36 @@ public sealed class SqlServerConcurrentMaintenanceTests
         {
             command.Parameters.AddWithValue("queue", queue);
         }
+        if (count is { } rows)
+        {
+            command.Parameters.AddWithValue("count", rows);
+        }
         await command.ExecuteNonQueryAsync();
+    }
+
+    // The FK from job_transitions.job_id to jobs.job_id is checked by a plan the optimizer owns, and for
+    // a batch that is large next to jobs it answers the check by scanning jobs - which asks for S on rows
+    // the batch does not own. That exposure is older than the hand-back and no hint removes the scan. A
+    // store that holds only the test's own jobs makes every batch large, so the deadlock test would
+    // measure that plan instead of the lock footprint it names. This gives jobs a production-shaped row
+    // count, so the check seeks and the batch locks only its own rows.
+    //
+    // The ballast sits on its own Queue, a year out, and never leaves Scheduled, so no claim, no sweep and
+    // no hand-back in this class ever reads a ballast row. UPDATE STATISTICS is not decoration: it is what
+    // invalidates the plan the empty table compiled, so the check is recompiled against the real count.
+    private static async Task AddBallast(int rows)
+    {
+        await using var connection = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await connection.OpenAsync();
+        await Execute(
+            connection, transaction: null,
+            """
+            INSERT INTO backwave.jobs (job_id, wire_name, payload, queue, state, due_time)
+            SELECT TOP (@count) NEWID(), 'ballast', 0x, 'ballast', 0, DATEADD(year, 1, SYSDATETIMEOFFSET())
+            FROM sys.all_objects a CROSS JOIN sys.all_objects b;
+            UPDATE STATISTICS backwave.jobs;
+            """,
+            count: rows);
     }
 
     // Polls until one session waits on a lock that <paramref name="session"/> holds. The rival closes the

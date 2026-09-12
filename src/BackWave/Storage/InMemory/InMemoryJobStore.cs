@@ -1317,13 +1317,15 @@ public sealed class InMemoryJobStore(
             // promotion rule reads FOR ZEROS, and a healthy fleet that increments it makes the trigger
             // meaningless.
             //
-            // What no legal race produces is a report from a worker that is not the owner while the claim
-            // Lease is still LIVE: the store holds an unexpired Lease for somebody else, so two workers
-            // believe they hold the same observer claim at once. Only that contradiction is counted.
+            // What no legal race produces is a report from a worker that is not the owner while that
+            // worker STILL BELIEVED its own claim Lease was live, so two workers believed they held the
+            // same observer claim at once. Only that contradiction is counted, and ObserverFence owns
+            // the test - the row's own expiry cannot answer it, because a peer that reclaimed this
+            // observer after the lapse leaves ITS future expiry here for the late report to read.
             if (!string.Equals(observer.LeaseOwner, report.WorkerId, StringComparison.Ordinal)
                 || observer.LeaseExpiry <= report.Now)
             {
-                if (observer.LeaseExpiry > report.Now)
+                if (ObserverFence.IsContradiction(report))
                 {
                     // No logger, unlike the four SQL adapters. This store takes no logging
                     // configuration at all, and adding one to its constructor would break every
@@ -1331,8 +1333,7 @@ public sealed class InMemoryJobStore(
                     // development or test host ever sees. The metric still counts the trigger.
                     Invariant.Degrade(
                         null, InvariantTrigger.ObserverReportFenceRejected,
-                        $"Observer '{report.ObserverId}': worker '{report.WorkerId}' reported against a claim lease " +
-                        $"still held by '{observer.LeaseOwner}' until {observer.LeaseExpiry:o}, and it is only {report.Now:o}.");
+                        ObserverFence.Detail(report, observer.LeaseOwner));
                 }
                 return ValueTask.FromResult(ObserverReportOutcome.FenceRejected);
             }

@@ -159,7 +159,12 @@ internal sealed class ObserverDispatchService : BackgroundService
                             claim.ObserverId, subscription.States, subscription.WireName, subscription.Queue,
                             claim.WorkerId, claim.MaxRows, claim.LeaseDuration, now),
                         stoppingToken).ConfigureAwait(false);
-                    events.TryWrite(new ObserverEvent.BatchClaimed(claim.ObserverId, batch.Deliveries, now));
+                    // The Lease this claim just granted, which is the request's instant plus the duration
+                    // it asked for: the store stamps the row from those same two values and never reads
+                    // its own clock, so this IS the stored expiry and not an estimate of it. Carried so
+                    // the report can tell the store's fence what this node believed.
+                    events.TryWrite(new ObserverEvent.BatchClaimed(
+                        claim.ObserverId, batch.Deliveries, now, now + claim.LeaseDuration));
                 }
                 catch (Exception exception) when (!stoppingToken.IsCancellationRequested)
                 {
@@ -201,7 +206,10 @@ internal sealed class ObserverDispatchService : BackgroundService
                     // store that predates this channel, reporting normally and then declining to say so -
                     // so it stays on the applied path and such a store behaves exactly as it did before.
                     var reported = await _store.TryReportObserverDeliveriesAsync(
-                        new ObserverDeliveryReport(report.ObserverId, report.WorkerId, report.Outcomes, now),
+                        new ObserverDeliveryReport(report.ObserverId, report.WorkerId, report.Outcomes, now)
+                        {
+                            BelievedLeaseExpiry = report.BelievedLeaseExpiry,
+                        },
                         stoppingToken).ConfigureAwait(false);
                     if (reported is ObserverReportOutcome.FenceRejected or ObserverReportOutcome.UnknownObserver)
                     {

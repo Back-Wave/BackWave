@@ -1,3 +1,5 @@
+using BackWave.Diagnostics;
+
 namespace BackWave.Storage;
 
 /// <summary>
@@ -104,7 +106,56 @@ public sealed record ObserverDeliveryOutcome(
 /// <param name="Outcomes">The per-row outcomes for the claimed batch.</param>
 /// <param name="Now">The current instant, used to test that the lease is still live.</param>
 public sealed record ObserverDeliveryReport(
-    string ObserverId, string WorkerId, IReadOnlyList<ObserverDeliveryOutcome> Outcomes, DateTimeOffset Now);
+    string ObserverId, string WorkerId, IReadOnlyList<ObserverDeliveryOutcome> Outcomes, DateTimeOffset Now)
+{
+    /// <summary>
+    /// The instant the REPORTER believes its own claim lease runs until, read on the reporter's clock:
+    /// the expiry the claim granted it. Optional, and null means the reporter did not say.
+    /// <para>
+    /// This is what separates a contradiction from a lapse when the fence refuses a report. The row's
+    /// CURRENT expiry cannot: after a lease lapses and a peer reclaims the observer, a late report from
+    /// the old owner reads the NEW owner's future expiry, and no two workers ever held the claim at
+    /// once. Only a reporter that still believed its own lease was live proves that they did. A store
+    /// reads this to decide whether to count the refusal, and never to decide the refusal itself - the
+    /// fence is the store's row, not the reporter's word.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// An init property rather than a fifth constructor parameter, for the reason
+    /// <see cref="BackWave.Diagnostics.InvariantTrigger"/>'s own surface is pinned: this package ships
+    /// on nuget.org, and a record's constructor, <c>Deconstruct</c>, and <c>Equals</c> all follow the
+    /// primary-constructor list, so a parameter there breaks every compiled caller at load time.
+    /// </remarks>
+    public DateTimeOffset? BelievedLeaseExpiry { get; init; }
+}
+
+// The one rule every store applies when its claim-lease fence refuses an observer report: was this a
+// contradiction, or the ordinary end of a delivery attempt?
+//
+// Shared rather than repeated, because five stores wrote the same branch and all five read the row's
+// CURRENT expiry, which answers a different question. After a lease lapses and a peer reclaims the
+// observer, a late report from the old owner reads the new owner's future expiry - so every store
+// counted a legal race, and the trigger's whole value is that a healthy fleet leaves it at zero.
+//
+// Mirrors the outcome fence in the Worker Group pump, deliberately: same evidence (what the reporter
+// itself believed), same allowance, same direction of error. A silent fence costs nothing. A noisy one
+// costs the trigger its meaning.
+internal static class ObserverFence
+{
+    // True only when the reporter still believed its own claim lease was live, by its own clock, with
+    // the skew allowance spent. A reporter that did not say what it believed is never counted: the
+    // belief is a lower bound, so the test errs toward silence and never toward a false alarm.
+    internal static bool IsContradiction(ObserverDeliveryReport report) =>
+        report.BelievedLeaseExpiry is { } believed
+        && report.Now + Invariant.ClockSkewAllowance < believed;
+
+    // The evidence, in the order it proves the point: who the store says holds the claim, and what the
+    // reporter believed about its own lease at the instant it reported.
+    internal static string Detail(ObserverDeliveryReport report, string? currentOwner) =>
+        $"Observer '{report.ObserverId}': worker '{report.WorkerId}' reported against a claim lease the " +
+        $"store holds for '{currentOwner ?? "(nobody)"}', but its own lease on that claim runs to " +
+        $"{report.BelievedLeaseExpiry:o} and it is only {report.Now:o}.";
+}
 
 /// <summary>
 /// What a store did with a delivery report. The report is fenced by the claim lease, so a worker that

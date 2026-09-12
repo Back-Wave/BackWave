@@ -12,6 +12,7 @@ internal static class Ops
     public const string Outcome = "outcome";
     public const string Heartbeat = "heartbeat";
     public const string Expire = "expire";
+    public const string Relinquish = "relinquish";
     public const string Cancel = "cancel";
     public const string Requeue = "requeue";
 

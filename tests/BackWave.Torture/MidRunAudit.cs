@@ -26,9 +26,12 @@ internal sealed class MidRunAudit(
     // are appended by sequential transactions), so carrying the tail across passes is sound.
     private readonly Dictionary<Guid, TransitionFacts> _lastSeen = [];
 
-    // The pass's own growing copy of the journal, extended by the delta each time: re-copying all of
-    // it every pass is the one cost that would grow without bound.
-    private readonly List<JournalEntry> _journalView = [];
+    // The journal-only oracle, carried across passes as counters. Each pass folds in only the entries
+    // appended since the last one, so a pass costs its delta and never the run's whole history.
+    private readonly JournalOracle _oracle = new();
+
+    // How far into the journal the oracle has read.
+    private int _absorbed;
 
     private long _cursor;
 
@@ -140,11 +143,12 @@ internal sealed class MidRunAudit(
         }
 
         var watermark = journal.Watermark;
-        if (watermark > _journalView.Count)
+        if (watermark > _absorbed)
         {
-            _journalView.AddRange(journal.Range(_journalView.Count, watermark - _journalView.Count));
+            _oracle.Absorb(journal.Range(_absorbed, watermark - _absorbed));
+            _absorbed = watermark;
         }
-        Checks.LiveJournal(_journalView, violations);
+        _oracle.Evaluate(violations);
 
         Passes++;
         Cost += timer.Elapsed;

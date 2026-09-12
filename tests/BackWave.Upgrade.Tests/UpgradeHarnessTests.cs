@@ -16,9 +16,10 @@ namespace BackWave.Upgrade.Tests;
 public sealed class UpgradeHarnessTests
 {
     // Short workload per prior version keeps the shipped-prior-version sweep battery-friendly while still
-    // running a real concurrent workload across the freshly migrated schema. Both networked adapters are
-    // re-baselined to a single consolidated v1, so their sweep (v1..v(current-1)) is legitimately empty and
-    // the clean facts pass vacuously; the sabotage fact below still exercises the oracle end to end.
+    // running a real concurrent workload across the freshly migrated schema. SQL Server ships v2, so its
+    // sweep carries one real step (v1 -> v2) that populates, migrates, works and audits. Postgres is still
+    // at the re-baselined consolidated v1, so its sweep (v1..v(current-1)) is legitimately empty and that
+    // clean fact passes vacuously; the sabotage fact below still exercises the oracle end to end.
     private static readonly TimeSpan BatteryWorkload = TimeSpan.FromSeconds(3);
 
     [Fact]

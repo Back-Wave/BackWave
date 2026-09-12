@@ -153,11 +153,15 @@ public sealed record HaltState(string ExceptionType, string Message)
     /// <summary>Renders the cause as <c>ExceptionType: Message</c>.</summary>
     /// <returns>The exception type and message joined by a colon.</returns>
     /// <remarks>
-    /// The trigger is deliberately left out. This rendering is what the health check puts in its
-    /// description, which an operator's response writer may serialize into a probe payload; keeping it
-    /// byte-identical keeps the trigger id out of every serialized artifact, so renaming a trigger costs
-    /// one metric tag value and one log parameter and nothing that outlives the process. Read
-    /// <see cref="Trigger"/> when you want the id.
+    /// The trigger is deliberately left out, so renaming a trigger costs one metric tag value and one
+    /// log parameter and nothing that outlives the process. Read <see cref="Trigger"/> when you want
+    /// the id.
+    /// <para>
+    /// This rendering is for an operator reading the halt IN PROCESS, and it carries the provider's
+    /// message. The health check does NOT use it: a description is what a response writer serializes
+    /// onto a probe endpoint, and a message from a failed connection names the host, the database and
+    /// the login. The check renders <see cref="ExceptionType"/> alone on both its impaired branches.
+    /// </para>
     /// </remarks>
     public override string ToString() => $"{ExceptionType}: {Message}";
 }
@@ -188,9 +192,9 @@ public sealed class BackWaveHealthCheck(BackWaveHealth health) : IHealthCheck
     /// <param name="context">The health-check context supplied by the pipeline.</param>
     /// <param name="cancellationToken">Unused; the check reads in-memory state and never blocks.</param>
     /// <returns>
-    /// A completed task with an unhealthy result whose description lists the wholly halted groups and
-    /// their causes; otherwise a degraded result naming the partially halted and degraded groups with
-    /// their exception TYPE names only; or a healthy result when there are none.
+    /// A completed task with an unhealthy result whose description names the wholly halted groups,
+    /// otherwise a degraded result naming the partially halted and degraded groups, or a healthy result
+    /// when there are none. Every description carries exception TYPE names only, never a message.
     /// </returns>
     /// <remarks>
     /// <b>Breaking behavioural change:</b> a transient store fault used to report
@@ -201,9 +205,16 @@ public sealed class BackWaveHealthCheck(BackWaveHealth health) : IHealthCheck
     {
         if (!health.IsHealthy)
         {
+            // The group name and the exception TYPE name only, exactly as the Degraded branch below and
+            // for the same reason: this description is what a stock response writer serializes onto a
+            // probe endpoint, and a provider's message carries the host, the database and the login it
+            // failed to reach. The halt path is the LOUDER of the two and reaches that endpoint through
+            // the negative catch-all - a failed login is non-transient, so it halts the group - which
+            // made this branch leak precisely what the quieter branch hides. HaltedGroups still carries
+            // the full message for an operator reading it in process.
             return Task.FromResult(HealthCheckResult.Unhealthy(
                 "Worker Group fail-stop: " + string.Join("; ",
-                    health.HaltedGroups.Select(g => $"{g.Key} ({g.Value})"))));
+                    health.HaltedGroups.Select(g => $"{g.Key} ({g.Value.ExceptionType})"))));
         }
         // Impaired but serving: a partially halted group is still claiming through its surviving pumps,
         // and a degraded group is retrying each poll. Neither is a fail-stop, and neither is clean.

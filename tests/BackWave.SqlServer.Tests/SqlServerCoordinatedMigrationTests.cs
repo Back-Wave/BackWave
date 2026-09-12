@@ -7,6 +7,9 @@ namespace BackWave.SqlServer.Tests;
 /// under true concurrency — exactly one Node applies the schema while the rest block, re-check, and
 /// no-op. Proven by a concurrent-boot storm against a fresh schema (teeth), a storm against an
 /// already-current schema (steady state), and a negative control with coordination off.
+///
+/// The version-bump facts live here too: a database left at a shipped prior version must reach the
+/// current one in place, carrying the objects that version added.
 /// </summary>
 [Collection("sqlserver")]
 public sealed class SqlServerCoordinatedMigrationTests
@@ -169,6 +172,91 @@ public sealed class SqlServerCoordinatedMigrationTests
                 admin);
             await drop.ExecuteNonQueryAsync();
         }
+    }
+
+    // A version bump only reaches a deployment that already ran. This applies ONLY the v1 script, the
+    // schema every shipped build before this one left behind, then runs the real migration on it and
+    // proves the upgrade lands in place: the version stamp advances and the new index is there.
+    //
+    // The schema-version row is the sharp edge. v1 SEEDS it with an INSERT guarded by WHERE NOT EXISTS,
+    // so a v2 script that inserted again would leave the row at 1 and every node would fail-stop on
+    // skew. Pinning both the row count and the version is what catches that.
+    [Fact]
+    public async Task AV1Database_UpgradesInPlaceToV2()
+    {
+        await DropSchemaAsync();
+        await ApplyScriptAsync("0001_initial.sql");
+        Assert.Equal(1, await DeployedVersionAsync());
+
+        await SqlServerMigrator.MigrateAsync(SqlServerTestDatabase.ConnectionString, Schema);
+
+        Assert.Equal(1, await SchemaVersionRowCountAsync());
+        Assert.Equal(2, await DeployedVersionAsync());
+        Assert.Equal(SqlServerMigrator.ExpectedSchemaVersion, await DeployedVersionAsync());
+        Assert.Equal("lease_owner", await LeaseOwnerIndexKeyColumnAsync());
+    }
+
+    // The hand-back's lock footprint is the index's whole reason to exist (see
+    // SqlServerConcurrentMaintenanceTests). An index keyed on anything else, or one the optimizer
+    // cannot use because the filter is gone, would leave the relinquish read scanning the live Leases
+    // again. This pins the two properties the seek needs, on the fresh-install path rather than the
+    // upgrade path, so both routes to v2 are covered.
+    [Fact]
+    public async Task AFreshInstall_CarriesTheFilteredLeaseOwnerIndex()
+    {
+        await DropSchemaAsync();
+        await SqlServerMigrator.MigrateAsync(SqlServerTestDatabase.ConnectionString, Schema);
+
+        Assert.Equal("lease_owner", await LeaseOwnerIndexKeyColumnAsync());
+        Assert.True(await LeaseOwnerIndexIsFilteredAsync(), "ix_backwave_jobs_lease_owner lost its state = 2 filter.");
+    }
+
+    // Runs one shipped schema script, rewritten into this class's private schema, exactly as the
+    // migrator would. Reaching a PRIOR version means applying its script and no later one.
+    private static async Task ApplyScriptAsync(string fileName)
+    {
+        var assembly = typeof(SqlServerMigrator).Assembly;
+        var resource = assembly.GetManifestResourceNames()
+            .Single(name => name.EndsWith(fileName, StringComparison.Ordinal));
+        await using var stream = assembly.GetManifestResourceStream(resource)!;
+        using var reader = new StreamReader(stream);
+        var sql = new SchemaRewriter(Schema).Rewrite(await reader.ReadToEndAsync());
+
+        await using var connection = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await connection.OpenAsync();
+        await using var apply = new SqlCommand(sql, connection);
+        await apply.ExecuteNonQueryAsync();
+    }
+
+    // The rewriter substitutes the schema name everywhere it appears, index names included, so the
+    // index this schema carries is ix_<schema>_jobs_lease_owner.
+    private static string LeaseOwnerIndexName()
+        => new SchemaRewriter(Schema).Rewrite("ix_backwave_jobs_lease_owner");
+
+    // The first key column of the lease-owner index, or null when no such index exists.
+    private static async Task<string?> LeaseOwnerIndexKeyColumnAsync()
+    {
+        await using var connection = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await connection.OpenAsync();
+        await using var query = new SqlCommand(
+            $"""
+            SELECT c.name
+            FROM sys.indexes i
+            JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE i.name = '{LeaseOwnerIndexName()}' AND ic.key_ordinal = 1
+            """,
+            connection);
+        return (string?)await query.ExecuteScalarAsync();
+    }
+
+    private static async Task<bool> LeaseOwnerIndexIsFilteredAsync()
+    {
+        await using var connection = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await connection.OpenAsync();
+        await using var query = new SqlCommand(
+            $"SELECT CAST(has_filter AS int) FROM sys.indexes WHERE name = '{LeaseOwnerIndexName()}'", connection);
+        return (int?)await query.ExecuteScalarAsync() == 1;
     }
 
     [Fact]

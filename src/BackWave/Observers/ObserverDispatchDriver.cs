@@ -21,6 +21,13 @@ internal sealed class ObserverDispatchDriver(ObserverDispatchOptions options)
     // re-poll from issuing a second concurrent claim for the same Observer on this node.
     private readonly HashSet<string> _inFlight = new(StringComparer.Ordinal);
 
+    // What this node believes about the claim Lease it is mid-delivery under, per Observer: the expiry
+    // the claim granted. Set when the batch comes back and read when its report is decided, because the
+    // report is what carries it to the store's fence. A separate map rather than a value on _inFlight,
+    // because the guard is set at POLL time (before any expiry exists) and this is known only after the
+    // claim returns. Dropped with the guard, so it cannot outlive the delivery it describes.
+    private readonly Dictionary<string, DateTimeOffset> _believedLeases = new(StringComparer.Ordinal);
+
     /// <summary>Decide what the Shell does next given one event. Pure: no I/O, no clock.</summary>
     public IReadOnlyList<ObserverCommand> Step(ObserverEvent observerEvent)
     {
@@ -44,8 +51,10 @@ internal sealed class ObserverDispatchDriver(ObserverDispatchOptions options)
                 {
                     // Lease held elsewhere, or nothing due: free this Observer to be claimed again later.
                     _inFlight.Remove(claimed.ObserverId);
+                    _believedLeases.Remove(claimed.ObserverId);
                     return [];
                 }
+                _believedLeases[claimed.ObserverId] = claimed.LeaseExpiry;
                 return [new ObserverCommand.InvokeBatch(claimed.ObserverId, claimed.Deliveries)];
 
             case ObserverEvent.BatchInvoked invoked:
@@ -59,7 +68,13 @@ internal sealed class ObserverDispatchDriver(ObserverDispatchOptions options)
                 {
                     outcomes.Add(Decide(result, invoked.Now));
                 }
-                return [new ObserverCommand.ReportBatch(invoked.ObserverId, options.WorkerId, outcomes)];
+                // Removed with the guard above it: the belief describes THIS delivery, and the next claim
+                // brings its own. Null when no claim this Core saw preceded the report, which leaves the
+                // store's fence silent rather than guessing.
+                _believedLeases.Remove(invoked.ObserverId, out var believed);
+                return [new ObserverCommand.ReportBatch(
+                    invoked.ObserverId, options.WorkerId, outcomes,
+                    believed == default ? null : believed)];
 
             case ObserverEvent.BatchReported reported:
                 // A batch just drained; more rows may be claimable now. Re-poll to keep up.
@@ -70,6 +85,7 @@ internal sealed class ObserverDispatchDriver(ObserverDispatchOptions options)
                 // so the next poll re-claims this Observer. Without this a single faulted claim would
                 // leave the guard stuck set, and this node would never claim the Observer again.
                 _inFlight.Remove(aborted.ObserverId);
+                _believedLeases.Remove(aborted.ObserverId);
                 return [];
 
             default:

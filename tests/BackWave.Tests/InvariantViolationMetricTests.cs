@@ -53,9 +53,13 @@ public class InvariantViolationMetricTests
         var measurements = new ConcurrentBag<(long Value, string? Trigger, string? Action)>();
         using var listener = Listen(measurements);
 
-        // The same worker reports after its own Lease lapsed - the everyday late-report race.
+        // The same worker reports after its own Lease lapsed - the everyday late-report race. It says
+        // what it believed, and what it believed is already behind it, so there is nothing to contradict.
         var outcome = await store.TryReportObserverDeliveriesAsync(new ObserverDeliveryReport(
-            "obs", "node-a", [Delivered(claim)], T0 + Lease + TimeSpan.FromSeconds(1)));
+            "obs", "node-a", [Delivered(claim)], T0 + Lease + TimeSpan.FromSeconds(1))
+        {
+            BelievedLeaseExpiry = T0 + Lease,
+        });
 
         Assert.Equal(ObserverReportOutcome.FenceRejected, outcome); // still refused, still no-op
         Assert.DoesNotContain(
@@ -75,15 +79,51 @@ public class InvariantViolationMetricTests
         var measurements = new ConcurrentBag<(long Value, string? Trigger, string? Action)>();
         using var listener = Listen(measurements);
 
-        // node-b never held this claim, and node-a's Lease has not lapsed.
+        // node-b never held this claim, and node-b still believes its own claim Lease runs a full minute
+        // out - well past the skew a fleet can carry - while node-a holds the row.
         var outcome = await store.TryReportObserverDeliveriesAsync(new ObserverDeliveryReport(
-            "obs", "node-b", [Delivered(claim)], T0 + TimeSpan.FromSeconds(1)));
+            "obs", "node-b", [Delivered(claim)], T0 + TimeSpan.FromSeconds(1))
+        {
+            BelievedLeaseExpiry = T0 + Lease,
+        });
 
         Assert.Equal(ObserverReportOutcome.FenceRejected, outcome);
         var measurement = Assert.Single(
             measurements, m => m.Trigger == nameof(InvariantTrigger.ObserverReportFenceRejected));
         Assert.Equal(1, measurement.Value);
         Assert.Equal(nameof(InvariantAction.Degrade), measurement.Action);
+    }
+
+    /// <summary>
+    /// The case the row's own expiry gets wrong. After node-a's Lease lapses, node-b reclaims the observer
+    /// and stamps a fresh Lease, and only then does node-a's late report land. The row now carries a
+    /// FUTURE expiry, so a fence that reads the row counts a violation - but no two workers ever held this
+    /// claim at once, and the report itself says node-a believed its Lease was long gone.
+    /// </summary>
+    [Fact]
+    public async Task ObserverReportFence_StaysSilent_WhenAPeerAlreadyReclaimedTheObserver()
+    {
+        var store = new InMemoryJobStore();
+        var claim = await ClaimOneDeliveryAsync(store, "node-a");
+
+        // node-a's Lease lapses, and node-b takes the claim: the row's expiry moves into the future.
+        var afterLapse = T0 + Lease + TimeSpan.FromSeconds(1);
+        var reclaim = await store.ClaimObserverDeliveriesAsync(new ObserverClaimRequest(
+            "obs", [JobState.Scheduled], WireName: null, Queue: null, "node-b", MaxRows: 32, Lease, afterLapse));
+        Assert.True(reclaim.Acquired);
+
+        var measurements = new ConcurrentBag<(long Value, string? Trigger, string? Action)>();
+        using var listener = Listen(measurements);
+
+        var outcome = await store.TryReportObserverDeliveriesAsync(new ObserverDeliveryReport(
+            "obs", "node-a", [Delivered(claim)], afterLapse + TimeSpan.FromSeconds(1))
+        {
+            BelievedLeaseExpiry = T0 + Lease,
+        });
+
+        Assert.Equal(ObserverReportOutcome.FenceRejected, outcome);
+        Assert.DoesNotContain(
+            measurements, m => m.Trigger == nameof(InvariantTrigger.ObserverReportFenceRejected));
     }
 
     /// <summary>

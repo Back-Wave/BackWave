@@ -77,7 +77,7 @@ jobs:
         run: dotnet restore
       - name: Build
         run: dotnet build --no-restore -c Release
-      - name: Test (includes the Simulator seed battery; soak runs nightly)
+      - name: Test (includes the Simulator seed battery; the Soak category runs in soak.yml)
         run: |
           rc=0
           for proj in \

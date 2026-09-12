@@ -1615,17 +1615,24 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
 
         // The claim already counted the Attempt, so the hand-back leaves it alone: a clean stop skips
         // the backoff but not the ceiling.
+        //
+        // Transition Log: one entry per relinquished job for its resulting state, at its unchanged
+        // Attempt, atomic with the state writes. Built in this same pass, because the ceiling is the
+        // policy's answer and asking it twice for one job invites two answers.
         var ready = new List<Guid>();
         var deadLettered = new List<(Guid JobId, string Cause)>();
+        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(held.Count);
         foreach (var (jobId, attempt) in held)
         {
             if (disposition.NextAttemptAt(attempt, now) is not null)
             {
                 ready.Add(jobId);
+                transitions.Add((jobId, JobState.Scheduled, attempt, null));
             }
             else
             {
                 deadLettered.Add((jobId, $"Lease relinquished on attempt {attempt} (attempt ceiling reached)."));
+                transitions.Add((jobId, JobState.DeadLettered, attempt, null));
             }
         }
 
@@ -1697,16 +1704,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             }
         }
 
-        // Transition Log: one entry per relinquished job for its resulting state, at its unchanged
-        // Attempt, atomic with the state writes. Batched, for the same reason the expiry path batches.
-        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(held.Count);
-        foreach (var (jobId, attempt) in held)
-        {
-            var resulting = disposition.NextAttemptAt(attempt, now) is not null
-                ? JobState.Scheduled
-                : JobState.DeadLettered;
-            transitions.Add((jobId, resulting, attempt, null));
-        }
+        // The entries go in batched, for the same reason the expiry path batches.
         await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
             .ConfigureAwait(false);
 
@@ -3437,18 +3435,19 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         // promotion rule reads FOR ZEROS, and a healthy fleet that increments it makes the trigger
         // meaningless.
         //
-        // What no legal race produces is a report from a worker that is not the owner while the claim
-        // Lease is still LIVE: the store holds an unexpired Lease for somebody else, so two workers
-        // believe they hold the same observer claim at once. Only that contradiction is counted.
+        // What no legal race produces is a report from a worker that is not the owner while that worker
+        // STILL BELIEVED its own claim Lease was live, so two workers believed they held the same
+        // observer claim at once. Only that contradiction is counted, and ObserverFence owns the test -
+        // the row's own expiry cannot answer it, because a peer that reclaimed this observer after the
+        // lapse leaves ITS future expiry here for the old owner's late report to read.
         if (!string.Equals(leaseOwner, report.WorkerId, StringComparison.Ordinal) || leaseExpiry <= report.Now)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            if (leaseExpiry > report.Now)
+            if (ObserverFence.IsContradiction(report))
             {
                 Invariant.Degrade(
                     _logger, InvariantTrigger.ObserverReportFenceRejected,
-                    $"Observer '{report.ObserverId}': worker '{report.WorkerId}' reported against a claim lease " +
-                    $"still held by '{leaseOwner}' until {leaseExpiry:o}, and it is only {report.Now:o}.");
+                    ObserverFence.Detail(report, leaseOwner));
             }
             return ObserverReportOutcome.FenceRejected;
         }

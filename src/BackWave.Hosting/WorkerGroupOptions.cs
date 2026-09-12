@@ -118,16 +118,26 @@ public sealed record WorkerGroupOptions
     public TimeSpan? HeartbeatInterval { get; init; }
 
     /// <summary>
-    /// How long the group may spend giving work back when it stops cleanly. On shutdown the group
-    /// first reports the outcomes it has buffered, then waits out the jobs it still has running, then
-    /// relinquishes the leases it still holds so those jobs return to the queue at once instead of
-    /// waiting out <see cref="LeaseDuration"/> on a node that is gone. All three steps share this one
-    /// budget, in that order. The budget is also clamped at four fifths of the host's own
-    /// <see cref="Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout"/>, so a hand-back can
-    /// never consume the whole window the host allows for stopping and leave the host to kill it
-    /// mid-relinquish. Whatever the budget does not cover simply lapses as it does today, which costs
-    /// latency and nothing else. Defaults to 5 seconds; set it to <see cref="TimeSpan.Zero"/> to skip
-    /// the hand-back entirely.
+    /// How long EACH PUMP of the group may spend giving work back when it stops cleanly. On shutdown a
+    /// pump first waits out the jobs it still has running, then reports the outcomes those jobs left
+    /// buffered, then relinquishes the leases it still holds so those jobs return to the queue at once
+    /// instead of waiting out <see cref="LeaseDuration"/> on a node that is gone. All three steps share
+    /// this one budget, in that order, and the relinquish keeps a reserved fifth of it that no earlier
+    /// step can spend.
+    /// <para>
+    /// The budget is per pump, not per group and not per host: a group runs <see cref="Pumps"/> of
+    /// them, and a host runs every group. It is clamped at four fifths of the host's own
+    /// <see cref="Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout"/>, which bounds one pump -
+    /// the host stops its hosted services one at a time unless
+    /// <see cref="Microsoft.Extensions.Hosting.HostOptions.ServicesStopConcurrently"/> is set, so those
+    /// per-pump budgets are additive against a window they share. What bounds their SUM is the host's
+    /// own stop token: every hand-back is linked to it, so the host's deadline cuts a hand-back short
+    /// rather than leaving it writing to the store after the host stopped waiting. Size this option
+    /// against the host's window and the number of pumps that must stop inside it.
+    /// </para>
+    /// Whatever the budget does not cover simply lapses as it does today, which costs latency and
+    /// nothing else. Defaults to 5 seconds; set it to <see cref="TimeSpan.Zero"/> to skip the hand-back
+    /// entirely.
     /// </summary>
     public TimeSpan ShutdownBudget { get; init; } = TimeSpan.FromSeconds(5);
 

@@ -48,6 +48,7 @@ internal sealed class WorkloadClient(
                     < 80 => PauseOrResumeAsync(),
                     < 85 => SetLimitAsync(),
                     < 92 => WorkflowAsync(),
+                    < 93 => RelinquishLeasesAsync(),
                     _ => StrayHeartbeatAsync(),
                 };
                 await op;
@@ -103,7 +104,7 @@ internal sealed class WorkloadClient(
                 Tags = TagStrings(tags), Parents = parents.Length > 0 ? parents : null,
                 Mode = parents.Length > 0 ? job.Mode.ToString() : null,
             };
-        });
+        }, jobId);
         if (entry?.Result == nameof(EnqueueResult.Ok))
         {
             Remember(jobId);
@@ -213,7 +214,7 @@ internal sealed class WorkloadClient(
                     Result = result.ToString(), Executed = executed, Tags = tagStrings,
                     Detail = outcome.GetType().Name,
                 };
-            });
+            }, record.JobId);
         }
 
         if (batch.Count > 0)
@@ -262,17 +263,18 @@ internal sealed class WorkloadClient(
                 LeaseExpiry = result?.Renewed == true ? (now + duration).UtcTicks : null,
                 CancelRequested = cancelRequested,
             };
-        });
+        }, record.JobId);
         return cancelRequested;
     }
 
     private Task StrayHeartbeatAsync()
+    {
         // Heartbeats for leases this worker usually does not hold — pure fence pressure. It CAN hit
         // a lease this same worker does hold, and then it renews (and possibly shortens) it, so the
         // new expiry must be journaled for the interval audit.
-        => Call(Ops.Heartbeat, async () =>
+        var jobId = PickKnownJobId();
+        return Call(Ops.Heartbeat, async () =>
         {
-            var jobId = PickKnownJobId();
             var duration = TimeSpan.FromSeconds(4);
             var now = Now();
             var t0 = Ticks();
@@ -285,7 +287,8 @@ internal sealed class WorkloadClient(
                 LeaseExpiry = renewed ? (now + duration).UtcTicks : null,
                 Detail = "stray",
             };
-        });
+        }, jobId);
+    }
 
     private Task ExpireLeasesAsync()
         => Call(Ops.Expire, async () =>
@@ -298,10 +301,37 @@ internal sealed class WorkloadClient(
             };
         });
 
-    private Task CancelAsync()
-        => Call(Ops.Cancel, async () =>
+    // The hand-back a Worker Group runs on a clean stop, aimed at a PEER's worker id as often as at
+    // this client's own. The peer is mid-flight: it is claiming, heartbeating, and reporting against
+    // the very Leases this call revokes, so the two writes meet on the same rows under the same lock
+    // footprint the shutdown path takes in production. Expiry never reaches that window - it takes only
+    // Leases that already lapsed, which no live claimer is racing.
+    //
+    // Sound against the oracles: a hand-back returns each row to Scheduled (or DeadLettered at the
+    // ceiling) at its UNCHANGED Attempt, and both are legal edges. The next claim counts a new Attempt,
+    // so no Attempt number is ever handed out twice and the hand-back grants no extra life. The revoked
+    // holder's late outcome meets the store's identity fence and applies nothing.
+    private Task RelinquishLeasesAsync()
+    {
+        var peer = _rng.Next(options.Clients);
+        var owner = $"torture-{keys.Seed:x8}-c{peer:D2}";
+        return Call(Ops.Relinquish, async () =>
         {
-            var jobId = PickKnownJobId();
+            var t0 = Ticks();
+            var handedBack = await store.RelinquishLeasesAsync(owner, Now(), _disposition);
+            return new JournalEntry
+            {
+                Client = _client, Op = Ops.Relinquish, T0 = t0, T1 = Ticks(),
+                Result = handedBack.ToString(), Detail = owner,
+            };
+        });
+    }
+
+    private Task CancelAsync()
+    {
+        var jobId = PickKnownJobId();
+        return Call(Ops.Cancel, async () =>
+        {
             var t0 = Ticks();
             var result = await store.CancelJobAsync(jobId, _workerId, Now());
             return new JournalEntry
@@ -309,7 +339,8 @@ internal sealed class WorkloadClient(
                 Client = _client, Op = Ops.Cancel, T0 = t0, T1 = Ticks(),
                 JobId = jobId, Result = result.ToString(),
             };
-        });
+        }, jobId);
+    }
 
     private Task RequeueAsync()
     {
@@ -334,7 +365,7 @@ internal sealed class WorkloadClient(
                 Client = _client, Op = Ops.Requeue, T0 = t0, T1 = Ticks(),
                 JobId = jobId, Result = result.ToString(),
             };
-        });
+        }, jobId);
     }
 
     private Task PauseOrResumeAsync()
@@ -445,8 +476,14 @@ internal sealed class WorkloadClient(
     /// contention noise, a HaltTriggerFired entry on a production fail-stop trigger, and a
     /// RawStoreException entry — a violation — on anything else. Raw provider exceptions escaping the
     /// store surface are exactly the 0194/0195 bug class.
+    /// <para>
+    /// <paramref name="jobId"/> names the one job the call acted on, when the op has one. A fault entry
+    /// that names no job ANSWERS no request: the oracle then reads the request as still in flight for the
+    /// rest of the run, and an op whose in-flight state widens a check leaves that check widened forever.
+    /// Ops that act on a batch, a queue, or the whole store pass nothing, which is honest.
+    /// </para>
     /// </summary>
-    private async Task<JournalEntry?> Call(string op, Func<Task<JournalEntry?>> action)
+    private async Task<JournalEntry?> Call(string op, Func<Task<JournalEntry?>> action, Guid? jobId = null)
     {
         try
         {
@@ -474,6 +511,7 @@ internal sealed class WorkloadClient(
             journal.Record(new JournalEntry
             {
                 Client = _client, Op = Ops.InvariantViolation, T0 = Ticks(), T1 = Ticks(),
+                JobId = jobId,
                 Result = violation.Trigger.ToString(), Detail = $"{op}: {violation.Message}",
             });
             return null;
@@ -483,6 +521,7 @@ internal sealed class WorkloadClient(
             journal.Record(new JournalEntry
             {
                 Client = _client, Op = Ops.TransientFault, T0 = Ticks(), T1 = Ticks(),
+                JobId = jobId,
                 Result = op, Detail = exception.GetType().Name,
             });
             return null;
@@ -492,6 +531,7 @@ internal sealed class WorkloadClient(
             journal.Record(new JournalEntry
             {
                 Client = _client, Op = Ops.UnexpectedException, T0 = Ticks(), T1 = Ticks(),
+                JobId = jobId,
                 Result = op, Detail = $"{exception.GetType().FullName}: {exception.Message}",
             });
             return null;

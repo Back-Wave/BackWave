@@ -153,11 +153,28 @@ internal sealed class WorkerGroupService(
     private static readonly TimeSpan ClockSkewAllowance = TimeSpan.FromSeconds(30);
 
     // <summary>
+    // Cancelled when the token the host passed to StopAsync fires, which is the instant the host stops
+    // waiting for this pump. Every hand-back budget links to it, so the hand-back is CLAMPED at the
+    // host's real deadline instead of being orphaned past it: BackgroundService.StopAsync returns the
+    // moment that token fires and leaves ExecuteAsync running, so an unlinked hand-back would keep
+    // writing to the store while the host tears the process down around it.
+    // The link is what makes the clamp below hold at all. HostOptions.ShutdownTimeout governs the
+    // whole stop, and the host stops its hosted services ONE AT A TIME unless
+    // HostOptions.ServicesStopConcurrently is set - so N pumps each clamped to four fifths of the
+    // host's window are additive against a window they share. The ceiling bounds one pump; this
+    // token is what bounds all of them together.
+    // </summary>
+    private readonly CancellationTokenSource _hostStopped = new();
+    private CancellationTokenRegistration _hostStopLink;
+
+    // <summary>
     // What the hand-back may actually spend: the configured ShutdownBudget, clamped so it cannot eat the
     // host's whole stop window. HostOptions.ShutdownTimeout is how long the host waits for its hosted
     // services to stop before it stops waiting - a hand-back that spends all of it turns the clean stop
     // it exists to serve into a kill, mid-relinquish. Four fifths of the host's window is the ceiling,
     // leaving the last fifth for the host to finish its own shutdown after the leases are given back.
+    // This ceiling is PER PUMP, and the host's window is shared by every pump in every group, so it is
+    // an upper bound on one hand-back and not on their sum - _hostStopped is what bounds the sum.
     // Absent the option (a pump constructed directly, as the tests do) the configured budget stands.
     // </summary>
     private TimeSpan EffectiveShutdownBudget
@@ -168,6 +185,21 @@ internal sealed class WorkerGroupService(
             var ceiling = hostTimeout > TimeSpan.Zero ? hostTimeout * 0.8 : TimeSpan.MaxValue;
             return options.ShutdownBudget < ceiling ? options.ShutdownBudget : ceiling;
         }
+    }
+
+    // <summary>
+    // Capture the host's stop token on the way past. It is the only handle on the host's actual
+    // deadline: the stoppingToken the pump holds is cancelled at the START of the stop and says
+    // nothing about when the host gives up waiting. Registered rather than stored, so the pump thread
+    // reads a thread-safe CancellationTokenSource instead of a field written by the stopping thread.
+    // An already-cancelled token runs the callback inline here, which is correct - a host that is
+    // already out of time gets no hand-back at all.
+    // </summary>
+    public override Task StopAsync(CancellationToken cancellationToken)
+    {
+        _hostStopLink = cancellationToken.Register(
+            static state => ((CancellationTokenSource)state!).Cancel(), _hostStopped);
+        return base.StopAsync(cancellationToken);
     }
 
     // <summary>
@@ -297,6 +329,11 @@ internal sealed class WorkerGroupService(
             }, stoppingToken).ConfigureAwait(false);
         }
 
+        // The fault this pump is fail-stopping on, or null on a clean stop. The hand-back in the finally
+        // below cannot tell the two apart on its own: a violation raised in cycle while shutdown is
+        // ALREADY running unwinds with stoppingToken cancelled, which is exactly what a clean stop looks
+        // like from there. Carried out explicitly so a halting pump writes nothing more to the store.
+        Exception? halting = null;
         try
         {
             await foreach (var nodeEvent in events.Reader.ReadAllAsync(stoppingToken).ConfigureAwait(false))
@@ -370,7 +407,18 @@ internal sealed class WorkerGroupService(
             // The channel wraps it, but the halt site in ExecuteAsync - and the health report it writes -
             // both read the trigger off the exception's own type, so unwrap it: left wrapped, every fault
             // carried this way would read as unclassified on both surfaces.
+            halting = carried;
             ExceptionDispatchInfo.Capture(carried).Throw();
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException
+            || !stoppingToken.IsCancellationRequested)
+        {
+            // Everything that is not the clean-stop cancellation is a halt by the time it gets here: the
+            // loop above already swallowed the transient store faults, so what is left reaches the
+            // fail-stop site in ExecuteAsync. Recorded, not handled - the rethrow leaves the exception
+            // and its stack exactly as the halt site would have seen them.
+            halting = exception;
+            throw;
         }
         finally
         {
@@ -381,7 +429,7 @@ internal sealed class WorkerGroupService(
             // channel - a completed writer would refuse every one of them.
             try
             {
-                await HandBackAsync(driver, events, stoppingToken).ConfigureAwait(false);
+                await HandBackAsync(driver, events, stoppingToken, halting).ConfigureAwait(false);
             }
             finally
             {
@@ -420,78 +468,59 @@ internal sealed class WorkerGroupService(
     // degrades to the Leases lapsing exactly as they do today, and never blocks the host from exiting.
     // </summary>
     private async Task HandBackAsync(
-        NodeDriver driver, Channel<NodeEvent> events, CancellationToken stoppingToken)
+        NodeDriver driver, Channel<NodeEvent> events, CancellationToken stoppingToken, Exception? halting)
     {
         // Clean stops only. A pump that exits any other way is fail-stopping, and a halted pump writes
-        // nothing more to the store: its Leases lapse and healthy nodes inherit the work.
+        // nothing more to the store: its Leases lapse and healthy nodes inherit the work. The halting
+        // fault is carried in rather than inferred from the token, because a violation raised in cycle
+        // during shutdown unwinds with stoppingToken already cancelled and is indistinguishable here.
         var allowance = EffectiveShutdownBudget;
-        if (!stoppingToken.IsCancellationRequested || allowance <= TimeSpan.Zero)
+        if (halting is not null || !stoppingToken.IsCancellationRequested || allowance <= TimeSpan.Zero)
         {
             return;
         }
 
-        // The relinquish gets a slice of the allowance that no step before it can spend. Those steps wait
+        // The relinquish gets a slice of the allowance that no step before it can spend. The settle waits
         // on work this pump does not govern - a handler that ignores its token eats every millisecond it
         // is given - and the relinquish is the one step the whole hand-back exists to perform. On one
         // shared token an unresponsive handler starves it, the store call gets an already-cancelled
         // token, and the Leases lapse: precisely the outcome this feature removes. The reserve is one
-        // fifth, so the drain still keeps the bulk, and its clock starts only when the drain is over, so
+        // fifth, so the settle still keeps the bulk, and its clock starts only when the settle is over, so
         // the two together can never exceed the allowance.
         var reserve = allowance / 5;
-        using var budget = new CancellationTokenSource(allowance - reserve);
         try
         {
-            await DrainInFlightAsync(budget.Token).ConfigureAwait(false);
-
-            // Everything those executions wrote as they finished, through the ordinary command path, so
-            // an outcome that landed after the pump loop exited settles exactly as one that landed a
-            // millisecond earlier. Each execution writes its event BEFORE its task completes, so the wait
-            // above is what guarantees they are all sitting in the reader by the time this loop starts.
-            //
-            // Only the four terminal execution events are stepped. Every other event the channel still
-            // holds is DISCARDED, because the Driver answers most of them by starting work this pump must
-            // not start: a ClaimCompleted returns one ExecuteJob per claimed job and can issue the next
-            // weighted ClaimBatch behind it, SchedulesLoaded mints, PurgeCompleted re-sweeps, and a poll or
-            // heartbeat tick claims or renews. Stepping those would run new Attempts after the wait that
-            // was supposed to end them, and each new Attempt would write another event to step. Discarding
-            // a ClaimCompleted strands nothing: its jobs are Leased to this worker and untouched, so the
-            // relinquish below is exactly what hands them back.
-            while (events.Reader.TryRead(out var nodeEvent))
+            try
             {
-                if (nodeEvent is not (NodeEvent.ExecutionSucceeded or NodeEvent.ExecutionFailed
-                    or NodeEvent.ExecutionCancelled or NodeEvent.ExecutionUnroutable))
-                {
-                    continue;
-                }
-                foreach (var command in driver.Step(nodeEvent))
-                {
-                    await ExecuteAsync(command, events.Writer, budget.Token).ConfigureAwait(false);
-                }
+                using var budget = CancellationTokenSource.CreateLinkedTokenSource(_hostStopped.Token);
+                budget.CancelAfter(allowance - reserve);
+                await SettleFinishedExecutionsAsync(driver, events, budget.Token).ConfigureAwait(false);
             }
-
-            // A handler that raised a named violation while the wait above ran completed the writer with
-            // that exception, and the pump loop that would have raised it exited before this method
-            // started: nothing else reads the channel now. Read the completion here, so a violation
-            // during the drain reaches the same halt site as one raised in cycle instead of being lost.
-            // Ahead of the flush and the relinquish, because a halting group writes nothing more to the
-            // store - the same reason the in-cycle path never flushes the buffer after a violation.
-            if (events.Reader.Completion is { IsFaulted: true } completion
-                && completion.Exception?.InnerException is { } carried)
+            catch (InvariantViolationException)
             {
-                ExceptionDispatchInfo.Capture(carried).Throw();
+                // Ahead of the catch below for the reason the pump loop has the same pair: a named check
+                // proved an impossible state, and no store's fault classifier gets a say in whether that
+                // is retryable. Past the relinquish as well as past the log, because a halting group
+                // writes nothing more to the store.
+                throw;
             }
-
-            // Through the ordinary command path too, so the buffered Failure Detail, Tags, Output, and
-            // held-open spans settle exactly as they do on a poll-tick flush. Last, because the drain
-            // above is what puts the final outcomes into the Driver's buffer in the first place.
-            if (driver.DrainBufferedOutcomes() is { } pending)
+            catch (Exception exception)
             {
-                await ExecuteAsync(pending, events.Writer, budget.Token).ConfigureAwait(false);
+                // The settle is best-effort and its own budget can run out mid-call, so it raises
+                // OperationCanceledException as an ORDINARY outcome. Caught HERE, in its own block, and
+                // not in the blanket catch below: sharing one block let a settle that ran out of time
+                // skip the relinquish entirely, so the reserve slice protected the relinquish from
+                // running out of budget but not from the control flow of the step before it - and the
+                // Leases lapsed anyway, which is the outcome this whole method exists to remove.
+                BackWaveLog.ShutdownHandBackFailed(logger, options.Name, exception);
             }
 
             // Fenced store-side on this pump's worker identity and the Leased state, so anything the
-            // flush above just settled is already out of reach.
-            using var relinquishBudget = new CancellationTokenSource(reserve);
+            // settle above managed to report is already out of reach. Linked to the host's stop token as
+            // well as to the reserve, so the host's deadline cuts this off rather than leaving it
+            // writing to the store after the host stopped waiting.
+            using var relinquishBudget = CancellationTokenSource.CreateLinkedTokenSource(_hostStopped.Token);
+            relinquishBudget.CancelAfter(reserve);
             var relinquished = await store.RelinquishLeasesAsync(
                 _workerId, _clock.GetUtcNow(), options.RetryPolicy.ToDisposition(), relinquishBudget.Token)
                 .ConfigureAwait(false);
@@ -502,18 +531,76 @@ internal sealed class WorkerGroupService(
         }
         catch (InvariantViolationException)
         {
-            // Ahead of the blanket catch below, exactly as in the pump loop: a named check proved an
-            // impossible state while giving the work back - every adapter raises one out of the
-            // relinquish path - and no store's fault classifier gets a say in whether that is retryable.
-            // Swallowed below it would read as a routine shutdown hiccup, leave the group green, and lose
-            // the trigger nothing else records. Thrown from this finally it supersedes the shutdown
-            // cancellation the pump was unwinding and reaches the one halt call site in ExecuteAsync,
-            // which classifies it off the exception exactly as it does an in-cycle violation.
+            // A named check proved an impossible state while giving the work back - every adapter raises
+            // one out of the relinquish path. Swallowed below it would read as a routine shutdown
+            // hiccup, leave the group green, and lose the trigger nothing else records. Thrown from this
+            // finally it supersedes the shutdown cancellation the pump was unwinding and reaches the one
+            // halt call site in ExecuteAsync, which classifies it off the exception exactly as it does an
+            // in-cycle violation.
             throw;
         }
         catch (Exception exception)
         {
             BackWaveLog.ShutdownHandBackFailed(logger, options.Name, exception);
+        }
+    }
+
+    // <summary>
+    // The settle: wait the in-flight executions out, step the terminal events they wrote on their way
+    // out, then flush whatever outcomes that left in the Driver's buffer. Everything the hand-back does
+    // BEFORE the relinquish, under the budget the relinquish does not get.
+    // A named violation raised in here leaves through this method, so the caller can keep it clear of
+    // the relinquish. Every other fault is the caller's to log.
+    // </summary>
+    private async Task SettleFinishedExecutionsAsync(
+        NodeDriver driver, Channel<NodeEvent> events, CancellationToken budget)
+    {
+        await DrainInFlightAsync(budget).ConfigureAwait(false);
+
+        // Everything those executions wrote as they finished, through the ordinary command path, so
+        // an outcome that landed after the pump loop exited settles exactly as one that landed a
+        // millisecond earlier. Each execution writes its event BEFORE its task completes, so the wait
+        // above is what guarantees they are all sitting in the reader by the time this loop starts.
+        //
+        // Only the four terminal execution events are stepped. Every other event the channel still
+        // holds is DISCARDED, because the Driver answers most of them by starting work this pump must
+        // not start: a ClaimCompleted returns one ExecuteJob per claimed job and can issue the next
+        // weighted ClaimBatch behind it, SchedulesLoaded mints, PurgeCompleted re-sweeps, and a poll or
+        // heartbeat tick claims or renews. Stepping those would run new Attempts after the wait that
+        // was supposed to end them, and each new Attempt would write another event to step. Discarding
+        // a ClaimCompleted strands nothing: its jobs are Leased to this worker and untouched, so the
+        // relinquish is exactly what hands them back.
+        while (events.Reader.TryRead(out var nodeEvent))
+        {
+            if (nodeEvent is not (NodeEvent.ExecutionSucceeded or NodeEvent.ExecutionFailed
+                or NodeEvent.ExecutionCancelled or NodeEvent.ExecutionUnroutable))
+            {
+                continue;
+            }
+            foreach (var command in driver.Step(nodeEvent))
+            {
+                await ExecuteAsync(command, events.Writer, budget).ConfigureAwait(false);
+            }
+        }
+
+        // A handler that raised a named violation while the wait above ran completed the writer with
+        // that exception, and the pump loop that would have raised it exited before this method
+        // started: nothing else reads the channel now. Read the completion here, so a violation
+        // during the drain reaches the same halt site as one raised in cycle instead of being lost.
+        // Ahead of the flush and the relinquish, because a halting group writes nothing more to the
+        // store - the same reason the in-cycle path never flushes the buffer after a violation.
+        if (events.Reader.Completion is { IsFaulted: true } completion
+            && completion.Exception?.InnerException is { } carried)
+        {
+            ExceptionDispatchInfo.Capture(carried).Throw();
+        }
+
+        // Through the ordinary command path too, so the buffered Failure Detail, Tags, Output, and
+        // held-open spans settle exactly as they do on a poll-tick flush. Last, because the drain
+        // above is what puts the final outcomes into the Driver's buffer in the first place.
+        if (driver.DrainBufferedOutcomes() is { } pending)
+        {
+            await ExecuteAsync(pending, events.Writer, budget).ConfigureAwait(false);
         }
     }
 
@@ -1231,5 +1318,7 @@ internal sealed class WorkerGroupService(
         // ObjectDisposedException is recognized as normal shutdown instead of faulting the pump.
         base.Dispose();
         _pollWake.Dispose();
+        _hostStopLink.Dispose();
+        _hostStopped.Dispose();
     }
 }
