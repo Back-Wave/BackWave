@@ -53,9 +53,14 @@ public static class BenchmarkTargetRegistry
             HangfireSqlServerTarget.ConnectionStringEnvVar,
             DatabaseDriver.SqlServer,
             static () => new HangfireSqlServerTarget()),
+        "jobmaster-postgres" or "jobmaster-pg" => new BenchmarkTargetDescriptor(
+            "jobmaster-postgres",
+            JobMasterPostgresTarget.ConnectionStringEnvVar,
+            DatabaseDriver.Postgres,
+            static () => new JobMasterPostgresTarget()),
         _ => throw new ArgumentException(
             $"Unknown target '{target}'. Expected 'postgres', 'sqlserver', 'oracle', " +
-            "'hangfire-postgres', or 'hangfire-sqlserver'."),
+            "'hangfire-postgres', 'hangfire-sqlserver', or 'jobmaster-postgres'."),
     };
 
     /// <summary>Resolves a <c>--target</c> name to its target, or throws for a name nothing serves.</summary>

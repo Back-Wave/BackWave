@@ -42,7 +42,26 @@
     <ProjectReference Include="..\..\src\BackWave.Oracle\BackWave.Oracle.csproj" />
     <ProjectReference Include="..\..\src\BackWave.SourceGenerators\BackWave.SourceGenerators.csproj"
                       OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+    <!-- The JobMaster competitor lives in its own executable because JobMaster.Postgres requires Npgsql 10
+         while the product (and so this harness) ships on Npgsql 9. ReferenceOutputAssembly=false builds the
+         host with the harness without merging its package graph; StageJobMasterHost copies its output next
+         to ours so JobMasterPostgresTarget can spawn it as a fresh child process per run. -->
+    <ProjectReference Include="..\BackWave.Benchmarks.JobMasterHost\BackWave.Benchmarks.JobMasterHost.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
+
+  <Target Name="StageJobMasterHost" AfterTargets="Build">
+    <MSBuild Projects="..\BackWave.Benchmarks.JobMasterHost\BackWave.Benchmarks.JobMasterHost.csproj"
+             Targets="GetTargetPath" Properties="Configuration=$(Configuration)">
+      <Output TaskParameter="TargetOutputs" PropertyName="JobMasterHostTargetPath" />
+    </MSBuild>
+    <ItemGroup>
+      <JobMasterHostFiles Include="$([System.IO.Path]::GetDirectoryName($(JobMasterHostTargetPath)))\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(JobMasterHostFiles)"
+          DestinationFiles="@(JobMasterHostFiles->'$(OutDir)jobmaster-host\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
 
   <ItemGroup>
     <InternalsVisibleTo Include="BackWave.Benchmarks.Tests" />

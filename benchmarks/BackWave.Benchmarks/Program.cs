@@ -14,7 +14,7 @@ using BackWave.Benchmarks.Workload;
 // Usage:
 //   dotnet run -c Release --project benchmarks/BackWave.Benchmarks -- [options]
 //
-//   --target  postgres|sqlserver|oracle|hangfire-postgres|hangfire-sqlserver
+//   --target  postgres|sqlserver|oracle|hangfire-postgres|hangfire-sqlserver|jobmaster-postgres
 //                                  system under test                    (default: postgres)
 //   --mode    local|official       run mode; only official+native-x64 is publishable (default: local)
 //   --jobs    N                    number of jobs in the stream         (default: 10000)

@@ -23,6 +23,7 @@ public sealed class TuningDialsTests
 
         Assert.Equal(backwave, new HangfirePostgresTarget(PgDsn).TuningDials["worker-pool-size"]);
         Assert.Equal(backwave, new HangfireSqlServerTarget(MssqlDsn).TuningDials["worker-pool-size"]);
+        Assert.Equal(backwave, new JobMasterPostgresTarget(PgDsn).TuningDials["worker-pool-size"]);
     }
 
     [Fact]

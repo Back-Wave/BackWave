@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The JobMaster competitor host. JobMaster's runtime starts once per process, has no stop, and caches
+       bucket ownership without a liveness check, so every benchmark run gets a fresh process: the harness
+       (JobMasterPostgresTarget) spawns this executable, drives it over stdin/stdout, and kills it after the
+       run. It is a separate project rather than part of the harness because JobMaster.Postgres requires
+       Npgsql 10 while BackWave ships on Npgsql 9; the two package graphs cannot share one executable. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>false</IsTestProject>
+    <RootNamespace>BackWave.Benchmarks.JobMasterHost</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="JobMaster" Version="0.0.11-alpha" />
+    <PackageReference Include="JobMaster.Postgres" Version="0.0.11-alpha" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.0" />
+    <!-- Only for the drain and sample queries against JobMaster's own tables. -->
+    <PackageReference Include="Npgsql" Version="10.0.1" />
+  </ItemGroup>
+
+  <!-- Shared with the harness by source link, so the workload shape and the enqueue fan-out are byte-identical
+       to the BackWave and Hangfire targets, and the protocol has one definition. -->
+  <ItemGroup>
+    <Compile Include="..\BackWave.Benchmarks\Workload\WorkloadSpec.cs" Link="Shared\WorkloadSpec.cs" />
+    <Compile Include="..\BackWave.Benchmarks\Workload\ParallelProducer.cs" Link="Shared\ParallelProducer.cs" />
+    <Compile Include="..\BackWave.Benchmarks\Targets\JobMasterHostProtocol.cs" Link="Shared\JobMasterHostProtocol.cs" />
+  </ItemGroup>
+
+</Project>
