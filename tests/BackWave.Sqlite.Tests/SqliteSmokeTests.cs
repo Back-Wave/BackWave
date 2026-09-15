@@ -37,6 +37,35 @@ public sealed class SqliteSmokeTests
     }
 
     [Fact]
+    public async Task Dispose_clears_the_pool_the_store_opened_with()
+    {
+        // SQLite removes the -wal and -shm sidecars when the LAST connection to the file closes. The store
+        // opens with the normalized connection string, whose pool is not the raw string's pool, so only
+        // the store can close the pooled connections it left behind. A leaked one keeps the sidecars.
+        var path = Path.Combine(Path.GetTempPath(), $"backwave_dispose_{Guid.NewGuid():N}.db");
+        try
+        {
+            var store = new SqliteJobStore(new SqliteStoreOptions { ConnectionString = $"Data Source={path}", AutoMigrate = true });
+            Assert.Equal(
+                EnqueueResult.Ok,
+                await store.EnqueueAsync(new NewJob(Guid.NewGuid(), "demo", new byte[] { 1 }, "default", T0), T0));
+            Assert.True(File.Exists(path + "-wal"));
+
+            await store.DisposeAsync();
+
+            Assert.False(File.Exists(path + "-wal"));
+            Assert.False(File.Exists(path + "-shm"));
+        }
+        finally
+        {
+            foreach (var suffix in new[] { "", "-wal", "-shm" })
+            {
+                File.Delete(path + suffix);
+            }
+        }
+    }
+
+    [Fact]
     public async Task Duplicate_enqueue_is_rejected_not_replaced()
     {
         await using var temp = TempSqliteStore.Create();

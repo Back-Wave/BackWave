@@ -35,17 +35,15 @@ internal sealed class SimStoreScope : IDisposable
     // Shared-cache in-memory SQLite lives only while a connection to it is open. This handle keeps
     // the database alive between the adapter's pooled connections and drops it on disposal.
     private readonly SqliteConnection? _keepAlive;
-    private readonly string? _connectionString;
     private readonly string? _path;
     private bool _disposed;
 
     private SimStoreScope(
-        IJobStore store, SqliteJobStore? sqlite, SqliteConnection? keepAlive, string? connectionString, string? path)
+        IJobStore store, SqliteJobStore? sqlite, SqliteConnection? keepAlive, string? path)
     {
         Store = store;
         _sqlite = sqlite;
         _keepAlive = keepAlive;
-        _connectionString = connectionString;
         _path = path;
     }
 
@@ -61,7 +59,7 @@ internal sealed class SimStoreScope : IDisposable
     {
         if (kind == SimStoreKind.InMemory)
         {
-            return new SimStoreScope(new InMemoryJobStore(), null, null, null, null);
+            return new SimStoreScope(new InMemoryJobStore(), null, null, null);
         }
 
         var id = Guid.NewGuid().ToString("N");
@@ -88,7 +86,7 @@ internal sealed class SimStoreScope : IDisposable
             // in-process nudge would only add work off the event loop.
             EnableInProcessHints = false,
         });
-        return new SimStoreScope(sqlite, sqlite, keepAlive, connectionString, path);
+        return new SimStoreScope(sqlite, sqlite, keepAlive, path);
     }
 
     public void Dispose()
@@ -99,17 +97,10 @@ internal sealed class SimStoreScope : IDisposable
         }
         _disposed = true;
 
+        // The store clears its own pool on dispose, so its file handles are closed before the delete
+        // below. ClearAllPools would reach every SQLite connection in the process, including the ones a
+        // sibling Simulator still holds open, and a VOPR worker runs those side by side.
         _sqlite?.DisposeAsync().AsTask().GetAwaiter().GetResult();
-
-        // The pool is keyed by the connection string, so one throwaway connection names exactly this
-        // scope's database and no other. ClearAllPools would reach every SQLite connection in the
-        // process, including the ones a sibling Simulator still holds open, and a VOPR worker runs
-        // those side by side.
-        if (_connectionString is not null)
-        {
-            using var key = new SqliteConnection(_connectionString);
-            SqliteConnection.ClearPool(key);
-        }
         _keepAlive?.Dispose();
         if (_path is null)
         {

@@ -136,7 +136,10 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
     /// <inheritdoc/>
     public StoreBounds Bounds => _options.Bounds;
 
-    /// <summary>Disposes the store, releasing its in-process resources. Safe to call more than once.</summary>
+    /// <summary>
+    /// Disposes the store, releasing its in-process resources, including the pooled connections it
+    /// opened. Safe to call more than once.
+    /// </summary>
     /// <returns>A task that completes when the store has been disposed.</returns>
     public async ValueTask DisposeAsync()
     {
@@ -145,6 +148,11 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             await _hintHub.DisposeAsync().ConfigureAwait(false);
         }
         _readyGate.Dispose();
+        // The pool is keyed by the exact connection string, and this store opens with the normalized
+        // form, so only the store itself can name the pool that holds its file handles. A caller that
+        // clears with the string it configured reaches an empty pool and leaves the handles open.
+        using var key = new SqliteConnection(_connectionString);
+        SqliteConnection.ClearPool(key);
     }
 
     // The one place a SQLite command is built, so the configured table prefix is swapped into every
