@@ -185,10 +185,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
 
         // The parent set is a set (§5.1): duplicate ids collapse before any rule applies.
-        if (job.Parents.Count > 1)
-        {
-            job = job with { Parents = job.Parents.Distinct().ToArray() };
-        }
+        job = job.WithDistinctParents();
 
         if (job.Payload.Length > _options.Bounds.MaxPayloadBytes)
         {
@@ -237,9 +234,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             // order latch resolution locks child sets — so an enqueue and a concurrent terminal
             // outcome over overlapping rows can never deadlock (sorted-id lock ordering, issue 0032).
             var states = new Dictionary<Guid, JobState>();
-            var distinctParents = job.Parents.Distinct().ToArray();
-            Array.Sort(distinctParents);
-            foreach (var parentId in distinctParents)
+            var sortedParents = job.Parents.ToArray();
+            Array.Sort(sortedParents);
+            foreach (var parentId in sortedParents)
             {
                 await using var parent = Cmd(
                     "SELECT state FROM backwave.jobs WHERE job_id = @id FOR UPDATE", connection, transaction);
@@ -249,14 +246,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     states[parentId] = (JobState)parentState;
                 }
             }
-            if (states.Count != distinctParents.Length)
+            if (states.Count != job.Parents.Count)
             {
                 return EnqueueResult.UnknownParent;
             }
-            // Distinct in its own right: the Workflow member path calls straight into here, skipping
-            // the set collapse the ordinary enqueue does, and a duplicate id would insert the same
-            // job_parents edge twice against its primary key.
-            foreach (var parentId in job.Parents.Distinct())
+            foreach (var parentId in job.Parents)
             {
                 var parentState = states[parentId];
                 if (!parentState.IsTerminal())
@@ -2386,6 +2380,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     {
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
 
+        workflow = workflow.WithDistinctParents();
+
         if (transaction is not null)
         {
             if (transaction is not NpgsqlTransaction { Connection: { } callerConnection } npgsqlTransaction)
@@ -2471,12 +2467,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             {
                 return WorkflowEnqueueResult.WireNameTooLong;
             }
-            var parents = member.Parents.Distinct().ToArray();
-            if (parents.Length > _options.Bounds.MaxParentsPerJob)
+            if (member.Parents.Count > _options.Bounds.MaxParentsPerJob)
             {
                 return WorkflowEnqueueResult.TooManyParents;
             }
-            if (parents.Any(p => !allowedParents.Contains(p)))
+            if (member.Parents.Any(p => !allowedParents.Contains(p)))
             {
                 return WorkflowEnqueueResult.ContainmentViolation;
             }
@@ -2540,7 +2535,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // after the live gating edges (job_parents) resolve away. Append adds its new edges to the set.
         foreach (var member in workflow.Members)
         {
-            foreach (var parent in member.Parents.Distinct())
+            foreach (var parent in member.Parents)
             {
                 await using var edge = Cmd(
                     """
@@ -2600,12 +2595,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     private static IReadOnlyList<NewJob> TopologicallyOrdered(IReadOnlyList<NewJob> members)
     {
         var byId = members.ToDictionary(m => m.JobId);
-        var indegree = members.ToDictionary(m => m.JobId, m => m.Parents.Distinct().Count(byId.ContainsKey));
+        var indegree = members.ToDictionary(m => m.JobId, m => m.Parents.Count(byId.ContainsKey));
         var ready = new Queue<NewJob>(members.Where(m => indegree[m.JobId] == 0));
         var children = new Dictionary<Guid, List<Guid>>();
         foreach (var m in members)
         {
-            foreach (var p in m.Parents.Distinct().Where(byId.ContainsKey))
+            foreach (var p in m.Parents.Where(byId.ContainsKey))
             {
                 (children.TryGetValue(p, out var list) ? list : children[p] = []).Add(m.JobId);
             }

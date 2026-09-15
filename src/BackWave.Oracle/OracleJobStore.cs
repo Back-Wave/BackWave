@@ -244,10 +244,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
 
         // The parent set is a set: duplicate ids collapse before any rule applies.
-        if (job.Parents.Count > 1)
-        {
-            job = job with { Parents = job.Parents.Distinct().ToArray() };
-        }
+        job = job.WithDistinctParents();
 
         if (job.Payload.Length > options.Bounds.MaxPayloadBytes)
         {
@@ -296,9 +293,9 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             // latch resolution locks child sets - so an enqueue and a concurrent terminal outcome over
             // overlapping rows can never deadlock (sorted-id lock ordering).
             var states = new Dictionary<Guid, JobState>();
-            var distinctParents = job.Parents.Distinct().ToArray();
-            Array.Sort(distinctParents);
-            foreach (var parentId in distinctParents)
+            var sortedParents = job.Parents.ToArray();
+            Array.Sort(sortedParents);
+            foreach (var parentId in sortedParents)
             {
                 await using var parent = Cmd(
                     "SELECT state FROM backwave.jobs WHERE job_id = :id FOR UPDATE", connection, transaction);
@@ -309,11 +306,11 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     states[parentId] = (JobState)reader.GetInt32(0);
                 }
             }
-            if (states.Count != distinctParents.Length)
+            if (states.Count != job.Parents.Count)
             {
                 return EnqueueResult.UnknownParent;
             }
-            foreach (var parentId in distinctParents)
+            foreach (var parentId in job.Parents)
             {
                 var parentState = states[parentId];
                 if (!parentState.IsTerminal())
@@ -2749,6 +2746,8 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
     {
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
 
+        workflow = workflow.WithDistinctParents();
+
         if (transaction is not null)
         {
             if (transaction is not OracleTransaction { Connection: { } callerConnection } oracleTransaction)
@@ -2832,12 +2831,11 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             {
                 return WorkflowEnqueueResult.WireNameTooLong;
             }
-            var parents = member.Parents.Distinct().ToArray();
-            if (parents.Length > options.Bounds.MaxParentsPerJob)
+            if (member.Parents.Count > options.Bounds.MaxParentsPerJob)
             {
                 return WorkflowEnqueueResult.TooManyParents;
             }
-            if (parents.Any(p => !allowedParents.Contains(p)))
+            if (member.Parents.Any(p => !allowedParents.Contains(p)))
             {
                 return WorkflowEnqueueResult.ContainmentViolation;
             }
@@ -2881,14 +2879,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         // children insert).
         foreach (var member in TopologicallyOrdered(workflow.Members))
         {
-            // The parent set is a set: duplicate ids collapse before any edge is written.
-            var deduped = member;
-            if (deduped.Parents.Count > 1)
-            {
-                deduped = deduped with { Parents = deduped.Parents.Distinct().ToArray() };
-            }
-
-            var applied = await EnqueueCoreAsync(connection, transaction, deduped, now, cancellationToken, workflow.WorkflowId)
+            var applied = await EnqueueCoreAsync(connection, transaction, member, now, cancellationToken, workflow.WorkflowId)
                 .ConfigureAwait(false);
             // A concurrent create can insert a member with the same JobId after this batch's existence
             // check passed; the member insert's NOT EXISTS guard / ORA-00001 catch reports it as Duplicate.
@@ -2908,7 +2899,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         // gating edges (job_parents) resolve away. Append adds its new edges to the set.
         foreach (var member in workflow.Members)
         {
-            foreach (var parent in member.Parents.Distinct())
+            foreach (var parent in member.Parents)
             {
                 await using var edge = Cmd(
                     """
@@ -2980,12 +2971,12 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
     private static IReadOnlyList<NewJob> TopologicallyOrdered(IReadOnlyList<NewJob> members)
     {
         var byId = members.ToDictionary(m => m.JobId);
-        var indegree = members.ToDictionary(m => m.JobId, m => m.Parents.Distinct().Count(byId.ContainsKey));
+        var indegree = members.ToDictionary(m => m.JobId, m => m.Parents.Count(byId.ContainsKey));
         var ready = new Queue<NewJob>(members.Where(m => indegree[m.JobId] == 0));
         var children = new Dictionary<Guid, List<Guid>>();
         foreach (var m in members)
         {
-            foreach (var p in m.Parents.Distinct().Where(byId.ContainsKey))
+            foreach (var p in m.Parents.Where(byId.ContainsKey))
             {
                 (children.TryGetValue(p, out var list) ? list : children[p] = []).Add(m.JobId);
             }

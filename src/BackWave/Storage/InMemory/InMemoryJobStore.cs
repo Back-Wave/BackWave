@@ -83,10 +83,7 @@ public sealed class InMemoryJobStore(
         CancellationToken cancellationToken = default)
     {
         // The parent set is a set (§5.1): duplicate ids collapse before any rule applies.
-        if (job.Parents.Count > 1)
-        {
-            job = job with { Parents = job.Parents.Distinct().ToArray() };
-        }
+        job = job.WithDistinctParents();
 
         if (job.Payload.Length > _bounds.MaxPayloadBytes)
         {
@@ -237,11 +234,10 @@ public sealed class InMemoryJobStore(
         }
 
         // Resolve parents already terminal at enqueue: each is an edge that will never
-        // fire later, so it must count against the latch (or cancel) right now. The set collapse
-        // is repeated here because a workflow member arrives without passing through EnqueueAsync.
+        // fire later, so it must count against the latch (or cancel) right now.
         var pendingParents = new List<Guid>();
         var cancelledByParent = (JobState?)null;
-        foreach (var parentId in job.Parents.Distinct())
+        foreach (var parentId in job.Parents)
         {
             var parentState = _jobs[parentId].State;
             if (!parentState.IsTerminal())
@@ -299,6 +295,8 @@ public sealed class InMemoryJobStore(
         WorkflowDefinition workflow, DateTimeOffset now, DbTransaction? transaction = null,
         CancellationToken cancellationToken = default)
     {
+        workflow = workflow.WithDistinctParents();
+
         if (transaction is not null)
         {
             if (transaction is not InMemoryTransaction memoryTransaction || memoryTransaction.Store != this)
@@ -400,12 +398,11 @@ public sealed class InMemoryJobStore(
             {
                 return WorkflowEnqueueResult.WireNameTooLong;
             }
-            var parents = member.Parents.Distinct().ToArray();
-            if (parents.Length > _bounds.MaxParentsPerJob)
+            if (member.Parents.Count > _bounds.MaxParentsPerJob)
             {
                 return WorkflowEnqueueResult.TooManyParents;
             }
-            if (parents.Any(p => !allowedParents.Contains(p)))
+            if (member.Parents.Any(p => !allowedParents.Contains(p)))
             {
                 return WorkflowEnqueueResult.ContainmentViolation;
             }
@@ -450,7 +447,7 @@ public sealed class InMemoryJobStore(
         var edges = _workflowEdges.TryGetValue(workflow.WorkflowId, out var existing) ? existing : [];
         foreach (var member in workflow.Members)
         {
-            foreach (var parent in member.Parents.Distinct())
+            foreach (var parent in member.Parents)
             {
                 edges.Add(new WorkflowEdge(parent, member.JobId));
             }
@@ -467,12 +464,12 @@ public sealed class InMemoryJobStore(
     private static IReadOnlyList<NewJob> TopologicallyOrdered(IReadOnlyList<NewJob> members)
     {
         var byId = members.ToDictionary(m => m.JobId);
-        var indegree = members.ToDictionary(m => m.JobId, m => m.Parents.Distinct().Count(byId.ContainsKey));
+        var indegree = members.ToDictionary(m => m.JobId, m => m.Parents.Count(byId.ContainsKey));
         var ready = new Queue<NewJob>(members.Where(m => indegree[m.JobId] == 0));
         var children = new Dictionary<Guid, List<Guid>>();
         foreach (var m in members)
         {
-            foreach (var p in m.Parents.Distinct().Where(byId.ContainsKey))
+            foreach (var p in m.Parents.Where(byId.ContainsKey))
             {
                 (children.TryGetValue(p, out var list) ? list : children[p] = []).Add(m.JobId);
             }
