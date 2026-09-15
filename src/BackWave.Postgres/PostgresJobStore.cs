@@ -237,9 +237,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             // order latch resolution locks child sets — so an enqueue and a concurrent terminal
             // outcome over overlapping rows can never deadlock (sorted-id lock ordering, issue 0032).
             var states = new Dictionary<Guid, JobState>();
-            var lockOrder = job.Parents.ToArray();
-            Array.Sort(lockOrder);
-            foreach (var parentId in lockOrder)
+            var distinctParents = job.Parents.Distinct().ToArray();
+            Array.Sort(distinctParents);
+            foreach (var parentId in distinctParents)
             {
                 await using var parent = Cmd(
                     "SELECT state FROM backwave.jobs WHERE job_id = @id FOR UPDATE", connection, transaction);
@@ -249,11 +249,14 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     states[parentId] = (JobState)parentState;
                 }
             }
-            if (states.Count != job.Parents.Count)
+            if (states.Count != distinctParents.Length)
             {
                 return EnqueueResult.UnknownParent;
             }
-            foreach (var parentId in job.Parents)
+            // Distinct in its own right: the Workflow member path calls straight into here, skipping
+            // the set collapse the ordinary enqueue does, and a duplicate id would insert the same
+            // job_parents edge twice against its primary key.
+            foreach (var parentId in job.Parents.Distinct())
             {
                 var parentState = states[parentId];
                 if (!parentState.IsTerminal())
@@ -446,7 +449,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 leased.Parameters.AddWithValue("queue", queue);
                 if (await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not long inUse)
                 {
-                    throw new InvariantViolationException(
+                    throw Invariant.Halt(
                         InvariantTrigger.LeasedCountAggregateNull,
                         $"The leased-count aggregate for queue '{queue}' returned no value; COUNT(*) always returns one.");
                 }
@@ -497,7 +500,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     var job = ReadJob(reader);
                     if (job.State != JobState.Leased || !string.Equals(job.LeaseOwner, request.WorkerId, StringComparison.Ordinal))
                     {
-                        throw new InvariantViolationException(
+                        throw Invariant.Halt(
                             InvariantTrigger.ClaimedRowNotLeasedToWorker,
                             $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
                     }
@@ -928,7 +931,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             {
                 if (!matched.TryGetValue(parentId, out var parentState))
                 {
-                    throw new InvariantViolationException(
+                    throw Invariant.Halt(
                         InvariantTrigger.ParentJobMissingFromBatch,
                         $"Parent job {parentId} came back from a lookup restricted to this batch's own terminal ids, yet it is absent from that batch.");
                 }
@@ -996,7 +999,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     await using var reader = await child.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     {
-                        throw new InvariantViolationException(
+                        throw Invariant.Halt(
                             InvariantTrigger.DanglingGatingEdge,
                             $"Gating edge {currentParent} -> {childId} named a child job row that does not exist; the job_parents foreign key forbids it.");
                     }
@@ -1023,7 +1026,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     var cancelled = await cancel.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (cancelled != 1)
                     {
-                        throw new InvariantViolationException(
+                        throw Invariant.Halt(
                             InvariantTrigger.UnexpectedAffectedRowCount,
                             $"Cancelling gated child {childId} affected {cancelled} rows; the row is locked FOR UPDATE by this transaction, so exactly 1 is the only possible count.");
                     }
@@ -1050,7 +1053,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 var resolved = await resolve.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 if (resolved != 1)
                 {
-                    throw new InvariantViolationException(
+                    throw Invariant.Halt(
                         InvariantTrigger.UnexpectedAffectedRowCount,
                         $"Resolving the latch on gated child {childId} affected {resolved} rows; the row is locked FOR UPDATE by this transaction, so exactly 1 is the only possible count.");
                 }
@@ -1163,23 +1166,43 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
         // Partition by the disposition (pure data): retry at a backoff instant, or dead-letter
         // at the ceiling. The claim already counted the Attempt, so expiry just disposes it.
+        //
+        // Transition Log (§5.12): one entry per expired job for its resulting state -
+        // Scheduled (rescheduled) or DeadLettered (ceiling) - at its post-claim Attempt
+        // (expiry counts as the already-claimed Attempt), atomic with the disposition writes.
+        // Batched, so a wide sweep does not undo the two set-based UPDATEs below with one
+        // insert per job. Each job appears once here (job_id is the key), so its ordinal holds.
+        // Built in this same pass, because the ceiling is the policy's answer and asking it
+        // twice for one job invites two answers.
         var retryIds = new List<Guid>();
         var retryDueTimes = new List<DateTimeOffset>();
         var deadIds = new List<Guid>();
         var deadCauses = new List<string>();
+        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(expired.Count);
         foreach (var (jobId, attempt) in expired)
         {
             if (disposition.NextAttemptAt(attempt, now) is { } retryAt)
             {
                 retryIds.Add(jobId);
                 retryDueTimes.Add(retryAt.ToUniversalTime());
+                transitions.Add((jobId, JobState.Scheduled, attempt, null));
             }
             else
             {
                 deadIds.Add(jobId);
                 deadCauses.Add($"Lease expired on attempt {attempt} (attempt ceiling reached).");
+                transitions.Add((jobId, JobState.DeadLettered, attempt, null));
             }
         }
+
+        // Recorded before the dead-letter cascade below, so the expired parent's own entry takes a
+        // lower observer_log_position than the entries that cascade cancels its gated children.
+        // Parent before child is the order every other store hands a reader, and an Observer walks
+        // by position, so the adapter it runs against must not decide what it sees happen first.
+        // The move is free: the expired set is Leased and the cascade touches only AwaitingParent
+        // children, so the two never name the same job and no per-job ordinal shifts.
+        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
+            .ConfigureAwait(false);
 
         // Set-based disposition: one UPDATE for the whole retry set, one for the dead-letter set
         // — O(1) statements, not one per job. The per-row due_time/cause ride in as arrays.
@@ -1240,22 +1263,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
         }
 
-        // Transition Log (§5.12): one entry per expired job for its resulting state —
-        // Scheduled (rescheduled) or DeadLettered (ceiling) — at its post-claim Attempt
-        // (expiry counts as the already-claimed Attempt), atomic with the disposition writes.
-        // Batched, so a wide sweep does not undo the two set-based UPDATEs above with one
-        // insert per job. Each job appears once here (job_id is the key), so its ordinal holds.
-        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(expired.Count);
-        foreach (var (jobId, attempt) in expired)
-        {
-            var resulting = disposition.NextAttemptAt(attempt, now) is not null
-                ? JobState.Scheduled
-                : JobState.DeadLettered;
-            transitions.Add((jobId, resulting, attempt, null));
-        }
-        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
-            .ConfigureAwait(false);
-
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return expired.Count;
     }
@@ -1289,10 +1296,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
         // Fenced on the lease itself: only rows this worker still holds, still Leased, so a job that
         // already reported an outcome is never revived.
-        var held = new List<(Guid JobId, int Attempt)>();
+        var held = new List<(Guid JobId, int Attempt, string Queue)>();
         await using (var select = Cmd(
             """
-            SELECT job_id, attempt FROM backwave.jobs
+            SELECT job_id, attempt, queue FROM backwave.jobs
             WHERE state = 2 AND lease_owner = @owner
             ORDER BY job_id
             FOR UPDATE
@@ -1303,7 +1310,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             await using var reader = await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
-                held.Add((reader.GetGuid(0), reader.GetInt32(1)));
+                held.Add((reader.GetGuid(0), reader.GetInt32(1), reader.GetString(2)));
             }
         }
 
@@ -1320,14 +1327,16 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // unchanged Attempt, atomic with the state writes. Built in this same pass, because the
         // ceiling is the policy's answer and asking it twice for one job invites two answers.
         var readyIds = new List<Guid>();
+        var readyQueues = new SortedSet<string>(StringComparer.Ordinal);
         var deadIds = new List<Guid>();
         var deadCauses = new List<string>();
         var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(held.Count);
-        foreach (var (jobId, attempt) in held)
+        foreach (var (jobId, attempt, queue) in held)
         {
             if (disposition.NextAttemptAt(attempt, now) is not null)
             {
                 readyIds.Add(jobId);
+                readyQueues.Add(queue);
                 transitions.Add((jobId, JobState.Scheduled, attempt, null));
             }
             else
@@ -1337,6 +1346,18 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 transitions.Add((jobId, JobState.DeadLettered, attempt, null));
             }
         }
+
+        // Recorded before the dead-letter cascade below, so the relinquished parent's own entry takes
+        // a lower observer_log_position than the entries that cascade cancels its gated children.
+        // Parent before child is the order every other store hands a reader, and an Observer walks by
+        // position, so the adapter it runs against must not decide what it sees happen first. The move
+        // is free: the held set is Leased and the cascade touches only AwaitingParent children, so the
+        // two never name the same job and no per-job ordinal shifts.
+        //
+        // The entries go in batched, for the same reason the expiry path batches: one insert for
+        // the whole hand-back.
+        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
+            .ConfigureAwait(false);
 
         if (readyIds.Count > 0)
         {
@@ -1352,6 +1373,15 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             ready.Parameters.AddWithValue("now", now.ToUniversalTime());
             ready.Parameters.AddWithValue("ids", readyIds.ToArray());
             await ready.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+
+            // Wake-Up Hint (§8): a relinquished job comes back due at this instant, so a peer that
+            // could take it should not wait out a poll interval first - the same reason a due enqueue
+            // hints. One per distinct queue, in a fixed order, and NOTIFY is transactional, so the
+            // hints fire on this transaction's commit or never.
+            foreach (var queue in readyQueues)
+            {
+                await PublishHintAsync(connection, transaction, queue, cancellationToken).ConfigureAwait(false);
+            }
         }
 
         if (deadIds.Count > 0)
@@ -1368,6 +1398,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             deadLetter.Parameters.AddWithValue("ids", deadIds.ToArray());
             deadLetter.Parameters.AddWithValue("causes", deadCauses.ToArray());
             await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+
+            // Crash after the dead-letter write, before the latch cascade: the hand-back opens the
+            // same torn-write window the expiry sweep does, so it gets the same seam under its own
+            // name (issue 0034, invariant I2).
+            await FailpointAsync("lease-relinquish", cancellationToken).ConfigureAwait(false);
 
             // Latch resolution touches only dead-lettered jobs that actually parent a
             // Dependency, exactly as the expiry path does (§5.6, I2).
@@ -1390,11 +1425,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     .ConfigureAwait(false);
             }
         }
-
-        // The entries go in batched, for the same reason the expiry path batches: one insert for
-        // the whole hand-back.
-        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
-            .ConfigureAwait(false);
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return held.Count;
@@ -1645,7 +1675,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     // ordinal is the per-job max + 1 (a sub-select against the same table), so it climbs even as
     // oldest rows age out. The trailing bounded delete enforces MaxTransitionsPerJob (§7): once the
     // cap is exceeded, the oldest entry is dropped, and it runs only when this entry put the cap in
-    // play. `now` is always the caller's clock — the database clock is never consulted (Virtual
+    // play. `now` is always the caller's clock - the database clock is never consulted (Virtual
     // Time stays meaningful in the Conformance Suite).
     // `failureDetail` is the Shell-captured exception text, written only on a failing transition
     // (§5.12) and clamped to MaxFailureDetailBytes; null on every other transition.
@@ -2075,7 +2105,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             transitions.Add(new JobTransition(
                 reader.GetInt64(0),
                 reader.GetFieldValue<DateTimeOffset>(1),
-                (JobState)reader.GetInt32(2),
+                ReadState(reader, 2),
                 reader.GetInt32(3),
                 reader.IsDBNull(4) ? null : reader.GetString(4)));
         }
@@ -2133,7 +2163,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             counts.Add(new QueueStateCount(
-                reader.GetString(0), (JobState)reader.GetInt32(1), (int)reader.GetInt64(2)));
+                reader.GetString(0), ReadState(reader, 1), (int)reader.GetInt64(2)));
         }
         return counts;
     }
@@ -2500,7 +2530,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
             if (applied != EnqueueResult.Ok) // always-on assertion: everything else validated above
             {
-                throw new InvariantViolationException(
+                throw Invariant.Halt(
                     InvariantTrigger.WorkflowMemberEnqueueRejected,
                     $"Workflow enqueue rejected member {member.JobId} with {applied} inside the transaction that had already validated it.");
             }
@@ -2605,7 +2635,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             // member ahead of its own parent and had the insert refused a few lines below - naming the
             // member as the problem rather than the cycle that is the actual cause. Raise here, at the
             // only point that can still tell the two apart, and before any row is written.
-            throw new InvariantViolationException(
+            throw Invariant.Halt(
                 InvariantTrigger.WorkflowMemberCycle,
                 $"A workflow of {members.Count} member(s) ordered only {ordered.Count} of them, " +
                 "so its in-batch dependency edges hold a cycle.");
@@ -2632,7 +2662,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             {
                 var wf = reader.GetGuid(0);
                 (statesByWorkflow.TryGetValue(wf, out var list) ? list : statesByWorkflow[wf] = [])
-                    .Add((JobState)reader.GetInt32(1));
+                    .Add(ReadState(reader, 1));
             }
         }
 
@@ -2859,9 +2889,16 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             await using var reader = await locked.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
-                throw new InvariantViolationException(
-                    InvariantTrigger.GuaranteedRowAbsent,
+                // Degrade, not Halt. The only caller of this path is the observer dispatch pump, which is
+                // fail-soft on purpose: it catches every exception without reading a trigger, logs it, and
+                // re-polls. A throw here therefore stops nothing and comes back every poll with the write
+                // aborted, which is worse than the benign branch. Counting it keeps the signal without the
+                // loop; arming it is a decision for whoever gives that pump a channel to fail-stop on.
+                // The action belongs to that caller, not to the store, so all four adapters degrade here.
+                Invariant.Degrade(
+                    _logger, InvariantTrigger.GuaranteedRowAbsent,
                     $"Observer '{request.ObserverId}' has no row immediately after this transaction ensured one.");
+                return ObserverClaim.None(request.ObserverId);
             }
             cursor = reader.GetInt64(0);
             leaseOwner = reader.IsDBNull(1) ? null : reader.GetString(1);
@@ -2930,7 +2967,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 var priorAttempt = reader.IsDBNull(9) ? 0 : reader.GetInt32(9);
                 candidates.Add(new ObserverClaimedDelivery(
                     reader.GetInt64(0), reader.GetGuid(1), reader.GetInt64(2), reader.GetString(3), reader.GetString(4),
-                    (JobState)reader.GetInt32(5), reader.GetInt32(6), reader.GetFieldValue<DateTimeOffset>(7),
+                    ReadState(reader, 5), reader.GetInt32(6), reader.GetFieldValue<DateTimeOffset>(7),
                     reader.IsDBNull(8) ? null : reader.GetString(8), priorAttempt + 1)); // the claim starts a delivery Attempt
             }
         }
@@ -3121,10 +3158,14 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             newCursor = result is DBNull or null ? null : (long)result;
         }
 
+        // Counted, not thrown: this runs under the fail-soft observer pump, which catches without a
+        // trigger, so a throw would only abort the report's write and return on the next poll. The
+        // branch below already holds the cursor where it is, which is the safe outcome either way.
+        // The action belongs to that caller, not to the store, so all four adapters degrade here.
         if (newCursor is { } regressed && regressed < cursor)
         {
-            throw new InvariantViolationException(
-                InvariantTrigger.ObserverCursorRegressed,
+            Invariant.Degrade(
+                _logger, InvariantTrigger.ObserverCursorRegressed,
                 $"Observer '{observerId}' would move its cursor from {cursor} back to {regressed}; the advance selects MAX(position) strictly greater than the cursor.");
         }
         if (newCursor is not { } target || target <= cursor)
@@ -3171,8 +3212,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             var moved = await move.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             if (moved != 1)
             {
-                throw new InvariantViolationException(
-                    InvariantTrigger.UnexpectedAffectedRowCount,
+                // Counted, not thrown, for the same reason the regression check above is: the fail-soft
+                // observer pump swallows the throw and re-polls, so the only effect would be to abort
+                // this report's write once per poll.
+                Invariant.Degrade(
+                    _logger, InvariantTrigger.UnexpectedAffectedRowCount,
                     $"Moving the cursor of observer '{observerId}' affected {moved} rows; the row is locked FOR UPDATE by this transaction, so exactly 1 is the only possible count.");
             }
         }
@@ -3227,9 +3271,14 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            throw new InvariantViolationException(
-                InvariantTrigger.GuaranteedRowAbsent,
+            // Degrade, not Halt. This is a Monitor read, reached from the dashboard and the MCP tools
+            // rather than from any pump, so a throw here fail-stops nothing and surfaces as a failed
+            // request. The reply is the same one the aggregate gives for an observer with no row.
+            // The action belongs to that caller, not to the store, so all four adapters degrade here.
+            Invariant.Degrade(
+                _logger, InvariantTrigger.GuaranteedRowAbsent,
                 $"The lag aggregate for observer '{request.ObserverId}' returned no row; an ungrouped aggregate always returns exactly one.");
+            return new ObserverLag(-1, 0, null);
         }
         var oldest = reader.IsDBNull(2) ? (DateTimeOffset?)null : reader.GetFieldValue<DateTimeOffset>(2);
         return new ObserverLag(reader.GetInt64(0), (int)reader.GetInt64(1), oldest);
@@ -3255,7 +3304,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             records.Add(new ObserverDeadLetterRecord(
-                reader.GetInt64(0), reader.GetGuid(1), reader.GetInt64(2), (JobState)reader.GetInt32(3),
+                reader.GetInt64(0), reader.GetGuid(1), reader.GetInt64(2), ReadState(reader, 3),
                 reader.GetInt32(4), reader.GetInt32(5), reader.GetFieldValue<DateTimeOffset>(6)));
         }
         return records;
@@ -3348,14 +3397,14 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         var storedState = reader.GetInt32(4);
         if (!Enum.IsDefined((JobState)storedState))
         {
-            throw new InvariantViolationException(
+            throw Invariant.Halt(
                 InvariantTrigger.UndefinedEnumValueStored,
                 $"Job {reader.GetGuid(0)} stores state {storedState}, which is not a defined JobState.");
         }
         var storedMode = reader.GetInt32(14);
         if (!Enum.IsDefined((DependencyMode)storedMode))
         {
-            throw new InvariantViolationException(
+            throw Invariant.Halt(
                 InvariantTrigger.UndefinedEnumValueStored,
                 $"Job {reader.GetGuid(0)} stores dependency mode {storedMode}, which is not a defined DependencyMode.");
         }
@@ -3380,6 +3429,20 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             Sequence = reader.GetInt64(16),
             WorkflowId = reader.IsDBNull(17) ? null : reader.GetGuid(17),
         };
+    }
+
+    // Every read of a state column an out-of-band write can reach goes through here: a value outside the
+    // enum surfaces as the named violation, never as a cast that hands the caller an undefined JobState.
+    private static JobState ReadState(NpgsqlDataReader reader, int ordinal)
+    {
+        var storedState = reader.GetInt32(ordinal);
+        if (!Enum.IsDefined((JobState)storedState))
+        {
+            throw Invariant.Halt(
+                InvariantTrigger.UndefinedEnumValueStored,
+                $"A stored column holds state {storedState}, which is not a defined JobState.");
+        }
+        return (JobState)storedState;
     }
 
     // ── Job Tags (ADR 0022) ─────────────────────────────────────────────────────

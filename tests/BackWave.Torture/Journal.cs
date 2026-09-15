@@ -13,6 +13,12 @@ internal static class Ops
     public const string Heartbeat = "heartbeat";
     public const string Expire = "expire";
     public const string Relinquish = "relinquish";
+
+    /// <summary>Journaled BEFORE the relinquish store call, carrying the owner it acts on and the call's
+    /// start, because a relinquish that commits and then loses its reply is journaled only as a fault -
+    /// which names neither. Answered by at most one <see cref="Relinquish"/> entry, matched by client and
+    /// start instant.</summary>
+    public const string RelinquishRequested = "relinquish-requested";
     public const string Cancel = "cancel";
     public const string Requeue = "requeue";
 

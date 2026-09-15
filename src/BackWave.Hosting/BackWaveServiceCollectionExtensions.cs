@@ -232,6 +232,14 @@ public sealed class BackWaveBuilder
             throw new InvalidOperationException(
                 $"Worker Group '{options.Name}' has a negative {nameof(WorkerGroupOptions.ShutdownBudget)} ({options.ShutdownBudget}); use TimeSpan.Zero to skip the shutdown hand-back.");
         }
+        // Caught at composition rather than on the way down. The hand-back arms its budget with
+        // CancellationTokenSource.CancelAfter, which throws past this bound - and it runs while the host
+        // is stopping, so without this guard the host starts happily and faults only as it shuts down.
+        if (options.ShutdownBudget.TotalMilliseconds > int.MaxValue)
+        {
+            throw new InvalidOperationException(
+                $"Worker Group '{options.Name}' has a {nameof(WorkerGroupOptions.ShutdownBudget)} above the supported ceiling of int.MaxValue milliseconds (~24.85 days); the shutdown hand-back cannot wait that long.");
+        }
         _workerGroups.Add(options);
         return this;
     }

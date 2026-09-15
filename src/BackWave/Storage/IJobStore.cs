@@ -258,8 +258,11 @@ public interface IJobStore
     /// retry backoff because a clean stop is not a failure, except that a job whose attempt ceiling is
     /// already reached (<paramref name="disposition"/> yields no next attempt) is Dead-Lettered instead,
     /// exactly as an expired lease would be. Implementations MUST append one transition per affected
-    /// job, at the unchanged Attempt, atomically with the state write, and MUST treat
-    /// <paramref name="disposition"/> as pure data, never as executable code.
+    /// job, at the unchanged Attempt, atomically with the state write, MUST resolve the dependent latches
+    /// of every job the ceiling branch Dead-Letters - each AwaitingParent child of a dead-lettered job
+    /// settles exactly as it does when an expired lease dead-letters its parent, so a child is never left
+    /// waiting on a parent that can no longer run - and MUST treat <paramref name="disposition"/> as pure
+    /// data, never as executable code.
     /// <para>
     /// The default implementation relinquishes nothing and returns zero, so a store that does not
     /// override it keeps today's behavior: the leases lapse and are swept by the expiry path.
@@ -655,6 +658,16 @@ public interface IJobStore
     /// tells the caller what the store did with the report. The fence refusal is a lost race, not a
     /// fault, so it is reported rather than thrown; without this return a refused report is
     /// indistinguishable from an applied one.
+    /// <para>
+    /// This is the member a store SHOULD implement: every store that ships with BackWave defines it and
+    /// satisfies <see cref="ReportObserverDeliveriesAsync"/> from it. A store that implements only
+    /// <see cref="ReportObserverDeliveriesAsync"/> stays valid: this default forwards to it and answers
+    /// <see cref="ObserverReportOutcome.Unreported"/>, because such a store has no verdict to give. A
+    /// store that WRAPS another MUST forward this member: forwarding only
+    /// <see cref="ReportObserverDeliveriesAsync"/> leaves this default in place, which answers
+    /// <see cref="ObserverReportOutcome.Unreported"/> and erases the inner store's real answer, so a
+    /// refused report reads as an applied one - the one thing this member exists to prevent.
+    /// </para>
     /// </summary>
     /// <param name="report">The per-row delivery results for the claimed batch, carrying the claim lease that fences the write.</param>
     /// <param name="cancellationToken">Cancels the operation.</param>

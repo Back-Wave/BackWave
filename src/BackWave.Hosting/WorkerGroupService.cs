@@ -145,13 +145,6 @@ internal sealed class WorkerGroupService(
     // the fixed-cadence ticker governs polling exactly as before.
     private bool AdaptivePoll => options.MaxPollInterval > options.PollInterval;
 
-    // How far ahead of this pump another node's clock can run before the outcome fence calls a rejection
-    // a contradiction rather than a lapse. The fleet shares no time source, so a peer that expires a
-    // Lease legally can leave this pump reading an expiry that is still in the future. Anything inside
-    // this window is ordinary skew and is counted nowhere. Thirty seconds is far wider than a fleet on
-    // NTP ever drifts, and far narrower than the shortest Lease a Worker Group takes.
-    private static readonly TimeSpan ClockSkewAllowance = TimeSpan.FromSeconds(30);
-
     // <summary>
     // Cancelled when the token the host passed to StopAsync fires, which is the instant the host stops
     // waiting for this pump. Every hand-back budget links to it, so the hand-back is CLAMPED at the
@@ -244,10 +237,6 @@ internal sealed class WorkerGroupService(
             var trigger = (exception as InvariantViolationException)?.Trigger;
             HostingLog.WorkerGroupFailStopped(
                 logger, options.Name, trigger?.ToString() ?? HostingLog.UnclassifiedTrigger, exception);
-            if (trigger is { } tripped)
-            {
-                BackWaveDiagnostics.RecordInvariantViolation(tripped, InvariantAction.Halt);
-            }
             // Per-pump health, surfaced at group altitude (ADR 0037): this Pump halts under its own
             // worker identity, so a sibling Pump's clean cycle never clears it and the group reads
             // wholly halted only once all options.Pumps Pumps are down.
@@ -611,7 +600,12 @@ internal sealed class WorkerGroupService(
     // while the relinquish below hands its job to another node, which would then run the same Attempt
     // concurrently instead of after the Lease lapsed.
     // Best-effort, like the rest of the hand-back: a handler that outlasts the budget is logged and its
-    // Lease relinquished anyway - today's behaviour - so this can never hold the host open past it.
+    // Lease relinquished anyway, so this can never hold the host open past it. That is a real widening,
+    // not the status quo: before the hand-back the Lease stayed held for its full duration, so a peer
+    // could not take the job until it lapsed - usually after the process was already gone. A relinquish
+    // past this budget hands the job over while the local handler is still running it, so the concurrent
+    // Attempt is one this step CREATES. At-least-once already permits it, and the alternative is the
+    // whole feature going quiet whenever one handler is slow, so the overlap is the accepted price.
     // </summary>
     private async Task DrainInFlightAsync(CancellationToken budget)
     {
@@ -822,7 +816,7 @@ internal sealed class WorkerGroupService(
                         // would re-run an Attempt whose effect already landed, so halt before dispatch.
                         if (job.State.IsTerminal())
                         {
-                            throw new InvariantViolationException(
+                            throw Invariant.Halt(
                                 InvariantTrigger.ClaimedJobTerminal,
                                 $"Claim for worker '{claim.WorkerId}' returned job {job.JobId} " +
                                 $"({job.WireName}, attempt {job.Attempt}) in terminal state {job.State}.");
@@ -855,25 +849,23 @@ internal sealed class WorkerGroupService(
                 // independently; the store returns one result per row, and the Driver re-polls on each
                 // applied outcome (a released Dependency may be due this instant).
                 var reports = new List<OutcomeReport>(batch.Outcomes.Count);
-                // The Lease expiry this pump still believed each row held as its execution settled, kept
-                // positionally alongside the report it belongs to (the Storage Contract pairs results to
-                // reports by position too). Null where the pump had no belief to contradict. Read only by
-                // the fence check below.
-                var believedLeases = new DateTimeOffset?[batch.Outcomes.Count];
+                // The held-open process span for each row - and, on it, the Lease expiry this pump still
+                // believed that row held as its execution settled - kept positionally alongside the report
+                // it belongs to (the Storage Contract pairs results to reports by position too). Null where
+                // the execution stashed nothing. Read by the settlement below and by the fence check.
+                var pendingSpans =
+                    new (Activity? Span, string WireName, string Queue, DateTimeOffset? LeaseExpiry)?[batch.Outcomes.Count];
                 foreach (var outcome in batch.Outcomes)
                 {
                     _failureDetail.TryRemove((outcome.JobId, outcome.Attempt), out var rowDetail);
                     _bufferedTags.TryRemove((outcome.JobId, outcome.Attempt), out var rowTags);
                     var rowHasOutput = _bufferedOutput.TryRemove((outcome.JobId, outcome.Attempt), out var rowOutput);
-                    // Settle the held-open process span: a Failure lands retry-scheduled or dead-lettered
-                    // (the disposition the Driver computed into this row's next-due time), then it stops.
                     if (_pendingProcessOutcomes.TryRemove((outcome.JobId, outcome.Attempt), out var span))
                     {
                         // Indexed by reports.Count, which is this row's position the instant before it is
-                        // appended below.
-                        believedLeases[reports.Count] = span.LeaseExpiry;
-                        BackWaveDiagnostics.CompleteProcess(span.Span, outcome.Outcome, span.WireName, span.Queue);
-                        LogSettlement(outcome, span.WireName, span.Queue);
+                        // appended below. Stashed, not settled: the settlement happens once the batch has
+                        // been applied, off the row the store actually took.
+                        pendingSpans[reports.Count] = span;
                     }
                     reports.Add(new OutcomeReport(outcome.JobId, outcome.WorkerId, outcome.Attempt, outcome.Outcome)
                     {
@@ -885,13 +877,41 @@ internal sealed class WorkerGroupService(
                         Output = rowHasOutput ? rowOutput : (ReadOnlyMemory<byte>?)null,
                     });
                 }
-                var (batchResults, reApplied) = await ApplyOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false);
+                IReadOnlyList<OutcomeReportResult> batchResults;
+                bool[] fencedByDesign;
+                try
+                {
+                    (batchResults, fencedByDesign) =
+                        await ApplyOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    // Settle the held-open process spans from the row as APPLIED, not as the handler left
+                    // it. ApplyOutcomesAsync rewrites a row whose Job Output the store rejected into a
+                    // terminal Failure, and a span closed on the original Success would record a
+                    // dead-lettered job as a success: no "dead-lettered" span event, no
+                    // backwave.jobs.dead_lettered increment, and no Dead-Lettered log, so an operator
+                    // alerting on any of the three is blind to the whole class. A Failure lands
+                    // retry-scheduled or dead-lettered (the disposition the Driver computed into this row's
+                    // next-due time), then it stops.
+                    // In a finally, because a store fault on the apply would otherwise leave every span in
+                    // the batch open forever - the pump already took them out of _pendingProcessOutcomes.
+                    for (var i = 0; i < reports.Count; i++)
+                    {
+                        if (pendingSpans[i] is { } settling)
+                        {
+                            BackWaveDiagnostics.CompleteProcess(
+                                settling.Span, reports[i].Outcome, settling.WireName, settling.Queue);
+                            LogSettlement(reports[i], settling.WireName, settling.Queue);
+                        }
+                    }
+                }
                 // The Storage Contract is one result per input row, in input order, and the Driver pairs the
                 // two by position. A short or long answer means some row's outcome is silently unreported or
                 // misattributed, so stop before the Driver acts on a mispaired result.
                 if (batchResults.Count != reports.Count)
                 {
-                    throw new InvariantViolationException(
+                    throw Invariant.Halt(
                         InvariantTrigger.OutcomeBatchCountMismatch,
                         $"Outcome batch of {reports.Count} row(s) came back with {batchResults.Count} result(s).");
                 }
@@ -904,7 +924,8 @@ internal sealed class WorkerGroupService(
                         // neither is a broken invariant: a Lease that lapsed before its outcome could be
                         // reported (another node has since taken the job over, or this pump's own sweep
                         // expired it), and a Job Output re-apply, where the rows the store already settled
-                        // on the rejected pass are fenced out by design. Both are logged at Debug and
+                        // on the rejected pass are fenced out by design - those rows only, so the check
+                        // below stays live for every other row in the batch. Both are logged at Debug and
                         // counted nowhere - the invariant ledger is the surface a promotion rule reads FOR
                         // ZEROS, so a healthy fleet that increments it makes the trigger meaningless.
                         //
@@ -921,19 +942,25 @@ internal sealed class WorkerGroupService(
                         // runs a few seconds ahead expires a lapsed Lease legally, and this pump still sees
                         // a future expiry. Only a window wider than any credible skew is a contradiction,
                         // so one skewed node cannot make the zero-counter non-zero on a healthy fleet.
-                        if (!reApplied && believedLeases[i] is { } until && now + ClockSkewAllowance < until)
+                        if (!fencedByDesign[i] && pendingSpans[i]?.LeaseExpiry is { } until
+                            && now + Invariant.ClockSkewAllowance < until)
                         {
                             var detail =
                                 $"Outcome {reports[i].Outcome} for job {rowResult.JobId} (attempt {reports[i].Attempt}, " +
                                 $"worker '{reports[i].WorkerId}') was refused by the store's identity fence, but this " +
                                 $"pump's Lease on it runs to {until:o} and it is only {now:o}.";
-                            // Both events fire, and neither is redundant: 2003 is the only one that names
-                            // the worker group (nothing puts it on a log scope), and Invariant.Degrade is
-                            // the only thing that welds the 1601 log to the counter - a group-altitude site
-                            // that hand-rolled the pair is exactly the omission it exists to prevent.
+                            // 2003, not the 1601 Invariant.Degrade writes: the two ids split by ALTITUDE,
+                            // and 16xx is reserved for invariant sites that degrade BELOW the Hosting
+                            // boundary. This is the group-altitude counterpart, and it is the only one of
+                            // the pair that names the worker group - nothing puts the group on a log scope.
+                            // Emitting both double-pages an operator who follows that split and inflates a
+                            // count of 1601 by the whole pump fence family. The counter is what the
+                            // promotion rule reads, so it is recorded directly here rather than left to
+                            // Invariant.Degrade, which cannot write 1601 without breaking the band.
                             HostingLog.WorkerGroupDegradedByInvariant(
                                 logger, options.Name, InvariantTrigger.OutcomeFenceRejected.ToString(), detail);
-                            Invariant.Degrade(logger, InvariantTrigger.OutcomeFenceRejected, detail);
+                            BackWaveDiagnostics.RecordInvariantViolation(
+                                InvariantTrigger.OutcomeFenceRejected, InvariantAction.Degrade);
                         }
                         else
                         {
@@ -952,7 +979,7 @@ internal sealed class WorkerGroupService(
                 // Lease; stop instead.
                 if (results.Count != heartbeat.JobIds.Count)
                 {
-                    throw new InvariantViolationException(
+                    throw Invariant.Halt(
                         InvariantTrigger.HeartbeatBatchCountMismatch,
                         $"Heartbeat for {heartbeat.JobIds.Count} job(s) came back with {results.Count} result(s).");
                 }
@@ -1012,17 +1039,22 @@ internal sealed class WorkerGroupService(
     // more. Each pass clears one distinct row's Output, so a row can never be rejected twice and the loop
     // is bounded by the row count; anything past that bound - or a rejection naming a job this batch never
     // sent - is unclassifiable and fail-stops the group exactly as before.
-    // ReApplied says whether any pass beyond the first ran, so the caller's fence check knows the
-    // StaleLease answers it is looking at are the ones this method's own re-apply produced.
+    // FencedByDesign marks, per row, whether a rejected pass could already have settled that row, so the
+    // caller's fence check knows which StaleLease answers this method's own re-apply produced. Per row and
+    // not per batch: only the rows AHEAD of a rejection can have been settled by the pass that threw, and
+    // on a store that pre-scans the whole batch not even those - so a batch-wide flag would silence the
+    // fence for rows nothing re-applied, and a genuine contradiction riding alongside an over-cap Output
+    // would go uncounted.
     // </summary>
-    private async ValueTask<(IReadOnlyList<OutcomeReportResult> Results, bool ReApplied)> ApplyOutcomesAsync(
+    private async ValueTask<(IReadOnlyList<OutcomeReportResult> Results, bool[] FencedByDesign)> ApplyOutcomesAsync(
         List<OutcomeReport> reports, DateTimeOffset now, CancellationToken stoppingToken)
     {
+        var fencedByDesign = new bool[reports.Count];
         for (var pass = 0; ; pass++)
         {
             try
             {
-                return (await store.ReportOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false), pass > 0);
+                return (await store.ReportOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false), fencedByDesign);
             }
             catch (JobOutputTooLargeException rejected) when (pass < reports.Count)
             {
@@ -1030,6 +1062,10 @@ internal sealed class WorkerGroupService(
                 if (index < 0)
                 {
                     throw;
+                }
+                for (var settled = 0; settled < index; settled++)
+                {
+                    fencedByDesign[settled] = true;
                 }
                 HostingLog.JobOutputRejected(
                     logger, options.Name, rejected.JobId, rejected.ActualBytes, rejected.MaxOutputBytes);
@@ -1292,7 +1328,7 @@ internal sealed class WorkerGroupService(
     // returned, and the outcome settles later on the event loop): a Failure with a next-due time is a
     // retry (Information), one without is a Dead-Letter (Error). A success or superseded outcome adds no
     // settlement event - the ExecutionCompleted log already covers it.
-    private void LogSettlement(ReportedOutcome outcome, string wireName, string queue)
+    private void LogSettlement(OutcomeReport outcome, string wireName, string queue)
     {
         if (outcome.Outcome is not JobOutcome.Failure failure)
         {

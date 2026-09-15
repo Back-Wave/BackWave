@@ -1,3 +1,5 @@
+using BackWave.Diagnostics;
+
 namespace BackWave.Torture;
 
 /// <summary>
@@ -151,18 +153,32 @@ internal static class UpgradeRun
 
         // 5. Drain to quiescence, then run the full oracle audit over the merged journal.
         var drainViolations = new ViolationSink(TorturePhase.Drain);
-        var drainer = new Drainer(store.CreateStore(), keys, options2, store.IsTransientFault);
-        drainViolations.AddRange(await drainer.DrainAsync(cancellationToken));
-
         var postDrain = new ViolationSink(TorturePhase.PostDrain);
-        var auditor = new Auditor(store.CreateStore(), keys, options2);
-        await auditor.AuditAsync(journal.Entries, postDrain, cancellationToken);
-        postDrain.AddRange(await store.RawAuditAsync(cancellationToken));
+        Auditor? auditor = null;
+        // The drainer and the auditor drive the freshly migrated adapter the clients just hammered, so they
+        // can trip the same production fail-stop triggers. Caught here rather than left to crash the
+        // process, so the harness still reports RED naming both the trigger and the version that produced it.
+        try
+        {
+            var drainer = new Drainer(store.CreateStore(), keys, options2, store.IsTransientFault);
+            drainViolations.AddRange(await drainer.DrainAsync(cancellationToken));
+
+            auditor = new Auditor(store.CreateStore(), keys, options2);
+            await auditor.AuditAsync(journal.Entries, postDrain, cancellationToken);
+            postDrain.AddRange(await store.RawAuditAsync(cancellationToken));
+        }
+        catch (InvariantViolationException violation)
+        {
+            postDrain.Add(new TortureViolation(
+                TortureInvariant.HaltTriggerFired,
+                $"Halt trigger {violation.Trigger} fired during the drain/audit - a production worker group " +
+                $"would have fail-stopped: {violation.Message}"));
+        }
         Checks.DegradedTriggers(journal.Entries, postDrain);
         var violations = new List<TortureViolation>(drainViolations.Snapshot());
         violations.AddRange(postDrain.Snapshot());
 
-        Console.WriteLine($"upgrade: v{priorVersion} audited {auditor.ScannedJobs.Count} jobs " +
+        Console.WriteLine($"upgrade: v{priorVersion} audited {auditor?.ScannedJobs.Count ?? 0} jobs " +
             $"({journal.Entries.Count} journal entries).");
         return violations;
     }

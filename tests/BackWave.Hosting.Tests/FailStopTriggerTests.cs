@@ -195,17 +195,15 @@ public class FailStopTriggerTests
         // answering "not this worker's" contradicts it. Counted and logged at Warning, group stays up.
         var violation = Assert.Single(violations.Measurements);
         Assert.Equal("Degrade", violation);
-        var warning = Assert.Single(
-            logs.Entries,
-            e => e.EventId == 1601 && e.Message.Contains(nameof(InvariantTrigger.OutcomeFenceRejected)));
-        Assert.Equal(LogLevel.Warning, warning.Level);
-        Assert.Contains(jobId.ToString(), warning.Message);
-        // The group-altitude counterpart (2003), the only one of the pair that names the worker group -
-        // nothing puts the group on a log scope. Both fire; the counter stays welded to 1601.
+        // 2003 and ONLY 2003. The ids split by altitude: this site sits above the Hosting boundary, and
+        // it is the only one of the pair that names the worker group - nothing puts the group on a log
+        // scope. 1601 is the below-the-boundary band, so an operator who follows the split is paged once.
         var atGroupAltitude = Assert.Single(logs.Entries, e => e.EventId == 2003);
         Assert.Equal(LogLevel.Warning, atGroupAltitude.Level);
         Assert.Contains("workers", atGroupAltitude.Message);
         Assert.Contains(nameof(InvariantTrigger.OutcomeFenceRejected), atGroupAltitude.Message);
+        Assert.Contains(jobId.ToString(), atGroupAltitude.Message);
+        Assert.DoesNotContain(logs.Entries, e => e.EventId == 1601);
         Assert.Empty(app.Services.GetRequiredService<BackWaveHealth>().HaltedGroups);
         Assert.Equal(
             HttpStatusCode.OK, (await app.GetTestClient().GetAsync("/health")).StatusCode);

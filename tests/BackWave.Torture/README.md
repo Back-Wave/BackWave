@@ -95,8 +95,8 @@ finding), HaltTriggerFired (an adapter raised the production `InvariantViolation
 production takes the worker group out of service; the finding names the tripped `InvariantTrigger`),
 DegradeTriggerFired, ClientCrash.
 
-The Degrade half of the fail-stop vocabulary throws nothing — the site counts the impossible state and
-carries on down its benign branch — and a torture process registers no log provider, so the
+The Degrade half of the fail-stop vocabulary throws nothing - the site counts the impossible state and
+carries on down its benign branch - and a torture process registers no log provider, so the
 `backwave.invariant.violations` counter is the only surface it reaches here. `DegradeWatch` subscribes to that
 counter (in the parent and in each SQLite child process, whose journal is merged home) and journals every
 Degrade measurement by trigger id; the run sweeps the whole journal for them once, at the end, and goes RED.
@@ -120,6 +120,14 @@ Mid-run: LegalInitialState, LegalTransition, AttemptMonotonic, AttemptCeiling, T
 LeaseOwnerPresent/LeaseOwnerCleared, the store half of QuarantineNotExecuted, RawStoreException,
 HaltTriggerFired, ClientCrash, DuplicateEnqueueAccepted, DuplicateWorkflowAccepted, NoDoubleExecution,
 SlotDoubleRelease, OutcomeProvenance.
+
+The journal-only half of that list - RawStoreException, HaltTriggerFired, ClientCrash,
+DuplicateEnqueueAccepted, DuplicateWorkflowAccepted, NoDoubleExecution, SlotDoubleRelease,
+OutcomeProvenance - reaches mid-run on every adapter except `SqliteMultiProcess`. There the clients are
+child processes that hand their journal to the parent only as they exit, which is after the time box has
+already ended the loop, so the parent's journal is empty for the whole workload. The pass says so on its
+console line and in `run.json` (`JournalHalfLive`) rather than counting an empty read as a clean one, and
+those checks still run in full in the post-drain audit over the merged journal.
 
 Held back to post-drain (each compares two sources read at different instants, and `WorkloadClient`
 journals *after* the store call returns): DrainLiveness, TerminalStable, NoAwaitingParentOrphan,

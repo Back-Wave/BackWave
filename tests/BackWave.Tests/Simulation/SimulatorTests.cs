@@ -992,6 +992,10 @@ public class SimulatorTests
         Assert.True(result.OutcomeBufferFlushed > 0, $"seed {seed}: no clean stop ever flushed a buffered outcome");
         Assert.Equal(0, result.OutcomeBufferDropped);          // nothing may be lost with both loss axes off
         Assert.True(result.LeasesRelinquished > 0, $"seed {seed}: no clean stop ever reached the store");
+        // The ORDER assertion. Relinquishing first would hand the Leases back before the buffered rows were
+        // written, so the fence would reject every one of them as stale; nothing else above moves if the two
+        // steps are swapped, and this is what makes that regression fail the test.
+        Assert.Equal(0, result.StaleOutcomes);
         Assert.Equal(200, result.Succeeded + result.DeadLettered + result.Cancelled + result.Quarantined);
     }
 

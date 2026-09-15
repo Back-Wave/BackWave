@@ -40,8 +40,10 @@ public sealed class SqlServerRoundTripBudgetTests
         new(Guid.NewGuid(), "budget-test", "{}"u8.ToArray(), queue, T0);
 
     // The recorded budgets: measured 2026-08-28 against SQL Server 2022 on Microsoft.Data.SqlClient
-    // 6.1.1, at schema version 1. Each is the cost of ONE call; the arithmetic behind each number is
-    // in its test.
+    // 6.1.1, at schema version 1. The measurement predates schema v2, which adds only the lease_owner
+    // index the hand-back seeks on: an index changes which plan a statement gets, never how many
+    // statements a call sends, and these budgets count statements. Each is the cost of ONE call; the
+    // arithmetic behind each number is in its test.
 
     private static readonly Budget Claim = new(
         "ClaimBatchAsync of 32 jobs (one queue, cold caches)", Statements: 6);

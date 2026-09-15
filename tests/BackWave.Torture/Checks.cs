@@ -38,10 +38,13 @@ internal sealed record AuditRow
 /// <summary>
 /// The check bodies shared by the post-drain <see cref="Auditor"/> and the mid-run cursor pass. A
 /// fork would let the two drift, and a drift means the mid-run pass quietly stops matching the real
-/// audit, so every check lives here exactly once and each caller feeds it the rows it has.
+/// audit, so every check the two share lives here exactly once and each caller feeds it the rows it has.
 /// </summary>
 internal static class Checks
 {
+    // The legal-edge table is spelled out twice more outside this project - in the simulator's model and
+    // in the Conformance suite - and nothing keeps the three in step. A change to the state machine has to
+    // land in all three; this copy is the one both torture oracles read.
     private static readonly IReadOnlySet<(JobState From, JobState To)> LegalEdges = new HashSet<(JobState, JobState)>
     {
         (JobState.AwaitingParent, JobState.Scheduled),
@@ -153,7 +156,7 @@ internal static class Checks
         {
             sink.Add(new TortureViolation(
                 TortureInvariant.QuarantineNotExecuted,
-                $"Job {job.JobId} is Quarantined but its wire '{job.WireName}' is routable — no client ever reports " +
+                $"Job {job.JobId} is Quarantined but its wire '{job.WireName}' is routable - no client ever reports " +
                 "Unroutable for a routable wire.", job.JobId));
         }
     }

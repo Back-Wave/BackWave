@@ -2,13 +2,12 @@ using Microsoft.Extensions.Logging;
 
 namespace BackWave.Diagnostics;
 
-// The one way a check site reports a detected impossible state it does NOT halt on.
+// The one way a check site reports a detected impossible state, whichever action it takes about it.
 //
-// A Halt site needs no helper: it writes its own branch and throws InvariantViolationException, which
-// carries the trigger to the pump, and the pump does the counting. A Degrade site has no such carrier.
-// It has to log AND count at the site, and the two calls are easy to half-write - a site that logs but
-// forgets the counter is invisible to the promotion rule that reads a full torture ledger for zeros.
-// Pairing them here makes the omission impossible.
+// Both actions have to count, and the count is the only thing they share: a Halt site throws what this
+// hands back, a Degrade site logs and carries past on its existing benign branch. Either way the two
+// calls are easy to half-write - a site that acts but forgets the counter is invisible to the promotion
+// rule that reads a full torture ledger for zeros. Pairing them here makes the omission impossible.
 //
 // Internal, like the rest of the detection vocabulary. The tag values it emits are public API; the
 // method that emits them is not.
@@ -25,6 +24,24 @@ internal static class Invariant
     // the invariant ledger is the surface the promotion rule reads FOR ZEROS, so one such fence makes
     // its trigger meaningless for the whole fleet.
     internal static readonly TimeSpan ClockSkewAllowance = TimeSpan.FromSeconds(30);
+
+    // Reports a tripped invariant the caller then raises, and hands back the exception to throw.
+    //
+    // Counting happens on the RAISE rather than inside the exception's constructor, because both of
+    // those constructors are public on a shipped assembly: anything that builds one without raising it
+    // - a health report describing a halt that already happened, a test inspecting the type - would
+    // otherwise put a violation that never occurred on the meter, and backwave.invariant.violations is
+    // the surface the promotion rule reads FOR ZEROS. Every Halt site under src/ raises through here,
+    // so a raise counts exactly once however far the throw travels before something catches it: a
+    // violation raised inside a worker group's pump is caught there, one raised on the client's enqueue
+    // path propagates to the application, and one raised in a dependency read can be swallowed by a
+    // handler's broad catch. Telemetry-only, exactly as for Degrade: the count never changes what
+    // happens next, and it is taken before the exception escapes, so no catch anywhere suppresses it.
+    internal static InvariantViolationException Halt(InvariantTrigger trigger, string message)
+    {
+        BackWaveDiagnostics.RecordInvariantViolation(trigger, InvariantAction.Halt);
+        return new InvariantViolationException(trigger, message);
+    }
 
     // Reports a tripped invariant the caller then carries past on its existing benign branch.
     //

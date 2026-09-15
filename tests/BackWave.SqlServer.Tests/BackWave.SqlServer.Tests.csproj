@@ -12,11 +12,10 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
-    <!-- The OTel SDK + in-memory exporter, for the BackWave.OpenTelemetry drift guard: it subscribes
-         by source NAME, so only building a real provider and watching a genuine signal arrive proves
-         the name still matches. Versions track the OpenTelemetry.Api 1.16.0 that package pins. -->
+    <!-- The OTel SDK, for the BackWave.OpenTelemetry drift guard: it subscribes by source NAME, so
+         only building a real provider and watching a genuine signal arrive proves the name still
+         matches. Version tracks the OpenTelemetry.Api 1.16.0 that package pins. -->
     <PackageReference Include="OpenTelemetry" Version="1.16.0" />
-    <PackageReference Include="OpenTelemetry.Exporter.InMemory" Version="1.16.0" />
   </ItemGroup>
 
   <ItemGroup>

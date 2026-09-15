@@ -5,7 +5,7 @@ using Microsoft.Data.Sqlite;
 namespace BackWave.Sqlite.Tests;
 
 /// <summary>
-/// The SQLite adapter's statement budget: the number of statements seven hot operations execute today,
+/// The SQLite adapter's statement budget: the number of statements eight hot operations execute today,
 /// pinned so a change has to move them on purpose.
 ///
 /// Read the number for what it is. SQLite runs in-process, so a statement here is a prepare plus a step
@@ -34,8 +34,15 @@ namespace BackWave.Sqlite.Tests;
 /// per-row and are pinned here as they are. A budget records what the adapter costs; it does not assert
 /// what it ought to cost.
 /// </summary>
+[Collection(SqliteStatementBudgetTests.StatementCounts)]
 public sealed class SqliteStatementBudgetTests
 {
+    // SqliteStatementCounts tracks live scopes in one process-global counter, and the unobserved-path
+    // measurement below only measures that path while the counter reads zero. xUnit runs test classes in
+    // parallel by default, so every class that opens an Observe() scope joins this collection and none of
+    // them can be inside one while that test runs.
+    internal const string StatementCounts = "SQLite statement counts";
+
     private static readonly DateTimeOffset T0 = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
     private static readonly TimeSpan Lease = TimeSpan.FromMinutes(5);
 
@@ -59,6 +66,9 @@ public sealed class SqliteStatementBudgetTests
 
     private static readonly Budget ExpireLeases = new(
         "ExpireLeasesAsync over 32 expired leases, all rescheduled", Statements: 35);
+
+    private static readonly Budget Relinquish = new(
+        "RelinquishLeasesAsync over 32 held leases, all rescheduled", Statements: 4);
 
     private static readonly Budget ListJobs = new(
         "ListJobsAsync over a full page of terminal jobs", Statements: 2);
@@ -252,6 +262,44 @@ public sealed class SqliteStatementBudgetTests
 
         Assert.Equal(ClaimBatch, reclaimed);
         AssertBudget(ExpireLeases, measured);
+    }
+
+    [Fact]
+    public async Task Relinquishing_every_held_lease_stays_within_its_statement_budget()
+    {
+        await using var temp = TempSqliteStore.Create();
+        var store = temp.Store;
+        for (var i = 0; i < ClaimBatch; i++)
+        {
+            await store.EnqueueAsync(Job(), T0);
+        }
+        var claimed = await store.ClaimAsync(new ClaimRequest("budget-worker", ["budget"], ClaimBatch, Lease, T0));
+        Assert.Equal(ClaimBatch, claimed.Count);
+
+        // 1 held-lease select + 1 set-based reschedule UPDATE + 2 batched transition write = 4,
+        // independent of how many leases the worker holds.
+        //
+        // This is the budget that guards the shape of the hand-back, and the one operation where the
+        // per-row shape would cost the most: a clean stop relinquishes every Lease the node holds at
+        // once, and it does it while the process is trying to exit, so a statement per row would put
+        // the adapter's widest write on the node's stop budget. Unlike the expiry sweep above, every
+        // rescheduled job here comes back due at the same instant, so one UPDATE over a json_each id
+        // list writes the whole set - there is no per-row value for it to carry.
+        //
+        // Every job retries rather than dead-letters, the shape a clean stop is usually full of: a
+        // dead-lettered job adds its own UPDATE plus the child-latch cascade.
+        var disposition = new RetryDisposition(MaxAttempts: 5, [TimeSpan.FromMinutes(1)]);
+
+        int handedBack;
+        int measured;
+        using (var scope = SqliteStatementCounts.Observe())
+        {
+            handedBack = await store.RelinquishLeasesAsync("budget-worker", T0 + TimeSpan.FromSeconds(1), disposition);
+            measured = scope.Statements;
+        }
+
+        Assert.Equal(ClaimBatch, handedBack);
+        AssertBudget(Relinquish, measured);
     }
 
     [Fact]

@@ -30,6 +30,10 @@ internal sealed class MidRunAudit(
     // appended since the last one, so a pass costs its delta and never the run's whole history.
     private readonly JournalOracle _oracle = new();
 
+    // The jobs whose row has already been checked on the pass now running. Cleared per pass, because a
+    // later pass reads a later snapshot of the same row and must check that one too.
+    private readonly HashSet<Guid> _rowsChecked = [];
+
     // How far into the journal the oracle has read.
     private int _absorbed;
 
@@ -47,6 +51,16 @@ internal sealed class MidRunAudit(
     public int Skips { get; private set; }
 
     public TimeSpan Cost { get; private set; }
+
+    /// <summary>
+    /// Whether the journal half of the pass has anything to read. In the cross-process shape the clients
+    /// are child processes that hand their journal to the parent only as they exit, which is after the
+    /// time box has already ended this loop - so the parent's journal is empty for the whole workload and
+    /// the journal-only checks would convict on nothing while reporting themselves as having run. The
+    /// pass says so rather than counting an empty read as a clean one; the post-drain audit runs the same
+    /// checks over the merged journal, so this costs reach mid-run, not coverage.
+    /// </summary>
+    public bool JournalHalfLive { get; } = options.Adapter != TortureAdapter.SqliteMultiProcess;
 
     /// <summary>Runs until the time box ends, cancelling it on the first violation so the drain never runs.</summary>
     public async Task RunAsync(CancellationTokenSource timebox)
@@ -75,7 +89,11 @@ internal sealed class MidRunAudit(
                 {
                     // A production fail-stop trigger, which the caller turns into a finding. Rethrown
                     // ahead of every classifier below on purpose: an adapter's classifier reads provider
-                    // fault codes, and a halt trigger must never be demoted to contention noise.
+                    // fault codes, and a halt trigger must never be demoted to contention noise. The time
+                    // box is cut first, on the same path every other mid-run finding takes: the throw
+                    // leaves the loop, so nothing below would reach the cut, and the clients would keep
+                    // hammering the store past the halt until the duration ran out.
+                    await timebox.CancelAsync();
                     throw;
                 }
                 catch (Exception exception) when (target.IsTransientFault(exception))
@@ -124,6 +142,7 @@ internal sealed class MidRunAudit(
     private async Task PassAsync(CancellationToken cancellationToken)
     {
         var timer = Stopwatch.StartNew();
+        _rowsChecked.Clear();
         while (true)
         {
             var rows = await target.ReadChangeFeedAsync(_cursor, PageRows, cancellationToken);
@@ -142,13 +161,16 @@ internal sealed class MidRunAudit(
             }
         }
 
-        var watermark = journal.Watermark;
-        if (watermark > _absorbed)
+        if (JournalHalfLive)
         {
-            _oracle.Absorb(journal.Range(_absorbed, watermark - _absorbed));
-            _absorbed = watermark;
+            var watermark = journal.Watermark;
+            if (watermark > _absorbed)
+            {
+                _oracle.Absorb(journal.Range(_absorbed, watermark - _absorbed));
+                _absorbed = watermark;
+            }
+            _oracle.Evaluate(violations);
         }
-        _oracle.Evaluate(violations);
 
         Passes++;
         Cost += timer.Elapsed;
@@ -156,7 +178,13 @@ internal sealed class MidRunAudit(
 
     private void Walk(AuditRow row)
     {
-        Checks.JobRow(row.Job, keys, options, violations);
+        // Once per job per pass, not once per transition: the joined read carries the job row beside
+        // every transition of that job, so checking each copy would report one bad row as one finding
+        // per transition it happens to carry.
+        if (_rowsChecked.Add(row.JobId))
+        {
+            Checks.JobRow(row.Job, keys, options, violations);
+        }
         if (_lastSeen.TryGetValue(row.JobId, out var previous))
         {
             Checks.TransitionEdge(row.JobId, previous, row.Transition, options.MaxAttempts, violations);

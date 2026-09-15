@@ -9,6 +9,7 @@ namespace BackWave.Tests;
 /// The Conformance Suite against the In-Memory Store — the reference implementation must
 /// pass 100% before any adapter runs it (spec §10).
 /// </summary>
+[Collection(InvariantViolationCounterCollection.Name)] // raises the observer-fence violation a neighbor reads
 public sealed class InMemoryConformanceTests : ConformanceSuite
 {
     protected override ValueTask<IJobStore> CreateStoreAsync(JobHistoryPolicy historyPolicy)

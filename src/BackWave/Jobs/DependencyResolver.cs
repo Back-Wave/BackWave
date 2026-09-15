@@ -73,12 +73,17 @@ internal sealed class StoreDependencyResolver(IJobStore store) : IDependencyReso
             // Retention prunes a Workflow row only once no job references it, so a live member proves its
             // Workflow row is still there: an absent one means the reader's whole graph - its edges, its
             // ancestors, its gates - is gone while the reader still runs. A terminal reader is exempt: it can
-            // be purged along with its Workflow between these two un-transacted reads.
-            if (!reader.State.IsTerminal())
+            // be purged along with its Workflow between these two un-transacted reads. The exemption is
+            // decided on a FRESH read, never on the snapshot above: that snapshot predates the Workflow read,
+            // so a reader that reached a terminal state and was purged inside the very window this comment
+            // names would otherwise fail-stop the group on the ordinary race it exists to allow. A reader
+            // that is gone entirely is exempt for the same reason.
+            var current = await store.GetJobAsync(readerJobId, cancellationToken).ConfigureAwait(false);
+            if (current is { } live && !live.State.IsTerminal())
             {
-                throw new InvariantViolationException(
+                throw Invariant.Halt(
                     InvariantTrigger.WorkflowMemberWithoutWorkflow,
-                    $"Job {readerJobId} is a member of workflow {workflowId} in state {reader.State}, " +
+                    $"Job {readerJobId} is a member of workflow {workflowId} in state {live.State}, " +
                     "but that workflow's row is absent.");
             }
 

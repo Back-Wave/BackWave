@@ -48,6 +48,7 @@ internal static class ArtifactWriter
                 midRun.TransitionsWalked,
                 midRun.Skips,
                 CostSeconds = midRun.Cost.TotalSeconds,
+                midRun.JournalHalfLive,
             },
             PostDrain = new { Present = auditor is not null, Reason = postDrainAbsentReason },
             Stats = stats.Snapshot(),

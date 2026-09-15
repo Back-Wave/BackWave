@@ -329,6 +329,10 @@ public class TransactionalEnqueueTests
             ObserverDeliveryReport report, CancellationToken cancellationToken = default)
             => ValueTask.CompletedTask;
 
+        public ValueTask<ObserverReportOutcome> TryReportObserverDeliveriesAsync(
+            ObserverDeliveryReport report, CancellationToken cancellationToken = default)
+            => ValueTask.FromResult(ObserverReportOutcome.Applied);
+
         public ValueTask<long> GetObserverCursorAsync(string observerId, CancellationToken cancellationToken = default)
             => ValueTask.FromResult(-1L);
 

@@ -87,6 +87,12 @@ public class JobOutputTooLargeTests
 
     private const int FencedOutEventId = 1208;
 
+    // BackWaveLog.DeadLettered, written by the pump's settlement pass. The over-cap rewrite turns a
+    // Success into a terminal Failure AFTER the handler returned, so this log - and the span event and
+    // the backwave.jobs.dead_lettered counter that settle alongside it - only fire if the settlement
+    // reads the row the store actually took rather than the one the handler produced.
+    private const int DeadLetteredEventId = 1203;
+
     [Fact]
     public async Task OversizedOutput_AgainstTheStoresOwnCap_DeadLettersTheJobAndLeavesTheGroupHealthy()
     {
@@ -199,6 +205,12 @@ public class JobOutputTooLargeTests
         var debug = Assert.Single(logs.Entries, entry => entry.EventId == FencedOutEventId);
         Assert.Contains(healthy.ToString(), debug.Message);
         Assert.Empty(violations.Measurements);
+
+        // And the rewritten row settles as the dead-letter it became. Settled from the original Success
+        // this log never fired, so the job was dead-lettered with the trace, the log, and the counter all
+        // reading success.
+        var deadLettered = Assert.Single(logs.Entries, entry => entry.EventId == DeadLetteredEventId);
+        Assert.Equal(LogLevel.Error, deadLettered.Level);
 
         var health = app.Services.GetRequiredService<BackWaveHealth>();
         Assert.True(health.IsHealthy);

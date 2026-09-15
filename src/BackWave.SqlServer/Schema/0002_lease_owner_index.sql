@@ -10,8 +10,8 @@
 --
 -- attempt rides along as an INCLUDE column. The hand-back reads exactly (job_id, attempt), and job_id
 -- is the clustered key, so the seek covers the whole read and never returns to the clustered index.
--- Filtered on state = 2 for the same reason ix_backwave_jobs_leased_queue is: only live Leases have a
--- lease_owner worth indexing, and every other row stays out of the index.
+-- Filtered on the Leased state for the same reason ix_backwave_jobs_leased_queue is: only a live
+-- Lease has a lease_owner worth indexing, and every other row stays out of the index.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_backwave_jobs_lease_owner')
     CREATE INDEX ix_backwave_jobs_lease_owner
         ON backwave.jobs (lease_owner) INCLUDE (attempt) WHERE state = 2;

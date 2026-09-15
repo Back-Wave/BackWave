@@ -503,7 +503,7 @@ public sealed class InMemoryJobStore(
             // member ahead of its own parent and had the insert refused a few lines below - naming the
             // member as the problem rather than the cycle that is the actual cause. Raise here, at the
             // only point that can still tell the two apart, and before any row is written.
-            throw new InvariantViolationException(
+            throw Invariant.Halt(
                 InvariantTrigger.WorkflowMemberCycle,
                 $"A workflow of {members.Count} member(s) ordered only {ordered.Count} of them, " +
                 "so its in-batch dependency edges hold a cycle.");

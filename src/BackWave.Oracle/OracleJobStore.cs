@@ -536,7 +536,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 var leasedCount = await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
                 if (leasedCount is null or DBNull)
                 {
-                    throw new InvariantViolationException(
+                    throw Invariant.Halt(
                         InvariantTrigger.LeasedCountAggregateNull,
                         $"The leased-count aggregate for queue '{queue}' returned no value; COUNT(*) always returns one.");
                 }
@@ -559,7 +559,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             await using (var claim = Cmd(
                 $"""
                 SELECT {JobColumns} FROM backwave.jobs
-                WHERE job_id IN (
+                WHERE state = {(int)JobState.Scheduled} AND job_id IN (
                     SELECT job_id FROM (
                         SELECT job_id FROM backwave.jobs
                         WHERE queue = :queue AND state = 0 AND due_time <= :now
@@ -580,11 +580,13 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     var job = ReadJob(reader);
                     // Oracle has no multi-row RETURNING, so the claim reads the row BEFORE it leases it.
                     // The post-lease state is therefore synthesized in memory and cannot be checked; what
-                    // can be is that the row honored the statement's own state = 0 predicate, which
-                    // FOR UPDATE re-evaluates after it takes the lock.
+                    // can be is that the row honored the outer statement's own Scheduled predicate, which
+                    // FOR UPDATE re-evaluates after it takes the lock. The predicate is repeated there and
+                    // not left to the ROWNUM subquery alone, so the check rests on a test the locking
+                    // query level actually makes.
                     if (job.State != JobState.Scheduled)
                     {
-                        throw new InvariantViolationException(
+                        throw Invariant.Halt(
                             InvariantTrigger.ClaimedRowNotEligible,
                             $"Claim locked job {job.JobId} in state {job.State}; the statement selects only state Scheduled.");
                     }
@@ -609,7 +611,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     var leasedRows = await update.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (leasedRows != queueClaims.Count)
                     {
-                        throw new InvariantViolationException(
+                        throw Invariant.Halt(
                             InvariantTrigger.UnexpectedAffectedRowCount,
                             $"The lease write affected {leasedRows} rows for {queueClaims.Count} ids this transaction already holds under FOR UPDATE.");
                     }
@@ -779,7 +781,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         }
         if (!anchored)
         {
-            throw new InvariantViolationException(
+            throw Invariant.Halt(
                 InvariantTrigger.QueueConfigLockNotAcquired,
                 $"The queue-config anchor for '{queue}' returned no row, so FOR UPDATE locked nothing and the lock was never taken.");
         }
@@ -1167,7 +1169,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             {
                 if (!matched.TryGetValue(parentId, out var parentState))
                 {
-                    throw new InvariantViolationException(
+                    throw Invariant.Halt(
                         InvariantTrigger.ParentJobMissingFromBatch,
                         $"Parent job {parentId} came back from a lookup restricted to this batch's own terminal ids, yet it is absent from that batch.");
                 }
@@ -1254,7 +1256,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     await using var reader = await child.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     {
-                        throw new InvariantViolationException(
+                        throw Invariant.Halt(
                             InvariantTrigger.DanglingGatingEdge,
                             $"Gating edge {currentParent} -> {childId} named a child job row that does not exist; the job_parents foreign key forbids it.");
                     }
@@ -1281,7 +1283,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     var cancelled = await cancel.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (cancelled != 1)
                     {
-                        throw new InvariantViolationException(
+                        throw Invariant.Halt(
                             InvariantTrigger.UnexpectedAffectedRowCount,
                             $"Cancelling gated child {childId} affected {cancelled} rows; the row is locked FOR UPDATE by this transaction, so exactly 1 is the only possible count.");
                     }
@@ -1309,7 +1311,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 var resolved = await resolve.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 if (resolved != 1)
                 {
-                    throw new InvariantViolationException(
+                    throw Invariant.Halt(
                         InvariantTrigger.UnexpectedAffectedRowCount,
                         $"Resolving the latch on gated child {childId} affected {resolved} rows; the row is locked FOR UPDATE by this transaction, so exactly 1 is the only possible count.");
                 }
@@ -1591,9 +1593,9 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         // already reported an outcome is never revived.
         var held = new List<(Guid JobId, int Attempt)>();
         await using (var select = Cmd(
-            """
+            $"""
             SELECT job_id, attempt FROM backwave.jobs
-            WHERE state = 2 AND lease_owner = :owner
+            WHERE state = {(int)JobState.Leased} AND lease_owner = :owner
             ORDER BY job_id
             FOR UPDATE
             """,
@@ -1641,28 +1643,30 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         // distinct, so the MERGE needs no fence of its own.
         if (ready.Count > 0)
         {
+            // Every relinquished job comes back due at the same instant, so the ready set carries no
+            // per-row payload.
             await using var restore = Cmd(
-                """
+                $"""
                 MERGE INTO backwave.jobs j
-                USING (SELECT HEXTORAW(d.job_hex) AS job_id, TO_TIMESTAMP_TZ(d.due, :fmt) AS due
+                USING (SELECT HEXTORAW(d.job_hex) AS job_id
                        FROM JSON_TABLE(:payload, '$[*]' COLUMNS (
-                                job_hex VARCHAR2(32) PATH '$.JobHex',
-                                due VARCHAR2(40) PATH '$.Due')) d) d
+                                job_hex VARCHAR2(32) PATH '$.JobHex')) d) d
                 ON (j.job_id = d.job_id)
                 WHEN MATCHED THEN UPDATE SET
-                    j.state = 0, j.due_time = d.due, j.lease_owner = NULL, j.lease_expiry = NULL
+                    j.state = {(int)JobState.Scheduled}, j.due_time = :now,
+                    j.lease_owner = NULL, j.lease_expiry = NULL
                 """,
                 connection, transaction);
             restore.Parameters.Add(Clob("payload", JsonSerializer.Serialize(
-                ready.Select(id => new RescheduleRow(Convert.ToHexString(id.ToByteArray()), Iso(now))))));
-            restore.Parameters.Add(Str("fmt", IsoTimestampFormat));
+                ready.Select(id => new IdRow(Convert.ToHexString(id.ToByteArray()))))));
+            restore.Parameters.Add(Tstz("now", now));
             await restore.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         if (deadLettered.Count > 0)
         {
             await using (var deadLetter = Cmd(
-                """
+                $"""
                 MERGE INTO backwave.jobs j
                 USING (SELECT HEXTORAW(d.job_hex) AS job_id, d.cause
                        FROM JSON_TABLE(:payload, '$[*]' COLUMNS (
@@ -1670,7 +1674,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                                 cause CLOB PATH '$.Cause')) d) d
                 ON (j.job_id = d.job_id)
                 WHEN MATCHED THEN UPDATE SET
-                    j.state = 5, j.lease_owner = NULL, j.lease_expiry = NULL,
+                    j.state = {(int)JobState.DeadLettered}, j.lease_owner = NULL, j.lease_expiry = NULL,
                     j.terminal_at = :now, j.terminal_cause = d.cause
                 """,
                 connection, transaction))
@@ -1681,15 +1685,27 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             }
 
+            // Crash after the dead-letter write, before the latch cascade: rollback must leave the worker
+            // holding every lease it started with and every child latch un-resolved.
+            await FailpointAsync("lease-relinquish", cancellationToken).ConfigureAwait(false);
+
             // Latch resolution touches only dead-lettered jobs that actually parent a Dependency, exactly
-            // as the expiry path does.
+            // as the expiry path does. The set rides the same JSON_TABLE shape the writes above use,
+            // because a clean stop hands back every lease the worker holds and that count has no cap -
+            // a bind list would raise ORA-01795 past 1000 and lapse the whole hand-back to the sweep.
             var deadIds = deadLettered.Select(d => d.JobId).ToList();
             var parents = new List<Guid>();
             await using (var withChildren = Cmd(
-                $"SELECT DISTINCT parent_id FROM backwave.job_parents WHERE parent_id IN ({ParameterList("p", deadIds.Count)})",
+                """
+                SELECT DISTINCT p.parent_id FROM backwave.job_parents p
+                JOIN JSON_TABLE(:payload, '$[*]' COLUMNS (
+                         job_hex VARCHAR2(32) PATH '$.JobHex')) d
+                  ON p.parent_id = HEXTORAW(d.job_hex)
+                """,
                 connection, transaction))
             {
-                AddIdList(withChildren, "p", deadIds);
+                withChildren.Parameters.Add(Clob("payload", JsonSerializer.Serialize(
+                    deadIds.Select(id => new IdRow(Convert.ToHexString(id.ToByteArray()))))));
                 await using var reader = (OracleDataReader)await withChildren.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
@@ -2295,7 +2311,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 await using var reader = await ExecuteLobReaderAsync(select, options.Bounds.MaxPayloadBytes, SingleRow, cancellationToken).ConfigureAwait(false);
                 if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
-                    throw new InvariantViolationException(
+                    throw Invariant.Halt(
                         InvariantTrigger.GuaranteedRowAbsent,
                         $"Schedule '{decision.ScheduleId}' has no row, yet this transaction just won its cursor fence on that row.");
                 }
@@ -2455,7 +2471,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             transitions.Add(new JobTransition(
                 reader.GetInt64(0),
                 ReadTstz(reader, 1),
-                (JobState)reader.GetInt32(2),
+                ReadState(reader, 2),
                 reader.GetInt32(3),
                 ReadTextOrNull(reader, 4)));
         }
@@ -2514,7 +2530,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             counts.Add(new QueueStateCount(
-                reader.GetString(0), (JobState)reader.GetInt32(1), reader.GetInt32(2)));
+                reader.GetString(0), ReadState(reader, 1), reader.GetInt32(2)));
         }
         return counts;
     }
@@ -2882,7 +2898,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             }
             if (applied != EnqueueResult.Ok) // always-on assertion: everything else validated above
             {
-                throw new InvariantViolationException(
+                throw Invariant.Halt(
                     InvariantTrigger.WorkflowMemberEnqueueRejected,
                     $"Workflow enqueue rejected member {member.JobId} with {applied} inside the transaction that had already validated it.");
             }
@@ -2999,7 +3015,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             // member ahead of its own parent and had the insert refused a few lines below - naming the
             // member as the problem rather than the cycle that is the actual cause. Raise here, at the
             // only point that can still tell the two apart, and before any row is written.
-            throw new InvariantViolationException(
+            throw Invariant.Halt(
                 InvariantTrigger.WorkflowMemberCycle,
                 $"A workflow of {members.Count} member(s) ordered only {ordered.Count} of them, " +
                 "so its in-batch dependency edges hold a cycle.");
@@ -3026,7 +3042,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             {
                 var wf = ReadGuid(reader, 0);
                 (statesByWorkflow.TryGetValue(wf, out var list) ? list : statesByWorkflow[wf] = [])
-                    .Add((JobState)reader.GetInt32(1));
+                    .Add(ReadState(reader, 1));
             }
         }
 
@@ -3265,9 +3281,16 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             await using var reader = (OracleDataReader)await locked.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
-                throw new InvariantViolationException(
-                    InvariantTrigger.GuaranteedRowAbsent,
+                // Degrade, not Halt. The only caller of this path is the observer dispatch pump, which is
+                // fail-soft on purpose: it catches every exception without reading a trigger, logs it, and
+                // re-polls. A throw here therefore stops nothing and comes back every poll with the write
+                // aborted, which is worse than the benign branch. Counting it keeps the signal without the
+                // loop; arming it is a decision for whoever gives that pump a channel to fail-stop on.
+                // The action belongs to that caller, not to the store, so all four adapters degrade here.
+                Invariant.Degrade(
+                    _logger, InvariantTrigger.GuaranteedRowAbsent,
                     $"Observer '{request.ObserverId}' has no row immediately after this transaction ensured one.");
+                return ObserverClaim.None(request.ObserverId);
             }
             cursor = reader.GetInt64(0);
             leaseOwner = reader.IsDBNull(1) ? null : reader.GetString(1);
@@ -3337,7 +3360,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 var priorAttempt = reader.IsDBNull(9) ? 0 : reader.GetInt32(9);
                 candidates.Add(new ObserverClaimedDelivery(
                     reader.GetInt64(0), ReadGuid(reader, 1), reader.GetInt64(2), reader.GetString(3), reader.GetString(4),
-                    (JobState)reader.GetInt32(5), reader.GetInt32(6), ReadTstz(reader, 7),
+                    ReadState(reader, 5), reader.GetInt32(6), ReadTstz(reader, 7),
                     ReadTextOrNull(reader, 8), priorAttempt + 1)); // the claim starts a delivery Attempt
             }
         }
@@ -3526,10 +3549,14 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             newCursor = result is null or DBNull ? null : Convert.ToInt64(result);
         }
 
+        // Counted, not thrown: this runs under the fail-soft observer pump, which catches without a
+        // trigger, so a throw would only abort the report's write and return on the next poll. The
+        // branch below already holds the cursor where it is, which is the safe outcome either way.
+        // The action belongs to that caller, not to the store, so all four adapters degrade here.
         if (newCursor is { } regressed && regressed < cursor)
         {
-            throw new InvariantViolationException(
-                InvariantTrigger.ObserverCursorRegressed,
+            Invariant.Degrade(
+                _logger, InvariantTrigger.ObserverCursorRegressed,
                 $"Observer '{observerId}' would move its cursor from {cursor} back to {regressed}; the advance selects MAX(position) strictly greater than the cursor.");
         }
         if (newCursor is not { } target || target <= cursor)
@@ -3577,8 +3604,11 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             var moved = await move.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             if (moved != 1)
             {
-                throw new InvariantViolationException(
-                    InvariantTrigger.UnexpectedAffectedRowCount,
+                // Counted, not thrown, for the same reason the regression check above is: the fail-soft
+                // observer pump swallows the throw and re-polls, so the only effect would be to abort
+                // this report's write once per poll.
+                Invariant.Degrade(
+                    _logger, InvariantTrigger.UnexpectedAffectedRowCount,
                     $"Moving the cursor of observer '{observerId}' affected {moved} rows; the row is locked FOR UPDATE by this transaction, so exactly 1 is the only possible count.");
             }
         }
@@ -3640,9 +3670,14 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            throw new InvariantViolationException(
-                InvariantTrigger.GuaranteedRowAbsent,
+            // Degrade, not Halt. This is a Monitor read, reached from the dashboard and the MCP tools
+            // rather than from any pump, so a throw here fail-stops nothing and surfaces as a failed
+            // request. The reply is the same one the aggregate gives for an observer with no row.
+            // The action belongs to that caller, not to the store, so all four adapters degrade here.
+            Invariant.Degrade(
+                _logger, InvariantTrigger.GuaranteedRowAbsent,
                 $"The lag aggregate for observer '{request.ObserverId}' returned no row; an ungrouped aggregate always returns exactly one.");
+            return new ObserverLag(-1, 0, null);
         }
         var oldest = reader.IsDBNull(2) ? (DateTimeOffset?)null : ReadTstz(reader, 2);
         return new ObserverLag(reader.GetInt64(0), (int)reader.GetInt64(1), oldest);
@@ -3668,7 +3703,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             records.Add(new ObserverDeadLetterRecord(
-                reader.GetInt64(0), ReadGuid(reader, 1), reader.GetInt64(2), (JobState)reader.GetInt32(3),
+                reader.GetInt64(0), ReadGuid(reader, 1), reader.GetInt64(2), ReadState(reader, 3),
                 reader.GetInt32(4), reader.GetInt32(5), ReadTstz(reader, 6)));
         }
         return records;
@@ -3688,14 +3723,14 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         var storedState = reader.GetInt32(4);
         if (!Enum.IsDefined((JobState)storedState))
         {
-            throw new InvariantViolationException(
+            throw Invariant.Halt(
                 InvariantTrigger.UndefinedEnumValueStored,
                 $"Job {ReadGuid(reader, 0)} stores state {storedState}, which is not a defined JobState.");
         }
         var storedMode = reader.GetInt32(14);
         if (!Enum.IsDefined((DependencyMode)storedMode))
         {
-            throw new InvariantViolationException(
+            throw Invariant.Halt(
                 InvariantTrigger.UndefinedEnumValueStored,
                 $"Job {ReadGuid(reader, 0)} stores dependency mode {storedMode}, which is not a defined DependencyMode.");
         }
@@ -3799,6 +3834,9 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
     private sealed record RescheduleRow(string JobHex, string? Due);
 
     private sealed record DeadLetterRow(string JobHex, string Cause);
+
+    // The set-valued id row for the statements whose only payload is a job id, serialized the same way.
+    private sealed record IdRow(string JobHex);
 
     // The set-valued tag row for the batch INSERT, serialized to JSON and unpacked by JSON_TABLE. Key
     // and Value are already encoded, so the empty-string sentinel never reaches Oracle as a NULL.
@@ -4100,6 +4138,20 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
     {
         var timestamp = reader.GetOracleTimeStampTZ(ordinal);
         return new DateTimeOffset(timestamp.Value, timestamp.GetTimeZoneOffset());
+    }
+
+    // Every read of a state column an out-of-band write can reach goes through here: a value outside the
+    // enum surfaces as the named violation, never as a cast that hands the caller an undefined JobState.
+    private static JobState ReadState(OracleDataReader reader, int ordinal)
+    {
+        var storedState = reader.GetInt32(ordinal);
+        if (!Enum.IsDefined((JobState)storedState))
+        {
+            throw Invariant.Halt(
+                InvariantTrigger.UndefinedEnumValueStored,
+                $"A stored column holds state {storedState}, which is not a defined JobState.");
+        }
+        return (JobState)storedState;
     }
 
     // The two LOB read helpers, and the only places the adapter pulls a LOB value across the wire. Both

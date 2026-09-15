@@ -23,7 +23,7 @@ public sealed class SqliteStatementSeamTests
     // The Microsoft.Data.Sqlite methods that actually run a statement. The adapter calling one of these
     // directly is work no budget can see.
     private static readonly Regex BareExecute = new(
-        @"\.(ExecuteNonQueryAsync|ExecuteReaderAsync|ExecuteScalarAsync)\s*\(",
+        @"\.(ExecuteNonQuery|ExecuteReader|ExecuteScalar|ExecuteDbDataReader)(?:Async)?\s*\(",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     // The only way past this gate, and deliberately a per-call-site one: a statement that belongs to no

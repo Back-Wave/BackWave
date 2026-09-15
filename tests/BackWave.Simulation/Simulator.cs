@@ -1503,7 +1503,17 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 break;
 
             case EventKind.Stop:
-                Stop(simEvent.Node);
+                // The stop is gated through the FaultPlan keyed by (node, scheduled time) - recorded as on
+                // (always true in generate, so it makes no draw and the battery is byte-identical) and
+                // removable by the minimizer, exactly as the isolation begin below is. The node and the
+                // instant were drawn up front on the stop stream, so a removed stop shifts nothing on it,
+                // and it is strictly calmer: the node simply never goes down. The restart downtime is drawn
+                // at apply time from the shared stream, the same shape the crash axis already has. Without
+                // this entry a failure caused by a stop minimizes to a Fault Map that never mentions it.
+                if (_faultPlan.Decide("stop", $"{simEvent.Node}:{_now:O}", true))
+                {
+                    Stop(simEvent.Node);
+                }
                 break;
 
             case EventKind.Restart:
@@ -2018,12 +2028,12 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
 
     /// <summary>
     /// Core-side coalescing: the Driver buffered terminal outcomes and flushes them as ONE
-    /// command. The harness vectorizes the singular report — per row a pre-state read, the
+    /// command. The harness vectorizes the singular report - per row a pre-state read, the
     /// per-(workerId, attempt) fence verdict, the Outcome-Provenance assertion, the slot-release detection,
     /// then Drive(OutcomeReported). Each row consults the per-node faulty store on the same "ReportOutcome"
     /// axis, so the store-fault stream is keyed exactly as it was per single report (the buffer adds no
     /// draws); a row that faults aborts the rest of the batch, and those leases lapse and reclaim
-    /// (At-Least-Once, the buffer-loss window modeled for free). The batch is applied synchronously — no new
+    /// (At-Least-Once, the buffer-loss window modeled for free). The batch is applied synchronously - no new
     /// SimEvent, so the determinism boundary is unchanged.
     ///
     /// Its own method because the clean-stop hand-back in <see cref="Stop"/> flushes through it too, exactly
@@ -2032,7 +2042,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     /// report path the sim would then be silently blessing.
     ///
     /// SabotageBatchFence self-test: model a native batch impl that fences single reports
-    /// correctly but applies a MULTI-row batch as a whole — without re-checking the (workerId, attempt) fence
+    /// correctly but applies a MULTI-row batch as a whole - without re-checking the (workerId, attempt) fence
     /// per row. Drop the fence for every row of a >1 batch so a stale row riding alongside live ones lands;
     /// the Outcome-Provenance oracle must catch it, proving the vectorized fence is enforced per row.
     /// Single-row batches stay fenced, so this is strictly the batched-path twin of SabotageOutcomeFence.
@@ -2787,6 +2797,13 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             // while isolated - it could not reach the store, so its Leases lapse and no bound applies. Crashes
             // do NOT disarm it: another node crashing has no bearing on whether this node handed its own Leases
             // back, which is the one place this oracle is wider than Migration-Liveness.
+            //
+            // The window is also bounded by the node's own Restart, which clears StoppedAt: a downtime draw
+            // shorter than RelinquishBound closes the window before the bound can elapse, so that stop never
+            // convicts. That is a reach limit, not a hole - the stops with a longer downtime, which is most of
+            // them, still carry the check. Holding the window open past the Restart is NOT sound: the restarted
+            // node keeps its "node-N" identity, so a job it legitimately claims after coming back would read as
+            // a Lease held past the bound, and the oracle would convict correct behaviour.
             if (options.StoreFaultProbability == 0
                 && !options.RadioactiveMode
                 && job is { State: JobState.Leased, LeaseOwner: { } stopOwner }
@@ -3391,6 +3408,14 @@ internal sealed class FenceDroppingStore(IJobStore inner) : IJobStore
         CancellationToken cancellationToken = default)
         => inner.ExpireLeasesAsync(now, maxJobs, queues, disposition, cancellationToken);
 
+    // Declared rather than inherited: the interface's default body answers zero without ever reaching the
+    // inner store, so a clean stop routed through this handle would hand nothing back and the sabotage
+    // would be testing the default body instead of the store it wraps.
+    public ValueTask<int> RelinquishLeasesAsync(
+        string workerId, DateTimeOffset now, RetryDisposition disposition,
+        CancellationToken cancellationToken = default)
+        => inner.RelinquishLeasesAsync(workerId, now, disposition, cancellationToken);
+
     public ValueTask<int> MintDueAsync(IReadOnlyList<MintDecision> decisions, CancellationToken cancellationToken = default)
         => inner.MintDueAsync(decisions, cancellationToken);
 
@@ -3469,6 +3494,12 @@ internal sealed class FenceDroppingStore(IJobStore inner) : IJobStore
 
     public ValueTask ReportObserverDeliveriesAsync(ObserverDeliveryReport report, CancellationToken cancellationToken = default)
         => inner.ReportObserverDeliveriesAsync(report, cancellationToken);
+
+    // Same reason as the relinquish above: the default body reports Unreported without reaching the inner
+    // store, so the caller would read a value this store never returned.
+    public ValueTask<ObserverReportOutcome> TryReportObserverDeliveriesAsync(
+        ObserverDeliveryReport report, CancellationToken cancellationToken = default)
+        => inner.TryReportObserverDeliveriesAsync(report, cancellationToken);
 
     public ValueTask<long> GetObserverCursorAsync(string observerId, CancellationToken cancellationToken = default)
         => inner.GetObserverCursorAsync(observerId, cancellationToken);

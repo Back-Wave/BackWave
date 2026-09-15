@@ -33,13 +33,20 @@ public class JobStateWireFormatTests
     {
         ["ix_backwave_jobs_claim"] = JobState.Scheduled,
         ["ix_backwave_jobs_leased_queue"] = JobState.Leased,
+        ["ix_backwave_jobs_lease_owner"] = JobState.Leased,
     };
 
-    // Postgres, SQL Server, and SQLite each carry both predicates; Oracle carries neither, because it has
-    // no partial index. Pinned so that dropping a predicate, or adding an adapter that needs one, is a
-    // deliberate edit here rather than a silent loss of coverage.
-    private const int GuardedPredicateCount = 6;
+    // Postgres, SQL Server, and SQLite each carry the claim and leased-queue predicates, SQL Server carries
+    // the lease-owner one as well, and Oracle carries none, because it has no partial index. Pinned so that
+    // dropping a predicate, or adding an adapter that needs one, is a deliberate edit here rather than a
+    // silent loss of coverage.
+    private const int GuardedPredicateCount = 7;
 
+    // The `-- States: 0 Scheduled, ...` gloss each schema carries above its jobs table, which is the one
+    // comment that has to spell the numbers out: it is the only documentation a DBA reading the canonical
+    // schema artifact gets for an int column. Matched only inside the gloss, so an unrelated enum's own
+    // ordinals are never read as JobState's.
+    private static readonly Regex OrdinalGloss = new(@"\b(\d+)\s+([A-Za-z]\w*)", RegexOptions.Compiled);
     private static readonly Regex StateLiteral = new(@"\bstate\s*=\s*(\d+)", RegexOptions.Compiled);
     private static readonly Regex IndexName = new(@"\bCREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
@@ -144,6 +151,74 @@ public class JobStateWireFormatTests
              literals are the one place the number is copied by hand. A predicate that filters on the wrong
              number costs no correctness - it costs the index: the claim path falls back to scanning the
              live table.
+             """);
+    }
+
+    [Fact]
+    public void EverySchemaOrdinalGloss_NamesTheStateItsNumberStillHas()
+    {
+        var offenders = new List<string>();
+        var source = SourceDirectory();
+
+        foreach (var file in SchemaFiles())
+        {
+            var lines = File.ReadAllLines(file);
+            var gloss = false;
+            for (var line = 0; line < lines.Length; line++)
+            {
+                var text = lines[line].TrimStart();
+                if (!text.StartsWith("--", StringComparison.Ordinal))
+                {
+                    gloss = false;
+                    continue;
+                }
+
+                if (text.Contains("States:", StringComparison.Ordinal))
+                {
+                    gloss = true;
+                }
+                else if (!gloss)
+                {
+                    continue;
+                }
+
+                var where = $"{Path.GetRelativePath(source, file)}:{line + 1}";
+                foreach (Match match in OrdinalGloss.Matches(text))
+                {
+                    var named = match.Groups[2].Value;
+                    var literal = int.Parse(match.Groups[1].Value);
+
+                    if (!PersistedValues.ContainsKey(named))
+                    {
+                        offenders.Add($"{where}: the states gloss reads '{match.Value}', but {named} is not a JobState member");
+                        continue;
+                    }
+
+                    var actual = (int)Enum.Parse<JobState>(named);
+                    if (literal != actual)
+                    {
+                        offenders.Add($"{where}: the states gloss reads '{match.Value}', but JobState.{named} is {actual}");
+                    }
+                }
+
+                // The gloss is one sentence, so it ends where that sentence does.
+                if (text.TrimEnd().EndsWith(".", StringComparison.Ordinal))
+                {
+                    gloss = false;
+                }
+            }
+        }
+
+        Assert.True(
+            offenders.Count == 0,
+            $"""
+             The states gloss in {offenders.Count} schema line(s) no longer agrees with JobState:
+
+             {string.Join(Environment.NewLine, offenders)}
+
+             The gloss is what a DBA reads to interpret the int column, and it is the only place a number
+             is written without the `state = N` form the predicate guard catches. Correct the gloss, or
+             drop the numbers from it and leave the names.
              """);
     }
 

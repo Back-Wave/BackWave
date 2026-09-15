@@ -13,6 +13,7 @@ namespace BackWave.Tests;
 /// carries the <see cref="InvariantTrigger"/> member NAME (never its ordinal, which is deliberately
 /// unpinned), and the action tag carries Halt or Degrade.
 /// </summary>
+[Collection(InvariantViolationCounterCollection.Name)]
 public class InvariantViolationMetricTests
 {
     /// <summary>
@@ -175,9 +176,10 @@ public class InvariantViolationMetricTests
         => new(delivery.Position, ObserverDeliveryDisposition.Delivered);
 
     /// <summary>
-    /// Subscribes to the violation counter. The instrument is process-global, so every test that reads it
-    /// lives in THIS class: xUnit runs a class's tests one at a time, which is what keeps one test's
-    /// deliberate violation out of another's measurements.
+    /// Subscribes to the violation counter. The instrument is process-global, so a reader sees every
+    /// violation the process raises, whoever raised it. Every test that reads it lives in THIS class,
+    /// and the classes that deliberately raise one share this class's xUnit collection, so no writer
+    /// ever runs while a listener is attached.
     /// </summary>
     private static MeterListener Listen(ConcurrentBag<(long Value, string? Trigger, string? Action)> measurements)
     {
@@ -203,4 +205,19 @@ public class InvariantViolationMetricTests
         listener.Start();
         return listener;
     }
+}
+
+/// <summary>
+/// The xUnit collection serializing the tests that READ the process-global
+/// <c>backwave.invariant.violations</c> counter against the ones that WRITE it. A MeterListener sees
+/// every measurement the process records, so a class that deliberately raises a violation - the
+/// in-memory run of the Conformance Suite drives the observer-report fence contradiction - would
+/// otherwise land its trigger in a listener attached by a class running beside it, and fail an
+/// assertion for a reason that is not a product bug. Any new test that raises a violation joins here.
+/// </summary>
+[CollectionDefinition(Name)]
+public sealed class InvariantViolationCounterCollection
+{
+    /// <summary>The collection name.</summary>
+    public const string Name = "BackWave invariant-violation counter";
 }

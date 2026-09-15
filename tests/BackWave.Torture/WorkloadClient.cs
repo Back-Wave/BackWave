@@ -315,9 +315,19 @@ internal sealed class WorkloadClient(
     {
         var peer = _rng.Next(options.Clients);
         var owner = $"torture-{keys.Seed:x8}-c{peer:D2}";
+        var t0 = Ticks();
+        // The request is journaled BEFORE the store call, as the requeue op does. A relinquish that
+        // COMMITS and then loses its reply reaches the client only as a fault entry, which names neither
+        // this owner nor this op, so the returns alone would leave a revoked owner its whole lease window
+        // and the audit would convict the next claimer of overlapping it. The request carries the owner
+        // and the call's real start - the catch blocks stamp a fresh Ticks() - and the return entry below
+        // is matched to it by client and that same start.
+        journal.Record(new JournalEntry
+        {
+            Client = _client, Op = Ops.RelinquishRequested, T0 = t0, T1 = t0, Detail = owner,
+        });
         return Call(Ops.Relinquish, async () =>
         {
-            var t0 = Ticks();
             var handedBack = await store.RelinquishLeasesAsync(owner, Now(), _disposition);
             return new JournalEntry
             {
@@ -474,7 +484,7 @@ internal sealed class WorkloadClient(
     /// <summary>
     /// Runs one store call, journaling its entry on success, a transient-fault entry on classified
     /// contention noise, a HaltTriggerFired entry on a production fail-stop trigger, and a
-    /// RawStoreException entry — a violation — on anything else. Raw provider exceptions escaping the
+    /// RawStoreException entry - a violation - on anything else. Raw provider exceptions escaping the
     /// store surface are exactly the 0194/0195 bug class.
     /// <para>
     /// <paramref name="jobId"/> names the one job the call acted on, when the op has one. A fault entry

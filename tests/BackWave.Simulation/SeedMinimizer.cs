@@ -14,7 +14,8 @@ namespace BackWave.Tests.Simulation;
 /// <para><b>Operator axis excluded.</b> Operator type/target draw from a shared <c>_opRng</c> at apply-time,
 /// so removing one operator entry shifts every later operator action (ADR 0018 ordinal-drift). Operator
 /// entries are never proposed for removal — they are carried through untouched and still replay from the
-/// map. Every other axis (store/crash/heartbeat/handler/ackloss/unroutable/isolation) is cleanly removable.</para>
+/// map. Every other axis (store/crash/heartbeat/handler/ackloss/unroutable/isolation/stop) is cleanly
+/// removable.</para>
 ///
 /// <para><b>Realized map persisted.</b> Replay routes through the Simulator's N−1 isolation budget guard, so
 /// an illegal requested fault is vetoed automatically; the minimizer persists the <i>realized</i> Fault Map

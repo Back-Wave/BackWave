@@ -100,7 +100,7 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
         ThrowIfFailing();
         if (ClaimInvariant is { } tripped)
         {
-            throw new InvariantViolationException(tripped, "forced named invariant violation on claim");
+            throw Invariant.Halt(tripped, "forced named invariant violation on claim");
         }
         if (PoisonedQueue is { } poisoned && request.Queues.Contains(poisoned))
         {
@@ -280,7 +280,7 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
         ThrowIfFailing();
         if (RelinquishInvariant is { } tripped)
         {
-            throw new InvariantViolationException(tripped, "forced named invariant violation on relinquish");
+            throw Invariant.Halt(tripped, "forced named invariant violation on relinquish");
         }
         if (FailRelinquish)
         {
@@ -396,6 +396,14 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
     public ValueTask ReportObserverDeliveriesAsync(
         ObserverDeliveryReport report, CancellationToken cancellationToken = default)
         => inner.ReportObserverDeliveriesAsync(report, cancellationToken);
+
+    // Declared, not inherited. TryReportObserverDeliveriesAsync is a default interface member, so a
+    // wrapper that leaves it out silently gets the default body - which calls the void twin and answers
+    // Unreported, a value no store returns - and the fence verdict the inner store produced never
+    // reaches the pump. Every new default member on IJobStore belongs here for the same reason.
+    public ValueTask<ObserverReportOutcome> TryReportObserverDeliveriesAsync(
+        ObserverDeliveryReport report, CancellationToken cancellationToken = default)
+        => inner.TryReportObserverDeliveriesAsync(report, cancellationToken);
 
     public ValueTask<long> GetObserverCursorAsync(string observerId, CancellationToken cancellationToken = default)
         => inner.GetObserverCursorAsync(observerId, cancellationToken);

@@ -108,11 +108,13 @@ internal sealed class JournalOracle
                     }
                     break;
 
-                case Ops.TransientFault or Ops.UnexpectedException when entry.Result == Ops.Requeue:
+                case Ops.TransientFault or Ops.UnexpectedException or Ops.InvariantViolation
+                    when AnswersRequeue(entry):
                     // A faulted requeue ANSWERS its request, and still grants a life: the store may have
                     // committed before the fault reached the client, and the client cannot tell which
                     // happened. Without the answer the request reads as in flight for the rest of the run,
-                    // which leaves the provenance check below widened long after the requeue resolved.
+                    // which leaves the provenance check below widened long after the requeue resolved. A
+                    // halt trigger ends the call the same way, so it answers the request the same way.
                     job.RequeueAnswers++;
                     job.RequeueLives++;
                     break;
@@ -235,7 +237,7 @@ internal sealed class JournalOracle
                         sink.Add(new TortureViolation(
                             TortureInvariant.OutcomeProvenance,
                             $"Job {jobId} attempt {outcome.Attempt} outcome APPLIED although attempt " +
-                            $"{attempt} had already been claimed before the report began — the fence let a stale " +
+                            $"{attempt} had already been claimed before the report began - the fence let a stale " +
                             "writer through.", jobId));
                         break;
                     }
@@ -249,6 +251,15 @@ internal sealed class JournalOracle
         }
         _dirtyJobs.Clear();
     }
+
+    /// <summary>
+    /// Whether a fault entry is the answer to a Requeue request. The transient and unexpected arms of the
+    /// client's call wrapper journal the op as the Result, but the halt arm needs the Result for the
+    /// trigger id, so it carries the op as its Detail prefix instead.
+    /// </summary>
+    private static bool AnswersRequeue(JournalEntry entry) => entry.Op == Ops.InvariantViolation
+        ? entry.Detail?.StartsWith($"{Ops.Requeue}: ", StringComparison.Ordinal) == true
+        : entry.Result == Ops.Requeue;
 
     private JobCounters Job(Guid jobId)
     {

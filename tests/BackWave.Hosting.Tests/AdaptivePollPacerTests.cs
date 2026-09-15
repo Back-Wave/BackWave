@@ -313,6 +313,12 @@ internal sealed class ClaimRecordingStore(IJobStore inner) : IJobStore
         ObserverDeliveryReport report, CancellationToken cancellationToken = default)
         => inner.ReportObserverDeliveriesAsync(report, cancellationToken);
 
+    // Forwarded as well as the void twin: without this override the interface default answers
+    // Unreported and flattens the inner store's fence verdict before the caller ever sees it.
+    public ValueTask<ObserverReportOutcome> TryReportObserverDeliveriesAsync(
+        ObserverDeliveryReport report, CancellationToken cancellationToken = default)
+        => inner.TryReportObserverDeliveriesAsync(report, cancellationToken);
+
     public ValueTask<long> GetObserverCursorAsync(string observerId, CancellationToken cancellationToken = default)
         => inner.GetObserverCursorAsync(observerId, cancellationToken);
 

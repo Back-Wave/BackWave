@@ -15,6 +15,9 @@ namespace BackWave.Sqlite.Tests;
 /// The Conformance Suite's cap clause interleaves the two recorders, so a batch re-prunes on the very
 /// next transition and hides an off-by-one in either skip. These pin each path on its own.
 /// </summary>
+// The prune assertions measure statements, so this class holds an Observe() scope and shares the
+// statement-count collection rather than running beside one that depends on no scope being open.
+[Collection(SqliteStatementBudgetTests.StatementCounts)]
 public sealed class SqliteTransitionPruneTests
 {
     private static readonly DateTimeOffset T0 = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);

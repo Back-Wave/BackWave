@@ -76,6 +76,16 @@ public abstract class ConformanceSuite
     /// </summary>
     protected virtual bool ComputesNextDue => true;
 
+    /// <summary>
+    /// Whether the store under test implements the optional hand-back
+    /// <see cref="IJobStore.RelinquishLeasesAsync"/>. The contract permits an adapter to omit it and keep
+    /// the interface default (clause 5.5.1, "optional, and safe to omit"); such a store sets this to
+    /// <see langword="false"/>, and the hand-back clauses then certify only the documented default -
+    /// nothing relinquished, zero returned, every lease left for the expiry sweep to dispose. Defaults to
+    /// <see langword="true"/>, since every first-party adapter hands its leases back.
+    /// </summary>
+    protected virtual bool RelinquishesLeases => true;
+
     private static NewJob Job(string wireName = "conformance-job", string queue = "default", DateTimeOffset? dueTime = null)
         => new(Guid.NewGuid(), wireName, "{}"u8.ToArray(), queue, dueTime ?? T0);
 
@@ -1360,6 +1370,22 @@ public abstract class ConformanceSuite
 
     // ── §5.5.1 RelinquishLeases ───────────────────────────────────────────────────
 
+    // The documented default for a store that declares it omits the optional hand-back: the call
+    // relinquishes nothing, returns zero, and leaves every lease exactly as it found it, so the §5.5
+    // sweep still disposes them and no job is lost. Asserted rather than skipped, so an omitting store
+    // is certified for what the contract promises on its behalf instead of passing on silence.
+    private static async Task AssertRelinquishIsANoOpAsync(
+        IJobStore store, DateTimeOffset handBack, RetryDisposition disposition, params Guid[] stillLeased)
+    {
+        Assert.Equal(0, await store.RelinquishLeasesAsync("w1", handBack, disposition));
+        foreach (var jobId in stillLeased)
+        {
+            var held = await store.GetJobAsync(jobId);
+            Assert.Equal(JobState.Leased, held!.State);
+            Assert.Equal("w1", held.LeaseOwner);
+        }
+    }
+
     /// <summary>
     /// Certifies that a worker giving its leases back returns each job to Scheduled at that instant - no
     /// retry backoff, because a clean stop is not a failure - while leaving the attempt the claim
@@ -1373,6 +1399,11 @@ public abstract class ConformanceSuite
         var claimed = Assert.Single(await ClaimAsync(store, T0)); // attempt 1 of 2
 
         var handBack = T0.AddSeconds(5);
+        if (!RelinquishesLeases)
+        {
+            await AssertRelinquishIsANoOpAsync(store, handBack, TwoAttempts, claimed.JobId);
+            return;
+        }
         Assert.Equal(1, await store.RelinquishLeasesAsync("w1", handBack, TwoAttempts));
 
         var job = await store.GetJobAsync(claimed.JobId);
@@ -1413,6 +1444,11 @@ public abstract class ConformanceSuite
         await store.ReportOutcomeAsync(settled.JobId, "w1", 1, new JobOutcome.Success(), T0);
 
         var handBack = T0.AddSeconds(5);
+        if (!RelinquishesLeases)
+        {
+            await AssertRelinquishIsANoOpAsync(store, handBack, TwoAttempts, mine.JobId);
+            return;
+        }
         Assert.Equal(1, await store.RelinquishLeasesAsync("w1", handBack, TwoAttempts));
 
         Assert.Equal(JobState.Scheduled, (await store.GetJobAsync(mine.JobId))!.State);
@@ -1441,6 +1477,13 @@ public abstract class ConformanceSuite
 
         var handBack = T0.AddSeconds(5);
         var deadLetterAtOnce = new RetryPolicy { MaxAttempts = 1 }.ToDisposition();
+        if (!RelinquishesLeases)
+        {
+            await AssertRelinquishIsANoOpAsync(store, handBack, deadLetterAtOnce, parent.JobId);
+            // The latch is untouched too: nothing dead-lettered, so nothing cascades to the child.
+            Assert.Equal(JobState.AwaitingParent, (await store.GetJobAsync(child.JobId))!.State);
+            return;
+        }
         Assert.Equal(1, await store.RelinquishLeasesAsync("w1", handBack, deadLetterAtOnce));
 
         var dead = await store.GetJobAsync(parent.JobId);
@@ -1476,6 +1519,12 @@ public abstract class ConformanceSuite
         Assert.Equal(2, (await store.ClaimAsync(new ClaimRequest("w1", ["fresh"], 32, Lease, reclaim))).Count);
 
         var handBack = reclaim.AddSeconds(5);
+        if (!RelinquishesLeases)
+        {
+            await AssertRelinquishIsANoOpAsync(
+                store, handBack, TwoAttempts, [.. atCeiling.Concat(fresh).Select(j => j.JobId)]);
+            return;
+        }
         Assert.Equal(4, await store.RelinquishLeasesAsync("w1", handBack, TwoAttempts));
 
         foreach (var job in fresh)
@@ -2118,7 +2167,7 @@ public abstract class ConformanceSuite
     /// example, an in-memory store with no transaction to abort and no separate connection to read
     /// torn state from — and those tests return early.
     /// </summary>
-    /// <param name="failpoint">The failpoint to arm: "claim", "enqueue", "report-outcome", "mint-due", or "lease-expiry".</param>
+    /// <param name="failpoint">The failpoint to arm: "claim", "enqueue", "report-outcome", "mint-due", "lease-expiry", or "lease-relinquish".</param>
     /// <returns>The fault-armed store over this test's database, or null when interruption is not simulable on this store.</returns>
     protected virtual ValueTask<IJobStore?> CreateFaultArmedStoreAsync(string failpoint)
         => new((IJobStore?)null);
@@ -2527,6 +2576,56 @@ public abstract class ConformanceSuite
         Assert.Equal(1, await store.ExpireLeasesAsync(afterExpiry, maxJobs: 32, DefaultQueues, deadLetterAtOnce));
         Assert.Equal(JobState.DeadLettered, (await store.GetJobAsync(parent.JobId))!.State);
         Assert.Equal(JobState.Scheduled, (await store.GetJobAsync(child.JobId))!.State);
+    }
+
+    /// <summary>
+    /// Certifies that a hand-back interrupted before the child-latch cascade rolls back whole: the
+    /// worker keeps every lease it held and the child stays latched until a clean hand-back disposes
+    /// both atomically. The hand-back opens the same torn-write window the expiry sweep does, so it
+    /// carries the same guarantee.
+    /// </summary>
+    [Fact]
+    public async Task Clause_4_Relinquish_CrashBeforeLatchCascade_LeavesLeaseAndLatchIntact()
+    {
+        var armed = await CreateFaultArmedStoreAsync("lease-relinquish");
+        if (armed is null)
+        {
+            return;
+        }
+        var store = await CreateStoreAsync();
+        var parent = Job();
+        await store.EnqueueAsync(parent, now: T0);
+        var child = Job() with { Parents = [parent.JobId] };
+        await store.EnqueueAsync(child, now: T0);
+        Assert.Single(await ClaimAsync(store, T0)); // attempt 1 of 1: already at the ceiling
+
+        var handBack = T0.AddSeconds(5);
+        var deadLetterAtOnce = new RetryPolicy { MaxAttempts = 1 }.ToDisposition();
+        if (!RelinquishesLeases)
+        {
+            await AssertRelinquishIsANoOpAsync(store, handBack, deadLetterAtOnce, parent.JobId);
+            // The latch is untouched too: nothing dead-lettered, so nothing cascades to the child.
+            Assert.Equal(JobState.AwaitingParent, (await store.GetJobAsync(child.JobId))!.State);
+            return;
+        }
+
+        await Assert.ThrowsAsync<FaultInjectedException>(async () =>
+            await armed.RelinquishLeasesAsync("w1", handBack, deadLetterAtOnce));
+
+        // Dead-letter write and latch cascade are one transaction: the worker still holds the lease it
+        // held and the child still awaits - never a dead-lettered parent over an unresolved child latch
+        // (invariant I2).
+        var held = await store.GetJobAsync(parent.JobId);
+        Assert.Equal(JobState.Leased, held!.State);
+        Assert.Equal("w1", held.LeaseOwner);
+        var stillWaiting = await store.GetJobAsync(child.JobId);
+        Assert.Equal(JobState.AwaitingParent, stillWaiting!.State);
+        Assert.Equal(1, stillWaiting.ParentsRemaining);
+
+        // A clean hand-back dead-letters the parent and cancels the on-success child atomically.
+        Assert.Equal(1, await store.RelinquishLeasesAsync("w1", handBack, deadLetterAtOnce));
+        Assert.Equal(JobState.DeadLettered, (await store.GetJobAsync(parent.JobId))!.State);
+        Assert.Equal(JobState.Cancelled, (await store.GetJobAsync(child.JobId))!.State);
     }
 
     // ── §5.8 Operator Actions (Requeue, Pause/Resume, TriggerScheduleNow, audit) ──
@@ -3180,6 +3279,13 @@ public abstract class ConformanceSuite
         var claimed = Assert.Single(await ClaimAsync(store, T0)); // attempt 1 of 2
 
         var handBack = T0.AddSeconds(5);
+        if (!RelinquishesLeases)
+        {
+            await AssertRelinquishIsANoOpAsync(store, handBack, TwoAttempts, claimed.JobId);
+            // Nothing happened, so nothing is appended: the log still ends at the claim's Leased entry.
+            Assert.Equal(JobState.Leased, (await store.GetJobHistoryAsync(claimed.JobId))[^1].State);
+            return;
+        }
         await store.RelinquishLeasesAsync("w1", handBack, TwoAttempts);
         var ready = (await store.GetJobHistoryAsync(claimed.JobId))[^1];
         Assert.Equal(JobState.Scheduled, ready.State); // the resulting state, not a 'relinquished' one
@@ -4080,12 +4186,19 @@ public abstract class ConformanceSuite
         var store = await CreateStoreAsync();
         await SucceedAsync(store, T0);
 
-        // An observer with no row cannot resolve anything, and says so.
-        Assert.Equal(
-            ObserverReportOutcome.UnknownObserver,
-            await store.TryReportObserverDeliveriesAsync(
-                new ObserverDeliveryReport(
-                    "never-claimed", "node-a", [new ObserverDeliveryOutcome(0, ObserverDeliveryDisposition.Delivered)], T0)));
+        // An observer with no row cannot resolve anything, and says so. A store that predates the outcome
+        // channel keeps the interface default and answers Unreported instead, which the clause allows: it
+        // still refuses the write, it just cannot name the refusal, so the clause certifies the no-op and
+        // stops rather than failing a store the contract calls conformant.
+        var unknown = await store.TryReportObserverDeliveriesAsync(
+            new ObserverDeliveryReport(
+                "never-claimed", "node-a", [new ObserverDeliveryOutcome(0, ObserverDeliveryDisposition.Delivered)], T0));
+        if (unknown == ObserverReportOutcome.Unreported)
+        {
+            Assert.Equal(-1, await store.GetObserverCursorAsync("never-claimed"));
+            return;
+        }
+        Assert.Equal(ObserverReportOutcome.UnknownObserver, unknown);
 
         var claim = await ClaimObsAsync(store, "obs", [JobState.Succeeded], T0, worker: "node-a");
         var delivery = Assert.Single(claim.Deliveries);
@@ -4115,8 +4228,9 @@ public abstract class ConformanceSuite
     /// adapter writes and no adapter case used to enter. A report carries the expiry its own claim granted
     /// it, so the store can tell a stale survivor of a lapsed lease from a worker that still believed the
     /// lease was its own. Both are refused and both leave the cursor alone; only the second is a
-    /// contradiction, and the counting rule for it is pinned in the Core suite, where the process-global
-    /// violation counter can be read without a neighboring test writing to it.
+    /// contradiction, and the counting rule for it is pinned in the Core suite, whose reader shares an
+    /// xUnit collection with the in-memory run of this suite so that nothing writes the process-global
+    /// violation counter while it is being read.
     /// </summary>
     [Fact]
     public async Task Clause_5_13_ReportObserverDeliveries_RefusesAReportTheReporterBelievedWasLive()
@@ -4129,16 +4243,21 @@ public abstract class ConformanceSuite
 
         // The contradiction: node-b never held this claim, yet reports while believing its own lease on it
         // runs a full minute out. node-a's lease is still live, so two workers believed they held one claim.
-        Assert.Equal(
-            ObserverReportOutcome.FenceRejected,
-            await store.TryReportObserverDeliveriesAsync(
-                new ObserverDeliveryReport(
-                    "obs", "node-b", [new ObserverDeliveryOutcome(delivery.Position, ObserverDeliveryDisposition.Delivered)],
-                    T0 + TimeSpan.FromSeconds(1))
-                {
-                    BelievedLeaseExpiry = T0 + Lease,
-                }));
+        var contradicted = await store.TryReportObserverDeliveriesAsync(
+            new ObserverDeliveryReport(
+                "obs", "node-b", [new ObserverDeliveryOutcome(delivery.Position, ObserverDeliveryDisposition.Delivered)],
+                T0 + TimeSpan.FromSeconds(1))
+            {
+                BelievedLeaseExpiry = T0 + Lease,
+            });
         Assert.Equal(-1, await store.GetObserverCursorAsync("obs"));
+        if (contradicted == ObserverReportOutcome.Unreported)
+        {
+            // A store predating the outcome channel refuses both reports all the same - the cursor above
+            // proves it - and simply has no way to name which refusal this was.
+            return;
+        }
+        Assert.Equal(ObserverReportOutcome.FenceRejected, contradicted);
 
         // The ordinary lapse, after a peer already reclaimed: the ROW now carries node-b's future expiry,
         // but node-a says it knew its own lease was gone. Refused all the same, and nothing is contradicted.

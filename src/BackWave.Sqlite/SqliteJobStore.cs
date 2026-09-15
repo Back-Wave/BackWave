@@ -445,7 +445,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 leased.Parameters.AddWithValue("$queue", queue);
                 if (await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not long inUse)
                 {
-                    throw new InvariantViolationException(
+                    throw Invariant.Halt(
                         InvariantTrigger.LeasedCountAggregateNull,
                         $"The leased-count aggregate for queue '{queue}' returned no value; COUNT(*) always returns one.");
                 }
@@ -484,7 +484,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                     var job = ReadJob(reader);
                     if (job.State != JobState.Leased || !string.Equals(job.LeaseOwner, request.WorkerId, StringComparison.Ordinal))
                     {
-                        throw new InvariantViolationException(
+                        throw Invariant.Halt(
                             InvariantTrigger.ClaimedRowNotLeasedToWorker,
                             $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
                     }
@@ -864,7 +864,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                     await using var reader = await child.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     {
-                        throw new InvariantViolationException(
+                        throw Invariant.Halt(
                             InvariantTrigger.DanglingGatingEdge,
                             $"Gating edge {currentParent} -> {childId} named a child job row that does not exist; the job_parents foreign key forbids it.");
                     }
@@ -891,7 +891,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                     var cancelled = await cancel.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                     if (cancelled != 1)
                     {
-                        throw new InvariantViolationException(
+                        throw Invariant.Halt(
                             InvariantTrigger.UnexpectedAffectedRowCount,
                             $"Cancelling gated child {childId} affected {cancelled} rows; this writer holds the database exclusively, so exactly 1 is the only possible count.");
                     }
@@ -918,7 +918,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 var resolved = await resolve.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
                 if (resolved != 1)
                 {
-                    throw new InvariantViolationException(
+                    throw Invariant.Halt(
                         InvariantTrigger.UnexpectedAffectedRowCount,
                         $"Resolving the latch on gated child {childId} affected {resolved} rows; this writer holds the database exclusively, so exactly 1 is the only possible count.");
                 }
@@ -1227,6 +1227,10 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             deadLetter.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
             deadLetter.Parameters.AddWithValue("$rows", JsonSerializer.Serialize(deadLettered));
             await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+
+            // Crash after the dead-letter write, before the latch cascade: rollback must leave the worker
+            // holding every lease it started with and every child latch un-resolved (invariant I2).
+            await FailpointAsync("lease-relinquish", cancellationToken).ConfigureAwait(false);
 
             foreach (var row in deadLettered)
             {
@@ -1927,7 +1931,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             transitions.Add(new JobTransition(
                 reader.GetInt64(0),
                 SqliteValueCodec.FromTicks(reader.GetInt64(1)),
-                (JobState)reader.GetInt32(2),
+                SqliteValueCodec.ToEnum<JobState>(reader.GetInt32(2)),
                 reader.GetInt32(3),
                 reader.IsDBNull(4) ? null : reader.GetString(4)));
         }
@@ -1983,7 +1987,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             counts.Add(new QueueStateCount(
-                reader.GetString(0), (JobState)reader.GetInt32(1), (int)reader.GetInt64(2)));
+                reader.GetString(0), SqliteValueCodec.ToEnum<JobState>(reader.GetInt32(1)), (int)reader.GetInt64(2)));
         }
         return counts;
     }
@@ -2413,7 +2417,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 .ConfigureAwait(false);
             if (applied != EnqueueResult.Ok) // always-on assertion: validated above
             {
-                throw new InvariantViolationException(
+                throw Invariant.Halt(
                     InvariantTrigger.WorkflowMemberEnqueueRejected,
                     $"Workflow enqueue rejected member {member.JobId} with {applied} inside the transaction that had already validated it.");
             }
@@ -2522,7 +2526,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             // member ahead of its own parent and had the insert refused a few lines below - naming the
             // member as the problem rather than the cycle that is the actual cause. Raise here, at the
             // only point that can still tell the two apart, and before any row is written.
-            throw new InvariantViolationException(
+            throw Invariant.Halt(
                 InvariantTrigger.WorkflowMemberCycle,
                 $"A workflow of {members.Count} member(s) ordered only {ordered.Count} of them, " +
                 "so its in-batch dependency edges hold a cycle.");
@@ -2546,7 +2550,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             {
                 var wf = SqliteValueCodec.ToGuid(reader.GetString(0));
                 (statesByWorkflow.TryGetValue(wf, out var list) ? list : statesByWorkflow[wf] = [])
-                    .Add((JobState)reader.GetInt32(1));
+                    .Add(SqliteValueCodec.ToEnum<JobState>(reader.GetInt32(1)));
             }
         }
 
@@ -2672,9 +2676,16 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             await using var reader = await locked.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
-                throw new InvariantViolationException(
-                    InvariantTrigger.GuaranteedRowAbsent,
+                // Degrade, not Halt. The only caller of this path is the observer dispatch pump, which is
+                // fail-soft on purpose: it catches every exception without reading a trigger, logs it, and
+                // re-polls. A throw here therefore stops nothing and comes back every poll with the write
+                // aborted, which is worse than the benign branch. Counting it keeps the signal without the
+                // loop; arming it is a decision for whoever gives that pump a channel to fail-stop on.
+                // The action belongs to that caller, not to the store, so all four adapters degrade here.
+                Invariant.Degrade(
+                    _logger, InvariantTrigger.GuaranteedRowAbsent,
                     $"Observer '{request.ObserverId}' has no row immediately after this transaction ensured one.");
+                return ObserverClaim.None(request.ObserverId);
             }
             cursor = reader.GetInt64(0);
             leaseOwner = reader.IsDBNull(1) ? null : reader.GetString(1);
@@ -2745,7 +2756,8 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 var priorAttempt = reader.IsDBNull(9) ? 0 : reader.GetInt32(9);
                 candidates.Add(new ObserverClaimedDelivery(
                     reader.GetInt64(0), SqliteValueCodec.ToGuid(reader.GetString(1)), reader.GetInt64(2),
-                    reader.GetString(3), reader.GetString(4), (JobState)reader.GetInt32(5), reader.GetInt32(6),
+                    reader.GetString(3), reader.GetString(4),
+                    SqliteValueCodec.ToEnum<JobState>(reader.GetInt32(5)), reader.GetInt32(6),
                     SqliteValueCodec.FromTicks(reader.GetInt64(7)),
                     reader.IsDBNull(8) ? null : reader.GetString(8), priorAttempt + 1));
             }
@@ -2931,10 +2943,14 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             newCursor = result is DBNull or null ? null : (long)result;
         }
 
+        // Counted, not thrown: this runs under the fail-soft observer pump, which catches without a
+        // trigger, so a throw would only abort the report's write and return on the next poll. The
+        // branch below already holds the cursor where it is, which is the safe outcome either way.
+        // The action belongs to that caller, not to the store, so all four adapters degrade here.
         if (newCursor is { } regressed && regressed < cursor)
         {
-            throw new InvariantViolationException(
-                InvariantTrigger.ObserverCursorRegressed,
+            Invariant.Degrade(
+                _logger, InvariantTrigger.ObserverCursorRegressed,
                 $"Observer '{observerId}' would move its cursor from {cursor} back to {regressed}; the advance selects MAX(position) strictly greater than the cursor.");
         }
         if (newCursor is not { } target || target <= cursor)
@@ -2981,8 +2997,11 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             var moved = await move.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
             if (moved != 1)
             {
-                throw new InvariantViolationException(
-                    InvariantTrigger.UnexpectedAffectedRowCount,
+                // Counted, not thrown, for the same reason the regression check above is: the fail-soft
+                // observer pump swallows the throw and re-polls, so the only effect would be to abort
+                // this report's write once per poll.
+                Invariant.Degrade(
+                    _logger, InvariantTrigger.UnexpectedAffectedRowCount,
                     $"Moving the cursor of observer '{observerId}' affected {moved} rows; this writer holds the database exclusively, so exactly 1 is the only possible count.");
             }
         }
@@ -3040,9 +3059,14 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            throw new InvariantViolationException(
-                InvariantTrigger.GuaranteedRowAbsent,
+            // Degrade, not Halt. This is a Monitor read, reached from the dashboard and the MCP tools
+            // rather than from any pump, so a throw here fail-stops nothing and surfaces as a failed
+            // request. The reply is the same one the aggregate gives for an observer with no row.
+            // The action belongs to that caller, not to the store, so all four adapters degrade here.
+            Invariant.Degrade(
+                _logger, InvariantTrigger.GuaranteedRowAbsent,
                 $"The lag aggregate for observer '{request.ObserverId}' returned no row; an ungrouped aggregate always returns exactly one.");
+            return new ObserverLag(-1, 0, null);
         }
         var oldest = reader.IsDBNull(2) ? (DateTimeOffset?)null : SqliteValueCodec.FromTicks(reader.GetInt64(2));
         return new ObserverLag(reader.GetInt64(0), (int)reader.GetInt64(1), oldest);
@@ -3069,7 +3093,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         {
             records.Add(new ObserverDeadLetterRecord(
                 reader.GetInt64(0), SqliteValueCodec.ToGuid(reader.GetString(1)), reader.GetInt64(2),
-                (JobState)reader.GetInt32(3), reader.GetInt32(4), reader.GetInt32(5),
+                SqliteValueCodec.ToEnum<JobState>(reader.GetInt32(3)), reader.GetInt32(4), reader.GetInt32(5),
                 SqliteValueCodec.FromTicks(reader.GetInt64(6))));
         }
         return records;

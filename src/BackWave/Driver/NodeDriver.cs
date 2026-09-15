@@ -111,7 +111,7 @@ internal sealed class NodeDriver(NodeOptions options)
                 // was held for. (A completion with no reservation in hand carries no bound to check.)
                 if (ReleaseClaim() is { } bound && claim.Jobs.Count > bound)
                 {
-                    throw new InvariantViolationException(
+                    throw Invariant.Halt(
                         InvariantTrigger.ClaimBatchOverrun,
                         $"A claim bounded at {bound} job(s) returned {claim.Jobs.Count}.");
                 }

@@ -13,6 +13,12 @@ namespace BackWave.Diagnostics;
 /// failure-detail text a failing attempt persists to its transition log, so the id lives only in
 /// places a rename is visible in: <see cref="Trigger"/>, the halt log's <c>invariant_trigger</c>
 /// parameter, and the <c>backwave.invariant.trigger</c> metric tag.
+/// <para>
+/// Constructing one counts nothing; raising one counts once. Every check site inside BackWave raises
+/// through a single internal helper that records <c>backwave.invariant.violations</c> before the throw,
+/// so building this type without raising it - to inspect one, or to describe a halt that already
+/// happened - leaves that counter alone.
+/// </para>
 /// </remarks>
 public sealed class InvariantViolationException : Exception
 {

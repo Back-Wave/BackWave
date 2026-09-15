@@ -25,15 +25,24 @@ internal static class TortureRun
         try
         {
             await target.InitializeAsync(CancellationToken.None);
+            var setup = target.CreateStore();
+            await setup.SetConcurrencyLimitAsync(keys.GovernedQueue, options.GovernedLimit, "torture-setup", DateTimeOffset.UtcNow);
         }
         catch (InvalidOperationException exception)
         {
             Console.Error.WriteLine($"torture: {exception.Message}");
             return 2;
         }
-
-        var setup = target.CreateStore();
-        await setup.SetConcurrencyLimitAsync(keys.GovernedQueue, options.GovernedLimit, "torture-setup", DateTimeOffset.UtcNow);
+        catch (InvariantViolationException violation)
+        {
+            // The migration and the limit write drive the same adapter the clients will, so they can trip
+            // the same production fail-stop triggers. There is no journal and no bundle yet, so the run
+            // reports RED naming the trigger here instead of dying to an unexplained stack trace.
+            Console.Error.WriteLine(
+                $"torture: RED - halt trigger {violation.Trigger} fired during setup - a production worker " +
+                $"group would have fail-stopped: {violation.Message}");
+            return 1;
+        }
 
         var started = DateTimeOffset.UtcNow;
         var journal = new Journal();
@@ -48,7 +57,12 @@ internal static class TortureRun
         using var timebox = new CancellationTokenSource(options.Duration);
         var midRunViolations = new ViolationSink(TorturePhase.Workload);
         var midRun = new MidRunAudit(target, journal, keys, options, midRunViolations);
-        Console.WriteLine($"torture: mid-run audit every {midRun.Interval.TotalSeconds:F0}s");
+        Console.WriteLine(
+            $"torture: mid-run audit every {midRun.Interval.TotalSeconds:F0}s" +
+            (midRun.JournalHalfLive
+                ? ""
+                : " - store rows only: the child journals reach this process at exit, so the journal-only " +
+                  "checks run post-drain and not mid-run on this adapter"));
         var midRunLoop = midRun.RunAsync(timebox);
 
         if (options.Adapter == TortureAdapter.SqliteMultiProcess)
@@ -88,7 +102,8 @@ internal static class TortureRun
         var midRunPercent = workloadSeconds > 0 ? midRun.Cost.TotalSeconds / workloadSeconds * 100 : 0;
         Console.WriteLine(
             $"torture: mid-run audit - {midRun.Passes} pass(es), {midRun.TransitionsWalked} transition(s) walked, " +
-            $"{midRun.Skips} skip(s), {midRun.Cost.TotalSeconds:F2}s ({midRunPercent:F2}% of wall)");
+            $"{midRun.Skips} skip(s), {midRun.Cost.TotalSeconds:F2}s ({midRunPercent:F2}% of wall)" +
+            (midRun.JournalHalfLive ? "" : ", store rows only"));
 
         var violations = new List<TortureViolation>(midRunViolations.Snapshot());
         Auditor? auditor = null;
@@ -102,7 +117,7 @@ internal static class TortureRun
         }
         else
         {
-            Console.WriteLine($"torture: workload done — {entries.Count} journal entries; draining (bound {options.DrainBound.TotalSeconds:F0}s)…");
+            Console.WriteLine($"torture: workload done - {entries.Count} journal entries; draining (bound {options.DrainBound.TotalSeconds:F0}s)…");
             var drainViolations = new ViolationSink(TorturePhase.Drain);
             var postDrain = new ViolationSink(TorturePhase.PostDrain);
             // The drainer and the auditor drive the same adapter the clients did, so they can trip the
@@ -128,6 +143,15 @@ internal static class TortureRun
                     TortureInvariant.HaltTriggerFired,
                     $"Halt trigger {violation.Trigger} fired during the drain/audit - a production worker group " +
                     $"would have fail-stopped: {violation.Message}"));
+            }
+            catch (Exception exception)
+            {
+                // The drainer and the auditor classify the transient faults they expect, so anything reaching
+                // here escaped the store surface. Caught for the same reason the mid-run loop's twin above is:
+                // everything below writes the artifact bundle, and a run that dies here reports nothing at all.
+                postDrain.Add(new TortureViolation(
+                    TortureInvariant.RawStoreException,
+                    $"The drain/audit ended on {exception.GetType().FullName}: {exception.Message}"));
             }
 
             violations.AddRange(drainViolations.Snapshot());

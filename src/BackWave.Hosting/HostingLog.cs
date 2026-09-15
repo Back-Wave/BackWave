@@ -26,6 +26,9 @@ internal static partial class HostingLog
 
     // The Degrade counterpart of 2001, at group altitude: a named check tripped, the site took its
     // benign branch, and the group keeps claiming and executing. Warning, not Critical - nothing stopped.
+    // "Degraded" here is the invariant sense and NOT BackWaveHealth's: that one means a transient store
+    // fault, it is reported only from the pump's transient catch, and it is what turns the health probe
+    // amber. This log never touches the probe, so a group that emits 2003 still reads Healthy.
     [LoggerMessage(EventId = 2003, Level = LogLevel.Warning,
         Message = "BackWave Worker Group '{worker_group}' tripped invariant '{invariant_trigger}': {detail}. "
             + "The group keeps running, degraded.")]

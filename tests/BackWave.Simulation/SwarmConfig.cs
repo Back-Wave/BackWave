@@ -206,7 +206,11 @@ internal static class SwarmConfig
         // single-Queue, unbounded-pool shape. NodeCount is 3 and the N-1 budget refuses the stop that would take
         // the last live node, so a band wider than 3 would mostly draw refusals; 0 stays inside the band, so a
         // share of runs still holds the untouched path.
-        var stops = topologyQueues == 0 && !poolBounded ? rng.Next(4) : 0; // 0..3 clean stops
+        // Drawn unconditionally and gated on the result, the same shape as the schedule coin above: the draw is
+        // last in this method today, but a value-only gate keeps the stream position stable if another draw is
+        // ever appended after it.
+        var stopDraw = rng.Next(SwarmEnvelope.StopMax + 1); // 0..3 clean stops
+        var stops = topologyQueues == 0 && !poolBounded ? stopDraw : 0;
 
         return new SimulationOptions
         {
@@ -314,6 +318,15 @@ internal static class SwarmConfig
             // Disarms ONLY the bound-dependent liveness oracles (DrainLiveness, ExecuteLiveness); every safety
             // oracle stays armed. See SimulationOptions.RadioactiveMode.
             RadioactiveMode = true,
+
+            // Clean stops, always on like every other radioactive axis: without this the relinquish/hand-back
+            // path is the one axis the maximal-chaos regime never reaches. 1..3, because NodeCount is 3 and the
+            // N-1 budget refuses the stop that would take the last live node. Written LAST so its draw lands
+            // after every pre-existing one and each seed's other axes stay byte-identical; the stop instants
+            // themselves come off the simulator's dedicated stop stream, so nothing else shifts either. The
+            // Restart-Reclaim bound is already disarmed by RadioactiveMode, so the stops here exercise the
+            // hand-back under maxed faults without arming a bound this regime cannot hold.
+            StopCount = 1 + rng.Next(SwarmEnvelope.StopMax),
         };
     }
 

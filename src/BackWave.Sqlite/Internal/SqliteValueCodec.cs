@@ -38,7 +38,7 @@ internal static class SqliteValueCodec
         var decoded = (TEnum)Enum.ToObject(typeof(TEnum), value);
         if (!Enum.IsDefined(decoded))
         {
-            throw new InvariantViolationException(
+            throw Invariant.Halt(
                 InvariantTrigger.UndefinedEnumValueStored,
                 $"A stored column holds {value}, which is not a defined {typeof(TEnum).Name}.");
         }

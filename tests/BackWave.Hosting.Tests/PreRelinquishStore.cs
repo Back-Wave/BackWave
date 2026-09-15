@@ -142,6 +142,14 @@ public sealed class PreRelinquishStore(IJobStore inner) : IJobStore
         ObserverDeliveryReport report, CancellationToken cancellationToken = default)
         => inner.ReportObserverDeliveriesAsync(report, cancellationToken);
 
+    // Declared, not inherited. TryReportObserverDeliveriesAsync is a default interface member, so a
+    // wrapper that leaves it out silently gets the default body - which calls the void twin and answers
+    // Unreported, a value no store returns - and the fence verdict the inner store produced never
+    // reaches the pump. Every new default member on IJobStore belongs here for the same reason.
+    public ValueTask<ObserverReportOutcome> TryReportObserverDeliveriesAsync(
+        ObserverDeliveryReport report, CancellationToken cancellationToken = default)
+        => inner.TryReportObserverDeliveriesAsync(report, cancellationToken);
+
     public ValueTask<long> GetObserverCursorAsync(string observerId, CancellationToken cancellationToken = default)
         => inner.GetObserverCursorAsync(observerId, cancellationToken);
 
