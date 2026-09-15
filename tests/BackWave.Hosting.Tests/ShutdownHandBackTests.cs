@@ -248,6 +248,29 @@ public class ShutdownHandBackTests
     }
 
     [Fact]
+    public async Task TheDrainWarning_CountsOnlyTheHandlersStillRunning_NotEveryOneItWaitedOn()
+    {
+        // Two handlers were in flight when the stop began. One returns inside the budget, one outlasts
+        // it. The warning names the one still running, not the two the drain set out to wait for.
+        var store = new FaultableStore(new InMemoryJobStore());
+        var gate = new StubbornGate { Hold = TimeSpan.FromSeconds(2) };
+        gate.HoldByName["returns-fast"] = TimeSpan.FromMilliseconds(50);
+        var logs = new CapturingLoggerProvider();
+        await using var app = BuildStubbornHost(store, gate, logs, shutdownBudget: TimeSpan.FromMilliseconds(500));
+        await app.StartAsync();
+
+        var client = app.Services.GetRequiredService<BackWaveClient>();
+        await client.EnqueueAsync(new PingJob("never-returns"), dueTime: DateTimeOffset.UtcNow);
+        await client.EnqueueAsync(new PingJob("returns-fast"), dueTime: DateTimeOffset.UtcNow);
+        await gate.AllStarted(2).WaitAsync(TestTimeout);
+
+        await app.StopAsync().WaitAsync(TestTimeout);
+
+        var warning = Assert.Single(logs.Entries, entry => entry.EventId == DrainIncompleteEventId);
+        Assert.Contains("1 execution(s) running", warning.Message);
+    }
+
+    [Fact]
     public async Task AShutdownBudgetLongerThanTheHostAllows_IsClampedBelowTheHostsOwnTimeout()
     {
         // The budget is documented as clamped against HostOptions.ShutdownTimeout, and now is: without the
@@ -432,6 +455,23 @@ public sealed class StubbornGate
     /// <summary>How long the handler runs, measured from the moment it starts.</summary>
     public TimeSpan Hold { get; init; } = TimeSpan.FromMilliseconds(500);
 
+    /// <summary>A hold for one job by name, so two in-flight handlers can run out different holds.</summary>
+    public Dictionary<string, TimeSpan> HoldByName { get; } = [];
+
+    private int _started;
+
+    /// <summary>Counts a handler that started. Called by the handler.</summary>
+    public void MarkStarted() => Interlocked.Increment(ref _started);
+
+    /// <summary>Completes once <paramref name="count"/> handlers are genuinely running.</summary>
+    public async Task AllStarted(int count)
+    {
+        while (Volatile.Read(ref _started) < count)
+        {
+            await Task.Delay(10);
+        }
+    }
+
     /// <summary>When the handler returned, or <see langword="null"/> if it never has.</summary>
     public DateTimeOffset? FinishedAt { get; set; }
 
@@ -446,7 +486,9 @@ public sealed class StubbornHandler(StubbornGate gate) : IJobHandler<PingJob>
     public async Task HandleAsync(PingJob job, JobContext context, CancellationToken cancellationToken)
     {
         gate.Started.TrySetResult();
-        await Task.Delay(gate.Hold, CancellationToken.None);
+        gate.MarkStarted();
+        var hold = gate.HoldByName.TryGetValue(job.Name, out var named) ? named : gate.Hold;
+        await Task.Delay(hold, CancellationToken.None);
         gate.FinishedAt = DateTimeOffset.UtcNow;
         if (gate.Violation is { } trigger)
         {
