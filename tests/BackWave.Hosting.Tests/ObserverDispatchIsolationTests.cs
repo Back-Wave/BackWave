@@ -410,6 +410,68 @@ public class ObserverDispatchIsolationTests
     }
 
     [Fact]
+    public async Task ReportRefusedInsideALiveClaimLease_DegradesOnce_AndTheRowRedeliversOnTheNextPoll()
+    {
+        // The other half of the fence answer, and the one no healthy fleet produces: the store refuses a
+        // report while the pump still believes its claim Lease is live. Two workers held the claim at once
+        // as far as the pump can tell, so this IS a contradiction and it must be counted, once, at group
+        // altitude. The knob routes ONE report to the store under a worker id that never held the claim,
+        // so it is the real fence that refuses it and not a rewritten answer.
+        var store = new FaultableStore(new InMemoryJobStore()) { MisattributeObserverReports = 1 };
+        var gated = new GatedObserver();
+        gated.Release.TrySetResult(); // a fast callback: the report lands well inside its Lease
+        var logs = new CapturingLoggerProvider();
+        using var refusals = new ViolationRecorder(InvariantTrigger.ObserverReportFenceRejected);
+        await using var app = BuildHost(
+            store,
+            o =>
+            {
+                o.PollInterval = TimeSpan.FromSeconds(3);
+                o.LeaseDuration = TimeSpan.FromMinutes(2); // well past the skew allowance
+            },
+            logs,
+            new ObserverSpec("fenced", new ObserverSubscription([JobState.Succeeded]) { WireName = "ping" }, gated));
+        await app.StartAsync();
+
+        var client = app.Services.GetRequiredService<BackWaveClient>();
+        var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
+        await client.EnqueueAsync(new PingJob("observed"), dueTime: DateTimeOffset.UtcNow);
+
+        await WaitForAsync(() => !refusals.Actions.IsEmpty, "the misattributed report to be refused and counted");
+
+        // Counted exactly once, as a Degrade: the group keeps running. The pump said what it believed, and
+        // that belief was live by more than the allowance - the evidence the store needs to count it.
+        Assert.Equal("Degrade", Assert.Single(refusals.Actions));
+        Assert.NotNull(store.LastObserverReportBelief);
+        Assert.True(store.LastObserverReportBelief > DateTimeOffset.UtcNow + TimeSpan.FromSeconds(30));
+
+        // A refused report drained no batch, so it earns no immediate re-poll: a second of quiet with the
+        // cursor still unmoved is the DeliveryAborted assertion.
+        var quietUntil = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(1);
+        while (DateTimeOffset.UtcNow < quietUntil)
+        {
+            Assert.Equal(1, Volatile.Read(ref gated.Completed));
+            Assert.Equal(-1, await monitor.GetObserverCursorAsync("fenced"));
+            await Task.Delay(25);
+        }
+
+        // The knob is spent, so the next scheduled poll re-claims the row under the pump's own live Lease,
+        // the report lands, and the cursor advances. At-least-once is intact.
+        await WaitForAsync(
+            () => monitor.GetObserverCursorAsync("fenced").AsTask().GetAwaiter().GetResult() >= 0,
+            "the refused delivery to redeliver on the next poll and advance the cursor");
+        Assert.Equal(2, Volatile.Read(ref gated.Completed));
+
+        // Still counted once: the redelivery's report was applied, not refused. And a refusal is not a
+        // fault - the report-faulted path (2103) stays untouched and no group halted.
+        Assert.Single(refusals.Actions);
+        Assert.DoesNotContain(logs.Entries, e => e.EventId == 2103);
+        Assert.Empty(app.Services.GetRequiredService<BackWaveHealth>().HaltedGroups);
+
+        await app.StopAsync();
+    }
+
+    [Fact]
     public async Task DeliveryTimeout_IsConfigurableViaConfigurePump_AndNeverReachesTheCore()
     {
         // The Core run config (ObserverDispatchOptions) carries no DeliveryTimeout — it is a Shell-only

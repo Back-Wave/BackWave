@@ -313,7 +313,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             {
                 return EnqueueResult.UnknownParent;
             }
-            foreach (var parentId in job.Parents)
+            foreach (var parentId in distinctParents)
             {
                 var parentState = states[parentId];
                 if (!parentState.IsTerminal())

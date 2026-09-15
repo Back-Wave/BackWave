@@ -241,6 +241,9 @@ public class ShutdownHandBackTests
         Assert.Contains("1 execution(s) running", warning.Message);
         Assert.Null(gate.FinishedAt);  // it really had not finished
         Assert.Equal(1, store.RelinquishCalls);  // and its Lease was given back regardless
+        // The drain spent the budget, yet the hand-back met a LIVE token: the reserve slice is what keeps
+        // the store call from being cancelled before it starts, and this pins that it exists.
+        Assert.False(store.RelinquishTokenCancelledAtEntry);
         Assert.Equal(JobState.Scheduled, (await monitor.GetJobAsync(jobId))!.State);
     }
 

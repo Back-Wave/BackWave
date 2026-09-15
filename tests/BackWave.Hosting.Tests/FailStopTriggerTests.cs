@@ -293,17 +293,24 @@ public class FailStopTriggerTests
         var logs = new CapturingLoggerProvider();
         using var violations = new ViolationRecorder(InvariantTrigger.OutcomeFenceRejected);
         var gate = new ExecutionGate();
+        var clock = new ShiftableTimeProvider();
 
-        // A Lease shorter than the handler parks for, with no heartbeat to renew it, so the pump has
-        // already watched its own belief expire by the time the outcome settles.
-        var group = Group("workers") with { LeaseDuration = TimeSpan.FromMilliseconds(50) };
-        await using var app = BuildHost(store, logs, group, gate);
+        // The same Lease the contradiction test grants, well past the skew allowance: without the clock
+        // shift below this outcome IS a contradiction and the test fails on the Degrade. The lapse is
+        // driven on the pump's own clock, and the maintenance sweep is parked so the shift cannot expire
+        // the Lease behind the handler's back and hand the job to a second execution.
+        var group = Group("workers") with
+        {
+            LeaseDuration = TimeSpan.FromMinutes(2),
+            MaintenanceInterval = TimeSpan.FromHours(1),
+        };
+        await using var app = BuildHost(store, logs, group, gate, clock);
         await app.StartAsync();
         var jobId = await app.Services.GetRequiredService<BackWaveClient>()
             .EnqueueAsync(new ParkedJob("lapsed"), dueTime: DateTimeOffset.UtcNow);
 
         await gate.Entered.Task.WaitAsync(TestTimeout);
-        await Task.Delay(200);  // outlive the Lease, then let the outcome report against the lapsed belief
+        clock.Shift(TimeSpan.FromMinutes(3));  // the pump watches its own 2 min belief lapse
         gate.Released.SetResult();
 
         await WaitForAsync(
@@ -378,7 +385,8 @@ public class FailStopTriggerTests
     };
 
     private static WebApplication BuildHost(
-        IJobStore store, ILoggerProvider logs, WorkerGroupOptions group, ExecutionGate? gate = null)
+        IJobStore store, ILoggerProvider logs, WorkerGroupOptions group, ExecutionGate? gate = null,
+        TimeProvider? clock = null)
     {
         var registry = new JobRegistry(
         [
@@ -393,6 +401,10 @@ public class FailStopTriggerTests
         builder.Logging.AddProvider(logs);
         builder.Logging.SetMinimumLevel(LogLevel.Debug);  // the benign fence path logs there and nowhere else
         builder.Services.AddSingleton(gate ?? new ExecutionGate());
+        if (clock is not null)
+        {
+            builder.Services.AddSingleton(clock);
+        }
         builder.Services.AddTransient<IJobHandler<ParkedJob>, ParkedHandler>();
         builder.Services.AddTransient<IJobHandler<PullingJob>, PullingHandler>();
         builder.Services.AddBackWave(backwave =>

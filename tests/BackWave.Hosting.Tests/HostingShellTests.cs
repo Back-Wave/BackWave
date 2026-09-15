@@ -791,6 +791,19 @@ public sealed class OffsetTimeProvider(TimeSpan offset) : TimeProvider
     public override DateTimeOffset GetUtcNow() => TimeProvider.System.GetUtcNow() + offset;
 }
 
+// An OffsetTimeProvider whose offset a test can move while the host runs. Timers stay real, so only the
+// instants the pump STAMPS jump: a test parks a handler, shifts the clock past the Lease it was granted,
+// and releases it, which is a lapse this pump watched on its own clock rather than a contradiction.
+public sealed class ShiftableTimeProvider : TimeProvider
+{
+    private long _offsetTicks;
+
+    public void Shift(TimeSpan by) => Interlocked.Add(ref _offsetTicks, by.Ticks);
+
+    public override DateTimeOffset GetUtcNow()
+        => TimeProvider.System.GetUtcNow() + TimeSpan.FromTicks(Volatile.Read(ref _offsetTicks));
+}
+
 /// <summary>Captures every log entry so tests can assert on level, event id, and the carried exception.</summary>
 public sealed class CapturingLoggerProvider : ILoggerProvider
 {

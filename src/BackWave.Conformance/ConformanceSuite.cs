@@ -1542,6 +1542,85 @@ public abstract class ConformanceSuite
         }
     }
 
+    /// <summary>
+    /// Certifies that a hand-back from a worker that holds nothing is a no-op: it reports zero and
+    /// leaves every other worker's lease exactly where it was. A worker id is the only key the fence
+    /// has, and an unknown one must match no row rather than every row.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_5_1_Relinquish_FromAWorkerThatHoldsNothing_TouchesNothing()
+    {
+        var store = await CreateStoreAsync();
+        await store.EnqueueAsync(Job(), now: T0);
+        var claimed = Assert.Single(await ClaimAsync(store, T0));
+
+        Assert.Equal(0, await store.RelinquishLeasesAsync("nobody", T0.AddSeconds(5), TwoAttempts));
+
+        var held = await store.GetJobAsync(claimed.JobId);
+        Assert.Equal(JobState.Leased, held!.State);
+        Assert.Equal("w1", held.LeaseOwner);
+        Assert.Equal(1, held.Attempt);
+    }
+
+    /// <summary>
+    /// Certifies the expiry race: once the sweep (§5.5) reclaims a lease this worker let lapse and a peer
+    /// claims the job again, the old owner's late hand-back must touch nothing. The job is Leased, but
+    /// by the peer, and the fence is on the owner - so the peer's attempt is neither handed back nor
+    /// charged.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_5_1_Relinquish_AfterTheSweepAndAPeerReclaim_LeavesThePeersLeaseAlone()
+    {
+        var store = await CreateStoreAsync();
+        await store.EnqueueAsync(Job(), now: T0);
+        var claimed = Assert.Single(await ClaimAsync(store, T0)); // attempt 1 of 2, by w1
+
+        var afterExpiry = T0 + Lease + TimeSpan.FromSeconds(1);
+        Assert.Equal(1, await store.ExpireLeasesAsync(afterExpiry, maxJobs: 32, ["default"], TwoAttempts));
+        var reclaim = afterExpiry.AddMinutes(2);
+        var reclaimed = Assert.Single(await ClaimAsync(store, reclaim, worker: "w2"));
+        Assert.Equal(claimed.JobId, reclaimed.JobId);
+        Assert.Equal(2, reclaimed.Attempt);
+
+        // w1 stops late, after the sweep already gave its job away.
+        Assert.Equal(0, await store.RelinquishLeasesAsync("w1", reclaim.AddSeconds(5), TwoAttempts));
+
+        var held = await store.GetJobAsync(claimed.JobId);
+        Assert.Equal(JobState.Leased, held!.State);
+        Assert.Equal("w2", held.LeaseOwner);
+        Assert.Equal(2, held.Attempt);
+        Assert.Equal(reclaim + Lease, held.LeaseExpiry);
+    }
+
+    /// <summary>
+    /// Certifies that expiry is not part of the fence: a lease that lapsed but that no sweep reached yet
+    /// is still this worker's and still Leased, so the hand-back returns it to Scheduled at the hand-back
+    /// instant. The only way a job leaves this worker's hands is the sweep, which leaves it not Leased
+    /// or not this worker's - and the previous clause covers that.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_5_1_Relinquish_HandsBackALapsedLeaseTheSweepHasNotReached()
+    {
+        var store = await CreateStoreAsync();
+        await store.EnqueueAsync(Job(), now: T0);
+        var claimed = Assert.Single(await ClaimAsync(store, T0)); // attempt 1 of 2
+
+        var handBack = T0 + Lease + TimeSpan.FromSeconds(1); // past expiry, and no sweep ran
+        if (!RelinquishesLeases)
+        {
+            await AssertRelinquishIsANoOpAsync(store, handBack, TwoAttempts, claimed.JobId);
+            return;
+        }
+        Assert.Equal(1, await store.RelinquishLeasesAsync("w1", handBack, TwoAttempts));
+
+        var job = await store.GetJobAsync(claimed.JobId);
+        Assert.Equal(JobState.Scheduled, job!.State);
+        Assert.Equal(handBack, job.DueTime);
+        Assert.Equal(1, job.Attempt); // the lapse was never swept, so it was never charged as a failure
+        Assert.Null(job.LeaseOwner);
+        Assert.Null(job.LeaseExpiry);
+    }
+
     // ── §5.8 Cancel ─────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -5021,6 +5100,34 @@ public abstract class ConformanceSuite
         Assert.Equal(WorkflowStatus.Running, graph.Status);
         Assert.Equal(2, graph.Members.Count);
         Assert.Equal([new WorkflowEdge(root.JobId, leaf.JobId)], graph.Edges);
+    }
+
+    /// <summary>
+    /// Certifies that a workflow member listing the same parent twice gates on the parent SET, exactly
+    /// as a plain enqueue does (§5.1): one edge, one latch, released once. The workflow path inserts
+    /// its members on its own, so a de-duplication the plain path performs up front is not enough.
+    /// </summary>
+    [Fact]
+    public async Task Clause_Workflow_DuplicateParentIds_CollapseToTheParentSet()
+    {
+        var store = await CreateStoreAsync();
+        var workflowId = Guid.NewGuid();
+        var root = WorkflowMember("root");
+        var leaf = WorkflowMember("leaf") with { Parents = [root.JobId, root.JobId] };
+        Assert.Equal(WorkflowEnqueueResult.Ok,
+            await store.EnqueueWorkflowAsync(Workflow(workflowId, [root, leaf]), T0));
+
+        var leafRow = await store.GetJobAsync(leaf.JobId);
+        Assert.Equal(JobState.AwaitingParent, leafRow!.State);
+        Assert.Equal(1, leafRow.ParentsRemaining);
+        var graph = await store.GetWorkflowAsync(workflowId);
+        Assert.Equal([new WorkflowEdge(root.JobId, leaf.JobId)], graph!.Edges);
+
+        // The one real parent going terminal fires the latch exactly once.
+        var claimed = Assert.Single(await ClaimAsync(store, T0));
+        Assert.Equal(root.JobId, claimed.JobId);
+        await store.ReportOutcomeAsync(claimed.JobId, "w1", claimed.Attempt, new JobOutcome.Success(), T0);
+        Assert.Equal(JobState.Scheduled, (await store.GetJobAsync(leaf.JobId))!.State);
     }
 
     /// <summary>

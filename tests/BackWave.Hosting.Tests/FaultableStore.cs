@@ -16,6 +16,7 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
 {
     private int _transientClaimFaults;
     private int _relinquishCalls;
+    private int _misattributeObserverReports;
     private int _reportOutcomesCalls;
     private int _rowsSettledBeforeRejection;
 
@@ -50,6 +51,12 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
     /// <summary>When the shutdown hand-back FIRST reached the store, so a test can order it against its handlers.</summary>
     public DateTimeOffset? RelinquishedAt { get; private set; }
 
+    /// <summary>
+    /// Whether the hand-back's token was already cancelled when it FIRST reached the store. The reserve
+    /// slice exists so a hand-back that follows an overrun drain still meets a live token here.
+    /// </summary>
+    public bool? RelinquishTokenCancelledAtEntry { get; private set; }
+
     /// <summary>Claims hand back their jobs rewritten into this state - the malformed-claim trigger.</summary>
     public JobState? RewriteClaimedState { get; set; }
 
@@ -70,6 +77,20 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
 
     /// <summary>Batched outcome reports come back rewritten to StaleLease - the fenced-out-write trigger.</summary>
     public bool FenceOutOutcomes { get; set; }
+
+    /// <summary>
+    /// The next N observer reports reach the store under a worker id that never held the claim, so the
+    /// store's own claim-lease fence refuses them - the observer-report-fence trigger, raised by the real
+    /// fence rather than a rewritten answer.
+    /// </summary>
+    public int MisattributeObserverReports
+    {
+        get => Volatile.Read(ref _misattributeObserverReports);
+        set => Volatile.Write(ref _misattributeObserverReports, value);
+    }
+
+    /// <summary>What the pump said it believed about its claim lease on its most recent observer report.</summary>
+    public DateTimeOffset? LastObserverReportBelief { get; private set; }
 
     /// <summary>The next N claims throw a transient store fault, then recover — the degraded-then-healthy trigger.</summary>
     public int TransientClaimFaults
@@ -276,6 +297,7 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
         if (Interlocked.Increment(ref _relinquishCalls) == 1)
         {
             RelinquishedAt = DateTimeOffset.UtcNow;
+            RelinquishTokenCancelledAtEntry = cancellationToken.IsCancellationRequested;
         }
         ThrowIfFailing();
         if (RelinquishInvariant is { } tripped)
@@ -403,7 +425,14 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
     // reaches the pump. Every new default member on IJobStore belongs here for the same reason.
     public ValueTask<ObserverReportOutcome> TryReportObserverDeliveriesAsync(
         ObserverDeliveryReport report, CancellationToken cancellationToken = default)
-        => inner.TryReportObserverDeliveriesAsync(report, cancellationToken);
+    {
+        LastObserverReportBelief = report.BelievedLeaseExpiry;
+        if (Interlocked.Decrement(ref _misattributeObserverReports) >= 0)
+        {
+            report = report with { WorkerId = "someone-else" };
+        }
+        return inner.TryReportObserverDeliveriesAsync(report, cancellationToken);
+    }
 
     public ValueTask<long> GetObserverCursorAsync(string observerId, CancellationToken cancellationToken = default)
         => inner.GetObserverCursorAsync(observerId, cancellationToken);

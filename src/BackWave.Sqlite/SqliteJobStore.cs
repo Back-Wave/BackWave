@@ -243,7 +243,8 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         if (job.Parents.Count > 0)
         {
             var states = new Dictionary<Guid, JobState>();
-            foreach (var parentId in job.Parents)
+            var distinctParents = job.Parents.Distinct().ToArray();
+            foreach (var parentId in distinctParents)
             {
                 await using var parent = Cmd(
                     "SELECT state FROM backwave_jobs WHERE job_id = $id", connection, transaction);
@@ -253,11 +254,11 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                     states[parentId] = SqliteValueCodec.ToEnum<JobState>(parentState);
                 }
             }
-            if (states.Count != job.Parents.Count)
+            if (states.Count != distinctParents.Length)
             {
                 return (EnqueueResult.UnknownParent, null);
             }
-            foreach (var parentId in job.Parents)
+            foreach (var parentId in distinctParents)
             {
                 var parentState = states[parentId];
                 if (!parentState.IsTerminal())

@@ -237,10 +237,11 @@ public sealed class InMemoryJobStore(
         }
 
         // Resolve parents already terminal at enqueue: each is an edge that will never
-        // fire later, so it must count against the latch (or cancel) right now.
+        // fire later, so it must count against the latch (or cancel) right now. The set collapse
+        // is repeated here because a workflow member arrives without passing through EnqueueAsync.
         var pendingParents = new List<Guid>();
         var cancelledByParent = (JobState?)null;
-        foreach (var parentId in job.Parents)
+        foreach (var parentId in job.Parents.Distinct())
         {
             var parentState = _jobs[parentId].State;
             if (!parentState.IsTerminal())

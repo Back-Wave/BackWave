@@ -252,7 +252,10 @@ public interface IJobStore
     /// cleanly returns its in-flight work at once instead of parking it for the full lease duration.
     /// The write is fenced on the lease itself: it touches only rows whose lease owner is exactly
     /// <paramref name="workerId"/> AND whose state is still Leased, so a job that already reported an
-    /// outcome (and therefore left the Leased state) is never revived. The Attempt is left UNCHANGED,
+    /// outcome (and therefore left the Leased state) is never revived. Expiry is not part of the fence:
+    /// a lease that lapsed but that no expiry sweep reached yet is still this worker's and still Leased,
+    /// so it is handed back like any other, and a lease the sweep already reclaimed (or a peer since
+    /// re-claimed) is skipped because the row is no longer Leased by this worker. The Attempt is left UNCHANGED,
     /// because the claim already counted it - relinquishing costs exactly what letting the lease lapse
     /// costs today. Each relinquished job returns to Scheduled at <paramref name="now"/>, skipping the
     /// retry backoff because a clean stop is not a failure, except that a job whose attempt ceiling is
