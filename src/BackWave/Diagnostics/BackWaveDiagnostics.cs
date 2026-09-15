@@ -719,6 +719,17 @@ public static class BackWaveDiagnostics
         }
     }
 
+    // Records a handler-side invariant violation onto its OPEN process span. A halt is not an execution
+    // outcome: the Attempt neither succeeded nor failed as a job, so nothing counts on the consumed or
+    // failed counters and no latency is sampled. The span still needs a verdict, or a trace reader cannot
+    // tell the halting Attempt from one that closed normally. The span stops later, at the same settlement
+    // site that closes an abandoned execution's span.
+    internal static void RecordHalted(Activity? activity, InvariantViolationException violation)
+    {
+        activity?.SetStatus(ActivityStatusCode.Error, violation.Message);
+        RecordProcessException(activity, violation);
+    }
+
     // The error.type dimension's value: the exception's full type name, falling back to the short name
     // for a type that reports none. Shared by the failed counter, the duration histogram, and the span.
     private static string ErrorType(Exception exception) =>

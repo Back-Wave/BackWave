@@ -1224,6 +1224,7 @@ internal sealed class WorkerGroupService(
                             // this pump had in hand still settle. This Attempt reports nothing - the group
                             // is halting and its Leases lapse - and the outer finally still releases the
                             // worker slot and disposes the linked CTS.
+                            BackWaveDiagnostics.RecordHalted(activity, violation);
                             events.TryComplete(violation);
                             outcome = null;
                         }

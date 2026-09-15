@@ -1,5 +1,6 @@
 using System.Net;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Text.Json.Serialization;
 using BackWave.Core;
@@ -262,6 +263,8 @@ public class FailStopTriggerTests
         var store = new FaultableStore(new InMemoryJobStore());
         var logs = new CapturingLoggerProvider();
         using var violations = new ViolationRecorder(InvariantTrigger.WorkflowMemberWithoutWorkflow);
+        var spans = new ConcurrentBag<Activity>();
+        using var listener = ListenToBackWave(spans);
         var now = DateTimeOffset.UtcNow;
         var member = new NewJob(Guid.NewGuid(), "pulling", JobPayload(new PullingJob("parent")), "default", now);
         Assert.Equal(
@@ -280,6 +283,26 @@ public class FailStopTriggerTests
         var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
         Assert.Equal(JobState.Leased, (await monitor.GetJobAsync(member.JobId))!.State);
         await app.StopAsync();
+
+        // The halting Attempt's process span closes with a verdict, not as a normal close: a trace reader
+        // sees the halt on the span itself, with the violation as its error.type and exception event.
+        var process = Assert.Single(spans, a =>
+            a.OperationName == "process" && Equals(a.GetTagItem("messaging.destination.template"), "pulling"));
+        Assert.Equal(ActivityStatusCode.Error, process.Status);
+        Assert.Equal(typeof(InvariantViolationException).FullName, process.GetTagItem("error.type"));
+        Assert.Single(process.Events, e => e.Name == "exception");
+    }
+
+    private static ActivityListener ListenToBackWave(ConcurrentBag<Activity> stopped)
+    {
+        var listener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == BackWaveDiagnostics.SourceName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStopped = stopped.Add,
+        };
+        ActivitySource.AddActivityListener(listener);
+        return listener;
     }
 
     [Fact]
