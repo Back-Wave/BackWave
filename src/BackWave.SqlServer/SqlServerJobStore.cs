@@ -1064,6 +1064,9 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         Guid JobId, string WorkerId, int Attempt, int State, string? Cause,
         DateTimeOffset? Due, DateTimeOffset? TerminalAt);
 
+    // The set-valued payload row for the hand-back's dead-letter UPDATE and its parent lookup.
+    private sealed record DeadLetterRow(Guid JobId, string Cause);
+
     /// <summary>
     /// The latch (invariant I2), inside the same transaction as the terminal transition.
     /// Deleting the edge claims it: each parent-child edge resolves exactly once.
@@ -1479,42 +1482,41 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
             .ConfigureAwait(false);
 
+        // The held set is every job this worker still holds, and a worker's pool has no ceiling, so
+        // unlike the expiry sweep's TOP-bounded batch it can pass the 2,100-parameter limit of one
+        // statement. Each set rides in as one JSON parameter and OPENJSON unpacks it, as ReportOutcomes
+        // does. INNER LOOP JOIN pins the seek per row: OPENJSON carries no cardinality, and left to
+        // itself the optimizer scans backwave.jobs and locks every row it passes (§5.5).
         if (ready.Count > 0)
         {
             // Every relinquished job comes back due at the same instant, so the ready set needs no
-            // per-row payload: an id list on the clustered PK seeks the batch's own rows.
-            var inList = string.Join(", ", ready.Select((_, i) => $"@rid{i}"));
+            // per-row payload beyond the id.
             await using var restore = Cmd(
-                $"""
-                UPDATE backwave.jobs
+                """
+                UPDATE j
                 SET state = 0, due_time = @now, lease_owner = NULL, lease_expiry = NULL
-                WHERE job_id IN ({inList})
+                FROM OPENJSON(@ids) WITH (job_id uniqueidentifier '$') d
+                INNER LOOP JOIN backwave.jobs j ON j.job_id = d.job_id
                 """,
                 connection, transaction);
             restore.Parameters.AddWithValue("now", now);
-            for (var i = 0; i < ready.Count; i++)
-            {
-                restore.Parameters.Add($"rid{i}", SqlDbType.UniqueIdentifier).Value = ready[i];
-            }
+            restore.Parameters.Add("ids", SqlDbType.NVarChar, -1).Value = JsonSerializer.Serialize(ready);
             await restore.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         if (deadLettered.Count > 0)
         {
-            var rows = string.Join(", ", deadLettered.Select((_, i) => $"(@did{i}, @dcause{i})"));
+            var payload = JsonSerializer.Serialize(
+                deadLettered.Select(d => new DeadLetterRow(d.JobId, d.Cause)).ToArray());
             await using var deadLetter = Cmd(
-                $"""
+                """
                 UPDATE j SET state = 5, lease_owner = NULL, lease_expiry = NULL, terminal_at = @now, terminal_cause = d.cause
-                FROM (VALUES {rows}) AS d(job_id, cause)
+                FROM OPENJSON(@payload) WITH (job_id uniqueidentifier '$.JobId', cause nvarchar(max) '$.Cause') d
                 INNER LOOP JOIN backwave.jobs j ON j.job_id = d.job_id
                 """,
                 connection, transaction);
             deadLetter.Parameters.AddWithValue("now", now);
-            for (var i = 0; i < deadLettered.Count; i++)
-            {
-                deadLetter.Parameters.Add($"did{i}", SqlDbType.UniqueIdentifier).Value = deadLettered[i].JobId;
-                deadLetter.Parameters.Add($"dcause{i}", SqlDbType.NVarChar).Value = deadLettered[i].Cause;
-            }
+            deadLetter.Parameters.Add("payload", SqlDbType.NVarChar, -1).Value = payload;
             await deadLetter.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
 
             // Crash after the dead-letter write, before the latch cascade: the hand-back opens the
@@ -1525,15 +1527,14 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             // Latch resolution touches only dead-lettered jobs that actually parent a
             // Dependency, exactly as the expiry path does (§5.6, I2).
             var parents = new List<Guid>();
-            var parentList = string.Join(", ", deadLettered.Select((_, i) => $"@p{i}"));
             await using (var withChildren = Cmd(
-                $"SELECT DISTINCT parent_id FROM backwave.job_parents WHERE parent_id IN ({parentList})",
+                """
+                SELECT DISTINCT parent_id FROM backwave.job_parents
+                WHERE parent_id IN (SELECT job_id FROM OPENJSON(@payload) WITH (job_id uniqueidentifier '$.JobId'))
+                """,
                 connection, transaction))
             {
-                for (var i = 0; i < deadLettered.Count; i++)
-                {
-                    withChildren.Parameters.Add($"p{i}", SqlDbType.UniqueIdentifier).Value = deadLettered[i].JobId;
-                }
+                withChildren.Parameters.Add("payload", SqlDbType.NVarChar, -1).Value = payload;
                 await using var reader = await withChildren.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
