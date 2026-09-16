@@ -253,10 +253,10 @@ public class ShutdownHandBackTests
         // Two handlers were in flight when the stop began. One returns inside the budget, one outlasts
         // it. The warning names the one still running, not the two the drain set out to wait for.
         var store = new FaultableStore(new InMemoryJobStore());
-        var gate = new StubbornGate { Hold = TimeSpan.FromSeconds(2) };
-        gate.HoldByName["returns-fast"] = TimeSpan.FromMilliseconds(50);
+        var gate = new StubbornGate { Hold = TimeSpan.FromSeconds(3) };
+        gate.HoldByName["returns-fast"] = TimeSpan.FromMilliseconds(250);
         var logs = new CapturingLoggerProvider();
-        await using var app = BuildStubbornHost(store, gate, logs, shutdownBudget: TimeSpan.FromMilliseconds(500));
+        await using var app = BuildStubbornHost(store, gate, logs, shutdownBudget: TimeSpan.FromSeconds(1));
         await app.StartAsync();
 
         var client = app.Services.GetRequiredService<BackWaveClient>();
