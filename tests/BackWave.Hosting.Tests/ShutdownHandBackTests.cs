@@ -201,7 +201,7 @@ public class ShutdownHandBackTests
         var client = app.Services.GetRequiredService<BackWaveClient>();
         var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
         var jobId = await client.EnqueueAsync(new PingJob("stubborn"), dueTime: DateTimeOffset.UtcNow);
-        await gate.Started.Task.WaitAsync(TestTimeout);
+        await gate.AllStarted(1).WaitAsync(TestTimeout);
 
         await app.StopAsync();
 
@@ -232,7 +232,7 @@ public class ShutdownHandBackTests
         var client = app.Services.GetRequiredService<BackWaveClient>();
         var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
         var jobId = await client.EnqueueAsync(new PingJob("never-returns"), dueTime: DateTimeOffset.UtcNow);
-        await gate.Started.Task.WaitAsync(TestTimeout);
+        await gate.AllStarted(1).WaitAsync(TestTimeout);
 
         await app.StopAsync().WaitAsync(TestTimeout);
 
@@ -288,7 +288,7 @@ public class ShutdownHandBackTests
 
         var client = app.Services.GetRequiredService<BackWaveClient>();
         var jobId = await client.EnqueueAsync(new PingJob("clamped"), dueTime: DateTimeOffset.UtcNow);
-        await gate.Started.Task.WaitAsync(TestTimeout);
+        await gate.AllStarted(1).WaitAsync(TestTimeout);
 
         await app.StopAsync().WaitAsync(TestTimeout);
 
@@ -344,7 +344,7 @@ public class ShutdownHandBackTests
         var client = app.Services.GetRequiredService<BackWaveClient>();
         var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
         var jobId = await client.EnqueueAsync(new PingJob("flush-first"), dueTime: DateTimeOffset.UtcNow);
-        await gate.Started.Task.WaitAsync(TestTimeout);
+        await gate.AllStarted(1).WaitAsync(TestTimeout);
 
         await app.StopAsync();
 
@@ -427,7 +427,7 @@ public class ShutdownHandBackTests
 
         var client = app.Services.GetRequiredService<BackWaveClient>();
         await client.EnqueueAsync(new PingJob("violate-mid-drain"), dueTime: DateTimeOffset.UtcNow);
-        await gate.Started.Task.WaitAsync(TestTimeout);
+        await gate.AllStarted(1).WaitAsync(TestTimeout);
 
         await app.StopAsync().WaitAsync(TestTimeout);
 
@@ -449,26 +449,48 @@ public class ShutdownHandBackTests
 /// </summary>
 public sealed class StubbornGate
 {
-    /// <summary>Completes once the handler is genuinely running, so a test can stop into a live execution.</summary>
-    public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
     /// <summary>How long the handler runs, measured from the moment it starts.</summary>
     public TimeSpan Hold { get; init; } = TimeSpan.FromMilliseconds(500);
 
     /// <summary>A hold for one job by name, so two in-flight handlers can run out different holds.</summary>
     public Dictionary<string, TimeSpan> HoldByName { get; } = [];
 
+    private readonly object _lock = new();
     private int _started;
+    private int _target;
+    private TaskCompletionSource? _reached;
 
-    /// <summary>Counts a handler that started. Called by the handler.</summary>
-    public void MarkStarted() => Interlocked.Increment(ref _started);
-
-    /// <summary>Completes once <paramref name="count"/> handlers are genuinely running.</summary>
-    public async Task AllStarted(int count)
+    /// <summary>
+    /// Counts a handler that started, and completes the pending <see cref="AllStarted"/> once the count
+    /// reaches its target. Called by the handler.
+    /// </summary>
+    public void MarkStarted()
     {
-        while (Volatile.Read(ref _started) < count)
+        lock (_lock)
         {
-            await Task.Delay(10);
+            _started++;
+            if (_started >= _target)
+            {
+                _reached?.TrySetResult();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Completes once <paramref name="count"/> handlers are genuinely running, so a test can stop into a
+    /// live execution.
+    /// </summary>
+    public Task AllStarted(int count)
+    {
+        lock (_lock)
+        {
+            _target = count;
+            _reached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (_started >= count)
+            {
+                _reached.SetResult();
+            }
+            return _reached.Task;
         }
     }
 
@@ -485,7 +507,6 @@ public sealed class StubbornHandler(StubbornGate gate) : IJobHandler<PingJob>
     /// <inheritdoc/>
     public async Task HandleAsync(PingJob job, JobContext context, CancellationToken cancellationToken)
     {
-        gate.Started.TrySetResult();
         gate.MarkStarted();
         var hold = gate.HoldByName.TryGetValue(job.Name, out var named) ? named : gate.Hold;
         await Task.Delay(hold, CancellationToken.None);
