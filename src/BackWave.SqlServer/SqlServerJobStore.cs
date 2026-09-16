@@ -1487,8 +1487,9 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         // The held set is every job this worker still holds, and a worker's pool has no ceiling, so
         // unlike the expiry sweep's TOP-bounded batch it can pass the 2,100-parameter limit of one
         // statement. Each set rides in as one JSON parameter and OPENJSON unpacks it, as ReportOutcomes
-        // does. INNER LOOP JOIN pins the seek per row: OPENJSON carries no cardinality, and left to
-        // itself the optimizer scans backwave.jobs and locks every row it passes (§5.5).
+        // does. The two UPDATEs on jobs use INNER LOOP JOIN to pin the seek per row: OPENJSON carries
+        // no cardinality, and left to itself the optimizer scans backwave.jobs and locks every row it
+        // passes (§5.5).
         if (ready.Count > 0)
         {
             // Every relinquished job comes back due at the same instant, so the ready set needs no
