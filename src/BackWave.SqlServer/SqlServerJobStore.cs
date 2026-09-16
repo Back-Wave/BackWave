@@ -1064,9 +1064,6 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         Guid JobId, string WorkerId, int Attempt, int State, string? Cause,
         DateTimeOffset? Due, DateTimeOffset? TerminalAt);
 
-    // The set-valued payload row for the hand-back's dead-letter UPDATE and its parent lookup.
-    private sealed record DeadLetterRow(Guid JobId, string Cause);
-
     /// <summary>
     /// The latch (invariant I2), inside the same transaction as the terminal transition.
     /// Deleting the edge claims it: each parent-child edge resolves exactly once.
@@ -1556,6 +1553,9 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return held.Count;
     }
+
+    // The set-valued payload row for the hand-back's dead-letter UPDATE and its parent lookup.
+    private sealed record DeadLetterRow(Guid JobId, string Cause);
 
     // ── §5.8 Cancel ─────────────────────────────────────────────────────────────
 
