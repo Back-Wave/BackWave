@@ -57,7 +57,9 @@ public sealed class SqlServerAdapterTests
         var held = 0;
         while (held < Jobs)
         {
-            held += (await store.ClaimAsync(new ClaimRequest("w", ["default"], Jobs, TimeSpan.FromMinutes(5), T0))).Count;
+            var claimed = await store.ClaimAsync(new ClaimRequest("w", ["default"], Jobs, TimeSpan.FromMinutes(5), T0));
+            Assert.NotEmpty(claimed);
+            held += claimed.Count;
         }
         var disposition = new RetryPolicy { MaxAttempts = retries ? 5 : 1 }.ToDisposition();
 
@@ -80,7 +82,9 @@ public sealed class SqlServerAdapterTests
         var held = new List<Guid>();
         while (held.Count < Jobs)
         {
-            held.AddRange((await store.ClaimAsync(new ClaimRequest("w", ["default"], Jobs, TimeSpan.FromMinutes(5), T0))).Select(j => j.JobId));
+            var claimed = await store.ClaimAsync(new ClaimRequest("w", ["default"], Jobs, TimeSpan.FromMinutes(5), T0));
+            Assert.NotEmpty(claimed);
+            held.AddRange(claimed.Select(j => j.JobId));
         }
 
         var results = await store.HeartbeatAsync("w", held, TimeSpan.FromMinutes(5), T0.AddSeconds(1));
