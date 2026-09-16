@@ -621,9 +621,13 @@ internal sealed class WorkerGroupService(
         catch (Exception exception)
         {
             // The count is what is STILL running, not what the drain set out to wait for: a handler that
-            // returned inside the budget is not the one an operator goes looking for.
+            // returned inside the budget is not the one an operator goes looking for. A handler can also
+            // return between the timeout and this count, and then there is nothing to warn about.
             var stillRunning = running.Count(execution => !execution.IsCompleted);
-            BackWaveLog.ShutdownDrainIncomplete(logger, options.Name, stillRunning, exception);
+            if (stillRunning > 0)
+            {
+                BackWaveLog.ShutdownDrainIncomplete(logger, options.Name, stillRunning, exception);
+            }
         }
     }
 
