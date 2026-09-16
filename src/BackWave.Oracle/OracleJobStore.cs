@@ -1348,7 +1348,6 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         // The requested set is every job the worker is executing and its pool has no ceiling, while a
         // bind list past 1,000 ids raises ORA-01795. JSON_TABLE cannot ride the lock read because
         // FOR UPDATE rejects it (ORA-01786), so the ids go through both statements in slices.
-        const int MaxInListIds = 1_000; // ORA-01795: maximum number of expressions in a list.
         var renewed = new Dictionary<Guid, bool>();
         foreach (var slice in jobIds.Chunk(MaxInListIds))
         {
@@ -3885,12 +3884,19 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
 
     private static string DecodeTag(string value) => value == "\u0001" ? string.Empty : value;
 
-    // ":p0, :p1, ..." - ODP.NET has no array parameters; the lists are bounded.
+    private const int MaxInListIds = 1_000; // ORA-01795: maximum number of expressions in a list.
+
+    // ":p0, :p1, ..." - ODP.NET has no array parameters; AddIdList rejects a list past MaxInListIds.
     private static string ParameterList(string prefix, int count)
         => string.Join(", ", Enumerable.Range(0, count).Select(i => $":{prefix}{i}"));
 
     private static void AddIdList(OracleCommand command, string prefix, IReadOnlyList<Guid> ids)
     {
+        if (ids.Count > MaxInListIds)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ids), ids.Count, $"An IN list of {ids.Count} ids passes the Oracle limit of {MaxInListIds} expressions.");
+        }
         for (var i = 0; i < ids.Count; i++)
         {
             command.Parameters.Add(Raw($"{prefix}{i}", ids[i]));
