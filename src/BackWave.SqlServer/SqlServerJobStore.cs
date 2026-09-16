@@ -1466,7 +1466,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         // unchanged Attempt, atomic with the state writes. Built in this same pass, because the
         // ceiling is the policy's answer and asking it twice for one job invites two answers.
         var ready = new List<Guid>();
-        var deadLettered = new List<(Guid JobId, string Cause)>();
+        var deadLettered = new List<DeadLetterRow>();
         var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(held.Count);
         foreach (var (jobId, attempt) in held)
         {
@@ -1477,7 +1477,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             }
             else
             {
-                deadLettered.Add((jobId, $"Lease relinquished on attempt {attempt} (attempt ceiling reached)."));
+                deadLettered.Add(new DeadLetterRow(jobId, $"Lease relinquished on attempt {attempt} (attempt ceiling reached)."));
                 transitions.Add((jobId, JobState.DeadLettered, attempt, null));
             }
         }
@@ -1511,8 +1511,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
 
         if (deadLettered.Count > 0)
         {
-            var payload = JsonSerializer.Serialize(
-                deadLettered.Select(d => new DeadLetterRow(d.JobId, d.Cause)).ToArray());
+            var payload = JsonSerializer.Serialize(deadLettered);
             await using var deadLetter = Cmd(
                 """
                 UPDATE j SET state = 5, lease_owner = NULL, lease_expiry = NULL, terminal_at = @now, terminal_cause = d.cause
