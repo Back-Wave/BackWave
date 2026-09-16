@@ -23,7 +23,19 @@ public sealed class TuningDialsTests
 
         Assert.Equal(backwave, new HangfirePostgresTarget(PgDsn).TuningDials["worker-pool-size"]);
         Assert.Equal(backwave, new HangfireSqlServerTarget(MssqlDsn).TuningDials["worker-pool-size"]);
-        Assert.Equal(backwave, new JobMasterPostgresTarget(PgDsn).TuningDials["worker-pool-size"]);
+    }
+
+    [Fact]
+    public void JobMaster_worker_count_is_the_smallest_multiple_of_five_at_or_above_backwave_pool_size()
+    {
+        // JobMaster sizes run slots as 5 x parallelism factor per bucket, so it cannot record a pool that
+        // is not a multiple of 5 (a 4-core runner gives BackWave 16). The factor rounds up, never down, so
+        // the competitor is never under-tuned and the overshoot is bounded by one factor step.
+        var backwave = int.Parse(new PostgresBenchmarkTarget(PgDsn).TuningDials["worker-pool-size"]);
+        var jobMaster = int.Parse(new JobMasterPostgresTarget(PgDsn).TuningDials["worker-pool-size"]);
+
+        Assert.InRange(jobMaster, backwave, backwave + 4);
+        Assert.Equal(0, jobMaster % 5);
     }
 
     [Fact]
