@@ -1197,18 +1197,23 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             return [];
         }
 
+        // The driver heartbeats every executing job at once, and a worker's pool has no ceiling, so
+        // the id set can pass the 2,100-parameter limit of one statement. It rides in as one JSON
+        // parameter and OPENJSON unpacks it, with INNER LOOP JOIN pinning the seek per row as the
+        // relinquish path does.
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Cmd(
-            $"""
-            UPDATE backwave.jobs
+            """
+            UPDATE j
             SET lease_expiry = @expiry
             OUTPUT inserted.job_id, inserted.cancel_requested
-            WHERE job_id IN ({ParameterList("p", jobIds.Count)})
-              AND state = 2 AND lease_owner = @worker AND lease_expiry > @now
+            FROM OPENJSON(@ids) WITH (job_id uniqueidentifier '$') d
+            INNER LOOP JOIN backwave.jobs j ON j.job_id = d.job_id
+            WHERE j.state = 2 AND j.lease_owner = @worker AND j.lease_expiry > @now
             """,
             connection);
         command.Parameters.AddWithValue("expiry", now + leaseDuration);
-        AddIdList(command, "p", jobIds);
+        command.Parameters.Add("ids", SqlDbType.NVarChar, -1).Value = JsonSerializer.Serialize(jobIds);
         command.Parameters.AddWithValue("worker", workerId);
         command.Parameters.AddWithValue("now", now);
 

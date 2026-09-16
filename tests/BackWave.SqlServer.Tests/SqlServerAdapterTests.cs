@@ -42,7 +42,7 @@ public sealed class SqlServerAdapterTests
     // A shutdown hand-back covers every job the worker still holds, and a worker's pool has no ceiling,
     // so the held set can pass the 2,100-parameter limit of one SQL Server statement. Both dispositions
     // run: the retry rung takes one parameter per id, and the dead-letter rung takes two plus the
-    // parent lookup. 2,200 jobs trips every per-id list.
+    // parent lookup. 2,200 jobs trips every per-id list. The heartbeat carries the same set every tick.
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -66,6 +66,27 @@ public sealed class SqlServerAdapterTests
         var expected = retries ? JobState.Scheduled : JobState.DeadLettered;
         var counts = await store.CountJobsAsync();
         Assert.Equal(Jobs, counts.Single(c => c.Queue == "default" && c.State == expected).Count);
+    }
+
+    [Fact]
+    public async Task Heartbeat_RenewsMoreJobsThanOneStatementHasParametersFor()
+    {
+        const int Jobs = 2_200;
+        var store = await SqlServerTestDatabase.CreateFreshStoreAsync();
+        for (var i = 0; i < Jobs; i++)
+        {
+            await store.EnqueueAsync(Job(), T0);
+        }
+        var held = new List<Guid>();
+        while (held.Count < Jobs)
+        {
+            held.AddRange((await store.ClaimAsync(new ClaimRequest("w", ["default"], Jobs, TimeSpan.FromMinutes(5), T0))).Select(j => j.JobId));
+        }
+
+        var results = await store.HeartbeatAsync("w", held, TimeSpan.FromMinutes(5), T0.AddSeconds(1));
+
+        Assert.Equal(Jobs, results.Count);
+        Assert.All(results, r => Assert.True(r.Renewed));
     }
 
     [Fact]
