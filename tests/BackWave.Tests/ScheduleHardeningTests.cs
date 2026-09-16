@@ -204,6 +204,46 @@ public class ScheduleHardeningTests
     }
 
     [Fact]
+    public void Skip_AfterALongOutage_ReachesTheFreshTickInOnePoll()
+    {
+        // Ten days of missed hourly ticks, then the fresh tick at T0+240h. One poll must mint the
+        // fresh tick and record only the bounded tail of the missed range; it must not spend
+        // poll after poll walking the backlog while the fresh tick waits.
+        var now = T0.AddDays(10).AddSeconds(10);
+        var decision = Assert.Single(MintPlanner.Plan([Hourly(CatchUpPolicy.Skip)], now));
+
+        Assert.Equal([T0.AddHours(240)], decision.Ticks);
+        Assert.Equal(Enumerable.Range(208, 32).Select(h => T0.AddHours(h)), decision.SkippedTicks);
+        Assert.Equal(T0.AddHours(240), decision.NewCursor);
+    }
+
+    [Fact]
+    public void Coalesce_AfterALongOutage_MintsTheLatestMissedTick_AndTheFreshTick()
+    {
+        var now = T0.AddDays(10).AddSeconds(10);
+        var decision = Assert.Single(MintPlanner.Plan([Hourly(CatchUpPolicy.Coalesce)], now));
+
+        Assert.Equal([T0.AddHours(239), T0.AddHours(240)], decision.Ticks); // one make-up, then the fresh tick
+        Assert.Equal(Enumerable.Range(208, 31).Select(h => T0.AddHours(h)), decision.SkippedTicks);
+        Assert.Equal(T0.AddHours(240), decision.NewCursor);
+    }
+
+    [Fact]
+    public async Task LongOutage_ThroughAStore_MintsTheFreshTickInOnePoll()
+    {
+        var store = new Storage.InMemory.InMemoryJobStore();
+        await store.UpsertScheduleAsync(Hourly(CatchUpPolicy.Skip).Schedule);
+
+        var now = T0.AddDays(10).AddSeconds(10);
+        await store.MintDueAsync(MintPlanner.Plan(await store.ListSchedulesAsync(), now));
+
+        var job = Assert.Single(await store.ListJobsAsync(new JobQuery { ScheduleId = "hourly" }));
+        Assert.Equal(T0.AddHours(240), job.DueTime);
+        var snapshot = Assert.Single(await store.ListSchedulesAsync());
+        Assert.Equal(T0.AddHours(240), snapshot.Schedule.Cursor);
+    }
+
+    [Fact]
     public void NormalOperation_AFreshTick_MintsUnderBothPolicies()
     {
         var now = T0.AddHours(1).AddSeconds(10); // within the missed-tick threshold
