@@ -10,7 +10,10 @@ namespace BackWave.Core;
 /// </summary>
 internal static class MintPlanner
 {
-    /// <summary>Named bound: ticks resolved per schedule per poll (a stalled cluster catches up in batches).</summary>
+    /// <summary>
+    /// Named bound: the recorded missed tail and the fresh ticks resolved per schedule per poll
+    /// are each capped here, so a backlog of any length clears in one poll.
+    /// </summary>
     public const int MaxTicksPerPoll = 32;
 
     /// <summary>
@@ -42,9 +45,13 @@ internal static class MintPlanner
             }
             var cron = cronEx!;
 
-            var ticks = new List<DateTimeOffset>();
-            var cursor = schedule.Cursor;
-            while (ticks.Count < MaxTicksPerPoll && ZonedCron.NextAfter(cron, cursor, zone) is { } tick && tick <= now)
+            var missedEnd = now - threshold;
+            var ticks = schedule.Cursor < missedEnd
+                ? MissedTail(cron, zone, schedule.Cursor, missedEnd)
+                : new List<DateTimeOffset>();
+            var cursor = ticks.Count > 0 ? ticks[^1] : schedule.Cursor;
+            var limit = ticks.Count + MaxTicksPerPoll;
+            while (ticks.Count < limit && ZonedCron.NextAfter(cron, cursor, zone) is { } tick && tick <= now)
             {
                 ticks.Add(tick);
                 cursor = tick;
@@ -84,6 +91,50 @@ internal static class MintPlanner
         }
 
         return decisions;
+    }
+
+    /// <summary>
+    /// The last <see cref="MaxTicksPerPoll"/> ticks in (cursor, missedEnd], ascending. The missed
+    /// range mints at most one job and its visible record is bounded, so the walk is bounded too:
+    /// a short outage walks forward from the cursor as before, and a longer backlog backs off from
+    /// missedEnd in doubling windows instead of walking the whole range.
+    /// </summary>
+    private static List<DateTimeOffset> MissedTail(
+        CronExpression cron, TimeZoneInfo? zone, DateTimeOffset cursor, DateTimeOffset missedEnd)
+    {
+        var forward = new List<DateTimeOffset>();
+        var at = cursor;
+        while (forward.Count < MaxTicksPerPoll && ZonedCron.NextAfter(cron, at, zone) is { } tick && tick <= missedEnd)
+        {
+            forward.Add(tick);
+            at = tick;
+        }
+        if (forward.Count < MaxTicksPerPoll || ZonedCron.NextAfter(cron, at, zone) is not { } beyond || beyond > missedEnd)
+        {
+            return forward;
+        }
+
+        var backlog = missedEnd - cursor;
+        var window = TimeSpan.FromMinutes(1);
+        while (true)
+        {
+            var start = window < backlog ? missedEnd - window : cursor;
+            var tail = new Queue<DateTimeOffset>();
+            while (ZonedCron.NextAfter(cron, start, zone) is { } tick && tick <= missedEnd)
+            {
+                if (tail.Count == MaxTicksPerPoll)
+                {
+                    tail.Dequeue();
+                }
+                tail.Enqueue(tick);
+                start = tick;
+            }
+            if (tail.Count == MaxTicksPerPoll || window >= backlog)
+            {
+                return [.. tail];
+            }
+            window += window;
+        }
     }
 }
 

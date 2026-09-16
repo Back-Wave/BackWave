@@ -472,10 +472,20 @@ public class SchedulePropertyTests
 
     private static List<DateTimeOffset> ResolvedTicks(string cron, DateTimeOffset cursor, DateTimeOffset now)
     {
+        // Mirrors the planner: the last MaxTicksPerPoll missed ticks (at or before now - threshold),
+        // then the forward walk from there, capped at MaxTicksPerPoll more.
         var expr = CronExpression.Parse(cron);
-        var ticks = new List<DateTimeOffset>();
+        var missedEnd = now - MintPlanner.MissedTickThreshold;
+        var missed = new List<DateTimeOffset>();
         var c = cursor;
-        while (ticks.Count < MintPlanner.MaxTicksPerPoll && ZonedCron.NextAfter(expr, c, null) is { } t && t <= now)
+        while (ZonedCron.NextAfter(expr, c, null) is { } t && t <= missedEnd)
+        {
+            missed.Add(t);
+            c = t;
+        }
+        var ticks = missed.TakeLast(MintPlanner.MaxTicksPerPoll).ToList();
+        var limit = ticks.Count + MintPlanner.MaxTicksPerPoll;
+        while (ticks.Count < limit && ZonedCron.NextAfter(expr, c, null) is { } t && t <= now)
         {
             ticks.Add(t);
             c = t;
