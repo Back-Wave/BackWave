@@ -1344,17 +1344,23 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         // Oracle returns no OUTPUT, so lock the still-live leases this worker holds, capture each job's
         // cancel_requested flag, then extend exactly those in one UPDATE. A job whose lease lapsed or was
         // stolen simply fails the fence and is reported not renewed.
+        //
+        // The requested set is every job the worker is executing and its pool has no ceiling, while a
+        // bind list past 1,000 ids raises ORA-01795. JSON_TABLE cannot ride the lock read because
+        // FOR UPDATE rejects it (ORA-01786), so the ids go through both statements in slices.
+        const int MaxInListIds = 1_000; // ORA-01795: maximum number of expressions in a list.
         var renewed = new Dictionary<Guid, bool>();
-        await using (var select = Cmd(
-            $"""
-            SELECT job_id, cancel_requested FROM backwave.jobs
-            WHERE job_id IN ({ParameterList("p", jobIds.Count)})
-              AND state = 2 AND lease_owner = :worker AND lease_expiry > :now
-            FOR UPDATE
-            """,
-            connection, transaction))
+        foreach (var slice in jobIds.Chunk(MaxInListIds))
         {
-            AddIdList(select, "p", jobIds);
+            await using var select = Cmd(
+                $"""
+                SELECT job_id, cancel_requested FROM backwave.jobs
+                WHERE job_id IN ({ParameterList("p", slice.Length)})
+                  AND state = 2 AND lease_owner = :worker AND lease_expiry > :now
+                FOR UPDATE
+                """,
+                connection, transaction);
+            AddIdList(select, "p", slice);
             select.Parameters.Add(Str("worker", workerId));
             select.Parameters.Add(Tstz("now", now));
             await using var reader = (OracleDataReader)await select.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
@@ -1364,13 +1370,13 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             }
         }
 
-        if (renewed.Count > 0)
+        foreach (var slice in renewed.Keys.Chunk(MaxInListIds))
         {
             await using var extend = Cmd(
-                $"UPDATE backwave.jobs SET lease_expiry = :expiry WHERE job_id IN ({ParameterList("r", renewed.Count)})",
+                $"UPDATE backwave.jobs SET lease_expiry = :expiry WHERE job_id IN ({ParameterList("r", slice.Length)})",
                 connection, transaction);
             extend.Parameters.Add(Tstz("expiry", now + leaseDuration));
-            AddIdList(extend, "r", [.. renewed.Keys]);
+            AddIdList(extend, "r", slice);
             await extend.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);

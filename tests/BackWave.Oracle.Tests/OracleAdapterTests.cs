@@ -40,6 +40,63 @@ public sealed class OracleAdapterTests
         }
     }
 
+    // A heartbeat covers every job the worker is executing, and a worker's pool has no ceiling, so the
+    // renewed set can pass the 1,000-expression limit of one IN list on Oracle before 23ai (ORA-01795).
+    // 1,200 jobs trips it.
+    [Fact]
+    public async Task Heartbeat_RenewsMoreJobsThanOneInListHoldsExpressionsFor()
+    {
+        const int Jobs = 1_200;
+        var store = await OracleTestDatabase.CreateFreshStoreAsync();
+        for (var i = 0; i < Jobs; i++)
+        {
+            await store.EnqueueAsync(Job(), T0);
+        }
+        var held = new List<Guid>();
+        while (held.Count < Jobs)
+        {
+            var claimed = await store.ClaimAsync(new ClaimRequest("w", ["default"], Jobs, TimeSpan.FromMinutes(5), T0));
+            Assert.NotEmpty(claimed);
+            held.AddRange(claimed.Select(job => job.JobId));
+        }
+
+        var results = await store.HeartbeatAsync("w", held, TimeSpan.FromMinutes(5), T0.AddSeconds(1));
+
+        Assert.Equal(Jobs, results.Count);
+        Assert.All(results, result => Assert.True(result.Renewed));
+    }
+
+    // A shutdown hand-back covers every job the worker still holds, and a worker's pool has no ceiling,
+    // so the held set can pass the 1,000-expression limit of one IN list on Oracle before 23ai
+    // (ORA-01795). Both dispositions run: the retry rung writes the ready set, and the dead-letter rung
+    // writes the dead-lettered set plus the parent lookup. 1,200 jobs trips every per-id list.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RelinquishLeases_HandsBackMoreJobsThanOneInListHoldsExpressionsFor(bool retries)
+    {
+        const int Jobs = 1_200;
+        var store = await OracleTestDatabase.CreateFreshStoreAsync();
+        for (var i = 0; i < Jobs; i++)
+        {
+            await store.EnqueueAsync(Job(), T0);
+        }
+        var held = 0;
+        while (held < Jobs)
+        {
+            var claimed = await store.ClaimAsync(new ClaimRequest("w", ["default"], Jobs, TimeSpan.FromMinutes(5), T0));
+            Assert.NotEmpty(claimed);
+            held += claimed.Count;
+        }
+        var disposition = new RetryPolicy { MaxAttempts = retries ? 5 : 1 }.ToDisposition();
+
+        Assert.Equal(Jobs, await store.RelinquishLeasesAsync("w", T0.AddSeconds(1), disposition));
+
+        var expected = retries ? JobState.Scheduled : JobState.DeadLettered;
+        var counts = await store.CountJobsAsync();
+        Assert.Equal(Jobs, counts.Single(c => c.Queue == "default" && c.State == expected).Count);
+    }
+
     [Fact]
     public async Task ConcurrentFirstUpserts_OfTheSameSchedule_NeverCollide()
     {
