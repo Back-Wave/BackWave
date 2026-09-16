@@ -2084,17 +2084,19 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         }
 
         // Distinct, because a batch may name one job more than once and both statements below want the
-        // job once. The same bind list serves the read and the prune.
-        var ids = (IReadOnlyList<Guid>)[.. rows.Select(row => row.JobId).Distinct()];
-        var idList = ParameterList("j", ids.Count);
-        long maxNewOrdinal;
-        await using (var highest = Cmd(
-            $"SELECT MAX(ordinal) FROM backwave.job_transitions WHERE job_id IN ({idList})",
-            connection, transaction))
+        // job once. The same bind lists serve the read and the prune. A shutdown hand-back records every
+        // job the worker held, and its pool has no ceiling, so the ids go through both in slices under
+        // the IN-list limit; a batch of 1,000 or fewer is one slice, as before.
+        var slices = rows.Select(row => row.JobId).Distinct().Chunk(MaxInListIds).ToArray();
+        var maxNewOrdinal = NoTransitionRecorded;
+        foreach (var slice in slices)
         {
-            AddIdList(highest, "j", ids);
+            await using var highest = Cmd(
+                $"SELECT MAX(ordinal) FROM backwave.job_transitions WHERE job_id IN ({ParameterList("j", slice.Length)})",
+                connection, transaction);
+            AddIdList(highest, "j", slice);
             var value = await highest.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
-            maxNewOrdinal = value is null or DBNull ? NoTransitionRecorded : Convert.ToInt64(value);
+            maxNewOrdinal = Math.Max(maxNewOrdinal, value is null or DBNull ? NoTransitionRecorded : Convert.ToInt64(value));
         }
 
         // Per-job-life cap: skip the DELETE entirely unless some job's new ordinal reached the cap. Under
@@ -2104,18 +2106,21 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         {
             return;
         }
-        await using var prune = Cmd(
-            $"""
-            DELETE FROM backwave.job_transitions jt
-            WHERE jt.job_id IN ({idList})
-              AND jt.ordinal <= (
-                  SELECT MAX(ordinal) FROM backwave.job_transitions x WHERE x.job_id = jt.job_id
-              ) - :cap
-            """,
-            connection, transaction);
-        AddIdList(prune, "j", ids);
-        prune.Parameters.Add(Int("cap", options.Bounds.MaxTransitionsPerJob));
-        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var slice in slices)
+        {
+            await using var prune = Cmd(
+                $"""
+                DELETE FROM backwave.job_transitions jt
+                WHERE jt.job_id IN ({ParameterList("j", slice.Length)})
+                  AND jt.ordinal <= (
+                      SELECT MAX(ordinal) FROM backwave.job_transitions x WHERE x.job_id = jt.job_id
+                  ) - :cap
+                """,
+                connection, transaction);
+            AddIdList(prune, "j", slice);
+            prune.Parameters.Add(Int("cap", options.Bounds.MaxTransitionsPerJob));
+            await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
     }
 
     // The set-valued transition row for the batch INSERT, serialized to JSON and unpacked by JSON_TABLE.

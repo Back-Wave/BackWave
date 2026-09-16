@@ -42,7 +42,8 @@ public sealed class OracleAdapterTests
 
     // A heartbeat covers every job the worker is executing, and a worker's pool has no ceiling, so the
     // renewed set can pass the 1,000-expression limit of one IN list on Oracle before 23ai (ORA-01795).
-    // 1,200 jobs trips it.
+    // The AddIdList guard makes that limit hold on every Oracle version, so this fails before the fix on
+    // the 23ai CI image too. 1,200 jobs trips it.
     [Fact]
     public async Task Heartbeat_RenewsMoreJobsThanOneInListHoldsExpressionsFor()
     {
@@ -68,8 +69,10 @@ public sealed class OracleAdapterTests
 
     // A shutdown hand-back covers every job the worker still holds, and a worker's pool has no ceiling,
     // so the held set can pass the 1,000-expression limit of one IN list on Oracle before 23ai
-    // (ORA-01795). Both dispositions run: the retry rung writes the ready set, and the dead-letter rung
-    // writes the dead-lettered set plus the parent lookup. 1,200 jobs trips every per-id list.
+    // (ORA-01795). The AddIdList guard makes that limit hold on every Oracle version, so this fails
+    // before the fix on the 23ai CI image too. The hand-back's own writes and the parent lookup ride
+    // JSON_TABLE; the list that trips is the transition recorder's MAX(ordinal) read and prune, which
+    // bind one id per held job. Both dispositions run through it. 1,200 jobs trips it.
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
