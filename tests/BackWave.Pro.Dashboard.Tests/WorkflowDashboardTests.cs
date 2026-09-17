@@ -73,8 +73,8 @@ public sealed class WorkflowDashboardTests
         var (app, store, http) = await StartAsync();
         await using (app)
         {
-            // Oldest first: a Running flow created at T0, then a fully-Succeeded one created later.
-            // ListWorkflows orders by CreatedAt, so the earlier-created Workflow leads.
+            // Newest first: a Running flow created at T0, then a fully-Succeeded one created later.
+            // The paged list orders by CreatedAt descending, so the later-created Workflow leads.
             var running = await EnqueueLinearWorkflowAsync(store, "running-flow", createdAt: T0);
             var (doneId, doneCharge, doneReceipt) = await EnqueueLinearWorkflowAsync(store, "done-flow", createdAt: T0.AddMinutes(1));
             await DriveToTerminalAsync(store, doneCharge, new JobOutcome.Success());
@@ -88,8 +88,77 @@ public sealed class WorkflowDashboardTests
             // The derived status badges: the first is still Running, the second every-member-Succeeded.
             Assert.Contains("Running", html);
             Assert.Contains("Succeeded", html);
-            // CreatedAt ordering (oldest first): the T0 running flow appears before the later done flow.
-            AssertWorkflowsAppearInOrder(html, running.WorkflowId, doneId);
+            // CreatedAt ordering (newest first): the later done flow appears before the T0 running flow.
+            AssertWorkflowsAppearInOrder(html, doneId, running.WorkflowId);
+            // Two workflows fit on one page, so there is no next-page link.
+            Assert.DoesNotContain("Next page", html);
+        }
+    }
+
+    [Fact]
+    public async Task Workflows_PagesThroughTheFullSet_ViaTheCursor_NewestFirst()
+    {
+        var (app, store, http) = await StartAsync();
+        await using (app)
+        {
+            // One more than the dashboard's page size (50), so the first page overflows by exactly one row.
+            const int pageSize = 50;
+            var ids = new List<Guid>();
+            for (var i = 0; i <= pageSize; i++)
+            {
+                ids.Add((await EnqueueLinearWorkflowAsync(store, $"flow-{i:D3}", createdAt: T0.AddMinutes(i))).WorkflowId);
+            }
+
+            var firstPage = await http.GetStringAsync("/backwave/workflows");
+            // The page holds the newest 50 workflows, in order; the oldest is left for page two.
+            AssertWorkflowsAppearInOrder(firstPage, [.. Enumerable.Reverse(ids).Take(pageSize)]);
+            Assert.DoesNotContain($"/workflows/{ids[0]}", firstPage);
+            var next = Regex.Match(firstPage, "href=\"(/backwave/workflows\\?after=[^\"]+)\"");
+            Assert.True(next.Success, "The overflowing first page should offer a next-page link.");
+            var nextHref = WebUtility.HtmlDecode(next.Groups[1].Value);
+            Assert.Equal($"/backwave/workflows?after={ids[1]}&at={T0.AddMinutes(1).UtcTicks}", nextHref);
+
+            var secondPage = await http.GetStringAsync(nextHref);
+            Assert.Contains($"/workflows/{ids[0]}", secondPage);
+            Assert.DoesNotContain($"/workflows/{ids[1]}", secondPage);
+            Assert.DoesNotContain("Next page", secondPage);
+
+            // The live refresh streams the same page for the same URL, cursor included: the client
+            // opens the SSE stream on its own location, so a paged view stays on its page.
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            using var response = await http.GetAsync(nextHref + "&live=1", HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            Assert.Equal("text/event-stream", response.Content.Headers.ContentType?.MediaType);
+            await using var stream = await response.Content.ReadAsStreamAsync(cts.Token);
+            using var reader = new StreamReader(stream);
+            var received = "";
+            while (!received.Contains("</table>", StringComparison.Ordinal))
+            {
+                var line = await reader.ReadLineAsync(cts.Token);
+                if (line is null) break;
+                received += line + "\n";
+            }
+            Assert.Contains($"/workflows/{ids[0]}", received);
+            Assert.DoesNotContain($"/workflows/{ids[1]}", received);
+        }
+    }
+
+    [Theory]
+    [InlineData("after=not-a-guid&at=1")]
+    [InlineData("after=0f0f0f0f-0f0f-0f0f-0f0f-0f0f0f0f0f0f&at=not-ticks")]
+    [InlineData("after=0f0f0f0f-0f0f-0f0f-0f0f-0f0f0f0f0f0f&at=9223372036854775807")]
+    public async Task Workflows_MalformedCursor_ShowsTheFirstPage(string queryString)
+    {
+        // A hand-edited or stale link must not turn into a server fault: a cursor that does not parse
+        // (including ticks outside the DateTimeOffset range) falls back to the first page.
+        var (app, store, http) = await StartAsync();
+        await using (app)
+        {
+            var workflow = await EnqueueLinearWorkflowAsync(store, "flow-a", createdAt: T0);
+
+            using var response = await http.GetAsync($"/backwave/workflows?{queryString}");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Contains($"/workflows/{workflow.WorkflowId}", await response.Content.ReadAsStringAsync());
         }
     }
 

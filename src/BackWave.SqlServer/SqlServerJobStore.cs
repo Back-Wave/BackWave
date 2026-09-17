@@ -2873,6 +2873,78 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
     }
 
     /// <inheritdoc/>
+    public async ValueTask<IReadOnlyList<WorkflowSnapshot>> ListWorkflowsAsync(
+        WorkflowListQuery query, CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        // Keyset on (created_at, workflow_id): the cursor is a position, not a row, so a purged
+        // cursor workflow still resumes exactly where it would have sat. Only the page's member
+        // states are read, so the work is bounded by the page, not the store. The tiebreak follows
+        // uniqueidentifier order, which the ORDER BY and the cursor predicate share.
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        var newestFirst = query.SortDirection == WorkflowSortDirection.NewestFirst;
+        var page = new List<(Guid WorkflowId, string? Name, DateTimeOffset CreatedAt, Guid? RestartedFrom)>();
+        await using (var workflows = new SqlCommand { Connection = connection })
+        {
+            var where = string.Empty;
+            if (query.After is { } after)
+            {
+                where = newestFirst
+                    ? "WHERE created_at < @at OR (created_at = @at AND workflow_id < @id) "
+                    : "WHERE created_at > @at OR (created_at = @at AND workflow_id > @id) ";
+                workflows.Parameters.Add("at", SqlDbType.DateTimeOffset).Value = after.CreatedAt;
+                workflows.Parameters.AddWithValue("id", after.WorkflowId);
+            }
+            var order = newestFirst ? "ORDER BY created_at DESC, workflow_id DESC" : "ORDER BY created_at, workflow_id";
+            workflows.CommandText = _schema.Rewrite(
+                $"SELECT TOP (@take) workflow_id, name, created_at, restarted_from FROM backwave.workflows {where}{order}");
+            workflows.Parameters.AddWithValue("take", query.ClampedMaxResults(options.Bounds));
+            await using var reader = await workflows.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                page.Add((
+                    reader.GetGuid(0),
+                    reader.IsDBNull(1) ? null : reader.GetString(1),
+                    reader.GetFieldValue<DateTimeOffset>(2),
+                    reader.IsDBNull(3) ? null : reader.GetGuid(3)));
+            }
+        }
+
+        var statesByWorkflow = new Dictionary<Guid, List<JobState>>();
+        if (page.Count > 0)
+        {
+            var ids = page.Select(w => w.WorkflowId).ToList();
+            await using var members = Cmd(
+                $"SELECT workflow_id, state FROM backwave.jobs WHERE workflow_id IN ({ParameterList("w", ids.Count)})", connection);
+            AddIdList(members, "w", ids);
+            await using var reader = await members.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var wf = reader.GetGuid(0);
+                (statesByWorkflow.TryGetValue(wf, out var list) ? list : statesByWorkflow[wf] = [])
+                    .Add(ReadState(reader, 1));
+            }
+        }
+
+        var snapshots = new List<WorkflowSnapshot>(page.Count);
+        foreach (var w in page)
+        {
+            var states = statesByWorkflow.GetValueOrDefault(w.WorkflowId) ?? [];
+            snapshots.Add(new WorkflowSnapshot
+            {
+                WorkflowId = w.WorkflowId,
+                Name = w.Name,
+                CreatedAt = w.CreatedAt,
+                Status = WorkflowStatusProjection.Project(states),
+                MemberCount = states.Count,
+                RestartedFrom = w.RestartedFrom,
+            });
+        }
+        return snapshots;
+    }
+
+    /// <inheritdoc/>
     public async ValueTask<WorkflowGraph?> GetWorkflowAsync(Guid workflowId, CancellationToken cancellationToken = default)
     {
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);

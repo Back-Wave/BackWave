@@ -51,16 +51,37 @@ public sealed class WorkflowDashboardExtension : IDashboardExtension
         new() { Template = "workflows/{id}/cancel", Permission = options => options.AuthorizeCancel, HandleAsync = CancelAsync },
     ];
 
-    // The Workflows list: every Workflow ordered by creation time, each with its derived status and
+    // The Workflows list: one page of Workflows, newest first, each with its derived status and
     // member count, through the Pro monitor surface. Live, because a Workflow's status moves under it
-    // as members reach terminal states.
+    // as members reach terminal states - and paged, because the live refresh re-runs this read every
+    // tick, so it must never scan the whole store. The cursor rides the query string (?after=<id>&at=<ticks>)
+    // as the OSS Jobs list's does, so it survives the live refresh; a malformed cursor selects the
+    // first page rather than erroring.
     private static async Task<Dictionary<string, object?>?> LoadListAsync(DashboardPageContext context)
     {
         var monitor = context.Http.RequestServices.GetRequiredService<BackWaveMonitor>();
+        var query = context.Http.Request.Query;
+        WorkflowCursor? after = null;
+        if (query["after"] is [{ Length: > 0 } rawAfter] && Guid.TryParse(rawAfter, out var afterId)
+            && query["at"] is [{ Length: > 0 } rawAt] && long.TryParse(rawAt, out var afterTicks)
+            && afterTicks >= DateTimeOffset.MinValue.Ticks && afterTicks <= DateTimeOffset.MaxValue.Ticks)
+        {
+            after = new WorkflowCursor(new DateTimeOffset(afterTicks, TimeSpan.Zero), afterId);
+        }
+
+        // Fetch PageSize+1: a trailing sentinel row means "next page exists". When the store's page cap
+        // is at or below PageSize the sentinel clamps away, so there a FULL page is treated as "there
+        // may be more" rather than silently dropping the rest.
+        var pageSize = Math.Min(DashboardRequestHandler.PageSize, monitor.MaxMonitorPageSize);
+        var page = await monitor.ListWorkflowsAsync(
+            new WorkflowListQuery { After = after, MaxResults = pageSize + 1 }).ConfigureAwait(false);
+        var shown = page.Take(pageSize).ToList();
+        var hasMore = page.Count > pageSize || (page.Count == pageSize && pageSize == monitor.MaxMonitorPageSize);
         return new Dictionary<string, object?>
         {
             ["BasePath"] = context.BasePath,
-            ["Items"] = await monitor.ListWorkflowsAsync().ConfigureAwait(false),
+            ["Items"] = shown,
+            ["Next"] = hasMore && shown.Count > 0 ? WorkflowCursor.From(shown[^1]) : null,
         };
     }
 

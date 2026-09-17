@@ -3313,6 +3313,9 @@ internal sealed class FaultInjectingStore(IJobStore inner, Func<string, bool> sh
     public ValueTask<IReadOnlyList<WorkflowSnapshot>> ListWorkflowsAsync(CancellationToken cancellationToken = default)
         => inner.ListWorkflowsAsync(cancellationToken);
 
+    public ValueTask<IReadOnlyList<WorkflowSnapshot>> ListWorkflowsAsync(WorkflowListQuery query, CancellationToken cancellationToken = default)
+        => inner.ListWorkflowsAsync(query, cancellationToken);
+
     public ValueTask<WorkflowGraph?> GetWorkflowAsync(Guid workflowId, CancellationToken cancellationToken = default)
         => inner.GetWorkflowAsync(workflowId, cancellationToken);
 
@@ -3481,6 +3484,9 @@ internal sealed class FenceDroppingStore(IJobStore inner) : IJobStore
 
     public ValueTask<IReadOnlyList<WorkflowSnapshot>> ListWorkflowsAsync(CancellationToken cancellationToken = default)
         => inner.ListWorkflowsAsync(cancellationToken);
+
+    public ValueTask<IReadOnlyList<WorkflowSnapshot>> ListWorkflowsAsync(WorkflowListQuery query, CancellationToken cancellationToken = default)
+        => inner.ListWorkflowsAsync(query, cancellationToken);
 
     public ValueTask<WorkflowGraph?> GetWorkflowAsync(Guid workflowId, CancellationToken cancellationToken = default)
         => inner.GetWorkflowAsync(workflowId, cancellationToken);

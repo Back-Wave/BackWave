@@ -606,6 +606,39 @@ public interface IJobStore
     ValueTask<IReadOnlyList<WorkflowSnapshot>> ListWorkflowsAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Reads one bounded page of workflows for monitoring - each with its derived status and member
+    /// count - ordered by creation time with the workflow id as the tiebreak, in the direction the
+    /// query asks for (newest first by default). The page size is clamped to at least one and at
+    /// most <see cref="StoreBounds.MaxMonitorPageSize"/>, so no caller can read the whole store in
+    /// one call. Paging is keyset: the page resumes strictly after the cursor's (created-at,
+    /// workflow-id) position, so a cursor whose workflow has since been purged still resumes exactly
+    /// where that workflow would have sat, with no rows skipped or repeated.
+    /// <para>
+    /// The default implementation pages in memory over <see cref="ListWorkflowsAsync(CancellationToken)"/>;
+    /// stores override it with a bounded read.
+    /// </para>
+    /// </summary>
+    /// <param name="query">The sort direction, cursor, and page size.</param>
+    /// <param name="cancellationToken">Cancels the operation.</param>
+    /// <returns>At most one page of workflows in the requested order.</returns>
+    async ValueTask<IReadOnlyList<WorkflowSnapshot>> ListWorkflowsAsync(
+        WorkflowListQuery query, CancellationToken cancellationToken = default)
+    {
+        var all = await ListWorkflowsAsync(cancellationToken).ConfigureAwait(false);
+        var newestFirst = query.SortDirection == WorkflowSortDirection.NewestFirst;
+        IEnumerable<WorkflowSnapshot> ordered = newestFirst
+            ? all.OrderByDescending(w => w.CreatedAt).ThenByDescending(w => w.WorkflowId)
+            : all.OrderBy(w => w.CreatedAt).ThenBy(w => w.WorkflowId);
+        if (query.After is { } after)
+        {
+            ordered = ordered.Where(w => newestFirst
+                ? w.CreatedAt < after.CreatedAt || (w.CreatedAt == after.CreatedAt && w.WorkflowId.CompareTo(after.WorkflowId) < 0)
+                : w.CreatedAt > after.CreatedAt || (w.CreatedAt == after.CreatedAt && w.WorkflowId.CompareTo(after.WorkflowId) > 0));
+        }
+        return ordered.Take(query.ClampedMaxResults(Bounds)).ToList();
+    }
+
+    /// <summary>
     /// Reads one workflow's full graph by id, for monitoring — its members with their current job
     /// state, the immutable structural edges between them, and the derived status.
     /// </summary>
@@ -837,6 +870,57 @@ public enum JobSortDirection
 
     /// <summary>Descending by Sequence — most recently enqueued jobs first.</summary>
     NewestFirst,
+}
+
+/// <summary>
+/// A request for one page of the workflow monitoring read (see
+/// <see cref="IJobStore.ListWorkflowsAsync(WorkflowListQuery, CancellationToken)"/>).
+/// </summary>
+public sealed record WorkflowListQuery
+{
+    /// <summary>
+    /// Keyset pagination cursor: the position of the last workflow from the previous page. Only
+    /// workflows strictly beyond it in the read's order are returned; null starts at the first page.
+    /// The cursor is direction-relative - under <see cref="WorkflowSortDirection.NewestFirst"/> the
+    /// next page holds older workflows, under <see cref="WorkflowSortDirection.OldestFirst"/> newer.
+    /// </summary>
+    public WorkflowCursor? After { get; init; }
+
+    /// <summary>The order of the read; defaults to <see cref="WorkflowSortDirection.NewestFirst"/>.</summary>
+    public WorkflowSortDirection SortDirection { get; init; } = WorkflowSortDirection.NewestFirst;
+
+    /// <summary>The requested page size; the store clamps it to at least one and at most <see cref="StoreBounds.MaxMonitorPageSize"/>.</summary>
+    public int MaxResults { get; init; } = 50;
+
+    /// <summary>The page size the store actually applies: <see cref="MaxResults"/> clamped to [1, <see cref="StoreBounds.MaxMonitorPageSize"/>].</summary>
+    /// <param name="bounds">The store's configured bounds.</param>
+    /// <returns>The clamped page size.</returns>
+    public int ClampedMaxResults(StoreBounds bounds) => Math.Max(1, Math.Min(MaxResults, bounds.MaxMonitorPageSize));
+}
+
+/// <summary>
+/// A workflow's position in the monitoring read's order - its creation time and id. Carrying both
+/// lets a page resume after a workflow that has since been purged: the store seeks to the position,
+/// not to the row.
+/// </summary>
+/// <param name="CreatedAt">The creation time of the workflow the page ended on.</param>
+/// <param name="WorkflowId">The id of the workflow the page ended on.</param>
+public sealed record WorkflowCursor(DateTimeOffset CreatedAt, Guid WorkflowId)
+{
+    /// <summary>Builds the cursor that continues a page after <paramref name="snapshot"/>.</summary>
+    /// <param name="snapshot">The last workflow shown on the page.</param>
+    /// <returns>The cursor to pass as <see cref="WorkflowListQuery.After"/>.</returns>
+    public static WorkflowCursor From(WorkflowSnapshot snapshot) => new(snapshot.CreatedAt, snapshot.WorkflowId);
+}
+
+/// <summary>The order of the workflow monitoring read.</summary>
+public enum WorkflowSortDirection
+{
+    /// <summary>Descending by creation time - the default; most recently created workflows first.</summary>
+    NewestFirst,
+
+    /// <summary>Ascending by creation time - creation order.</summary>
+    OldestFirst,
 }
 
 /// <summary>One cell of the queue-depths read: how many jobs sit in a Queue in a given state.</summary>

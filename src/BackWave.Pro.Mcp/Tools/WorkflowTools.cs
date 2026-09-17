@@ -41,7 +41,7 @@ internal sealed class WorkflowTools(
         "after_cursor to fetch the next page. Sorted newest-first by default. Drill into one " +
         "workflow's full graph with get_workflow.")]
     public async Task<ListWorkflowsResult> ListWorkflowsAsync(
-        [Description("The paging cursor: the nextCursor value from the previous page. Omit to start at the first page. If the workflow it pointed at has since been removed, paging safely restarts from the first page (some already-seen rows may repeat) instead of failing.")]
+        [Description("The paging cursor: the nextCursor value from the previous page, passed back verbatim. Omit to start at the first page. The cursor is a position in the sort order, so paging resumes exactly where the previous page ended even if the workflow it pointed at has since been removed.")]
         string? after_cursor = null,
         [Description("Sort order: \"newest_first\" (the default) or \"oldest_first\".")]
         string? sort = null,
@@ -63,61 +63,44 @@ internal sealed class WorkflowTools(
             throw new McpException("max_results must be at least 1.");
         }
 
-        // Clamp the in-memory slice so an enormous max_results can't serialize every workflow in one
-        // response. search_jobs gets this ceiling for free from the store's own paged read; this list
-        // is read whole and sliced here, so we apply the same bound explicitly. No sentinel over-fetch
-        // (unlike search_jobs) because hasMore below is computed from the full ordered count, not from
-        // an over-read, so we clamp straight to the cap rather than cap - 1. The cap is read from the
-        // monitor, so a host that configures a non-default page cap is honored.
-        // The Math.Max(1, ...) floor guards a degenerate host cap of 0: a plain Min would drive pageSize
-        // to 0, and any existing workflow would then set hasMore=true below (start + 0 < ordered.Count)
-        // while page is empty, so the NextCursor read (page[^1]) would throw and surface as an opaque
-        // server fault. The floor yields a clean single-row page instead.
-        pageSize = Math.Max(1, Math.Min(pageSize, monitor.MaxMonitorPageSize));
+        // Keep room for the +1 next-page sentinel under the store's monitor page cap, exactly as
+        // search_jobs does: the store's paged read is the bound, so an enormous max_results can never
+        // serialize every workflow in one response. If pageSize + 1 exceeded the cap, the store would
+        // clamp the sentinel away and a full final page would report hasMore=false, stranding every
+        // later row. Clamping to cap - 1 first also stops pageSize + 1 from overflowing when
+        // max_results is int.MaxValue. The cap is read from the monitor, so a host that configures a
+        // non-default page cap is honored. The Math.Max(1, ...) floor guards a degenerate host cap of
+        // 0 or 1: cap - 1 would drive pageSize to 0 or below, and the store then clamps the read to a
+        // single row with no sentinel, so paging cannot detect a next page (hasMore stays false) but
+        // the tool returns a clean single-row page rather than faulting.
+        pageSize = Math.Max(1, Math.Min(pageSize, monitor.MaxMonitorPageSize - 1));
 
-        // The store lists every workflow oldest-first with a stable id tiebreak, so reversing is
-        // the deterministic newest-first order. The cursor is the last-returned workflow's id,
-        // re-located in the fresh read: rows created after the previous page sort strictly newer
-        // (before the cursor, newest-first), so resuming after the cursor id never skips or
-        // repeats the rows that were still ahead — the same guarantee search_jobs gets from its
-        // monotonic sequence cursor. If the cursor workflow itself is gone (workflow-aware retention
-        // can purge a drained workflow between pages), see the absent-cursor branch below.
-        var all = await monitor.ListWorkflowsAsync(cancellationToken).ConfigureAwait(false);
-        IReadOnlyList<WorkflowSnapshot> ordered = newestFirst ? [.. all.Reverse()] : all;
-
-        var start = 0;
+        // The cursor is the last-returned workflow's keyset position (creation time and id), so the
+        // store resumes strictly after that position even when the workflow itself has since been
+        // purged (workflow-aware retention can drop a drained workflow between pages): the next page
+        // starts exactly where it would have, never skipping or repeating a row.
+        WorkflowCursor? after = null;
         if (after_cursor is not null)
         {
-            if (!Guid.TryParse(after_cursor, out var cursorId))
-            {
-                throw MalformedCursor(after_cursor);
-            }
-            var index = -1;
-            for (var i = 0; i < ordered.Count; i++)
-            {
-                if (ordered[i].WorkflowId == cursorId)
-                {
-                    index = i;
-                    break;
-                }
-            }
-            // A well-formed cursor whose workflow is no longer present is NOT malformed input:
-            // workflow-aware retention can purge a drained workflow between pages, so a valid
-            // nextCursor can legitimately vanish. MalformedCursor is reserved strictly for the
-            // non-GUID case (already thrown above). The cursor is only a WorkflowId, and the purged
-            // row's sort key (creation time) is gone with it, so we cannot re-locate its exact sort
-            // position; restart from the start of the fresh list. That can repeat rows the client
-            // already saw but never skips one (no silent data loss), keeping paging usable instead
-            // of dead-ending the client on a cursor it can never resume from.
-            start = index < 0 ? 0 : index + 1;
+            after = ParseCursor(after_cursor) ?? throw MalformedCursor(after_cursor);
         }
 
-        var page = ordered.Skip(start).Take(pageSize).Select(WorkflowRow.From).ToList();
-        var hasMore = start + page.Count < ordered.Count;
+        var query = new WorkflowListQuery
+        {
+            After = after,
+            SortDirection = newestFirst ? WorkflowSortDirection.NewestFirst : WorkflowSortDirection.OldestFirst,
+            // One extra row answers "is there a next page?"; pageSize was clamped so the extra row
+            // always survives the store's monitor page cap.
+            MaxResults = pageSize + 1,
+        };
+        var page = await monitor.ListWorkflowsAsync(query, cancellationToken).ConfigureAwait(false);
+
+        var hasMore = page.Count > pageSize;
+        var shown = page.Take(pageSize).ToList();
         return new ListWorkflowsResult
         {
-            Workflows = page,
-            NextCursor = hasMore ? page[^1].WorkflowId.ToString() : null,
+            Workflows = shown.Select(WorkflowRow.From).ToList(),
+            NextCursor = hasMore ? FormatCursor(WorkflowCursor.From(shown[^1])) : null,
             HasMore = hasMore,
         };
     }
@@ -216,6 +199,24 @@ internal sealed class WorkflowTools(
         => new(
             $"Invalid after_cursor '{cursor}': pass the nextCursor value returned by a previous "
             + "list_workflows page, or omit it to start at the first page.");
+
+    // The wire cursor is "<creation time UTC ticks>:<workflow id>", the keyset position the store
+    // resumes after. Opaque to clients: they pass nextCursor back verbatim.
+    private static string FormatCursor(WorkflowCursor cursor)
+        => $"{cursor.CreatedAt.UtcTicks}:{cursor.WorkflowId}";
+
+    private static WorkflowCursor? ParseCursor(string cursor)
+    {
+        var separator = cursor.IndexOf(':');
+        if (separator > 0
+            && long.TryParse(cursor.AsSpan(0, separator), out var ticks)
+            && ticks >= DateTimeOffset.MinValue.Ticks && ticks <= DateTimeOffset.MaxValue.Ticks
+            && Guid.TryParse(cursor.AsSpan(separator + 1), out var workflowId))
+        {
+            return new WorkflowCursor(new DateTimeOffset(ticks, TimeSpan.Zero), workflowId);
+        }
+        return null;
+    }
 }
 
 /// <summary>The structured result of <c>list_workflows</c>: one page of rows plus the paging cursor.</summary>

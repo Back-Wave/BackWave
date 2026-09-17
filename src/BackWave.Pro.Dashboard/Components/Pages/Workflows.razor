@@ -1,5 +1,5 @@
 @namespace BackWave.Pro.Dashboard
-@* Workflows list (a BackWave Pro surface): every Workflow ordered by creation time, each with its
+@* Workflows list (a BackWave Pro surface): one page of Workflows, newest first, each with its
    derived status badge (Running / Succeeded / Failed / Cancelled) and member count. The status is
    always a PROJECTION of member states, never stored — so a Workflow can legitimately reopen
    Succeeded→Running when live work is appended. Follow a Workflow to its graph view. Read through the
@@ -63,12 +63,20 @@
                 </div>
             }
         </div>
+
+        @if (Next is { } next)
+        {
+            <p><a class="mono" href="@($"{BasePath}/workflows?after={next.WorkflowId}&at={next.CreatedAt.UtcTicks}")">Next page →</a></p>
+        }
     </div>
 </DashboardLayout>
 
 @code {
     [Parameter, EditorRequired] public string BasePath { get; set; } = "";
     [Parameter, EditorRequired] public IReadOnlyList<WorkflowSnapshot> Items { get; set; } = [];
+
+    /// <summary>The cursor for the next page, or null on the last page; the handler decides from its +1 sentinel row.</summary>
+    [Parameter] public WorkflowCursor? Next { get; set; }
 
     /// <summary>Render only the live region (SSE fragment) rather than the full document.</summary>
     [Parameter] public bool ContentOnly { get; set; }

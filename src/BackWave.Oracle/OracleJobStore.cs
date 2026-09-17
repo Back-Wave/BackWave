@@ -3086,6 +3086,76 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
     }
 
     /// <inheritdoc/>
+    public async ValueTask<IReadOnlyList<WorkflowSnapshot>> ListWorkflowsAsync(
+        WorkflowListQuery query, CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        // Keyset on (created_at, workflow_id): the cursor is a position, not a row, so a purged
+        // cursor workflow still resumes exactly where it would have sat. Only the page's member
+        // states are read, in IN-list slices, so the work is bounded by the page, not the store.
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        var newestFirst = query.SortDirection == WorkflowSortDirection.NewestFirst;
+        var page = new List<(Guid WorkflowId, string? Name, DateTimeOffset CreatedAt, Guid? RestartedFrom)>();
+        await using (var workflows = new OracleCommand { Connection = connection, BindByName = true })
+        {
+            var where = string.Empty;
+            if (query.After is { } after)
+            {
+                where = newestFirst
+                    ? "WHERE created_at < :at OR (created_at = :at AND workflow_id < :id) "
+                    : "WHERE created_at > :at OR (created_at = :at AND workflow_id > :id) ";
+                workflows.Parameters.Add(Tstz("at", after.CreatedAt));
+                workflows.Parameters.Add(Raw("id", after.WorkflowId));
+            }
+            var order = newestFirst ? "ORDER BY created_at DESC, workflow_id DESC" : "ORDER BY created_at, workflow_id";
+            workflows.CommandText = _schema.Rewrite(
+                $"SELECT workflow_id, name, created_at, restarted_from FROM backwave.workflows {where}{order} FETCH FIRST :take ROWS ONLY");
+            workflows.Parameters.Add(Int("take", query.ClampedMaxResults(options.Bounds)));
+            await using var reader = await ExecuteLobReaderAsync(workflows, UncappedTextPrefetchBytes, LobFetchWindowRows, cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                page.Add((
+                    ReadGuid(reader, 0),
+                    ReadTextOrNull(reader, 1),
+                    ReadTstz(reader, 2),
+                    reader.IsDBNull(3) ? null : ReadGuid(reader, 3)));
+            }
+        }
+
+        var statesByWorkflow = new Dictionary<Guid, List<JobState>>();
+        foreach (var slice in page.Select(w => w.WorkflowId).Chunk(MaxInListIds))
+        {
+            await using var members = Cmd(
+                $"SELECT workflow_id, state FROM backwave.jobs WHERE workflow_id IN ({ParameterList("w", slice.Length)})", connection);
+            AddIdList(members, "w", slice);
+            await using var reader = (OracleDataReader)await members.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var wf = ReadGuid(reader, 0);
+                (statesByWorkflow.TryGetValue(wf, out var list) ? list : statesByWorkflow[wf] = [])
+                    .Add(ReadState(reader, 1));
+            }
+        }
+
+        var snapshots = new List<WorkflowSnapshot>(page.Count);
+        foreach (var w in page)
+        {
+            var states = statesByWorkflow.GetValueOrDefault(w.WorkflowId) ?? [];
+            snapshots.Add(new WorkflowSnapshot
+            {
+                WorkflowId = w.WorkflowId,
+                Name = w.Name,
+                CreatedAt = w.CreatedAt,
+                Status = WorkflowStatusProjection.Project(states),
+                MemberCount = states.Count,
+                RestartedFrom = w.RestartedFrom,
+            });
+        }
+        return snapshots;
+    }
+
+    /// <inheritdoc/>
     public async ValueTask<WorkflowGraph?> GetWorkflowAsync(Guid workflowId, CancellationToken cancellationToken = default)
     {
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);

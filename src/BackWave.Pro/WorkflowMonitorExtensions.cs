@@ -53,6 +53,21 @@ public static class WorkflowMonitorExtensions
         => monitor.Store.ListWorkflowsAsync(cancellationToken);
 
     /// <summary>
+    /// One page of workflows, each with its member count and derived status, newest first by default.
+    /// The page size is clamped to at least one and at most <see cref="BackWaveMonitor.MaxMonitorPageSize"/>,
+    /// so a live view never reads the whole store. Pass <see cref="WorkflowCursor.From"/> of the last
+    /// workflow shown as <see cref="WorkflowListQuery.After"/> to read the next page; the page resumes
+    /// at that position even when the workflow itself has since been purged.
+    /// </summary>
+    /// <param name="monitor">The monitor to read through.</param>
+    /// <param name="query">The sort direction, cursor, and page size.</param>
+    /// <param name="cancellationToken">Cancels the read.</param>
+    /// <returns>At most one page of workflows in the requested order; empty when none remain.</returns>
+    public static ValueTask<IReadOnlyList<WorkflowSnapshot>> ListWorkflowsAsync(
+        this BackWaveMonitor monitor, WorkflowListQuery query, CancellationToken cancellationToken = default)
+        => monitor.Store.ListWorkflowsAsync(query, cancellationToken);
+
+    /// <summary>
     /// One workflow's full graph: its member jobs (as <see cref="JobSnapshot"/>s), the fixed structural
     /// edges between them, and the derived status. Use it to render a workflow's dependency graph.
     /// </summary>

@@ -1928,6 +1928,53 @@ public sealed class InMemoryJobStore(
     }
 
     /// <inheritdoc/>
+    public ValueTask<IReadOnlyList<WorkflowSnapshot>> ListWorkflowsAsync(
+        WorkflowListQuery query, CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+        {
+            // Keyset on (CreatedAt, WorkflowId): the cursor is a position, not a row, so a purged
+            // cursor workflow still resumes exactly where it would have sat.
+            var newestFirst = query.SortDirection == WorkflowSortDirection.NewestFirst;
+            IEnumerable<WorkflowRecord> ordered = newestFirst
+                ? _workflows.Values.OrderByDescending(w => w.CreatedAt).ThenByDescending(w => w.WorkflowId)
+                : _workflows.Values.OrderBy(w => w.CreatedAt).ThenBy(w => w.WorkflowId);
+            if (query.After is { } after)
+            {
+                ordered = ordered.Where(w => newestFirst
+                    ? w.CreatedAt < after.CreatedAt || (w.CreatedAt == after.CreatedAt && w.WorkflowId.CompareTo(after.WorkflowId) < 0)
+                    : w.CreatedAt > after.CreatedAt || (w.CreatedAt == after.CreatedAt && w.WorkflowId.CompareTo(after.WorkflowId) > 0));
+            }
+            var page = ordered.Take(query.ClampedMaxResults(_bounds)).ToList();
+
+            // Only the page's members are projected.
+            var pageIds = page.Select(w => w.WorkflowId).ToHashSet();
+            var statesByWorkflow = new Dictionary<Guid, List<JobState>>();
+            foreach (var job in _jobs.Values)
+            {
+                if (job.WorkflowId is { } wf && pageIds.Contains(wf))
+                {
+                    (statesByWorkflow.TryGetValue(wf, out var list) ? list : statesByWorkflow[wf] = []).Add(job.State);
+                }
+            }
+            return ValueTask.FromResult<IReadOnlyList<WorkflowSnapshot>>(
+                page.Select(w =>
+                {
+                    var states = statesByWorkflow.GetValueOrDefault(w.WorkflowId) ?? [];
+                    return new WorkflowSnapshot
+                    {
+                        WorkflowId = w.WorkflowId,
+                        Name = w.Name,
+                        CreatedAt = w.CreatedAt,
+                        Status = WorkflowStatusProjection.Project(states),
+                        MemberCount = states.Count,
+                        RestartedFrom = w.RestartedFrom,
+                    };
+                }).ToList());
+        }
+    }
+
+    /// <inheritdoc/>
     public ValueTask<WorkflowGraph?> GetWorkflowAsync(Guid workflowId, CancellationToken cancellationToken = default)
     {
         lock (_gate)

@@ -80,7 +80,8 @@ public sealed class WorkflowToolsTests
                 .Select(w => Guid.Parse(w.GetProperty("workflowId").GetString()!)));
         Assert.True(firstPage.GetProperty("hasMore").GetBoolean());
         var cursor = firstPage.GetProperty("nextCursor").GetString();
-        Assert.Equal(ids[1].ToString(), cursor);
+        // The cursor is the last row's keyset position: its creation time and id.
+        Assert.Equal($"{baseTime.AddMinutes(1).UtcTicks}:{ids[1]}", cursor);
 
         var second = await server.Client.CallToolAsync(
             "list_workflows", new { max_results = 2, after_cursor = cursor });
@@ -112,10 +113,11 @@ public sealed class WorkflowToolsTests
     [Fact]
     public async Task ListWorkflows_MaxResultsAboveTheStorePageCap_IsClampedToTheConfiguredCap()
     {
-        // An in-memory slice must not exceed the store's configured monitor page cap however large
-        // max_results is, so one call can never serialize every workflow at once. The clamp reads the
-        // store's actual cap through the monitor, not a hardcoded default: configure a non-default cap
-        // and the clamp must track it — the assertion that would have caught a hardcoded 200.
+        // A page must not exceed the store's configured monitor page cap however large max_results
+        // is, so one call can never serialize every workflow at once. The clamp reads the store's
+        // actual cap through the monitor, not a hardcoded default: configure a non-default cap and
+        // the clamp must track it - the assertion that would have caught a hardcoded 200. As with
+        // search_jobs, the request is clamped to cap - 1 so the +1 next-page sentinel survives.
         const int cap = 10;
         await using var server = await McpTestServer.StartAsync(
             bounds: StoreBounds.Default with { MaxMonitorPageSize = cap });
@@ -129,7 +131,7 @@ public sealed class WorkflowToolsTests
 
         Assert.False(result.IsError);
         var structured = result.StructuredContent!.Value;
-        Assert.Equal(cap, structured.GetProperty("workflows").EnumerateArray().Count());
+        Assert.Equal(cap - 1, structured.GetProperty("workflows").EnumerateArray().Count());
         // The extra rows remain reachable behind the cursor, not silently dropped.
         Assert.True(structured.GetProperty("hasMore").GetBoolean());
     }
@@ -161,17 +163,17 @@ public sealed class WorkflowToolsTests
         var (wf1, _, _) = await SeedFanOutWorkflowAsync(server.Store, "wf-1", baseTime.AddMinutes(1));
         var (wf2, r2, c2) = await SeedFanOutWorkflowAsync(server.Store, "wf-2", baseTime.AddMinutes(2));
 
-        // Page 1 (newest-first) returns wf2 and hands back its id as the resume cursor.
+        // Page 1 (newest-first) returns wf2 and hands back its keyset position as the resume cursor.
         var first = await server.Client.CallToolAsync("list_workflows", new { max_results = 1 });
         Assert.False(first.IsError);
         var cursor = first.StructuredContent!.Value.GetProperty("nextCursor").GetString();
-        Assert.Equal(wf2.ToString(), cursor);
+        Assert.Equal($"{baseTime.AddMinutes(2).UtcTicks}:{wf2}", cursor);
 
         // Workflow-aware retention drains and purges wf2 (the cursor's own workflow) before page 2.
         await PurgeWorkflowAsync(server.Store, r2, c2);
 
-        // The now-absent-but-well-formed cursor does NOT error: paging recovers and the remaining
-        // rows are all still reachable (restart-from-start semantics — no exception, no data loss).
+        // The now-absent-but-well-formed cursor does NOT error: it is a position, not a row, so
+        // page 2 resumes exactly where wf2 would have sat - no exception, no skipped or repeated row.
         var second = await server.Client.CallToolAsync(
             "list_workflows", new { max_results = 10, after_cursor = cursor });
         Assert.False(second.IsError);
@@ -180,7 +182,7 @@ public sealed class WorkflowToolsTests
             second.StructuredContent!.Value.GetProperty("workflows").EnumerateArray()
                 .Select(w => Guid.Parse(w.GetProperty("workflowId").GetString()!)));
 
-        // A genuinely malformed (non-GUID) cursor still errors with actionable text.
+        // A genuinely malformed cursor still errors with actionable text.
         var malformed = await server.Client.CallToolAsync(
             "list_workflows", new { after_cursor = "not-a-guid" });
         Assert.True(malformed.IsError);

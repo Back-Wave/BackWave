@@ -5398,6 +5398,127 @@ public abstract class ConformanceSuite
     }
 
     /// <summary>
+    /// Certifies that the paged workflow listing orders by creation time - newest first by default,
+    /// oldest first on request - and carries the same projected status, name, and member count as
+    /// the unbounded listing.
+    /// </summary>
+    [Fact]
+    public async Task Clause_Workflow_Monitor_ListsWorkflowsPaged_OrderedByCreationTime()
+    {
+        var store = await CreateStoreAsync();
+        var first = Guid.NewGuid();
+        var second = Guid.NewGuid();
+        var third = Guid.NewGuid();
+        await store.EnqueueWorkflowAsync(Workflow(first, [WorkflowMember()], name: "first"), T0);
+        await store.EnqueueWorkflowAsync(Workflow(second, [WorkflowMember(), WorkflowMember()], name: "second"), T0.AddMinutes(1));
+        await store.EnqueueWorkflowAsync(Workflow(third, [WorkflowMember()], name: "third"), T0.AddMinutes(2));
+
+        var newestFirst = await store.ListWorkflowsAsync(new WorkflowListQuery());
+        Assert.Equal([third, second, first], newestFirst.Select(w => w.WorkflowId));
+        Assert.Equal("second", newestFirst[1].Name);
+        Assert.Equal(2, newestFirst[1].MemberCount);
+        Assert.Equal(WorkflowStatus.Running, newestFirst[1].Status);
+        Assert.Equal(T0.AddMinutes(1), newestFirst[1].CreatedAt);
+
+        var oldestFirst = await store.ListWorkflowsAsync(
+            new WorkflowListQuery { SortDirection = WorkflowSortDirection.OldestFirst });
+        Assert.Equal([first, second, third], oldestFirst.Select(w => w.WorkflowId));
+    }
+
+    /// <summary>
+    /// Certifies that the paged workflow listing never reads the whole store: MaxResults is clamped to
+    /// at most the store's monitor page cap and to at least one.
+    /// </summary>
+    [Fact]
+    public async Task Clause_Workflow_Monitor_ListsWorkflowsPaged_MaxResults_ClampedToBound()
+    {
+        var store = await CreateStoreAsync();
+        var cap = store.Bounds.MaxMonitorPageSize;
+        for (var i = 0; i < cap + 10; i++)
+        {
+            await store.EnqueueWorkflowAsync(Workflow(Guid.NewGuid(), [WorkflowMember()]), T0.AddSeconds(i));
+        }
+
+        var capped = await store.ListWorkflowsAsync(new WorkflowListQuery { MaxResults = int.MaxValue });
+        Assert.Equal(cap, capped.Count);
+
+        var atLeastOne = await store.ListWorkflowsAsync(new WorkflowListQuery { MaxResults = 0 });
+        Assert.Single(atLeastOne);
+    }
+
+    /// <summary>
+    /// Certifies the keyset cursor: each page resumes strictly after the cursor workflow in the read's
+    /// order, so a walk tiles the set exactly once - including workflows that share a creation time,
+    /// where the workflow id is the tiebreak.
+    /// </summary>
+    [Fact]
+    public async Task Clause_Workflow_Monitor_ListsWorkflowsPaged_CursorResumes_StrictlyAfterTheCursor()
+    {
+        var store = await CreateStoreAsync();
+        var ids = new List<Guid>();
+        for (var i = 0; i < 5; i++)
+        {
+            var id = Guid.NewGuid();
+            ids.Add(id);
+            // Two pairs share a creation time so the id tiebreak is exercised at a page boundary.
+            await store.EnqueueWorkflowAsync(Workflow(id, [WorkflowMember()]), T0.AddMinutes(i / 2));
+        }
+
+        var walked = new List<Guid>();
+        WorkflowCursor? cursor = null;
+        while (true)
+        {
+            var page = await store.ListWorkflowsAsync(new WorkflowListQuery { After = cursor, MaxResults = 2 });
+            if (page.Count == 0)
+            {
+                break;
+            }
+            walked.AddRange(page.Select(w => w.WorkflowId));
+            Assert.True(page.Count <= 2);
+            cursor = WorkflowCursor.From(page[^1]);
+        }
+
+        Assert.Equal(ids.Count, walked.Count);
+        Assert.Equal(ids.ToHashSet(), walked.ToHashSet()); // every workflow exactly once
+        // Creation time is the primary order, newest first, whatever the tiebreak within a pair.
+        Assert.Equal([2, 1, 1, 0, 0], walked.Select(id => ids.IndexOf(id) / 2));
+    }
+
+    /// <summary>
+    /// Certifies that the cursor is a position, not a row: when the cursor workflow is purged between
+    /// pages, the next page resumes exactly where that workflow would have sat, with no row skipped
+    /// or repeated.
+    /// </summary>
+    [Fact]
+    public async Task Clause_Workflow_Monitor_ListsWorkflowsPaged_ResumesAfterAPurgedCursorWorkflow()
+    {
+        var store = await CreateStoreAsync();
+        var oldest = Guid.NewGuid();
+        var middle = Guid.NewGuid();
+        var newest = Guid.NewGuid();
+        var middleMember = WorkflowMember("middle");
+        await store.EnqueueWorkflowAsync(Workflow(oldest, [WorkflowMember("oldest")]), T0);
+        await store.EnqueueWorkflowAsync(Workflow(middle, [middleMember]), T0.AddMinutes(1));
+        await store.EnqueueWorkflowAsync(Workflow(newest, [WorkflowMember("newest")]), T0.AddMinutes(2));
+
+        var firstPage = await store.ListWorkflowsAsync(new WorkflowListQuery { MaxResults = 2 });
+        Assert.Equal([newest, middle], firstPage.Select(w => w.WorkflowId));
+        var cursor = WorkflowCursor.From(firstPage[^1]);
+
+        // Drain and purge the cursor workflow only: every member is claimed (so none is purgeable),
+        // then just the middle one succeeds and its drained workflow is dropped with its identity.
+        var claims = await ClaimAsync(store, T0, maxJobs: 3);
+        var middleClaim = Assert.Single(claims, j => j.JobId == middleMember.JobId);
+        await store.ReportOutcomeAsync(middleClaim.JobId, "w1", middleClaim.Attempt, new JobOutcome.Success(), T0);
+        Assert.Equal(1, await store.PurgeTerminalAsync(
+            TerminalStateClass.SucceededOrCancelled, T0.AddHours(1), maxJobs: 32));
+        Assert.Null(await store.GetWorkflowAsync(middle));
+
+        var secondPage = await store.ListWorkflowsAsync(new WorkflowListQuery { After = cursor, MaxResults = 2 });
+        Assert.Equal([oldest], secondPage.Select(w => w.WorkflowId));
+    }
+
+    /// <summary>
     /// Certifies that a restarted workflow records the workflow it was restarted from, readable from
     /// both the graph and the listing.
     /// </summary>
