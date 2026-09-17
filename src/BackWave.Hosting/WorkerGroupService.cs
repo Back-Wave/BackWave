@@ -1036,16 +1036,17 @@ internal sealed class WorkerGroupService(
     }
 
     // <summary>
-    // Applies an outcome batch, dead-lettering a row whose Job Output the store rejects rather than letting
-    // that rejection reach the fail-stop catch. An over-cap blob (rejected loudly, never truncated) is a
-    // defect in ONE user handler, not an invariant violation, so it must cost that job and nothing else:
-    // the offending row is rewritten as a terminal Failure carrying the rejection as its cause and Failure
-    // Detail - with its Output dropped - and the batch is applied again. A store that pre-scans the whole
-    // batch has written nothing yet; one that applies row by row has already settled the rows ahead of the
-    // rejection, and those simply fence out as StaleLease on the re-apply, which costs a re-poll and no
-    // more. Each pass clears one distinct row's Output, so a row can never be rejected twice and the loop
-    // is bounded by the row count; anything past that bound - or a rejection naming a job this batch never
-    // sent - is unclassifiable and fail-stops the group exactly as before.
+    // Applies an outcome batch, dead-lettering a row whose Job Output or Tag delta the store rejects rather
+    // than letting that rejection reach the fail-stop catch. An over-cap blob or an over-long Tag (rejected
+    // loudly, never truncated) is a defect in ONE user handler, not an invariant violation, so it must cost
+    // that job and nothing else: the offending row is rewritten as a terminal Failure carrying the rejection
+    // as its cause and Failure Detail - with its Output or its Tag delta dropped - and the batch is applied
+    // again. A store that pre-scans the whole batch has written nothing yet; one that applies row by row
+    // has already settled the rows ahead of the rejection, and those simply fence out as StaleLease on the
+    // re-apply, which costs a re-poll and no more. Each pass clears one distinct row's Output or Tag delta,
+    // so a row can be rejected at most once per kind and the loop is bounded by twice the row count;
+    // anything past that bound - or a rejection naming a job this batch never sent - is unclassifiable and
+    // fail-stops the group exactly as before.
     // FencedByDesign marks, per row, whether a rejected pass could already have settled that row, so the
     // caller's fence check knows which StaleLease answers this method's own re-apply produced. Per row and
     // not per batch: only the rows AHEAD of a rejection can have been settled by the pass that threw, and
@@ -1063,7 +1064,7 @@ internal sealed class WorkerGroupService(
             {
                 return (await store.ReportOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false), fencedByDesign);
             }
-            catch (JobOutputTooLargeException rejected) when (pass < reports.Count)
+            catch (JobOutputTooLargeException rejected) when (pass < reports.Count * 2)
             {
                 var index = reports.FindIndex(report => report.JobId == rejected.JobId);
                 if (index < 0)
@@ -1086,6 +1087,32 @@ internal sealed class WorkerGroupService(
                 {
                     FailureDetail = FailureDetail(rejected),
                     AddedTags = row.AddedTags,
+                };
+            }
+            catch (JobTagTooLongException rejected) when (pass < reports.Count * 2)
+            {
+                var index = reports.FindIndex(report => report.JobId == rejected.JobId);
+                if (index < 0)
+                {
+                    throw;
+                }
+                for (var settled = 0; settled < index; settled++)
+                {
+                    fencedByDesign[settled] = true;
+                }
+                HostingLog.JobTagRejected(
+                    logger, options.Name, rejected.JobId, rejected.Tag.Key.Length, rejected.Tag.Value.Length,
+                    rejected.MaxTagKeyLength, rejected.MaxTagValueLength);
+                var row = reports[index];
+                reports[index] = new OutcomeReport(
+                    row.JobId, row.WorkerId, row.Attempt,
+                    new JobOutcome.Failure(
+                        null,
+                        $"Job Tag rejected: a {rejected.Tag.Key.Length}-character key and "
+                            + $"{rejected.Tag.Value.Length}-character value exceeds the MaxTagKeyLength "
+                            + $"{rejected.MaxTagKeyLength} / MaxTagValueLength {rejected.MaxTagValueLength} bound."))
+                {
+                    FailureDetail = FailureDetail(rejected),
                 };
             }
         }

@@ -95,6 +95,11 @@ public sealed class InMemoryJobStore(
             return ValueTask.FromResult(EnqueueResult.WireNameTooLong);
         }
 
+        if (_bounds.FindOverLengthTag(job.Tags) is not null)
+        {
+            return ValueTask.FromResult(EnqueueResult.TagTooLong);
+        }
+
         if (job.Parents.Count > _bounds.MaxParentsPerJob)
         {
             return ValueTask.FromResult(EnqueueResult.TooManyParents);
@@ -397,6 +402,10 @@ public sealed class InMemoryJobStore(
             if (member.WireName.Length > _bounds.MaxWireNameLength)
             {
                 return WorkflowEnqueueResult.WireNameTooLong;
+            }
+            if (_bounds.FindOverLengthTag(member.Tags) is not null)
+            {
+                return WorkflowEnqueueResult.TagTooLong;
             }
             if (member.Parents.Count > _bounds.MaxParentsPerJob)
             {
@@ -727,6 +736,13 @@ public sealed class InMemoryJobStore(
         ReadOnlyMemory<byte>? output = null,
         CancellationToken cancellationToken = default)
     {
+        // An over-long tag in the delta is REJECTED loudly, never truncated, before the fence is even
+        // read, so a rejected report leaves the store untouched (Effect-Once holds).
+        if (_bounds.FindOverLengthTag(addedTags) is { } overLength)
+        {
+            throw new JobTagTooLongException(jobId, overLength, _bounds.MaxTagKeyLength, _bounds.MaxTagValueLength);
+        }
+
         lock (_gate)
         {
             if (!_jobs.TryGetValue(jobId, out var job)
@@ -839,6 +855,10 @@ public sealed class InMemoryJobStore(
                 && blob.Length > _bounds.MaxOutputBytes)
             {
                 throw new JobOutputTooLargeException(row.JobId, blob.Length, _bounds.MaxOutputBytes);
+            }
+            if (_bounds.FindOverLengthTag(row.AddedTags) is { } overLength)
+            {
+                throw new JobTagTooLongException(row.JobId, overLength, _bounds.MaxTagKeyLength, _bounds.MaxTagValueLength);
             }
         }
 

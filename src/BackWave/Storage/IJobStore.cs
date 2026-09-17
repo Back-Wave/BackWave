@@ -123,7 +123,8 @@ public interface IJobStore
     /// Attempt. It rides the same lease fence: when the outcome is applied the set unions onto the
     /// job's existing tags (re-adding an identical tag is a no-op — set semantics), and when the
     /// report is fenced out the buffered tags are discarded with the rest of the write, so a stale
-    /// node never leaves split-brain annotations.
+    /// node never leaves split-brain annotations. A tag whose key or value exceeds the store's tag
+    /// length bounds MUST be REJECTED loudly before any write, never truncated.
     /// </para>
     /// <para>
     /// <paramref name="output"/> is an optional opaque result blob the handler emitted. It rides the
@@ -147,6 +148,7 @@ public interface IJobStore
     /// <param name="cancellationToken">Cancels the operation.</param>
     /// <returns><see cref="OutcomeResult.Applied"/> when the outcome was applied; <see cref="OutcomeResult.StaleLease"/> when the caller no longer held the live lease for this Attempt and nothing changed.</returns>
     /// <exception cref="JobOutputTooLargeException">A success outcome carried <paramref name="output"/> larger than the store's output cap; the write is rejected, never truncated.</exception>
+    /// <exception cref="JobTagTooLongException"><paramref name="addedTags"/> carried a tag whose key or value exceeds the store's tag length bounds; the write is rejected, never truncated.</exception>
     ValueTask<OutcomeResult> ReportOutcomeAsync(
         Guid jobId, string workerId, int attempt, JobOutcome outcome, DateTimeOffset now,
         string? failureDetail = null,
@@ -189,6 +191,7 @@ public interface IJobStore
     /// <param name="cancellationToken">Cancels the operation.</param>
     /// <returns>One result per input row, in the same order, each pairing the row's job id with whether its outcome was <see cref="OutcomeResult.Applied"/> or fenced out as <see cref="OutcomeResult.StaleLease"/>.</returns>
     /// <exception cref="JobOutputTooLargeException">A success row carried output larger than the store's output cap; that write is rejected, never truncated. Whether the rows ahead of it in the batch were already applied depends on the store - see the batch-shape rule above.</exception>
+    /// <exception cref="JobTagTooLongException">A row's tag delta carried a tag whose key or value exceeds the store's tag length bounds; that write is rejected, never truncated, under the same batch-shape rule as over-cap output.</exception>
     async ValueTask<IReadOnlyList<OutcomeReportResult>> ReportOutcomesAsync(
         IReadOnlyList<OutcomeReport> batch, DateTimeOffset now, CancellationToken cancellationToken = default)
     {
@@ -1159,6 +1162,9 @@ public enum EnqueueResult
     /// <summary>The wire name exceeds the store's wire-name length bound; nothing was created.</summary>
     WireNameTooLong,
 
+    /// <summary>A tag's key or value exceeds the store's tag length bound; nothing was created (never truncated).</summary>
+    TagTooLong,
+
     /// <summary>A declared gating parent does not exist; nothing was created.</summary>
     UnknownParent,
 
@@ -1250,6 +1256,30 @@ public sealed class JobOutputTooLargeException(Guid jobId, int actualBytes, int 
 
     /// <summary>The maximum output size the store allows, in bytes.</summary>
     public int MaxOutputBytes { get; } = maxOutputBytes;
+}
+
+/// <summary>
+/// Thrown when an outcome-reported tag delta carries a tag whose key or value exceeds the store's tag
+/// length bounds. Tags are queried and faceted on verbatim, so a clipped tag is a different tag: the
+/// write is rejected loudly rather than truncated, and the outcome it rode on is not applied.
+/// </summary>
+public sealed class JobTagTooLongException(Guid jobId, JobTag tag, int maxTagKeyLength, int maxTagValueLength)
+    : Exception(
+        $"A Job Tag on job {jobId} has a {tag.Key.Length}-character key and a {tag.Value.Length}-character " +
+        $"value, which exceeds the MaxTagKeyLength bound of {maxTagKeyLength} or the MaxTagValueLength " +
+        $"bound of {maxTagValueLength}. Tags are rejected (never truncated) so no store silently clips one.")
+{
+    /// <summary>The id of the job whose tag delta exceeded a bound.</summary>
+    public Guid JobId { get; } = jobId;
+
+    /// <summary>The rejected tag, exactly as it was submitted.</summary>
+    public JobTag Tag { get; } = tag;
+
+    /// <summary>The maximum tag key length the store allows, in characters.</summary>
+    public int MaxTagKeyLength { get; } = maxTagKeyLength;
+
+    /// <summary>The maximum tag value length the store allows, in characters.</summary>
+    public int MaxTagValueLength { get; } = maxTagValueLength;
 }
 
 /// <summary>The outcome of executing one job Attempt, reported back to the store.</summary>

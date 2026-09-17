@@ -42,6 +42,15 @@ internal static partial class HostingLog
     internal static partial void JobOutputRejected(
         ILogger logger, string worker_group, Guid job_id, int actual_bytes, int max_output_bytes);
 
+    [LoggerMessage(EventId = 2004, Level = LogLevel.Error,
+        Message = "BackWave Worker Group '{worker_group}' job {job_id} added a Job Tag with a {key_length}-character key "
+            + "and a {value_length}-character value, which exceeds the store's MaxTagKeyLength {max_tag_key_length} / "
+            + "MaxTagValueLength {max_tag_value_length} bound; the job is dead-lettered and the group keeps running. "
+            + "Tags are rejected, never truncated.")]
+    internal static partial void JobTagRejected(
+        ILogger logger, string worker_group, Guid job_id, int key_length, int value_length,
+        int max_tag_key_length, int max_tag_value_length);
+
     [LoggerMessage(EventId = 2101, Level = LogLevel.Error,
         Message = "BackWave Observer dispatch pump faulted on a non-cancellation error; the pump is stopping. "
             + "The cursor Lease will lapse and another node re-claims; the host keeps serving.")]

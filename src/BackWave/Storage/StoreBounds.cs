@@ -12,6 +12,19 @@ public sealed record StoreBounds
     /// <summary>The longest accepted payload-type wire name, in characters. An over-limit enqueue is rejected.</summary>
     public int MaxWireNameLength { get; init; } = 128;
 
+    /// <summary>
+    /// The longest accepted tag key, in characters. Enforced on every tag write (enqueue, workflow
+    /// enqueue, and the outcome-reported tag delta): an over-limit tag is rejected, never truncated,
+    /// so no adapter can silently clip a key to fit its column.
+    /// </summary>
+    public int MaxTagKeyLength { get; init; } = 200;
+
+    /// <summary>
+    /// The longest accepted tag value (or label text), in characters. Enforced on every tag write the
+    /// same way as <see cref="MaxTagKeyLength"/>: an over-limit tag is rejected, never truncated.
+    /// </summary>
+    public int MaxTagValueLength { get; init; } = 200;
+
     /// <summary>The most jobs a single claim call may return. A larger request is clamped down to this.</summary>
     public int MaxClaimBatch { get; init; } = 32;
 
@@ -81,6 +94,29 @@ public sealed record StoreBounds
             length--;
         }
         return System.Text.Encoding.UTF8.GetString(buffer, 0, length);
+    }
+
+    /// <summary>
+    /// Finds the first tag in <paramref name="tags"/> whose key exceeds <see cref="MaxTagKeyLength"/> or
+    /// whose value exceeds <see cref="MaxTagValueLength"/>, so every store rejects the same tag on the
+    /// same threshold. Null (or an empty set) has nothing to reject.
+    /// </summary>
+    /// <param name="tags">The tag set about to be written, or null.</param>
+    /// <returns>The first over-limit tag, or null when every tag is within both bounds.</returns>
+    public JobTag? FindOverLengthTag(JobTags? tags)
+    {
+        if (tags is null)
+        {
+            return null;
+        }
+        foreach (var tag in tags)
+        {
+            if (tag.Key.Length > MaxTagKeyLength || tag.Value.Length > MaxTagValueLength)
+            {
+                return tag;
+            }
+        }
+        return null;
     }
 
     /// <summary>The default bounds, used when a store is configured without explicit ones.</summary>

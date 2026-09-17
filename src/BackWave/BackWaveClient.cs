@@ -61,7 +61,7 @@ public sealed class BackWaveClient(
     /// <param name="callerLineNumber">Compiler-supplied. The line of the enqueue call site, stamped on the send span; do not set it.</param>
     /// <returns>The new job's id, for later tracking or for use as a dependency parent.</returns>
     /// <exception cref="NotSupportedException">A <paramref name="transaction"/> was supplied but the storage adapter does not support transactional enqueue.</exception>
-    /// <exception cref="ArgumentException">The serialized payload exceeds the store's maximum payload size; store a reference (an id or blob key) instead of the data itself.</exception>
+    /// <exception cref="ArgumentException">The serialized payload exceeds the store's maximum payload size (store a reference, an id or blob key, instead of the data itself), or a tag key or value exceeds the store's tag length bound.</exception>
     /// <exception cref="InvalidOperationException">The store rejected the enqueue for another reason (for example, a duplicate job id).</exception>
     /// <example>
     /// <code>
@@ -126,6 +126,10 @@ public sealed class BackWaveClient(
                 $"Payload for wire name '{registration.WireName}' is {payload.Length} bytes, " +
                 $"which exceeds the MaxPayloadBytes bound. Store a reference (id, blob key) instead of the data itself.",
                 nameof(job)),
+            EnqueueResult.TagTooLong => throw new ArgumentException(
+                $"A tag on wire name '{registration.WireName}' has a key or value longer than the " +
+                "MaxTagKeyLength / MaxTagValueLength bound. Tags are rejected, never truncated.",
+                nameof(tags)),
             _ => throw new InvalidOperationException($"Enqueue failed: {result}."),
         };
     }
@@ -148,7 +152,7 @@ public sealed class BackWaveClient(
     /// <param name="callerMemberName">The member that made the enqueue call. Supplied by the compiler; do not pass it.</param>
     /// <param name="callerLineNumber">The source line of the enqueue call site. Supplied by the compiler; do not pass it.</param>
     /// <returns>The new dependent job's id.</returns>
-    /// <exception cref="ArgumentException">No job exists with the given <paramref name="parentId"/>.</exception>
+    /// <exception cref="ArgumentException">No job exists with the given <paramref name="parentId"/>, or a tag key or value exceeds the store's tag length bound.</exception>
     /// <exception cref="InvalidOperationException">The store rejected the enqueue for another reason.</exception>
     /// <example>
     /// <code>
@@ -206,6 +210,10 @@ public sealed class BackWaveClient(
             EnqueueResult.Ok => jobId,
             EnqueueResult.UnknownParent => throw new ArgumentException(
                 $"Parent job {parentId} does not exist.", nameof(parentId)),
+            EnqueueResult.TagTooLong => throw new ArgumentException(
+                $"A tag on wire name '{registration.WireName}' has a key or value longer than the " +
+                "MaxTagKeyLength / MaxTagValueLength bound. Tags are rejected, never truncated.",
+                nameof(tags)),
             _ => throw new InvalidOperationException($"Enqueue failed: {result}."),
         };
     }

@@ -4498,6 +4498,62 @@ public abstract class ConformanceSuite
     }
 
     /// <summary>
+    /// Certifies that the tag key and value length bounds are enforced on every tag write path at the
+    /// same inclusive thresholds: a key or value exactly at the cap is accepted and round-trips whole,
+    /// one character over is rejected with the matching result, and no store ever truncates a tag to fit.
+    /// </summary>
+    [Fact]
+    public async Task Clause_Tags_LengthBounds_AreEnforcedOnEveryWritePath_NeverTruncation()
+    {
+        var store = await CreateStoreAsync();
+        var atKey = new string('k', StoreBounds.Default.MaxTagKeyLength);
+        var atValue = new string('v', StoreBounds.Default.MaxTagValueLength);
+        var overKey = new string('k', StoreBounds.Default.MaxTagKeyLength + 1);
+        var overValue = new string('v', StoreBounds.Default.MaxTagValueLength + 1);
+
+        // Plain enqueue: exactly at the cap is stored whole; one over is rejected and leaves no trace.
+        var atBound = Job() with { Tags = JobTags.Empty.WithTag(atKey, atValue).WithLabel(atValue) };
+        Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(atBound, now: T0));
+        Assert.Equal(atBound.Tags, (await store.GetJobAsync(atBound.JobId))!.Tags);
+
+        var overKeyJob = Job() with { Tags = JobTags.Empty.WithTag(overKey, "v") };
+        Assert.Equal(EnqueueResult.TagTooLong, await store.EnqueueAsync(overKeyJob, now: T0));
+        Assert.Null(await store.GetJobAsync(overKeyJob.JobId));
+        var overValueJob = Job() with { Tags = JobTags.Empty.WithLabel(overValue) };
+        Assert.Equal(EnqueueResult.TagTooLong, await store.EnqueueAsync(overValueJob, now: T0));
+        Assert.Null(await store.GetJobAsync(overValueJob.JobId));
+
+        // Workflow enqueue: a member's tags are held to the same thresholds.
+        var atMember = WorkflowMember() with { Tags = JobTags.Empty.WithTag(atKey, atValue) };
+        Assert.Equal(WorkflowEnqueueResult.Ok, await store.EnqueueWorkflowAsync(Workflow(Guid.NewGuid(), [atMember]), T0));
+        Assert.Equal(atMember.Tags, (await store.GetJobAsync(atMember.JobId))!.Tags);
+        var overMember = WorkflowMember() with { Tags = JobTags.Empty.WithTag("k", overValue) };
+        Assert.Equal(WorkflowEnqueueResult.TagTooLong,
+            await store.EnqueueWorkflowAsync(Workflow(Guid.NewGuid(), [overMember]), T0));
+        Assert.Null(await store.GetJobAsync(overMember.JobId));
+
+        // Outcome-reported delta: an over-long tag is rejected before the write lands, single and
+        // batched, so the job stays Leased; one exactly at the cap unions onto the job whole.
+        var claimed = (await ClaimAsync(store, T0)).Single(j => j.JobId == atBound.JobId);
+        await Assert.ThrowsAsync<JobTagTooLongException>(() => store.ReportOutcomeAsync(
+            claimed.JobId, "w1", claimed.Attempt, new JobOutcome.Success(), T0,
+            addedTags: JobTags.Empty.WithTag(overKey, "v")).AsTask());
+        await Assert.ThrowsAsync<JobTagTooLongException>(() => store.ReportOutcomesAsync(
+        [
+            new OutcomeReport(claimed.JobId, "w1", claimed.Attempt, new JobOutcome.Success())
+            {
+                AddedTags = JobTags.Empty.WithLabel(overValue),
+            },
+        ], T0).AsTask());
+        Assert.Equal(JobState.Leased, (await store.GetJobAsync(claimed.JobId))!.State);
+
+        Assert.Equal(OutcomeResult.Applied, await store.ReportOutcomeAsync(
+            claimed.JobId, "w1", claimed.Attempt, new JobOutcome.Success(), T0,
+            addedTags: JobTags.Empty.WithTag("delta", atValue)));
+        Assert.Contains(JobTag.Keyed("delta", atValue), (await store.GetJobAsync(claimed.JobId))!.Tags);
+    }
+
+    /// <summary>
     /// Certifies that the record returned by Claim carries the job's enqueue-time tags — the claiming
     /// worker sees the full tag set without a second read.
     /// </summary>

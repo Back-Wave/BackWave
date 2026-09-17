@@ -216,6 +216,9 @@ public enum WorkflowEnqueueResult
     /// <summary>A member's wire name exceeds the store's maximum wire-name length.</summary>
     WireNameTooLong,
 
+    /// <summary>A member's tag key or value exceeds the store's tag length bound; nothing was created (never truncated).</summary>
+    TagTooLong,
+
     /// <summary>A member declares more parents than the store's per-job parent limit.</summary>
     TooManyParents,
 }

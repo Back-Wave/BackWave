@@ -254,6 +254,10 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         {
             return EnqueueResult.WireNameTooLong;
         }
+        if (options.Bounds.FindOverLengthTag(job.Tags) is not null)
+        {
+            return EnqueueResult.TagTooLong;
+        }
         if (job.Parents.Count > options.Bounds.MaxParentsPerJob)
         {
             return EnqueueResult.TooManyParents;
@@ -829,6 +833,12 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         {
             throw new JobOutputTooLargeException(jobId, output.Value.Length, options.Bounds.MaxOutputBytes);
         }
+        // The Tag delta is held to the same rule: an over-long key or value is REJECTED before any
+        // write, never truncated.
+        if (options.Bounds.FindOverLengthTag(addedTags) is { } overLength)
+        {
+            throw new JobTagTooLongException(jobId, overLength, options.Bounds.MaxTagKeyLength, options.Bounds.MaxTagValueLength);
+        }
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
 
         var (sql, configure, newStateValue) = outcome switch
@@ -946,6 +956,10 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 && blob.Length > options.Bounds.MaxOutputBytes)
             {
                 throw new JobOutputTooLargeException(row.JobId, blob.Length, options.Bounds.MaxOutputBytes);
+            }
+            if (options.Bounds.FindOverLengthTag(row.AddedTags) is { } overLength)
+            {
+                throw new JobTagTooLongException(row.JobId, overLength, options.Bounds.MaxTagKeyLength, options.Bounds.MaxTagValueLength);
             }
         }
 
@@ -2854,6 +2868,10 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             if (member.WireName.Length > options.Bounds.MaxWireNameLength)
             {
                 return WorkflowEnqueueResult.WireNameTooLong;
+            }
+            if (options.Bounds.FindOverLengthTag(member.Tags) is not null)
+            {
+                return WorkflowEnqueueResult.TagTooLong;
             }
             if (member.Parents.Count > options.Bounds.MaxParentsPerJob)
             {
