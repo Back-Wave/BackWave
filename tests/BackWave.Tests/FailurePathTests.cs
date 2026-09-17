@@ -306,4 +306,32 @@ public class FailurePathTests
             () => RetryDisposition.FromIntervals(RetryDisposition.MaxAttemptCeiling + 1, [TimeSpan.FromSeconds(1)]));
         Assert.Contains(RetryDisposition.MaxAttemptCeiling.ToString(), error.Message);
     }
+
+    [Fact]
+    public void RetryPolicy_RejectsACeilingBelowOne()
+    {
+        var error = Assert.Throws<ArgumentOutOfRangeException>(() => new RetryPolicy { MaxAttempts = 0 });
+        Assert.Equal(nameof(RetryPolicy.MaxAttempts), error.ParamName);
+    }
+
+    [Fact]
+    public void RetryPolicy_RejectsACeilingAboveTheCap()
+    {
+        var error = Assert.Throws<ArgumentOutOfRangeException>(
+            () => new RetryPolicy { MaxAttempts = RetryDisposition.MaxAttemptCeiling + 1 });
+        Assert.Equal(nameof(RetryPolicy.MaxAttempts), error.ParamName);
+        Assert.Contains(RetryDisposition.MaxAttemptCeiling.ToString(), error.Message);
+    }
+
+    [Fact]
+    public void RetryPolicy_AcceptsTheBoundaryCeilings()
+    {
+        var one = new RetryPolicy { MaxAttempts = 1 };
+        var cap = new RetryPolicy { MaxAttempts = RetryDisposition.MaxAttemptCeiling };
+
+        Assert.Empty(one.ToDisposition().BackoffByAttempt);
+        Assert.Null(one.NextAttemptAt(1, T0));
+        Assert.Equal(RetryDisposition.MaxAttemptCeiling - 1, cap.ToDisposition().BackoffByAttempt.Count);
+        Assert.Null(cap.NextAttemptAt(RetryDisposition.MaxAttemptCeiling, T0));
+    }
 }

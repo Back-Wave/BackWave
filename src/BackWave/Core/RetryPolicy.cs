@@ -6,8 +6,33 @@ namespace BackWave.Core;
 /// </summary>
 public sealed record RetryPolicy
 {
-    /// <summary>The maximum number of attempts before the job dead-letters instead of retrying. Defaults to 10.</summary>
-    public int MaxAttempts { get; init; } = 10;
+    /// <summary>
+    /// The maximum number of attempts before the job dead-letters instead of retrying: at least 1 and at
+    /// most <see cref="RetryDisposition.MaxAttemptCeiling"/>. Defaults to 10.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// The value is less than 1 or more than <see cref="RetryDisposition.MaxAttemptCeiling"/>.
+    /// </exception>
+    public int MaxAttempts
+    {
+        get => _maxAttempts;
+        init
+        {
+            if (value < 1)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(MaxAttempts), value, "A retry policy must allow at least one attempt.");
+            }
+            if (value > RetryDisposition.MaxAttemptCeiling)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(MaxAttempts), value, $"A retry policy allows at most {RetryDisposition.MaxAttemptCeiling} attempts.");
+            }
+            _maxAttempts = value;
+        }
+    }
+
+    private int _maxAttempts = 10;
 
     /// <summary>
     /// Computes the delay before the next attempt, given the number of the attempt that just
