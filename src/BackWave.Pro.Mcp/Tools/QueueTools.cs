@@ -46,7 +46,7 @@ internal sealed record QueueDepthsResult
 internal sealed record QueueDepthRow(
     [property: Description("The queue name.")]
     string Queue,
-    [property: Description("The job state counted, e.g. Scheduled, Executing, Succeeded, DeadLettered, Quarantined.")]
+    [property: Description("The job state counted: Scheduled, AwaitingParent, Leased, Succeeded, Cancelled, DeadLettered, or Quarantined.")]
     string State,
     [property: Description("How many jobs on this queue are currently in this state.")]
     int Count);
