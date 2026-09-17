@@ -2,18 +2,31 @@ using System.Data.Common;
 using BackWave.Conformance;
 using BackWave.Storage;
 using Microsoft.Data.SqlClient;
+using Xunit.Abstractions;
 
 namespace BackWave.SqlServer.Tests;
 
 /// <summary>The Conformance Suite against real SQL Server (spec §10).</summary>
 [Collection("sqlserver")]
-public sealed class SqlServerConformanceTests : ConformanceSuite
+public sealed class SqlServerConformanceTests(ITestOutputHelper output) : ConformanceSuite(output)
 {
+    // Every optional capability: the store computes NextDue, hands leases back, names its observer
+    // refusals, and applies a batch in one transaction (OPENJSON multi-row UPDATE); the hooks below
+    // provide the rest.
+    protected override ConformanceCapabilities Capabilities
+        => ConformanceCapabilities.NextDue
+        | ConformanceCapabilities.LeaseRelinquish
+        | ConformanceCapabilities.ObserverReportOutcomes
+        | ConformanceCapabilities.AtomicBatchOutcomes
+        | ConformanceCapabilities.FaultInjection
+        | ConformanceCapabilities.ForcedInterleaving
+        | ConformanceCapabilities.QueueConfigLock
+        | ConformanceCapabilities.ConcurrentTagInsert
+        | ConformanceCapabilities.ConcurrentEdgeInsert
+        | ConformanceCapabilities.OutOfBandStateWrite;
+
     protected override async ValueTask<IJobStore> CreateStoreAsync(JobHistoryPolicy historyPolicy)
         => await SqlServerTestDatabase.CreateFreshStoreAsync(historyPolicy);
-
-    // The native batch override applies the whole report in one transaction (OPENJSON multi-row UPDATE).
-    protected override bool BatchOutcomesAreAtomic => true;
 
     // A second store on the same test database with the failpoint armed — no truncation, so it
     // shares the state the test sets up through the normal store (issue 0034).

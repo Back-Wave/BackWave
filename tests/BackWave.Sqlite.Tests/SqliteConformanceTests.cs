@@ -2,6 +2,7 @@ using System.Data.Common;
 using BackWave.Conformance;
 using BackWave.Storage;
 using Microsoft.Data.Sqlite;
+using Xunit.Abstractions;
 
 namespace BackWave.Sqlite.Tests;
 
@@ -10,9 +11,12 @@ namespace BackWave.Sqlite.Tests;
 /// no Docker (the Embedded Adapter needs none). Both the ordinary store and the fault-armed store
 /// (issue 0034/0096) point at the SAME file, so the armed store shares the state the test set up. The
 /// caller transaction for §5.1 Transactional Enqueue opens a raw connection on that same file —
-/// exactly the shape co-resident application code uses (issue 0095).
+/// exactly the shape co-resident application code uses (issue 0095). One BEGIN IMMEDIATE writer at a
+/// time means two operations can never interleave and no row can be held uncommitted against a
+/// second writer, so the forced-interleaving, queue-config-lock, and held-row capabilities are
+/// left undeclared and those clauses skip.
 /// </summary>
-public sealed class SqliteConformanceTests : ConformanceSuite, IAsyncLifetime
+public sealed class SqliteConformanceTests(ITestOutputHelper output) : ConformanceSuite(output), IAsyncLifetime
 {
     private readonly string _path = Path.Combine(
         Path.GetTempPath(), $"backwave_sqlite_conf_{Guid.NewGuid():N}.db");
@@ -20,6 +24,17 @@ public sealed class SqliteConformanceTests : ConformanceSuite, IAsyncLifetime
     private readonly List<SqliteConnection> _callerConnections = [];
 
     private string ConnectionString => $"Data Source={_path}";
+
+    // The store computes NextDue, hands leases back, names its observer refusals, and applies a batch in
+    // one BEGIN IMMEDIATE transaction; the fault-armed store and the out-of-band state write are the only
+    // hooks a single-writer file can honor.
+    protected override ConformanceCapabilities Capabilities
+        => ConformanceCapabilities.NextDue
+        | ConformanceCapabilities.LeaseRelinquish
+        | ConformanceCapabilities.ObserverReportOutcomes
+        | ConformanceCapabilities.AtomicBatchOutcomes
+        | ConformanceCapabilities.FaultInjection
+        | ConformanceCapabilities.OutOfBandStateWrite;
 
     /// <summary>Migrate the file once up front, so a §5.1 caller transaction never races first-use migration.</summary>
     public async Task InitializeAsync()
@@ -37,9 +52,6 @@ public sealed class SqliteConformanceTests : ConformanceSuite, IAsyncLifetime
         await store.CountJobsAsync();
         return store;
     }
-
-    // The native batch override applies the whole report in one BEGIN IMMEDIATE transaction.
-    protected override bool BatchOutcomesAreAtomic => true;
 
     protected override ValueTask<IJobStore?> CreateFaultArmedStoreAsync(string failpoint)
     {

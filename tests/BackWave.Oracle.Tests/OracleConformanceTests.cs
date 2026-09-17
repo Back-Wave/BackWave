@@ -2,19 +2,31 @@ using System.Data.Common;
 using BackWave.Conformance;
 using BackWave.Storage;
 using Oracle.ManagedDataAccess.Client;
+using Xunit.Abstractions;
 
 namespace BackWave.Oracle.Tests;
 
 /// <summary>The Conformance Suite against real Oracle (spec §10).</summary>
 [Collection("oracle")]
-public sealed class OracleConformanceTests : ConformanceSuite
+public sealed class OracleConformanceTests(ITestOutputHelper output) : ConformanceSuite(output)
 {
+    // Every optional capability: the store computes NextDue, hands leases back, names its observer
+    // refusals, and applies a batch inside one Oracle transaction (a per-row fenced UPDATE loop, committed
+    // once); the hooks below provide the rest.
+    protected override ConformanceCapabilities Capabilities
+        => ConformanceCapabilities.NextDue
+        | ConformanceCapabilities.LeaseRelinquish
+        | ConformanceCapabilities.ObserverReportOutcomes
+        | ConformanceCapabilities.AtomicBatchOutcomes
+        | ConformanceCapabilities.FaultInjection
+        | ConformanceCapabilities.ForcedInterleaving
+        | ConformanceCapabilities.QueueConfigLock
+        | ConformanceCapabilities.ConcurrentTagInsert
+        | ConformanceCapabilities.ConcurrentEdgeInsert
+        | ConformanceCapabilities.OutOfBandStateWrite;
+
     protected override async ValueTask<IJobStore> CreateStoreAsync(JobHistoryPolicy historyPolicy)
         => await OracleTestDatabase.CreateFreshStoreAsync(historyPolicy);
-
-    // The batch override applies the whole report inside one Oracle transaction (a per-row fenced UPDATE
-    // loop, committed once), so a batch is all-or-nothing.
-    protected override bool BatchOutcomesAreAtomic => true;
 
     // A second store on the same test database with the failpoint armed - no wipe, so it shares the state
     // the test sets up through the normal store.

@@ -1,6 +1,9 @@
+using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
 using BackWave.Core;
 using BackWave.Diagnostics;
 using BackWave.Storage;
+using Xunit.Abstractions;
 
 namespace BackWave.Conformance;
 
@@ -8,10 +11,11 @@ namespace BackWave.Conformance;
 // Clause_ prefixes in the method names track that spec's section numbers. Keep them in lockstep.
 /// <summary>
 /// The certification suite for the storage contract behind <see cref="IJobStore"/>. To certify an
-/// adapter, subclass this class in an xunit test project and override
+/// adapter, subclass this class in an xunit test project, override
 /// <see cref="CreateStoreAsync(JobHistoryPolicy)"/> to return a fresh, empty store honoring the
-/// given history policy; every test here is a public xunit fact, so the test runner discovers and
-/// runs the whole suite against your store. The In-Memory reference store that ships with BackWave
+/// given history policy, and declare the optional capabilities your subclass provides through
+/// <see cref="Capabilities"/>; every test here is a public xunit fact, so the test runner discovers
+/// and runs the whole suite against your store. The In-Memory reference store that ships with BackWave
 /// passes the suite 100%, so a failing test indicates a divergence between your adapter and the
 /// contract. Test names carry a stable clause-numbering scheme (<c>Clause_5_2_…</c>) that groups
 /// related guarantees in test output; each test's summary states, in plain English, the guarantee
@@ -22,6 +26,11 @@ namespace BackWave.Conformance;
 /// <code>
 /// public sealed class MyStoreConformanceTests : ConformanceSuite
 /// {
+///     // Declare exactly the optional capabilities this class provides; a declared capability whose
+///     // hook still returns its default fails its clauses instead of passing them in silence.
+///     protected override ConformanceCapabilities Capabilities
+///         => ConformanceCapabilities.NextDue | ConformanceCapabilities.LeaseRelinquish;
+///
 ///     protected override async ValueTask&lt;IJobStore&gt; CreateStoreAsync(JobHistoryPolicy historyPolicy)
 ///     {
 ///         // Return a fresh, empty store per call — e.g. over a new temp database — honoring the policy.
@@ -34,6 +43,25 @@ namespace BackWave.Conformance;
 /// </example>
 public abstract class ConformanceSuite
 {
+    private readonly ITestOutputHelper? _output;
+
+    /// <summary>
+    /// Creates the suite without a test output sink: a clause that returns early because its capability
+    /// is not declared still does so, but leaves no "skipped" line behind.
+    /// </summary>
+    protected ConformanceSuite()
+    {
+    }
+
+    /// <summary>
+    /// Creates the suite with xunit's test output sink, which the runner injects into a subclass
+    /// constructor that takes one. Every clause that returns early because its capability is not
+    /// declared writes a single "skipped" line to it, so an undeclared capability stays visible in the run.
+    /// </summary>
+    /// <param name="output">The per-test output sink xunit hands the subclass constructor.</param>
+    protected ConformanceSuite(ITestOutputHelper output)
+        => _output = output;
+
     /// <summary>The fixed instant every test starts from; each test's clock advances from here.</summary>
     protected static readonly DateTimeOffset T0 = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
@@ -68,23 +96,65 @@ public abstract class ConformanceSuite
     protected abstract ValueTask<IJobStore> CreateStoreAsync(JobHistoryPolicy historyPolicy);
 
     /// <summary>
-    /// Whether the store under test overrides <see cref="IJobStore.ClaimBatchAsync"/> to report a real
-    /// <see cref="ClaimResult.NextDue"/>. The contract permits an adapter to keep the default and always
-    /// report <c>null</c> (unknown); such a store sets this to <see langword="false"/>, and the NextDue
-    /// clauses then certify only the documented null fallback. Defaults to <see langword="true"/>, since
-    /// every first-party adapter computes NextDue.
+    /// The optional capabilities this subclass provides, declared up front so a lapse cannot pass in
+    /// silence. Every clause that needs an optional hook or store feature is gated on its flag: when the
+    /// flag is declared, the hook must produce a value or the clause fails naming it; when it is not, the
+    /// clause returns early and writes a "skipped" line to the test output. A hook that produces a value
+    /// without its flag declared fails the clause too, so the declaration stays exact in both directions.
+    /// The contract permits an adapter to omit <see cref="ConformanceCapabilities.NextDue"/> and
+    /// <see cref="ConformanceCapabilities.LeaseRelinquish"/> (clause 5.5.1, "optional, and safe to
+    /// omit"); their clauses then certify only the documented interface default. Every first-party
+    /// adapter declares both.
     /// </summary>
-    protected virtual bool ComputesNextDue => true;
+    protected abstract ConformanceCapabilities Capabilities { get; }
 
     /// <summary>
-    /// Whether the store under test implements the optional hand-back
-    /// <see cref="IJobStore.RelinquishLeasesAsync"/>. The contract permits an adapter to omit it and keep
-    /// the interface default (clause 5.5.1, "optional, and safe to omit"); such a store sets this to
-    /// <see langword="false"/>, and the hand-back clauses then certify only the documented default -
-    /// nothing relinquished, zero returned, every lease left for the expiry sweep to dispose. Defaults to
-    /// <see langword="true"/>, since every first-party adapter hands its leases back.
+    /// Gates a clause on a declared capability that has no hook of its own. Returns true when the
+    /// capability is declared; otherwise writes the "skipped" line and returns false so the caller can
+    /// certify only the documented default.
     /// </summary>
-    protected virtual bool RelinquishesLeases => true;
+    private bool Declares(ConformanceCapabilities capability, [CallerMemberName] string clause = "")
+    {
+        if (Capabilities.HasFlag(capability))
+        {
+            return true;
+        }
+        _output?.WriteLine($"skipped: {capability} not declared in {nameof(Capabilities)} ({clause})");
+        return false;
+    }
+
+    /// <summary>
+    /// Gates a clause on a hook-backed capability. Returns true when the hook produced a value and the
+    /// capability is declared. Fails the clause when the two disagree: a declared capability whose hook
+    /// returned its default is a lapsed override, and a hook that produced a value without its
+    /// declaration is an understated manifest. Otherwise writes the "skipped" line and returns false.
+    /// </summary>
+    private bool Provided(
+        ConformanceCapabilities capability, bool provided, string hook, [CallerMemberName] string clause = "")
+    {
+        var declared = Capabilities.HasFlag(capability);
+        if (declared && !provided)
+        {
+            Assert.Fail(
+                $"{clause}: {nameof(Capabilities)} declares {capability}, but {hook} returned its default. "
+                + $"Override {hook}, or drop {capability} from {nameof(Capabilities)}.");
+        }
+        if (provided && !declared)
+        {
+            Assert.Fail(
+                $"{clause}: {hook} produced a value, but {nameof(Capabilities)} does not declare {capability}. "
+                + $"Add {capability} to {nameof(Capabilities)}.");
+        }
+        return Declares(capability, clause);
+    }
+
+    /// <summary>
+    /// The reference-shaped form of <see cref="Provided(ConformanceCapabilities, bool, string, string)"/>
+    /// for hooks that answer with null when they are not overridden.
+    /// </summary>
+    private bool Provided<T>(
+        ConformanceCapabilities capability, [NotNullWhen(true)] T? value, string hook, [CallerMemberName] string clause = "")
+        => Provided(capability, value is not null, hook, clause);
 
     private static NewJob Job(string wireName = "conformance-job", string queue = "default", DateTimeOffset? dueTime = null)
         => new(Guid.NewGuid(), wireName, "{}"u8.ToArray(), queue, dueTime ?? T0);
@@ -563,7 +633,7 @@ public abstract class ConformanceSuite
         var result = await ClaimBatchAsync(store, T0);
 
         Assert.Empty(result.Jobs); // not due yet
-        if (ComputesNextDue)
+        if (Declares(ConformanceCapabilities.NextDue))
         {
             Assert.Equal(future, result.NextDue);
         }
@@ -588,7 +658,7 @@ public abstract class ConformanceSuite
         var result = await ClaimBatchAsync(store, T0);
 
         Assert.Single(result.Jobs);
-        if (ComputesNextDue)
+        if (Declares(ConformanceCapabilities.NextDue))
         {
             Assert.Equal(future, result.NextDue);
         }
@@ -613,7 +683,7 @@ public abstract class ConformanceSuite
         var result = await ClaimBatchAsync(store, T0);
 
         Assert.Single(result.Jobs); // limit 1 withholds the second
-        if (ComputesNextDue)
+        if (Declares(ConformanceCapabilities.NextDue))
         {
             Assert.Equal(T0, result.NextDue);
         }
@@ -637,7 +707,7 @@ public abstract class ConformanceSuite
         var result = await ClaimBatchAsync(store, T0, maxJobs: 1);
 
         Assert.Single(result.Jobs); // cap 1 leaves the second due-now
-        if (ComputesNextDue)
+        if (Declares(ConformanceCapabilities.NextDue))
         {
             Assert.Equal(T0, result.NextDue);
         }
@@ -878,21 +948,13 @@ public abstract class ConformanceSuite
     }
 
     /// <summary>
-    /// Whether the store under test applies a batched outcome report as one all-or-nothing unit.
-    /// Override to return <c>true</c> when your adapter wraps the whole batch in a transaction.
-    /// The default is <c>false</c>, matching stores that loop the single-report primitive per row
-    /// (best-effort, not atomic); the whole-batch atomicity test returns early on those stores.
-    /// </summary>
-    protected virtual bool BatchOutcomesAreAtomic => false;
-
-    /// <summary>
     /// Certifies that on stores declaring atomic batch reporting, an over-limit output row aborts the
     /// whole batch — sibling rows ordered before it are not applied either.
     /// </summary>
     [Fact]
     public async Task Clause_5_6b_Batch_AtomicStore_OverCapOutputRow_LeavesSiblingRowsUntouched()
     {
-        if (!BatchOutcomesAreAtomic)
+        if (!Declares(ConformanceCapabilities.AtomicBatchOutcomes))
         {
             return; // the default per-row loop applies earlier rows before a later row throws — not atomic
         }
@@ -1106,7 +1168,7 @@ public abstract class ConformanceSuite
     public async Task Clause_4_ReportOutcomes_Batch_CrashBeforeLatchCascade_RollsBackWhole()
     {
         var armed = await CreateFaultArmedStoreAsync("report-outcome");
-        if (armed is null)
+        if (!Provided(ConformanceCapabilities.FaultInjection, armed, nameof(CreateFaultArmedStoreAsync)))
         {
             return; // interruption not simulable on this store
         }
@@ -1399,7 +1461,7 @@ public abstract class ConformanceSuite
         var claimed = Assert.Single(await ClaimAsync(store, T0)); // attempt 1 of 2
 
         var handBack = T0.AddSeconds(5);
-        if (!RelinquishesLeases)
+        if (!Declares(ConformanceCapabilities.LeaseRelinquish))
         {
             await AssertRelinquishIsANoOpAsync(store, handBack, TwoAttempts, claimed.JobId);
             return;
@@ -1444,7 +1506,7 @@ public abstract class ConformanceSuite
         await store.ReportOutcomeAsync(settled.JobId, "w1", 1, new JobOutcome.Success(), T0);
 
         var handBack = T0.AddSeconds(5);
-        if (!RelinquishesLeases)
+        if (!Declares(ConformanceCapabilities.LeaseRelinquish))
         {
             await AssertRelinquishIsANoOpAsync(store, handBack, TwoAttempts, mine.JobId);
             return;
@@ -1477,7 +1539,7 @@ public abstract class ConformanceSuite
 
         var handBack = T0.AddSeconds(5);
         var deadLetterAtOnce = new RetryPolicy { MaxAttempts = 1 }.ToDisposition();
-        if (!RelinquishesLeases)
+        if (!Declares(ConformanceCapabilities.LeaseRelinquish))
         {
             await AssertRelinquishIsANoOpAsync(store, handBack, deadLetterAtOnce, parent.JobId);
             // The latch is untouched too: nothing dead-lettered, so nothing cascades to the child.
@@ -1519,7 +1581,7 @@ public abstract class ConformanceSuite
         Assert.Equal(2, (await store.ClaimAsync(new ClaimRequest("w1", ["fresh"], 32, Lease, reclaim))).Count);
 
         var handBack = reclaim.AddSeconds(5);
-        if (!RelinquishesLeases)
+        if (!Declares(ConformanceCapabilities.LeaseRelinquish))
         {
             await AssertRelinquishIsANoOpAsync(
                 store, handBack, TwoAttempts, [.. atCeiling.Concat(fresh).Select(j => j.JobId)]);
@@ -1606,7 +1668,7 @@ public abstract class ConformanceSuite
         var claimed = Assert.Single(await ClaimAsync(store, T0)); // attempt 1 of 2
 
         var handBack = T0 + Lease + TimeSpan.FromSeconds(1); // past expiry, and no sweep ran
-        if (!RelinquishesLeases)
+        if (!Declares(ConformanceCapabilities.LeaseRelinquish))
         {
             await AssertRelinquishIsANoOpAsync(store, handBack, TwoAttempts, claimed.JobId);
             return;
@@ -2170,7 +2232,8 @@ public abstract class ConformanceSuite
         var store = await CreateStoreAsync();
         var job = Job();
         await store.EnqueueAsync(job, now: T0);
-        if (!await TryStoreUndefinedJobStateAsync(job.JobId, 99))
+        var stored = await TryStoreUndefinedJobStateAsync(job.JobId, 99);
+        if (!Provided(ConformanceCapabilities.OutOfBandStateWrite, stored, nameof(TryStoreUndefinedJobStateAsync)))
         {
             return; // 5.9: the store keeps no integer state column an out-of-band write can reach
         }
@@ -2244,7 +2307,9 @@ public abstract class ConformanceSuite
     /// crash-mid-write tests use it to prove each multi-effect operation lands all-or-nothing. The
     /// default returns null, meaning mid-write interruption is not simulable on this store — for
     /// example, an in-memory store with no transaction to abort and no separate connection to read
-    /// torn state from — and those tests return early.
+    /// torn state from - and those tests return early. An override must be paired with
+    /// <see cref="ConformanceCapabilities.FaultInjection"/> in <see cref="Capabilities"/>; those tests
+    /// fail when the two disagree.
     /// </summary>
     /// <param name="failpoint">The failpoint to arm: "claim", "enqueue", "report-outcome", "mint-due", "lease-expiry", or "lease-relinquish".</param>
     /// <returns>The fault-armed store over this test's database, or null when interruption is not simulable on this store.</returns>
@@ -2260,7 +2325,9 @@ public abstract class ConformanceSuite
     /// almost never hits. The default returns null, meaning the interleaving is not simulable on
     /// this store — an in-memory store has no transaction to park, and a store that serializes
     /// every writer on one database-wide lock can never interleave the two operations — and those
-    /// tests return early.
+    /// tests return early. An override must be paired with
+    /// <see cref="ConformanceCapabilities.ForcedInterleaving"/> in <see cref="Capabilities"/>; those
+    /// tests fail when the two disagree.
     /// </summary>
     /// <param name="onFailpoint">Invoked with the failpoint name and a cancellation token whenever an operation reaches a failpoint; awaiting inside parks that operation there.</param>
     /// <returns>The instrumented store over this test's database, or null when forced interleaving is not simulable on this store.</returns>
@@ -2275,7 +2342,9 @@ public abstract class ConformanceSuite
     /// does, because a row lock on a not-yet-existent row does not reliably serialize against the
     /// first insert. The override must derive the lock key exactly as the store does, or the guard
     /// silently lapses. The default returns null, meaning the adapter takes no such lock (nothing
-    /// to reproduce on a single-process or single-writer store); the test returns early.
+    /// to reproduce on a single-process or single-writer store); the test returns early. An override
+    /// must be paired with <see cref="ConformanceCapabilities.QueueConfigLock"/> in
+    /// <see cref="Capabilities"/>; the test fails when the two disagree.
     /// </summary>
     /// <param name="queue">The queue whose claim-vs-config lock to acquire and hold.</param>
     /// <returns>A handle whose disposal releases the held lock, or null when the adapter takes no such lock.</returns>
@@ -2290,6 +2359,8 @@ public abstract class ConformanceSuite
     /// insert must converge on idempotently, never surface as a raw duplicate-key error. The
     /// default returns null, meaning the race is not simulable on this store (no transaction, or
     /// one database-wide writer lock so the two inserts can never overlap); the test returns early.
+    /// An override must be paired with <see cref="ConformanceCapabilities.ConcurrentTagInsert"/> in
+    /// <see cref="Capabilities"/>; the test fails when the two disagree.
     /// </summary>
     /// <param name="jobId">The already-committed job the duplicate tag row targets.</param>
     /// <param name="tag">The tag row to hold uncommitted.</param>
@@ -2302,7 +2373,9 @@ public abstract class ConformanceSuite
     /// uncommitted (workflow, parent, child) structural-edge row inside an open transaction and
     /// returns a handle whose disposal commits it, pinning the concurrent-duplicate window for edge
     /// inserts. The default returns null, meaning the race is not simulable on this store, exactly
-    /// as for the tag row; the test returns early.
+    /// as for the tag row; the test returns early. An override must be paired with
+    /// <see cref="ConformanceCapabilities.ConcurrentEdgeInsert"/> in <see cref="Capabilities"/>; the
+    /// test fails when the two disagree.
     /// </summary>
     /// <param name="workflowId">The workflow the held edge belongs to.</param>
     /// <param name="parentId">The held edge's parent job.</param>
@@ -2316,7 +2389,9 @@ public abstract class ConformanceSuite
     /// every path the store owns. A value outside <see cref="JobState"/> is a state no caller can
     /// reach, and a store must meet it with a named violation instead of a raw cast. The default
     /// returns false, meaning the store keeps no integer state column that an out-of-band write can
-    /// reach - an in-memory store holds the enum itself - and the test returns early.
+    /// reach - an in-memory store holds the enum itself - and the test returns early. An override must
+    /// be paired with <see cref="ConformanceCapabilities.OutOfBandStateWrite"/> in
+    /// <see cref="Capabilities"/>; the test fails when the two disagree.
     /// </summary>
     /// <param name="jobId">The already-enqueued job whose state column the write overwrites.</param>
     /// <param name="state">The raw integer to store, chosen outside the defined <see cref="JobState"/> values.</param>
@@ -2332,7 +2407,7 @@ public abstract class ConformanceSuite
     public async Task Clause_4_Claim_CrashBeforeCommit_RollsBackTheLease_NeverHalfClaimed()
     {
         var armed = await CreateFaultArmedStoreAsync("claim");
-        if (armed is null)
+        if (!Provided(ConformanceCapabilities.FaultInjection, armed, nameof(CreateFaultArmedStoreAsync)))
         {
             return; // §4: interruption not simulable on this store
         }
@@ -2362,7 +2437,7 @@ public abstract class ConformanceSuite
     public async Task Clause_4_Enqueue_CrashBetweenJobAndEdges_LeavesNoOrphanedJobOrLatch()
     {
         var armed = await CreateFaultArmedStoreAsync("enqueue");
-        if (armed is null)
+        if (!Provided(ConformanceCapabilities.FaultInjection, armed, nameof(CreateFaultArmedStoreAsync)))
         {
             return;
         }
@@ -2391,7 +2466,7 @@ public abstract class ConformanceSuite
     public async Task Clause_4_ReportOutcome_CrashBeforeLatchCascade_LeavesParentLeased_AndChildLatched()
     {
         var armed = await CreateFaultArmedStoreAsync("report-outcome");
-        if (armed is null)
+        if (!Provided(ConformanceCapabilities.FaultInjection, armed, nameof(CreateFaultArmedStoreAsync)))
         {
             return;
         }
@@ -2426,7 +2501,7 @@ public abstract class ConformanceSuite
     public async Task Clause_4_MintDue_CrashAfterCursorAdvance_RestoresCursor_NeverLosingTicks()
     {
         var armed = await CreateFaultArmedStoreAsync("mint-due");
-        if (armed is null)
+        if (!Provided(ConformanceCapabilities.FaultInjection, armed, nameof(CreateFaultArmedStoreAsync)))
         {
             return;
         }
@@ -2627,7 +2702,7 @@ public abstract class ConformanceSuite
     public async Task Clause_4_LeaseExpiry_CrashBeforeLatchCascade_LeavesLeaseAndLatchIntact()
     {
         var armed = await CreateFaultArmedStoreAsync("lease-expiry");
-        if (armed is null)
+        if (!Provided(ConformanceCapabilities.FaultInjection, armed, nameof(CreateFaultArmedStoreAsync)))
         {
             return;
         }
@@ -2667,7 +2742,7 @@ public abstract class ConformanceSuite
     public async Task Clause_4_Relinquish_CrashBeforeLatchCascade_LeavesLeaseAndLatchIntact()
     {
         var armed = await CreateFaultArmedStoreAsync("lease-relinquish");
-        if (armed is null)
+        if (!Provided(ConformanceCapabilities.FaultInjection, armed, nameof(CreateFaultArmedStoreAsync)))
         {
             return;
         }
@@ -2680,7 +2755,7 @@ public abstract class ConformanceSuite
 
         var handBack = T0.AddSeconds(5);
         var deadLetterAtOnce = new RetryPolicy { MaxAttempts = 1 }.ToDisposition();
-        if (!RelinquishesLeases)
+        if (!Declares(ConformanceCapabilities.LeaseRelinquish))
         {
             await AssertRelinquishIsANoOpAsync(store, handBack, deadLetterAtOnce, parent.JobId);
             // The latch is untouched too: nothing dead-lettered, so nothing cascades to the child.
@@ -2831,7 +2906,7 @@ public abstract class ConformanceSuite
         // it observably on Postgres, but on SQL Server the row lock's phantom-key behaviour is
         // plan-dependent): holding the shared key externally must STALL a claim at its config read.
         var held = await HoldQueueConfigLockAsync("default");
-        if (held is null)
+        if (!Provided(ConformanceCapabilities.QueueConfigLock, held, nameof(HoldQueueConfigLockAsync)))
         {
             return; // adapter takes no claim-vs-config lock (see HoldQueueConfigLockAsync)
         }
@@ -2876,7 +2951,7 @@ public abstract class ConformanceSuite
             parked.TrySetResult();
             await release.Task;
         });
-        if (claimStore is null)
+        if (!Provided(ConformanceCapabilities.ForcedInterleaving, claimStore, nameof(CreateInterleavingStoreAsync)))
         {
             return; // race not simulable on this store (see CreateInterleavingStoreAsync)
         }
@@ -2938,7 +3013,7 @@ public abstract class ConformanceSuite
             parked.TrySetResult();
             await release.Task;
         });
-        if (claimStore is null)
+        if (!Provided(ConformanceCapabilities.ForcedInterleaving, claimStore, nameof(CreateInterleavingStoreAsync)))
         {
             return; // race not simulable on this store (see CreateInterleavingStoreAsync)
         }
@@ -3004,7 +3079,7 @@ public abstract class ConformanceSuite
         // catch on this path maps to the defined WorkflowEnqueueResult.DuplicateWorkflow. RED now on both
         // SQL adapters (one create throws); GREEN once the duplicate is a defined result.
         var parked = await ParkedWorkflowCreateStoreAsync(CreateInterleavingStoreAsync);
-        if (parked is null)
+        if (!Provided(ConformanceCapabilities.ForcedInterleaving, parked, nameof(CreateInterleavingStoreAsync)))
         {
             return; // race not simulable on this store (see CreateInterleavingStoreAsync)
         }
@@ -3047,7 +3122,7 @@ public abstract class ConformanceSuite
         // as an InvalidOperationException ("commit failed") instead of the defined DuplicateMember. RED
         // now on both SQL adapters; GREEN once the member Duplicate maps to DuplicateMember.
         var parked = await ParkedWorkflowCreateStoreAsync(CreateInterleavingStoreAsync);
-        if (parked is null)
+        if (!Provided(ConformanceCapabilities.ForcedInterleaving, parked, nameof(CreateInterleavingStoreAsync)))
         {
             return; // race not simulable on this store (see CreateInterleavingStoreAsync)
         }
@@ -3101,7 +3176,7 @@ public abstract class ConformanceSuite
         var claimed = Assert.Single(await ClaimAsync(store, T0));
 
         var held = await HoldTagRowAsync(job.JobId, tag);
-        if (held is null)
+        if (!Provided(ConformanceCapabilities.ConcurrentTagInsert, held, nameof(HoldTagRowAsync)))
         {
             return; // race not simulable on this store (see HoldTagRowAsync)
         }
@@ -3144,7 +3219,7 @@ public abstract class ConformanceSuite
         // The append adds child C with parent P — its structural edge is (workflowId, P, C).
         var child = Job(wireName: "child") with { Parents = [parent.JobId] };
         var held = await HoldEdgeRowAsync(workflowId, parent.JobId, child.JobId);
-        if (held is null)
+        if (!Provided(ConformanceCapabilities.ConcurrentEdgeInsert, held, nameof(HoldEdgeRowAsync)))
         {
             return; // race not simulable on this store (see HoldEdgeRowAsync)
         }
@@ -3358,7 +3433,7 @@ public abstract class ConformanceSuite
         var claimed = Assert.Single(await ClaimAsync(store, T0)); // attempt 1 of 2
 
         var handBack = T0.AddSeconds(5);
-        if (!RelinquishesLeases)
+        if (!Declares(ConformanceCapabilities.LeaseRelinquish))
         {
             await AssertRelinquishIsANoOpAsync(store, handBack, TwoAttempts, claimed.JobId);
             // Nothing happened, so nothing is appended: the log still ends at the claim's Leased entry.
@@ -4302,7 +4377,10 @@ public abstract class ConformanceSuite
         var unknown = await store.TryReportObserverDeliveriesAsync(
             new ObserverDeliveryReport(
                 "never-claimed", "node-a", [new ObserverDeliveryOutcome(0, ObserverDeliveryDisposition.Delivered)], T0));
-        if (unknown == ObserverReportOutcome.Unreported)
+        if (!Provided(
+            ConformanceCapabilities.ObserverReportOutcomes,
+            unknown != ObserverReportOutcome.Unreported,
+            nameof(IJobStore.TryReportObserverDeliveriesAsync)))
         {
             Assert.Equal(-1, await store.GetObserverCursorAsync("never-claimed"));
             return;
@@ -4360,7 +4438,10 @@ public abstract class ConformanceSuite
                 BelievedLeaseExpiry = T0 + Lease,
             });
         Assert.Equal(-1, await store.GetObserverCursorAsync("obs"));
-        if (contradicted == ObserverReportOutcome.Unreported)
+        if (!Provided(
+            ConformanceCapabilities.ObserverReportOutcomes,
+            contradicted != ObserverReportOutcome.Unreported,
+            nameof(IJobStore.TryReportObserverDeliveriesAsync)))
         {
             // A store predating the outcome channel refuses both reports all the same - the cursor above
             // proves it - and simply has no way to name which refusal this was.
