@@ -2799,13 +2799,17 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // terminal_at — is <= @before, so the window starts at the drain point and the graph stays coherent
         // (and materialized for Restart) for the Workflow's whole life. workflow_id is read here at
         // retention time only, never the scheduling hot path. The drained-workflows CTE folds both: a
-        // non-NULL drain_at means drained, NULL means a live member still exists.
+        // non-NULL drain_at means drained, NULL means a live member still exists. A drained Workflow
+        // takes the class of its WORST member: has_dead (bool_or over "is DeadLettered or Quarantined")
+        // puts every member in the DeadLetteredOrQuarantined class whatever its own state, so the graph
+        // purges whole at that cutoff, never half-present.
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Cmd(
             """
             WITH drained AS (
                 SELECT workflow_id,
-                       CASE WHEN bool_and(state IN (3, 4, 5, 6)) THEN max(terminal_at) END AS drain_at
+                       CASE WHEN bool_and(state IN (3, 4, 5, 6)) THEN max(terminal_at) END AS drain_at,
+                       bool_or(state IN (5, 6)) AS has_dead
                 FROM backwave.jobs
                 WHERE workflow_id IS NOT NULL
                 GROUP BY workflow_id
@@ -2814,10 +2818,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             WHERE job_id IN (
                 SELECT j.job_id FROM backwave.jobs j
                 LEFT JOIN drained d ON d.workflow_id = j.workflow_id
-                WHERE j.state = ANY(@states)
-                  AND CASE
-                        WHEN j.workflow_id IS NULL THEN j.terminal_at <= @before
-                        ELSE d.drain_at IS NOT NULL AND d.drain_at <= @before
+                WHERE CASE
+                        WHEN j.workflow_id IS NULL THEN j.state = ANY(@states) AND j.terminal_at <= @before
+                        ELSE d.drain_at IS NOT NULL AND d.drain_at <= @before AND d.has_dead = @dead
                       END
                 ORDER BY j.terminal_at, j.sequence
                 LIMIT @max
@@ -2828,6 +2831,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         command.Parameters.AddWithValue("states", stateClass == TerminalStateClass.SucceededOrCancelled
             ? new[] { (int)JobState.Succeeded, (int)JobState.Cancelled }
             : new[] { (int)JobState.DeadLettered, (int)JobState.Quarantined });
+        command.Parameters.AddWithValue("dead", stateClass == TerminalStateClass.DeadLetteredOrQuarantined);
         command.Parameters.AddWithValue("before", terminalBefore.ToUniversalTime());
         command.Parameters.AddWithValue("max", Math.Min(maxJobs, _options.Bounds.MaxPurgeBatch));
         var purged = await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);

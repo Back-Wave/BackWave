@@ -3197,8 +3197,11 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         // has drained (no member still non-terminal) AND the DRAIN instant - max member terminal_at - is
         // <= :before, so the window starts at the drain point and the graph stays coherent for the
         // Workflow's whole life. The drained CTE folds both: a non-NULL drain_at means drained, NULL means
-        // a live member exists. Oracle has no WITH before DELETE, so the CTE lives inside the IN subquery,
-        // and the ORDER BY-then-ROWNUM inline view caps the batch after the ordering is applied.
+        // a live member exists. A drained Workflow takes the class of its WORST member: has_dead (MAX over
+        // "is DeadLettered or Quarantined") puts every member in the DeadLetteredOrQuarantined class
+        // whatever its own state, so the graph purges whole at that cutoff, never half-present. Oracle has
+        // no WITH before DELETE, so the CTE lives inside the IN subquery, and the ORDER BY-then-ROWNUM
+        // inline view caps the batch after the ordering is applied.
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = await BeginAsync(connection, cancellationToken).ConfigureAwait(false);
         await using var command = Cmd(
@@ -3208,7 +3211,8 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 WITH drained AS (
                     SELECT workflow_id,
                            CASE WHEN MIN(CASE WHEN state IN (3, 4, 5, 6) THEN 1 ELSE 0 END) = 1
-                                THEN MAX(terminal_at) END AS drain_at
+                                THEN MAX(terminal_at) END AS drain_at,
+                           MAX(CASE WHEN state IN (5, 6) THEN 1 ELSE 0 END) AS has_dead
                     FROM backwave.jobs
                     WHERE workflow_id IS NOT NULL
                     GROUP BY workflow_id
@@ -3217,9 +3221,8 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     SELECT j.job_id
                     FROM backwave.jobs j
                     LEFT JOIN drained d ON d.workflow_id = j.workflow_id
-                    WHERE j.state IN (:stateA, :stateB)
-                      AND ((j.workflow_id IS NULL AND j.terminal_at <= :before)
-                           OR (j.workflow_id IS NOT NULL AND d.drain_at IS NOT NULL AND d.drain_at <= :before))
+                    WHERE (j.workflow_id IS NULL AND j.state IN (:stateA, :stateB) AND j.terminal_at <= :before)
+                       OR (j.workflow_id IS NOT NULL AND d.drain_at IS NOT NULL AND d.drain_at <= :before AND d.has_dead = :dead)
                     ORDER BY j.terminal_at, j.sequence
                 ) WHERE ROWNUM <= :max
             )
@@ -3231,6 +3234,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         command.Parameters.Add(Int("stateA", (int)stateA));
         command.Parameters.Add(Int("stateB", (int)stateB));
         command.Parameters.Add(Tstz("before", terminalBefore));
+        command.Parameters.Add(Int("dead", stateClass == TerminalStateClass.DeadLetteredOrQuarantined ? 1 : 0));
         command.Parameters.Add(Int("max", Math.Min(maxJobs, options.Bounds.MaxPurgeBatch)));
         var purged = await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
 

@@ -619,8 +619,12 @@ public interface IJobStore
     /// terminal instant is at or before <paramref name="terminalBefore"/>. The retention clock is
     /// always the terminal instant, never enqueue time. The call is bounded so a single sweep can
     /// never become a storm; the caller schedules repeated sweeps until a pass purges nothing.
+    /// A workflow's members are retained as a unit: none is eligible until every member is terminal,
+    /// the clock starts at that drain instant, and the whole workflow takes the class of its worst
+    /// member (dead-lettered-or-quarantined when any member is, succeeded-or-cancelled otherwise),
+    /// so one pass purges every member regardless of each member's own state.
     /// </summary>
-    /// <param name="stateClass">Which class of terminal jobs to purge (succeeded-or-cancelled, or dead-lettered-or-quarantined).</param>
+    /// <param name="stateClass">Which class of terminal jobs to purge (succeeded-or-cancelled, or dead-lettered-or-quarantined); a workflow member is classed by its workflow's worst member.</param>
     /// <param name="terminalBefore">Only jobs that became terminal at or before this instant are eligible to purge.</param>
     /// <param name="maxJobs">The maximum number of jobs to delete in this call, bounding the sweep.</param>
     /// <param name="cancellationToken">Cancels the operation.</param>

@@ -3,7 +3,9 @@ namespace BackWave.Core;
 /// <summary>
 /// Keep-then-purge retention: how long terminal jobs stay queryable before background sweeps
 /// delete them. The retention clock starts at the instant a job reached its terminal state, not
-/// when it was enqueued.
+/// when it was enqueued. A workflow is kept as a unit: its clock starts when every member is
+/// terminal, and the whole workflow follows the window of its worst member, so one dead-lettered
+/// or quarantined member keeps all of its siblings for <see cref="KeepDeadLettered"/>.
 /// </summary>
 public sealed record RetentionPolicy
 {

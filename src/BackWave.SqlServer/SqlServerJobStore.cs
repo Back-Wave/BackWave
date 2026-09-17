@@ -2987,13 +2987,17 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         // (and materialized for Restart) for the Workflow's whole life. workflow_id is read here at
         // retention time only, never the scheduling hot path. The drained CTE folds both: a non-NULL
         // drain_at means drained (MIN over the "is terminal" flag = 1), NULL means a live member exists.
+        // A drained Workflow takes the class of its WORST member: has_dead (MAX over "is DeadLettered or
+        // Quarantined") puts every member in the DeadLetteredOrQuarantined class whatever its own state,
+        // so the graph purges whole at that cutoff, never half-present.
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Cmd(
             """
             WITH drained AS (
                 SELECT workflow_id,
                        CASE WHEN MIN(CASE WHEN state IN (3, 4, 5, 6) THEN 1 ELSE 0 END) = 1
-                            THEN MAX(terminal_at) END AS drain_at
+                            THEN MAX(terminal_at) END AS drain_at,
+                       MAX(CASE WHEN state IN (5, 6) THEN 1 ELSE 0 END) AS has_dead
                 FROM backwave.jobs
                 WHERE workflow_id IS NOT NULL
                 GROUP BY workflow_id
@@ -3003,9 +3007,8 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 SELECT TOP (@max) j.job_id
                 FROM backwave.jobs j WITH (UPDLOCK, READPAST, ROWLOCK)
                 LEFT JOIN drained d ON d.workflow_id = j.workflow_id
-                WHERE j.state IN (@stateA, @stateB)
-                  AND ((j.workflow_id IS NULL AND j.terminal_at <= @before)
-                       OR (j.workflow_id IS NOT NULL AND d.drain_at IS NOT NULL AND d.drain_at <= @before))
+                WHERE (j.workflow_id IS NULL AND j.state IN (@stateA, @stateB) AND j.terminal_at <= @before)
+                   OR (j.workflow_id IS NOT NULL AND d.drain_at IS NOT NULL AND d.drain_at <= @before AND d.has_dead = @dead)
                 ORDER BY j.terminal_at, j.[sequence]
             )
             """,
@@ -3015,6 +3018,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             : (JobState.DeadLettered, JobState.Quarantined);
         command.Parameters.AddWithValue("stateA", (int)stateA);
         command.Parameters.AddWithValue("stateB", (int)stateB);
+        command.Parameters.AddWithValue("dead", stateClass == TerminalStateClass.DeadLetteredOrQuarantined ? 1 : 0);
         command.Parameters.AddWithValue("before", terminalBefore);
         command.Parameters.AddWithValue("max", Math.Min(maxJobs, options.Bounds.MaxPurgeBatch));
         var purged = await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);

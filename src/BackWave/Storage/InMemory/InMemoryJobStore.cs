@@ -1487,11 +1487,14 @@ public sealed class InMemoryJobStore(
             // once the WHOLE Workflow has drained (every member terminal), and then the window starts
             // from the DRAIN point (max member TerminalAt) — not each member's own terminal instant —
             // so the graph stays coherent (and materialized for Restart) for the Workflow's whole life.
+            // A drained Workflow takes the class of its WORST member: one DeadLettered or Quarantined
+            // member puts every member in the DeadLetteredOrQuarantined class, whatever its own state,
+            // so the graph is purged whole at that class's cutoff and never left half-present.
             // Non-workflow jobs keep today's per-job rule. Drain reads WorkflowId at retention time
             // only, never the scheduling hot path.
             var drainByWorkflow = WorkflowDrainInstantsLocked();
             var purgeable = _jobs.Values
-                .Where(j => InClass(j.State, stateClass) && RetentionEligible(j, terminalBefore, drainByWorkflow))
+                .Where(j => InClass(j, stateClass, drainByWorkflow) && RetentionEligible(j, terminalBefore, drainByWorkflow))
                 .OrderBy(j => j.TerminalAt)
                 .ThenBy(j => j.Sequence)
                 .Take(Math.Min(maxJobs, _bounds.MaxPurgeBatch))
@@ -1524,13 +1527,14 @@ public sealed class InMemoryJobStore(
     }
 
     /// <summary>
-    /// Per-workflow drain instant: for each workflow, the <c>max</c> member
+    /// Per-workflow drain facts: <see cref="WorkflowDrain.DrainAt"/> is the <c>max</c> member
     /// <see cref="JobRecord.TerminalAt"/> when EVERY member is terminal, else <c>null</c> (still
-    /// live). The caller holds the gate.
+    /// live); <see cref="WorkflowDrain.HasDead"/> is whether any member is DeadLettered or Quarantined,
+    /// the worst-member class of a drained workflow. The caller holds the gate.
     /// </summary>
-    private Dictionary<Guid, DateTimeOffset?> WorkflowDrainInstantsLocked()
+    private Dictionary<Guid, WorkflowDrain> WorkflowDrainInstantsLocked()
     {
-        var drain = new Dictionary<Guid, DateTimeOffset?>();
+        var drain = new Dictionary<Guid, WorkflowDrain>();
         var live = new HashSet<Guid>();
         foreach (var job in _jobs.Values)
         {
@@ -1541,7 +1545,7 @@ public sealed class InMemoryJobStore(
             if (!job.State.IsTerminal())
             {
                 live.Add(wf); // a single live member means the whole Workflow has not drained
-                drain[wf] = null;
+                drain[wf] = default;
                 continue;
             }
             if (live.Contains(wf))
@@ -1549,21 +1553,28 @@ public sealed class InMemoryJobStore(
                 continue;
             }
             var running = drain.GetValueOrDefault(wf);
-            drain[wf] = running is { } prev && prev >= job.TerminalAt ? prev : job.TerminalAt;
+            drain[wf] = new WorkflowDrain(
+                running.DrainAt is { } prev && prev >= job.TerminalAt ? prev : job.TerminalAt,
+                running.HasDead || job.State is JobState.DeadLettered or JobState.Quarantined);
         }
         return drain;
     }
 
+    private readonly record struct WorkflowDrain(DateTimeOffset? DrainAt, bool HasDead);
+
     private static bool RetentionEligible(
-        JobRecord j, DateTimeOffset terminalBefore, IReadOnlyDictionary<Guid, DateTimeOffset?> drainByWorkflow)
+        JobRecord j, DateTimeOffset terminalBefore, IReadOnlyDictionary<Guid, WorkflowDrain> drainByWorkflow)
         => j.WorkflowId is { } wf
-            ? drainByWorkflow.GetValueOrDefault(wf) is { } drain && drain <= terminalBefore
+            ? drainByWorkflow.GetValueOrDefault(wf).DrainAt is { } drain && drain <= terminalBefore
             : j.TerminalAt <= terminalBefore;
 
-    private static bool InClass(JobState state, TerminalStateClass stateClass)
-        => stateClass == TerminalStateClass.SucceededOrCancelled
-            ? state is JobState.Succeeded or JobState.Cancelled
-            : state is JobState.DeadLettered or JobState.Quarantined;
+    private static bool InClass(
+        JobRecord j, TerminalStateClass stateClass, IReadOnlyDictionary<Guid, WorkflowDrain> drainByWorkflow)
+        => j.WorkflowId is { } wf
+            ? (stateClass == TerminalStateClass.DeadLetteredOrQuarantined) == drainByWorkflow.GetValueOrDefault(wf).HasDead
+            : stateClass == TerminalStateClass.SucceededOrCancelled
+                ? j.State is JobState.Succeeded or JobState.Cancelled
+                : j.State is JobState.DeadLettered or JobState.Quarantined;
 
     /// <inheritdoc/>
     public ValueTask UpsertScheduleAsync(ScheduleRecord schedule, CancellationToken cancellationToken = default)

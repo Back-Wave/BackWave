@@ -9,7 +9,8 @@ namespace BackWave.Tests;
 /// Workflow-aware retention (PRD 0006, issue 0119, ADR 0023, §5.11): a Workflow's members are
 /// retained <b>as a unit</b> — none becomes purge-eligible until the whole Workflow drains (all
 /// members terminal), and then the retention window starts from the <b>drain point</b> (max member
-/// TerminalAt). Non-workflow jobs keep today's per-job rule. Reuses the
+/// TerminalAt) under the class of the <b>worst member</b> (one dead-lettered or quarantined member
+/// puts the whole unit in that class). Non-workflow jobs keep today's per-job rule. Reuses the
 /// ChargeOrder/SendReceipt/ReleaseHold job types from <see cref="DependencyTests"/>.
 /// </summary>
 public class WorkflowRetentionTests
@@ -138,7 +139,7 @@ public class WorkflowRetentionTests
     }
 
     [Fact]
-    public async Task DrainedWorkflow_PurgedAcrossBothTerminalClasses()
+    public async Task DrainedWorkflow_PurgedWholeUnderItsWorstMembersClass()
     {
         var h = NewHarness(out var recorder);
         recorder.ChargeFails = true; // "charge" dead-letters; "settle" we cancel into Succeeded class
@@ -159,14 +160,17 @@ public class WorkflowRetentionTests
         await h.Store.CancelJobAsync(settleId, "op", h.Now);
         await h.AdvanceAsync(TimeSpan.Zero); // run charge to DeadLettered — the Workflow is now drained
 
-        // A SucceededOrCancelled pass takes the cancelled member; the failed member survives that pass.
-        Assert.Equal(1, await h.Store.PurgeTerminalAsync(TerminalStateClass.SucceededOrCancelled, FarFuture, Lots));
-        Assert.Null(await h.Store.GetJobAsync(settleId));
+        // A SucceededOrCancelled pass takes nothing: the cancelled member follows its Workflow's worst
+        // member into the DeadLetteredOrQuarantined class, so the graph never goes half-present.
+        Assert.Equal(0, await h.Store.PurgeTerminalAsync(TerminalStateClass.SucceededOrCancelled, FarFuture, Lots));
+        Assert.NotNull(await h.Store.GetJobAsync(settleId));
         Assert.NotNull(await h.Store.GetJobAsync(chargeId));
 
-        // The DeadLetteredOrQuarantined pass takes the rest; the Workflow row is then gone.
-        Assert.Equal(1, await h.Store.PurgeTerminalAsync(TerminalStateClass.DeadLetteredOrQuarantined, FarFuture, Lots));
+        // The DeadLetteredOrQuarantined pass takes the whole unit; the Workflow row is then gone.
+        Assert.Equal(2, await h.Store.PurgeTerminalAsync(TerminalStateClass.DeadLetteredOrQuarantined, FarFuture, Lots));
+        Assert.Null(await h.Store.GetJobAsync(settleId));
         Assert.Null(await h.Store.GetJobAsync(chargeId));
+        Assert.Null(await h.Monitor.GetWorkflowAsync(def.WorkflowId));
     }
 
     private static BackWaveHarness NewHarness(out DependencyRecorder recorder)

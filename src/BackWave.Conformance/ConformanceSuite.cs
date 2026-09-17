@@ -5458,6 +5458,46 @@ public abstract class ConformanceSuite
     }
 
     /// <summary>
+    /// Certifies that a drained workflow is purged whole under its worst member's class: with one
+    /// dead-lettered and one succeeded member, the succeeded-or-cancelled pass leaves both members
+    /// even past the drain instant, and the dead-lettered-or-quarantined pass removes both members
+    /// and the workflow record together.
+    /// </summary>
+    [Fact]
+    public async Task Clause_Workflow_Retention_PurgesWholeUnderTheWorstMembersClass()
+    {
+        var store = await CreateStoreAsync();
+        var workflowId = Guid.NewGuid();
+        var a = WorkflowMember("a");
+        var b = WorkflowMember("b");
+        await store.EnqueueWorkflowAsync(Workflow(workflowId, [a, b]), T0);
+
+        // A succeeds at T0; B dead-letters at T0+1h. The Workflow drains at T0+1h with a dead member.
+        var aClaim = Assert.Single(await ClaimAsync(store, T0, maxJobs: 1)); // due-order: A claimed first
+        await store.ReportOutcomeAsync(aClaim.JobId, "w1", aClaim.Attempt, new JobOutcome.Success(), T0);
+        var bClaim = Assert.Single(await ClaimAsync(store, T0.AddHours(1)));
+        Assert.Equal(b.JobId, bClaim.JobId);
+        await store.ReportOutcomeAsync(
+            bClaim.JobId, "w1", bClaim.Attempt, new JobOutcome.Failure(null, "boom"), T0.AddHours(1));
+        Assert.Equal(JobState.DeadLettered, (await store.GetJobAsync(b.JobId))!.State);
+
+        // The succeeded-or-cancelled pass, even at a cutoff past the drain instant, takes nothing: the
+        // succeeded member belongs to its workflow's worst-member class, not its own.
+        Assert.Equal(0, await store.PurgeTerminalAsync(
+            TerminalStateClass.SucceededOrCancelled, T0.AddHours(2), maxJobs: 32));
+        Assert.NotNull(await store.GetJobAsync(a.JobId));
+        Assert.NotNull(await store.GetJobAsync(b.JobId));
+
+        // The dead-lettered-or-quarantined pass at that cutoff purges the whole Workflow and its identity.
+        Assert.Equal(2, await store.PurgeTerminalAsync(
+            TerminalStateClass.DeadLetteredOrQuarantined, T0.AddHours(2), maxJobs: 32));
+        Assert.Null(await store.GetJobAsync(a.JobId));
+        Assert.Null(await store.GetJobAsync(b.JobId));
+        Assert.Null(await store.GetWorkflowAsync(workflowId));
+        Assert.Empty(await store.ListWorkflowsAsync());
+    }
+
+    /// <summary>
     /// Certifies that on stores supporting transactional enqueue, rolling back the caller's transaction
     /// means the whole workflow graph never existed.
     /// </summary>

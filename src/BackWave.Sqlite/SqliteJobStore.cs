@@ -2270,7 +2270,9 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         // job keeps the per-job rule (terminal_at <= before); a Workflow member is eligible only once the
         // WHOLE Workflow has drained AND the drain instant — max member terminal_at — is <= before. The
         // drained CTE folds both: a non-NULL drain_at means drained. Postgres's bool_and becomes
-        // MIN(state IN terminal) here.
+        // MIN(state IN terminal) here. A drained Workflow takes the class of its WORST member: has_dead
+        // (MAX over "is DeadLettered or Quarantined") puts every member in the DeadLetteredOrQuarantined
+        // class whatever its own state, so the graph purges whole at that cutoff, never half-present.
         var (states, stateParams) = StatePlaceholders(stateClass == TerminalStateClass.SucceededOrCancelled
             ? [JobState.Succeeded, JobState.Cancelled]
             : [JobState.DeadLettered, JobState.Quarantined]);
@@ -2281,7 +2283,8 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             WITH drained AS (
                 SELECT workflow_id,
                        CASE WHEN MIN(CASE WHEN state IN ({(int)JobState.Succeeded}, {(int)JobState.Cancelled}, {(int)JobState.DeadLettered}, {(int)JobState.Quarantined}) THEN 1 ELSE 0 END) = 1
-                            THEN MAX(terminal_at) END AS drain_at
+                            THEN MAX(terminal_at) END AS drain_at,
+                       MAX(CASE WHEN state IN ({(int)JobState.DeadLettered}, {(int)JobState.Quarantined}) THEN 1 ELSE 0 END) AS has_dead
                 FROM backwave_jobs
                 WHERE workflow_id IS NOT NULL
                 GROUP BY workflow_id
@@ -2290,10 +2293,9 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             WHERE job_id IN (
                 SELECT j.job_id FROM backwave_jobs j
                 LEFT JOIN drained d ON d.workflow_id = j.workflow_id
-                WHERE j.state IN ({states})
-                  AND CASE
-                        WHEN j.workflow_id IS NULL THEN j.terminal_at <= $before
-                        ELSE d.drain_at IS NOT NULL AND d.drain_at <= $before
+                WHERE CASE
+                        WHEN j.workflow_id IS NULL THEN j.state IN ({states}) AND j.terminal_at <= $before
+                        ELSE d.drain_at IS NOT NULL AND d.drain_at <= $before AND d.has_dead = $dead
                       END
                 ORDER BY j.terminal_at, j.sequence
                 LIMIT $max
@@ -2302,6 +2304,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             connection))
         {
             command.Parameters.AddWithValue("$before", SqliteValueCodec.ToTicks(terminalBefore));
+            command.Parameters.AddWithValue("$dead", stateClass == TerminalStateClass.DeadLetteredOrQuarantined ? 1 : 0);
             command.Parameters.AddWithValue("$max", Math.Min(maxJobs, _options.Bounds.MaxPurgeBatch));
             foreach (var (name, value) in stateParams)
             {
