@@ -4231,6 +4231,36 @@ public abstract class ConformanceSuite
     }
 
     /// <summary>
+    /// Certifies that an expiry sweep records the dead-lettered parent's own transition before the
+    /// cascade that cancels its gated child, so an Observer walking the log by position sees the
+    /// parent go terminal before the child does, whichever store it runs against.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_13_Observer_ExpiredParent_IsDeliveredBeforeItsCascadedChild()
+    {
+        var store = await CreateStoreAsync();
+        var parent = Job();
+        await store.EnqueueAsync(parent, now: T0);
+        var child = Job() with { Parents = [parent.JobId] };
+        await store.EnqueueAsync(child, now: T0);
+        Assert.Single(await ClaimAsync(store, T0)); // parent leased, attempt 1
+
+        // Dead-letter at once, so the sweep both dead-letters the parent and cascade-cancels the child.
+        var deadLetterAtOnce = new RetryPolicy { MaxAttempts = 1 }.ToDisposition();
+        var afterExpiry = T0 + Lease + TimeSpan.FromSeconds(1);
+        Assert.Equal(1, await store.ExpireLeasesAsync(afterExpiry, maxJobs: 32, DefaultQueues, deadLetterAtOnce));
+
+        var claim = await ClaimObsAsync(store, "obs", [JobState.DeadLettered, JobState.Cancelled], afterExpiry);
+        Assert.Equal(2, claim.Deliveries.Count);
+        var parentEntry = Assert.Single(claim.Deliveries, d => d.JobId == parent.JobId);
+        var childEntry = Assert.Single(claim.Deliveries, d => d.JobId == child.JobId);
+        Assert.Equal(JobState.DeadLettered, parentEntry.State);
+        Assert.Equal(JobState.Cancelled, childEntry.State);
+        // Parent before child: the parent's entry takes the lower position.
+        Assert.True(parentEntry.Position < childEntry.Position);
+    }
+
+    /// <summary>
     /// Certifies that reporting to an unknown observer, or to a leaseless observer created by an
     /// empty-States claim, is a safe no-op that neither throws nor advances the cursor.
     /// </summary>

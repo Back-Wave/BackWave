@@ -1469,6 +1469,27 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             }
         }
 
+        // Transition Log: one entry per expired job for its resulting state - Scheduled (rescheduled) or
+        // DeadLettered (ceiling) - at its post-claim Attempt, atomic with the disposition writes. Batched,
+        // so a wide sweep does not undo the two statements below with one insert per job.
+        //
+        // Recorded before the dead-letter cascade below, so the expired parent's own entry takes a
+        // lower observer_log_position than the entries that cascade cancels its gated children.
+        // Parent before child is the order every other store hands a reader, and an Observer walks
+        // by position, so the adapter it runs against must not decide what it sees happen first.
+        // The move is free: the expired set is Leased and the cascade touches only AwaitingParent
+        // children, so the two never name the same job and no per-job ordinal shifts.
+        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(expired.Count);
+        foreach (var (jobId, attempt) in expired)
+        {
+            var resulting = disposition.NextAttemptAt(attempt, now) is not null
+                ? JobState.Scheduled
+                : JobState.DeadLettered;
+            transitions.Add((jobId, resulting, attempt, null));
+        }
+        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
+            .ConfigureAwait(false);
+
         // One set-based write per disposition, whatever maxJobs is. Oracle has no VALUES table
         // constructor, so the set arrives as a JSON payload and JSON_TABLE unpacks it - the same shape the
         // outcome write uses, and for the same reason: a sweep of 500 expired leases is 500 round trips as
@@ -1545,20 +1566,6 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     .ConfigureAwait(false);
             }
         }
-
-        // Transition Log: one entry per expired job for its resulting state - Scheduled (rescheduled) or
-        // DeadLettered (ceiling) - at its post-claim Attempt, atomic with the disposition writes. Batched,
-        // so a wide sweep does not undo the two statements above with one insert per job.
-        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(expired.Count);
-        foreach (var (jobId, attempt) in expired)
-        {
-            var resulting = disposition.NextAttemptAt(attempt, now) is not null
-                ? JobState.Scheduled
-                : JobState.DeadLettered;
-            transitions.Add((jobId, resulting, attempt, null));
-        }
-        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
-            .ConfigureAwait(false);
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return expired.Count;
@@ -1639,6 +1646,17 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 transitions.Add((jobId, JobState.DeadLettered, attempt, null));
             }
         }
+
+        // Recorded before the dead-letter cascade below, so the relinquished parent's own entry takes
+        // a lower observer_log_position than the entries that cascade cancels its gated children.
+        // Parent before child is the order every other store hands a reader, and an Observer walks by
+        // position, so the adapter it runs against must not decide what it sees happen first. The move
+        // is free: the held set is Leased and the cascade touches only AwaitingParent children, so the
+        // two never name the same job and no per-job ordinal shifts.
+        //
+        // The entries go in batched, for the same reason the expiry path batches.
+        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
+            .ConfigureAwait(false);
 
         // One set-based write per branch, whatever the hand-back size, through the same JSON_TABLE shape
         // the expiry path uses. Every row is already locked by the FOR UPDATE above and the ids are
@@ -1721,10 +1739,6 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     .ConfigureAwait(false);
             }
         }
-
-        // The entries go in batched, for the same reason the expiry path batches.
-        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
-            .ConfigureAwait(false);
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return held.Count;

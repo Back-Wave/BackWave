@@ -1081,6 +1081,29 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             }
         }
 
+        // Transition Log (§5.12): one entry per expired job for its resulting state — at its
+        // post-claim Attempt — atomic with the disposition writes.
+        // Batched into one insert, so a wide sweep does not add an insert per job on top of the
+        // dispositions above. Those stay a row at a time: a reschedule and a dead-letter write
+        // different columns. Each job appears once here (job_id is the key), so its ordinal holds.
+        //
+        // Recorded before the dead-letter cascade below, so the expired parent's own entry takes a
+        // lower observer_log_position than the entries that cascade cancels its gated children.
+        // Parent before child is the order every other store hands a reader, and an Observer walks
+        // by position, so the adapter it runs against must not decide what it sees happen first.
+        // The move is free: the expired set is Leased and the cascade touches only AwaitingParent
+        // children, so the two never name the same job and no per-job ordinal shifts.
+        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(expired.Count);
+        foreach (var (jobId, attempt) in expired)
+        {
+            var resulting = disposition.NextAttemptAt(attempt, now) is not null
+                ? JobState.Scheduled
+                : JobState.DeadLettered;
+            transitions.Add((jobId, resulting, attempt, null));
+        }
+        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
+            .ConfigureAwait(false);
+
         if (deadLetteredParents.Count > 0)
         {
             // Crash after the dead-letter writes, before the latch cascade: rollback must leave the
@@ -1092,22 +1115,6 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                     .ConfigureAwait(false);
             }
         }
-
-        // Transition Log (§5.12): one entry per expired job for its resulting state — at its
-        // post-claim Attempt — atomic with the disposition writes.
-        // Batched into one insert, so a wide sweep does not add an insert per job on top of the
-        // dispositions above. Those stay a row at a time: a reschedule and a dead-letter write
-        // different columns. Each job appears once here (job_id is the key), so its ordinal holds.
-        var transitions = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(expired.Count);
-        foreach (var (jobId, attempt) in expired)
-        {
-            var resulting = disposition.NextAttemptAt(attempt, now) is not null
-                ? JobState.Scheduled
-                : JobState.DeadLettered;
-            transitions.Add((jobId, resulting, attempt, null));
-        }
-        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
-            .ConfigureAwait(false);
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return expired.Count;
@@ -1193,6 +1200,15 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             }
         }
 
+        // Recorded before the dead-letter cascade below, so the relinquished parent's own entry takes
+        // a lower observer_log_position than the entries that cascade cancels its gated children.
+        // Parent before child is the order every other store hands a reader, and an Observer walks by
+        // position, so the adapter it runs against must not decide what it sees happen first. The move
+        // is free: the held set is Leased and the cascade touches only AwaitingParent children, so the
+        // two never name the same job and no per-job ordinal shifts.
+        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
+            .ConfigureAwait(false);
+
         // One UPDATE per branch, whatever the hand-back size. A shutdown hands back every Lease the
         // worker holds at once, so a statement per row put the store's slowest path on the node's
         // stop budget. The ids ride a JSON parameter unpacked by json_each, the same shape the
@@ -1244,9 +1260,6 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                     .ConfigureAwait(false);
             }
         }
-
-        await RecordTransitionsBatchAsync(connection, transaction, transitions, now, cancellationToken)
-            .ConfigureAwait(false);
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return held.Count;
