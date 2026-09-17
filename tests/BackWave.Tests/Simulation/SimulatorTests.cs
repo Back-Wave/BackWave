@@ -785,6 +785,34 @@ public class SimulatorTests
     }
 
     /// <summary>
+    /// Oracle self-test for the double-execution invariant (I1): SabotageDoubleClaim hands one claim a row a
+    /// peer is still executing under a Lease live on the peer's own clock, so two nodes run the same job
+    /// while each believes it holds a live Lease. The store row is untouched (the peer stays its owner), so an
+    /// oracle that counts executors by the store's single LeaseOwner reads exactly one and never trips; only
+    /// a count taken from each node's own record of the job reaches two. Runs at a Pristine fault level
+    /// (crashes and heartbeat loss off) so the sabotage's injected double run is the only thing that can
+    /// trip the oracle.
+    /// </summary>
+    [Theory]
+    [InlineData(1UL)]
+    [InlineData(2UL)]
+    public void DoubleExecutionSelfTest_ASecondNodeClaimingALiveLease_FailsTheRun_AndPrintsTheSeed(ulong seed)
+    {
+        var exception = Assert.Throws<SimulationInvariantException>(() =>
+            new Simulator(new SimulationOptions
+            {
+                Seed = seed,
+                CrashProbabilityPerPoll = 0,
+                HeartbeatLossProbability = 0,
+                SabotageDoubleClaim = true,
+            }).Run());
+
+        Assert.Contains($"seed {seed}", exception.Message);
+        Assert.Contains("I1", exception.Message); // the double-execution invariant fired
+        Assert.Equal(InvariantId.NoDoubleExecution, exception.InvariantId);
+    }
+
+    /// <summary>
     /// Named scenario: permanent node loss + migration liveness (issue 0069). Half the isolation episodes
     /// never heal — nodes lost for good — while crashes and heartbeat loss stay OFF, so the only way a Lease
     /// ever lapses is isolation and the only way a job a lost node held can reach terminal is to MIGRATE: its

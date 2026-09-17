@@ -330,6 +330,18 @@ internal sealed record SimulationOptions
     public bool SabotageDeferredUnroutableReport { get; init; }
 
     /// <summary>
+    /// Oracle self-test for the double-execution detector: at most one node may execute a job while it
+    /// holds a live Lease on it. With this on, the first claim that comes back with spare room is handed
+    /// one extra row - a job another node is still executing under a Lease that node's clock says is live -
+    /// exactly as a store whose claim ignores the Lease expiry would hand out a row a peer still owns. The
+    /// second node starts executing it, so a live <see cref="InvariantId.NoDoubleExecution"/> oracle MUST
+    /// see two nodes each holding a live Lease on the same job and fail with the seed. The store row itself is
+    /// untouched: the oracle has to count from each node's own view, not from the single store record, to
+    /// see it. Never set in real regimes.
+    /// </summary>
+    public bool SabotageDoubleClaim { get; init; }
+
+    /// <summary>
     /// Weighted-under-load regime (issue 0075, ADR 0016): force EVERY node's Worker Group to the Weighted
     /// Dispatch Policy instead of leaving the Strict/Weighted choice to the topology coin in
     /// <see cref="MakePolicy"/>. Paired with a finite <see cref="PoolSize"/> (claims go partial) and Driver
@@ -640,6 +652,11 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         // kept (not just the id) so a cooperative cancel can raise ExecutionCancelled for the exact
         // in-flight Attempt, mirroring the pumps' captured flight.Job rather than re-reading state.
         public Dictionary<Guid, JobRecord> Executing { get; } = [];
+        // The (JobId, Attempt) pairs still in Executing whose handler has already finished: the report
+        // could not land (isolation, or a lost ack) and the entry is kept only so the retry can re-report.
+        // The host drops such a job from its in-flight set the moment the handler returns, so the
+        // double-execution oracle does not count these as running. Cleared with Executing.
+        public HashSet<(Guid JobId, int Attempt)> AwaitingReport { get; } = [];
     }
 
     private readonly DeterministicRandom _rng = new(options.Seed);
@@ -763,6 +780,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     private readonly Dictionary<(Guid JobId, int Attempt), int> _slotReleases = [];
     private string? _slotDoubleReleaseViolation;
     private bool _slotReleaseSabotaged;
+    private bool _doubleClaimSabotaged;
     // Coverage saturation signals (issue 0124): tallied in the oracle pass (CheckInvariants), which already
     // recomputes per-Queue leased counts and reads each node's real in-flight set every step — so these draw
     // NO rng and never perturb the determinism battery (both stay 0 when no limit is configured and the pool
@@ -1465,6 +1483,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 // re-leased, so the stale ReportOutcome hits the (workerId, attempt) fence (ADR 0013).
                 if (_isolation.IsIsolated(simEvent.Node))
                 {
+                    execNode.AwaitingReport.Add((simEvent.Job!.JobId, simEvent.Job.Attempt));
                     Schedule(_now + options.PollInterval, simEvent);
                     break;
                 }
@@ -1487,6 +1506,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 {
                     _ackLosses++;
                     _nodeFaulty[simEvent.Node].AckLossArmed = true;
+                    execNode.AwaitingReport.Add(ackKey);
                     // The node is out (the "isolation" of a lost ack) until it retries on heal — long enough
                     // that the store moves on: a committed Failure becomes due past its Backoff and a
                     // survivor re-leases it on a fresh Attempt, so the retry lands stale and is fenced.
@@ -1497,6 +1517,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     break;
                 }
                 execNode.Executing.Remove(simEvent.Job.JobId);
+                execNode.AwaitingReport.Remove(ackKey);
                 TryDrive(simEvent.Node, simEvent.Fails
                     ? new NodeEvent.ExecutionFailed(simEvent.Job, "simulated failure", NodeNow(simEvent.Node))
                     : new NodeEvent.ExecutionSucceeded(simEvent.Job, NodeNow(simEvent.Node)));
@@ -1878,6 +1899,15 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     {
                         jobs = Get(_nodeFaulty[nodeIndex].ClaimAsync(request));
                     }
+                    // SabotageDoubleClaim: once, hand this claim one extra row a peer is still executing under
+                    // a Lease live on the peer's clock, as a claim that ignored Lease expiry would. The store
+                    // row keeps the peer as owner; only the per-node views show two live executors.
+                    if (options.SabotageDoubleClaim && !_doubleClaimSabotaged && jobs.Count < claim.MaxJobs
+                        && FindLiveHeldByPeer(nodeIndex) is { } stolen)
+                    {
+                        _doubleClaimSabotaged = true;
+                        jobs = [.. jobs, stolen with { LeaseOwner = claim.WorkerId }];
+                    }
                     // Always report the claim's completion, an empty result included: the Driver reserved this
                     // batch's slots at issue and frees them here, so an empty claim must still land or the
                     // reservation would strand and wedge the pool.
@@ -1938,8 +1968,18 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     break;
 
                 case Command.Heartbeat heartbeat:
+                    var heartbeatNow = NodeNow(nodeIndex);
                     var results = Get(_nodeFaulty[nodeIndex].HeartbeatAsync(
-                        heartbeat.WorkerId, heartbeat.JobIds, heartbeat.LeaseDuration, NodeNow(nodeIndex)));
+                        heartbeat.WorkerId, heartbeat.JobIds, heartbeat.LeaseDuration, heartbeatNow));
+                    // A renewed Lease moves this node's own view of its expiry forward, as the host's
+                    // in-flight record does, so the double-execution oracle keeps counting a long run.
+                    foreach (var renewed in results)
+                    {
+                        if (renewed.Renewed && node.Executing.TryGetValue(renewed.JobId, out var renewedJob))
+                        {
+                            node.Executing[renewed.JobId] = renewedJob with { LeaseExpiry = heartbeatNow + heartbeat.LeaseDuration };
+                        }
+                    }
                     Drive(nodeIndex, new NodeEvent.HeartbeatCompleted(results, NodeNow(nodeIndex)));
                     break;
 
@@ -2296,6 +2336,29 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     /// <summary>The realized Fault Map for this run (issue 0083): every fault decision taken, in call order.</summary>
     public IReadOnlyList<FaultEntry> RealizedFaultMap => _faultPlan.ToFaultMap();
 
+    /// <summary>
+    /// SabotageDoubleClaim helper: a job some node other than <paramref name="nodeIndex"/> is executing under a
+    /// Lease that node's own clock still says is live, or null when no peer holds one.
+    /// </summary>
+    private JobRecord? FindLiveHeldByPeer(int nodeIndex)
+    {
+        for (var m = 0; m < _nodes.Length; m++)
+        {
+            if (m == nodeIndex || _nodes[m].Down)
+            {
+                continue;
+            }
+            foreach (var held in _nodes[m].Executing.Values)
+            {
+                if (held.LeaseExpiry > NodeNow(m) && !_nodes[nodeIndex].Executing.ContainsKey(held.JobId))
+                {
+                    return held;
+                }
+            }
+        }
+        return null;
+    }
+
     private void Crash(int nodeIndex)
     {
         var node = _nodes[nodeIndex];
@@ -2311,6 +2374,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         node.Crashed = true;
         node.Epoch++;
         node.Executing.Clear();
+        node.AwaitingReport.Clear();
         _crashes++;
         Schedule(_now + _rng.NextTimeSpan(options.MaxCrashDowntime), new SimEvent(EventKind.Restart, nodeIndex, 0, null, false));
     }
@@ -2355,6 +2419,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         node.StoppedAt = _now;
         node.Epoch++;
         node.Executing.Clear();
+        node.AwaitingReport.Clear();
 
         // 1. The buffered outcomes, through the ordinary command path (RunOutcomeBatch), so the fence, the
         //    Outcome-Provenance oracle and the slot-release detector all see them exactly as they see a
@@ -2724,16 +2789,20 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             }
 
             // I1 — no double execution while a Lease is live: at most one node may be executing
-            // a job whose unexpired Lease the store still attributes to it. Two nodes running the
-            // same job is legal under a GC pause (one Lease has lapsed and been reclaimed); two
-            // running it while each still owns a live Lease is the headline invariant violation.
+            // a job while it holds a Lease its own clock says is live. Two nodes running the same
+            // job is legal under a GC pause (one Lease has lapsed and been reclaimed); two running
+            // it while each still owns a live Lease is the headline invariant violation. Count from
+            // each node's OWN record of the job (the row it claimed, renewed on heartbeat), never from
+            // the store row: the store names one LeaseOwner, so a count keyed on it can never reach
+            // two and the oracle would be a tautology. A double claim leaves the store row untouched
+            // and shows up only in the per-node views. A finished execution kept only for its report
+            // retry is not running, so it is not an executor.
             var liveExecutors = 0;
             for (var n = 0; n < _nodes.Length; n++)
             {
-                if (_nodes[n].Executing.ContainsKey(jobId)
-                    && job.State == JobState.Leased
-                    && job.LeaseOwner == $"node-{n}"
-                    && job.LeaseExpiry > NodeNow(n))
+                if (_nodes[n].Executing.TryGetValue(jobId, out var held)
+                    && !_nodes[n].AwaitingReport.Contains((jobId, held.Attempt))
+                    && held.LeaseExpiry > NodeNow(n))
                 {
                     liveExecutors++;
                 }

@@ -80,6 +80,7 @@ internal sealed record Scenario
     public bool SabotageServedSet { get; init; }
     public bool SabotageInlineUnroutableReport { get; init; }
     public bool SabotageDeferredUnroutableReport { get; init; }
+    public bool SabotageDoubleClaim { get; init; }
 
     // Radioactive regime — carried so a Plan captured by the --radioactive swarm replays with the same liveness
     // oracles disarmed (a safety finding still re-trips its per-step oracle either way; this keeps replay exact).
@@ -137,6 +138,7 @@ internal sealed record Scenario
         SabotageServedSet = o.SabotageServedSet,
         SabotageInlineUnroutableReport = o.SabotageInlineUnroutableReport,
         SabotageDeferredUnroutableReport = o.SabotageDeferredUnroutableReport,
+        SabotageDoubleClaim = o.SabotageDoubleClaim,
         RadioactiveMode = o.RadioactiveMode,
     };
 
@@ -192,6 +194,7 @@ internal sealed record Scenario
         SabotageServedSet = SabotageServedSet,
         SabotageInlineUnroutableReport = SabotageInlineUnroutableReport,
         SabotageDeferredUnroutableReport = SabotageDeferredUnroutableReport,
+        SabotageDoubleClaim = SabotageDoubleClaim,
         RadioactiveMode = RadioactiveMode,
     };
 }
