@@ -1,4 +1,7 @@
 using System.Reflection;
+using BackWave.Diagnostics;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
 
 namespace BackWave.Postgres;
@@ -138,11 +141,12 @@ public static class PostgresMigrator
         }
     }
 
-    // True when the deployed schema is at ExpectedSchemaVersion. Uses to_regclass to probe for the
-    // table WITHOUT raising: a missing-table error inside the migration transaction would poison it
+    // True when the deployed schema is at ExpectedSchemaVersion or newer. Uses to_regclass to probe for
+    // the table WITHOUT raising: a missing-table error inside the migration transaction would poison it
     // (Postgres aborts a transaction on the first error), so the in-lock re-check must never throw for
-    // a not-yet-created schema. Returns false for both a missing and a stale schema — either needs the
-    // (idempotent) scripts run.
+    // a not-yet-created schema. Returns false for both a missing and a stale schema - either needs the
+    // (idempotent) scripts run. A newer schema is current for this build: every script it ships is
+    // already applied, and re-running them would stamp the version back down under the nodes that need it.
     private static async Task<bool> IsSchemaCurrentAsync(
         NpgsqlConnection connection, NpgsqlTransaction? transaction, SchemaRewriter rewriter,
         CancellationToken cancellationToken)
@@ -165,20 +169,21 @@ public static class PostgresMigrator
         // uncounted round trip: the second half of the same schema-current probe, on the migrator's
         // own connection inside the migration transaction.
         var version = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-        return version is int deployed && deployed == ExpectedSchemaVersion;
+        return version is int deployed && deployed >= ExpectedSchemaVersion;
     }
 
     /// <summary>
-    /// Checks that the database's deployed schema version matches the version this adapter build
-    /// requires. The store calls this on first use and refuses to run on a mismatch, so version
-    /// skew can never corrupt job state — call it yourself if you provision the schema out of band
-    /// and want to fail fast before starting work.
+    /// Checks that the database's deployed schema version satisfies the version this adapter build
+    /// requires. The store calls this on first use and refuses to run on a missing or older schema, so
+    /// version skew can never corrupt job state - call it yourself if you provision the schema out of
+    /// band and want to fail fast before starting work. A newer schema is accepted, because every
+    /// BackWave migration is additive: an older node keeps running through a rolling upgrade.
     /// </summary>
     /// <param name="dataSource">An open data source for the target database. Not disposed here.</param>
     /// <param name="cancellationToken">Cancels the check.</param>
     /// <returns>A task that completes when the deployed version matches the required version.</returns>
     /// <exception cref="InvalidOperationException">
-    /// The schema is missing (no tables found), or the deployed version differs from the version
+    /// The schema is missing (no tables found), or the deployed version is older than the version
     /// this adapter build requires.
     /// </exception>
     /// <exception cref="OperationCanceledException">The token was cancelled.</exception>
@@ -201,12 +206,17 @@ public static class PostgresMigrator
     /// <returns>A task that completes when the deployed version matches the required version.</returns>
     /// <exception cref="ArgumentException"><paramref name="schemaName"/> is not a valid identifier.</exception>
     /// <exception cref="InvalidOperationException">
-    /// The schema is missing (no tables found), or the deployed version differs from the version
+    /// The schema is missing (no tables found), or the deployed version is older than the version
     /// this adapter build requires.
     /// </exception>
     /// <exception cref="OperationCanceledException">The token was cancelled.</exception>
-    public static async Task VerifySchemaVersionAsync(
+    public static Task VerifySchemaVersionAsync(
         NpgsqlDataSource dataSource, string schemaName, CancellationToken cancellationToken = default)
+        => VerifySchemaVersionAsync(dataSource, schemaName, NullLogger.Instance, cancellationToken);
+
+    // The store's entry point: the same check, with the store's logger to name a newer schema on.
+    internal static async Task VerifySchemaVersionAsync(
+        NpgsqlDataSource dataSource, string schemaName, ILogger logger, CancellationToken cancellationToken)
     {
         var rewriter = new SchemaRewriter(schemaName);
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -227,11 +237,17 @@ public static class PostgresMigrator
                 exception);
         }
 
-        if (version is not int deployed || deployed != ExpectedSchemaVersion)
+        if (version is not int deployed || deployed < ExpectedSchemaVersion)
         {
             throw new InvalidOperationException(
                 $"BackWave schema version mismatch: database has {version ?? "none"}, this adapter requires " +
                 $"{ExpectedSchemaVersion}. Refusing to start — version skew must never corrupt job state.");
+        }
+        if (deployed > ExpectedSchemaVersion)
+        {
+            // The N-1 window of a rolling upgrade: a newer schema is additive by contract, so this older
+            // build keeps running on it rather than fail-stopping every node the upgrade has not reached.
+            BackWaveLog.SchemaNewerThanAdapter(logger, deployed, ExpectedSchemaVersion);
         }
     }
 }

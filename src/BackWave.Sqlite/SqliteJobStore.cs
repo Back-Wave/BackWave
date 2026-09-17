@@ -3321,7 +3321,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 BackWaveLog.MigrationApplied(
                     _logger, "sqlite");
             }
-            await SqliteMigrator.VerifySchemaVersionAsync(_connectionString, _options.TablePrefix, cancellationToken).ConfigureAwait(false);
+            await SqliteMigrator.VerifySchemaVersionAsync(_connectionString, _options.TablePrefix, _logger, cancellationToken).ConfigureAwait(false);
             _ready = true;
         }
         finally

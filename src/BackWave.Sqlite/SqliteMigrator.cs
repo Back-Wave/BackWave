@@ -1,6 +1,9 @@
 using System.Globalization;
 using System.Reflection;
+using BackWave.Diagnostics;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace BackWave.Sqlite;
 
@@ -154,10 +157,12 @@ public static class SqliteMigrator
         }
     }
 
-    // True when the deployed schema is at ExpectedSchemaVersion. Probes for the version table without
-    // relying on catching a "no such table" error — an error inside the migration transaction is not
-    // needed, and a plain existence probe keeps the in-lock re-check clean. Returns false for both a
-    // missing and a stale schema — either needs the (idempotent) scripts run.
+    // True when the deployed schema is at ExpectedSchemaVersion or newer. Probes for the version table
+    // without relying on catching a "no such table" error - an error inside the migration transaction
+    // is not needed, and a plain existence probe keeps the in-lock re-check clean. Returns false for
+    // both a missing and a stale schema - either needs the (idempotent) scripts run. A newer schema is
+    // current for this build: every script it ships is already applied, and re-running them would
+    // stamp the version back down under the nodes that need it.
     private static async Task<bool> IsSchemaCurrentAsync(
         SqliteConnection connection, SqliteTransaction? transaction, SchemaRewriter rewriter,
         CancellationToken cancellationToken)
@@ -183,19 +188,20 @@ public static class SqliteMigrator
         // connection. It decides whether the scripts still need running, which is boot work, not store
         // work.
         var version = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-        return version is long deployed && deployed == ExpectedSchemaVersion;
+        return version is long deployed && deployed >= ExpectedSchemaVersion;
     }
 
     /// <summary>
-    /// Checks that the database is at the schema version this adapter requires. A missing or
-    /// mismatched schema throws rather than letting the workers run against a schema they do not
-    /// understand and risk corrupting job state.
+    /// Checks that the database is at the schema version this adapter requires. A missing or older
+    /// schema throws rather than letting the workers run against a schema they do not understand and
+    /// risk corrupting job state. A newer schema is accepted, because every BackWave migration is
+    /// additive: an older node keeps running through a rolling upgrade.
     /// </summary>
     /// <param name="connectionString">The <c>Microsoft.Data.Sqlite</c> connection string for the target database file.</param>
     /// <param name="cancellationToken">Token to cancel the check.</param>
     /// <returns>A task that completes when the schema is confirmed current.</returns>
     /// <exception cref="InvalidOperationException">
-    /// The BackWave schema is missing, or its version does not match the version this adapter
+    /// The BackWave schema is missing, or its version is older than the version this adapter
     /// requires.
     /// </exception>
     /// <exception cref="OperationCanceledException">The token was cancelled.</exception>
@@ -219,11 +225,16 @@ public static class SqliteMigrator
     /// <returns>A task that completes when the schema is confirmed current.</returns>
     /// <exception cref="ArgumentException"><paramref name="tablePrefix"/> is not a valid identifier root.</exception>
     /// <exception cref="InvalidOperationException">
-    /// The BackWave schema is missing, or its version does not match the version this adapter requires.
+    /// The BackWave schema is missing, or its version is older than the version this adapter requires.
     /// </exception>
     /// <exception cref="OperationCanceledException">The token was cancelled.</exception>
-    public static async Task VerifySchemaVersionAsync(
+    public static Task VerifySchemaVersionAsync(
         string connectionString, string tablePrefix, CancellationToken cancellationToken = default)
+        => VerifySchemaVersionAsync(connectionString, tablePrefix, NullLogger.Instance, cancellationToken);
+
+    // The store's entry point: the same check, with the store's logger to name a newer schema on.
+    internal static async Task VerifySchemaVersionAsync(
+        string connectionString, string tablePrefix, ILogger logger, CancellationToken cancellationToken)
     {
         var rewriter = new SchemaRewriter(tablePrefix);
         await using var connection = new SqliteConnection(connectionString);
@@ -248,11 +259,17 @@ public static class SqliteMigrator
                 exception);
         }
 
-        if (version is not long deployed || deployed != ExpectedSchemaVersion)
+        if (version is not long deployed || deployed < ExpectedSchemaVersion)
         {
             throw new InvalidOperationException(
                 $"BackWave schema version mismatch: database has {version ?? "none"}, this adapter requires " +
                 $"{ExpectedSchemaVersion}. Fail-stopping the Worker Group — version skew must never corrupt job state.");
+        }
+        if (deployed > ExpectedSchemaVersion)
+        {
+            // The N-1 window of a rolling upgrade: a newer schema is additive by contract, so this older
+            // build keeps running on it rather than fail-stopping every node the upgrade has not reached.
+            BackWaveLog.SchemaNewerThanAdapter(logger, (int)deployed, ExpectedSchemaVersion);
         }
     }
 

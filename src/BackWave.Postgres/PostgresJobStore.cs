@@ -132,7 +132,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 BackWaveLog.MigrationApplied(
                     _logger, "postgresql");
             }
-            await PostgresMigrator.VerifySchemaVersionAsync(_dataSource, _options.SchemaName, cancellationToken).ConfigureAwait(false);
+            await PostgresMigrator.VerifySchemaVersionAsync(_dataSource, _options.SchemaName, _logger, cancellationToken).ConfigureAwait(false);
             _ready = true;
         }
         finally

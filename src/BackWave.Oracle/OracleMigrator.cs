@@ -1,3 +1,6 @@
+using BackWave.Diagnostics;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Oracle.ManagedDataAccess.Client;
 
 namespace BackWave.Oracle;
@@ -121,15 +124,16 @@ public static class OracleMigrator
     }
 
     /// <summary>
-    /// Checks that the database is at the schema version this adapter requires. A missing or mismatched
+    /// Checks that the database is at the schema version this adapter requires. A missing or older
     /// schema throws rather than letting the workers run against a schema they do not understand and risk
-    /// corrupting job state.
+    /// corrupting job state. A newer schema is accepted, because every BackWave migration is additive:
+    /// an older node keeps running through a rolling upgrade.
     /// </summary>
     /// <param name="connectionString">The ODP.NET connection string for the target database.</param>
     /// <param name="cancellationToken">Token to cancel the check.</param>
     /// <returns>A task that completes when the schema is confirmed current.</returns>
     /// <exception cref="InvalidOperationException">
-    /// The BackWave schema is missing, or its version does not match the version this adapter requires.
+    /// The BackWave schema is missing, or its version is older than the version this adapter requires.
     /// </exception>
     // Fail-stop on version skew: never run against an unknown schema.
     public static Task VerifySchemaVersionAsync(
@@ -151,10 +155,15 @@ public static class OracleMigrator
     /// <returns>A task that completes when the schema is confirmed current.</returns>
     /// <exception cref="ArgumentException"><paramref name="schemaName"/> is not a valid identifier.</exception>
     /// <exception cref="InvalidOperationException">
-    /// The BackWave schema is missing, or its version does not match the version this adapter requires.
+    /// The BackWave schema is missing, or its version is older than the version this adapter requires.
     /// </exception>
-    public static async Task VerifySchemaVersionAsync(
+    public static Task VerifySchemaVersionAsync(
         string connectionString, string schemaName, CancellationToken cancellationToken = default)
+        => VerifySchemaVersionAsync(connectionString, schemaName, NullLogger.Instance, cancellationToken);
+
+    // The store's entry point: the same check, with the store's logger to name a newer schema on.
+    internal static async Task VerifySchemaVersionAsync(
+        string connectionString, string schemaName, ILogger logger, CancellationToken cancellationToken)
     {
         var rewriter = new SchemaRewriter(schemaName);
         await using var connection = new OracleConnection(connectionString);
@@ -179,12 +188,18 @@ public static class OracleMigrator
 
         // Oracle returns NUMBER as decimal; normalize before comparing to the expected version.
         var deployed = version is null ? (int?)null : Convert.ToInt32(version);
-        if (deployed != ExpectedSchemaVersion)
+        if (deployed is null || deployed < ExpectedSchemaVersion)
         {
             throw new InvalidOperationException(
                 $"BackWave schema version mismatch: database has {deployed?.ToString() ?? "none"}, this adapter " +
                 $"requires {ExpectedSchemaVersion}. Fail-stopping the Worker Group - version skew must never " +
                 "corrupt job state.");
+        }
+        if (deployed > ExpectedSchemaVersion)
+        {
+            // The N-1 window of a rolling upgrade: a newer schema is additive by contract, so this older
+            // build keeps running on it rather than fail-stopping every node the upgrade has not reached.
+            BackWaveLog.SchemaNewerThanAdapter(logger, deployed.Value, ExpectedSchemaVersion);
         }
     }
 }

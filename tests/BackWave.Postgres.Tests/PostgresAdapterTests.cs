@@ -17,7 +17,8 @@ public sealed class PostgresAdapterTests
         await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
         await using var dataSource = NpgsqlDataSource.Create(PostgresTestDatabase.ConnectionString);
 
-        await using (var bump = dataSource.CreateCommand("UPDATE backwave.schema_version SET version = 99"))
+        await using (var bump = dataSource.CreateCommand(
+            $"UPDATE backwave.schema_version SET version = {PostgresMigrator.ExpectedSchemaVersion - 1}"))
         {
             await bump.ExecuteNonQueryAsync();
         }
@@ -28,6 +29,33 @@ public sealed class PostgresAdapterTests
             var exception = await Assert.ThrowsAsync<InvalidOperationException>(
                 async () => await skewed.EnqueueAsync(Job(), now: T0));
             Assert.Contains("schema version mismatch", exception.Message);
+        }
+        finally
+        {
+            await using var restore = dataSource.CreateCommand(
+                $"UPDATE backwave.schema_version SET version = {PostgresMigrator.ExpectedSchemaVersion}");
+            await restore.ExecuteNonQueryAsync();
+        }
+    }
+
+    // The N-1 window of a rolling upgrade: a node built for the previous schema meets the one the
+    // upgraded nodes already stamped. Every migration is additive, so the older node keeps working.
+    [Fact]
+    public async Task SchemaVersionNewer_IsAccepted_SoAnOlderNodeSurvivesARollingUpgrade()
+    {
+        await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
+        await using var dataSource = NpgsqlDataSource.Create(PostgresTestDatabase.ConnectionString);
+
+        await using (var bump = dataSource.CreateCommand(
+            $"UPDATE backwave.schema_version SET version = {PostgresMigrator.ExpectedSchemaVersion + 1}"))
+        {
+            await bump.ExecuteNonQueryAsync();
+        }
+        try
+        {
+            await using var older = new PostgresJobStore(
+                new PostgresStoreOptions { ConnectionString = PostgresTestDatabase.ConnectionString });
+            await older.EnqueueAsync(Job(), now: T0);
         }
         finally
         {

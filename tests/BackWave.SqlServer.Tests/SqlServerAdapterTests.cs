@@ -19,7 +19,8 @@ public sealed class SqlServerAdapterTests
         await using var connection = new SqlConnection(SqlServerTestDatabase.ConnectionString);
         await connection.OpenAsync();
 
-        await using (var bump = new SqlCommand("UPDATE backwave.schema_version SET version = 99", connection))
+        await using (var bump = new SqlCommand(
+            $"UPDATE backwave.schema_version SET version = {SqlServerMigrator.ExpectedSchemaVersion - 1}", connection))
         {
             await bump.ExecuteNonQueryAsync();
         }
@@ -30,6 +31,34 @@ public sealed class SqlServerAdapterTests
             var exception = await Assert.ThrowsAsync<InvalidOperationException>(
                 async () => await skewed.EnqueueAsync(Job(), now: T0));
             Assert.Contains("schema version mismatch", exception.Message);
+        }
+        finally
+        {
+            await using var restore = new SqlCommand(
+                $"UPDATE backwave.schema_version SET version = {SqlServerMigrator.ExpectedSchemaVersion}", connection);
+            await restore.ExecuteNonQueryAsync();
+        }
+    }
+
+    // The N-1 window of a rolling upgrade: a node built for the previous schema meets the one the
+    // upgraded nodes already stamped. Every migration is additive, so the older node keeps working.
+    [Fact]
+    public async Task SchemaVersionNewer_IsAccepted_SoAnOlderNodeSurvivesARollingUpgrade()
+    {
+        _ = await SqlServerTestDatabase.CreateFreshStoreAsync();
+        await using var connection = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await connection.OpenAsync();
+
+        await using (var bump = new SqlCommand(
+            $"UPDATE backwave.schema_version SET version = {SqlServerMigrator.ExpectedSchemaVersion + 1}", connection))
+        {
+            await bump.ExecuteNonQueryAsync();
+        }
+        try
+        {
+            var older = new SqlServerJobStore(
+                new SqlServerStoreOptions { ConnectionString = SqlServerTestDatabase.ConnectionString });
+            await older.EnqueueAsync(Job(), now: T0);
         }
         finally
         {

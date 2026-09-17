@@ -119,7 +119,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 await SqlServerMigrator.MigrateAsync(options.ConnectionString, options.SchemaName, options.CoordinateMigration, cancellationToken).ConfigureAwait(false);
                 BackWaveLog.MigrationApplied(_logger, "mssql");
             }
-            await SqlServerMigrator.VerifySchemaVersionAsync(options.ConnectionString, options.SchemaName, cancellationToken).ConfigureAwait(false);
+            await SqlServerMigrator.VerifySchemaVersionAsync(options.ConnectionString, options.SchemaName, _logger, cancellationToken).ConfigureAwait(false);
             _ready = true;
         }
         finally

@@ -74,7 +74,7 @@ public sealed class SqliteMigrationTests
         {
             await connection.OpenAsync();
             await using var bump = connection.CreateCommand();
-            bump.CommandText = "UPDATE backwave_schema_version SET version = 999";
+            bump.CommandText = $"UPDATE backwave_schema_version SET version = {SqliteMigrator.ExpectedSchemaVersion - 1}";
             await bump.ExecuteNonQueryAsync();
         }
         SqliteConnection.ClearAllPools();
@@ -86,9 +86,45 @@ public sealed class SqliteMigrationTests
         });
         await using (stale)
         {
-            await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
                 await stale.ClaimAsync(new ClaimRequest("w", ["default"], 1, TimeSpan.FromMinutes(1), T0)));
+            Assert.Contains("schema version mismatch", exception.Message);
         }
+    }
+
+    // The N-1 window of a rolling upgrade: a node built for the previous schema meets the one the
+    // upgraded nodes already stamped. Every migration is additive, so the older node keeps working,
+    // and names the skew once so an operator can see which nodes still need the new binary.
+    [Fact]
+    public async Task Schema_version_newer_is_accepted_so_an_older_node_survives_a_rolling_upgrade()
+    {
+        await using var temp = TempSqliteStore.Create();
+        await temp.Store.EnqueueAsync(new NewJob(Guid.NewGuid(), "demo", default, "default", T0), T0);
+
+        await using (var connection = new SqliteConnection($"Data Source={temp.Path}"))
+        {
+            await connection.OpenAsync();
+            await using var bump = connection.CreateCommand();
+            bump.CommandText = $"UPDATE backwave_schema_version SET version = {SqliteMigrator.ExpectedSchemaVersion + 1}";
+            await bump.ExecuteNonQueryAsync();
+        }
+        SqliteConnection.ClearAllPools();
+
+        var capture = new LogCapture();
+        var older = new SqliteJobStore(new SqliteStoreOptions
+        {
+            ConnectionString = $"Data Source={temp.Path}",
+            AutoMigrate = false,
+            LoggerFactory = new CapturingLoggerFactory(capture),
+        });
+        await using (older)
+        {
+            var claim = await older.ClaimAsync(new ClaimRequest("w", ["default"], 1, TimeSpan.FromMinutes(1), T0));
+            Assert.Single(claim);
+        }
+
+        var skew = Assert.Single(capture.Records, r => r.EventId == 1303);
+        Assert.Equal(LogLevel.Warning, skew.Level);
     }
 
     [Theory]

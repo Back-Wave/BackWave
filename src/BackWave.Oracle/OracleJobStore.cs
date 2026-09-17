@@ -172,7 +172,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 await OracleMigrator.MigrateAsync(options.ConnectionString, options.SchemaName, options.CoordinateMigration, cancellationToken).ConfigureAwait(false);
                 BackWaveLog.MigrationApplied(_logger, "oracle");
             }
-            await OracleMigrator.VerifySchemaVersionAsync(options.ConnectionString, options.SchemaName, cancellationToken).ConfigureAwait(false);
+            await OracleMigrator.VerifySchemaVersionAsync(options.ConnectionString, options.SchemaName, _logger, cancellationToken).ConfigureAwait(false);
             _ready = true;
         }
         finally

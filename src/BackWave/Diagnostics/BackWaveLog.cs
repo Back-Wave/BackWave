@@ -136,6 +136,14 @@ internal static partial class BackWaveLog
         Message = "BackWave schema migration applied for {db_system}.")]
     internal static partial void MigrationApplied(ILogger logger, string db_system);
 
+    // The N-1 window of a rolling upgrade: a node built for an older schema found a newer one. Every
+    // shipped migration is additive, so the older node keeps running on it; this names the skew so an
+    // operator can see which nodes still need the new binary.
+    [LoggerMessage(EventId = 1303, Level = LogLevel.Warning,
+        Message = "BackWave schema version {deployed_version} is newer than the {expected_version} this adapter "
+            + "requires; continuing on the additive schema until this node is upgraded.")]
+    internal static partial void SchemaNewerThanAdapter(ILogger logger, int deployed_version, int expected_version);
+
     [LoggerMessage(EventId = 1401, Level = LogLevel.Warning,
         Message = "Observer '{observer_id}' delivery dead-lettered after exhausting its retry ceiling.")]
     internal static partial void ObserverDeliveryDeadLettered(ILogger logger, string observer_id);
