@@ -100,6 +100,31 @@ public sealed class OracleAdapterTests
         Assert.Equal(Jobs, counts.Single(c => c.Queue == "default" && c.State == expected).Count);
     }
 
+    // A workflow's member set has no ceiling, so a graph read can pass the 1,000-expression limit of one
+    // IN list on Oracle before 23ai (ORA-01795). The AddIdList guard makes that limit hold on every Oracle
+    // version, so this fails before the fix on the 23ai CI image too. The enqueue inserts members one at
+    // a time and succeeds; the list that trips is the tag hydration on the read, which binds one id per
+    // member, so the workflow was written but could never be read back. 1,001 members trips it.
+    [Fact]
+    public async Task GetWorkflow_ReadsMoreMembersThanOneInListHoldsExpressionsFor()
+    {
+        const int Members = 1_001;
+        var store = await OracleTestDatabase.CreateFreshStoreAsync();
+        var workflow = new WorkflowDefinition
+        {
+            WorkflowId = Guid.NewGuid(),
+            Members = [.. Enumerable.Range(0, Members)
+                .Select(i => Job() with { Tags = JobTags.Empty.WithTag("member", i.ToString()) })],
+        };
+        Assert.Equal(WorkflowEnqueueResult.Ok, await store.EnqueueWorkflowAsync(workflow, T0));
+
+        var graph = await store.GetWorkflowAsync(workflow.WorkflowId);
+
+        Assert.NotNull(graph);
+        Assert.Equal(Members, graph.Members.Count);
+        Assert.All(graph.Members, member => Assert.Single(member.Tags));
+    }
+
     [Fact]
     public async Task ConcurrentFirstUpserts_OfTheSameSchedule_NeverCollide()
     {

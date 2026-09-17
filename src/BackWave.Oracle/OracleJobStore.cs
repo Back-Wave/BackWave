@@ -3845,27 +3845,28 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
 
     // Reads the Tags for a batch of jobs in one round-trip (job_id IN (...)) - never N+1. Reconstructs each
     // set with the empty-key => Label discriminator, decoding the CHR(1) sentinel back to empty. Jobs with
-    // no Tags are simply absent from the map.
+    // no Tags are simply absent from the map. A workflow read hydrates every member, and a workflow's
+    // member set has no ceiling, so the ids go through in slices under the IN-list limit; a batch of
+    // 1,000 or fewer is one slice, as before.
     private async Task<Dictionary<Guid, JobTags>> HydrateTagsAsync(
         OracleConnection connection, IReadOnlyList<Guid> jobIds, CancellationToken cancellationToken)
     {
         var result = new Dictionary<Guid, JobTags>();
-        if (jobIds.Count == 0)
+        foreach (var slice in jobIds.Chunk(MaxInListIds))
         {
-            return result;
-        }
-        await using var command = Cmd(
-            $"SELECT job_id, key, value FROM backwave.job_tags WHERE job_id IN ({ParameterList("id", jobIds.Count)})",
-            connection);
-        AddIdList(command, "id", jobIds);
-        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            var jobId = ReadGuid(reader, 0);
-            var key = DecodeTag(reader.GetString(1));
-            var value = DecodeTag(reader.GetString(2));
-            var tag = key.Length == 0 ? JobTag.Label(value) : JobTag.Keyed(key, value);
-            result[jobId] = (result.TryGetValue(jobId, out var existing) ? existing : JobTags.Empty).With(tag);
+            await using var command = Cmd(
+                $"SELECT job_id, key, value FROM backwave.job_tags WHERE job_id IN ({ParameterList("id", slice.Length)})",
+                connection);
+            AddIdList(command, "id", slice);
+            await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var jobId = ReadGuid(reader, 0);
+                var key = DecodeTag(reader.GetString(1));
+                var value = DecodeTag(reader.GetString(2));
+                var tag = key.Length == 0 ? JobTag.Label(value) : JobTag.Keyed(key, value);
+                result[jobId] = (result.TryGetValue(jobId, out var existing) ? existing : JobTags.Empty).With(tag);
+            }
         }
         return result;
     }
