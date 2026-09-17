@@ -648,6 +648,12 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         // The idle ramp grows PollDelay by elapsed idle time, not by the count of empty polls, so a drain
         // tail's burst of empty re-polls cannot saturate the delay to the ceiling. Mirrors _idleSince.
         public DateTimeOffset? IdleSince { get; set; }
+        // Whether a backoff-floor reset has already woken an immediate re-poll since this node's last
+        // timed poll. The host wakes its pacer on EVERY reset and is bounded only by the store round
+        // trip; the zero-latency sim would spin at one instant on due-now pressure it cannot claim
+        // (a concurrency limit held elsewhere), so a reset that claimed nothing wakes once per timed
+        // poll. A reset that claimed work always wakes: that chain drains a finite backlog.
+        public bool PollWoken { get; set; }
         // The jobs this node is executing, keyed by JobId → the Attempt's JobRecord. The record is
         // kept (not just the id) so a cooperative cancel can raise ExecutionCancelled for the exact
         // in-flight Attempt, mirroring the pumps' captured flight.Job rather than re-reading state.
@@ -1437,6 +1443,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     break;
                 }
                 _pollCount++;
+                pollNode.PollWoken = false;
                 TryDrive(simEvent.Node, new NodeEvent.PollDue(NodeNow(simEvent.Node)));
                 // Observer delivery rides the same poll cadence (§0076): claim each Observer's next
                 // batch, invoke the recording sink, advance the cursor. Same per-node faulty store, so
@@ -1545,6 +1552,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 restarting.Driver = NewDriver(simEvent.Node);
                 restarting.PollDelay = options.PollInterval; // a fresh pump starts at the floor
                 restarting.IdleSince = null;
+                restarting.PollWoken = false;
 
                 Schedule(_now + _rng.NextTimeSpan(options.PollInterval), new SimEvent(EventKind.Poll, simEvent.Node, 0, null, false));
                 Schedule(_now + _rng.NextTimeSpan(options.HeartbeatInterval), new SimEvent(EventKind.Heartbeat, simEvent.Node, 0, null, false));
@@ -3204,10 +3212,10 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     private bool AdaptivePoll => options.MaxPollInterval > options.PollInterval;
 
     // Fold a claim outcome into a node's idle poll-backoff delay, mirroring the host pump. Work claimed, or
-    // a store that reports due-now pressure it withheld, resets to the floor. An empty poll with a future
-    // next-due sleeps to that instant (clamped to floor/ceiling). An empty poll with no next-due grows the
-    // delay toward the ceiling in step with how long the node has been idle. The delay only sets WHEN the
-    // node next polls, never WHETHER work is claimed.
+    // a store that reports due-now pressure it withheld, resets to the floor and wakes the next poll at
+    // once. An empty poll with a future next-due sleeps to that instant (clamped to floor/ceiling). An
+    // empty poll with no next-due grows the delay toward the ceiling in step with how long the node has
+    // been idle. The delay only sets WHEN the node next polls, never WHETHER work is claimed.
     private void UpdatePollBackoff(int nodeIndex, bool claimedWork, DateTimeOffset? nextDue, DateTimeOffset now)
     {
         var floor = options.PollInterval;
@@ -3217,6 +3225,15 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         {
             _nodes[nodeIndex].IdleSince = null;
             next = floor;
+            // The host's WakePoll: the pacer wakes and ticks a PollDue at once rather than sleeping out the
+            // floor. Ride the re-poll queue, the same path a RequestPoll takes, so it runs at this instant
+            // after the cascade unwinds and the Driver's pool-full gate still decides whether it claims.
+            // See SimNode.PollWoken for the bound on a reset that claimed nothing.
+            if (claimedWork || !_nodes[nodeIndex].PollWoken)
+            {
+                _nodes[nodeIndex].PollWoken = true;
+                _pendingRePolls.Enqueue((nodeIndex, now));
+            }
         }
         else if (nextDue is { } scheduled)
         {
