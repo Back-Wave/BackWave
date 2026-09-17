@@ -2068,13 +2068,14 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
 
     /// <summary>
     /// Core-side coalescing: the Driver buffered terminal outcomes and flushes them as ONE
-    /// command. The harness vectorizes the singular report - per row a pre-state read, the
-    /// per-(workerId, attempt) fence verdict, the Outcome-Provenance assertion, the slot-release detection,
-    /// then Drive(OutcomeReported). Each row consults the per-node faulty store on the same "ReportOutcome"
-    /// axis, so the store-fault stream is keyed exactly as it was per single report (the buffer adds no
-    /// draws); a row that faults aborts the rest of the batch, and those leases lapse and reclaim
-    /// (At-Least-Once, the buffer-loss window modeled for free). The batch is applied synchronously - no new
-    /// SimEvent, so the determinism boundary is unchanged.
+    /// command, and the harness reports it as one store call - <c>ReportOutcomesAsync</c>, the batched
+    /// API the host calls - so the store's own batch shape is what runs. Per row: a pre-state read and the
+    /// per-(workerId, attempt) fence verdict BEFORE the batch lands, then after it the Outcome-Provenance
+    /// assertion, the slot-release detection and Drive(OutcomeReported) over the row's returned result. The
+    /// batch consults the per-node faulty store once on the same "ReportOutcome" axis a single report uses;
+    /// a fault aborts the whole batch, and those leases lapse and reclaim (At-Least-Once, the buffer-loss
+    /// window modeled for free). The batch is applied synchronously - no new SimEvent, so the determinism
+    /// boundary is unchanged.
     ///
     /// Its own method because the clean-stop hand-back in <see cref="Stop"/> flushes through it too, exactly
     /// as production's HandBackAsync flushes through the ordinary command path rather than a shutdown-only
@@ -2090,39 +2091,67 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     private void RunOutcomeBatch(int nodeIndex, Command.ReportOutcomeBatch batch)
     {
         var dropBatchFence = options.SabotageBatchFence && batch.Outcomes.Count > 1;
-        foreach (var outcome in batch.Outcomes)
+        var reportNow = NodeNow(nodeIndex);
+        var reports = new List<OutcomeReport>(batch.Outcomes.Count);
+        var pres = new JobRecord?[batch.Outcomes.Count];
+        var fenceShouldApply = new bool[batch.Outcomes.Count];
+        for (var i = 0; i < batch.Outcomes.Count; i++)
         {
-            ReportOneOutcome(nodeIndex, outcome.JobId, outcome.WorkerId, outcome.Attempt,
-                outcome.Outcome, dropFence: dropBatchFence);
+            var row = batch.Outcomes[i];
+            (pres[i], fenceShouldApply[i]) = FenceVerdict(row.JobId, row.WorkerId, row.Attempt, reportNow);
+            reports.Add(new OutcomeReport(row.JobId, row.WorkerId, row.Attempt, row.Outcome));
+        }
+        // SabotageBatchFence forces a multi-row batch through a fence-dropping store; every real regime
+        // reports through the per-node faulty store on the same "ReportOutcome" fault axis.
+        var results = dropBatchFence
+            ? Get(BatchFenceDroppingStore.ReportOutcomesAsync(reports, reportNow))
+            : Get(_nodeFaulty[nodeIndex].ReportOutcomesAsync(reports, reportNow));
+        for (var i = 0; i < batch.Outcomes.Count; i++)
+        {
+            var row = batch.Outcomes[i];
+            ObserveOutcome(nodeIndex, row.JobId, row.WorkerId, row.Attempt, row.Outcome,
+                pres[i], fenceShouldApply[i], results[i].Result);
         }
     }
 
     /// <summary>
-    /// Applies one outcome row through the per-node faulty store and runs the per-row oracles, then drives
-    /// the resulting OutcomeReported back into the Driver. Shared by the singular ReportOutcome path and by
-    /// each row of a coalesced ReportOutcomeBatch (ADR 0035), so the vectorized fence is enforced per row
-    /// and keyed on the same "ReportOutcome" store-fault axis as a single report. <paramref name="dropFence"/>
-    /// is the SabotageBatchFence self-test hook: when set, the row's write goes through a fence-dropping
-    /// store so a stale row in a batch lands and the Outcome-Provenance oracle catches it.
+    /// Applies one outcome row through the per-node faulty store's singular report and runs the per-row
+    /// oracles, then drives the resulting OutcomeReported back into the Driver. Only the
+    /// SabotageInlineUnroutableReport self-test reports this way; every buffered outcome goes through
+    /// <see cref="RunOutcomeBatch"/> and the batched store API.
     /// </summary>
-    private void ReportOneOutcome(
-        int nodeIndex, Guid jobId, string workerId, int attempt, JobOutcome outcome, bool dropFence = false)
+    private void ReportOneOutcome(int nodeIndex, Guid jobId, string workerId, int attempt, JobOutcome outcome)
     {
-        // Outcome-Provenance Oracle (issue 0068, ADR 0013): compute the fence verdict from the
-        // authoritative pre-state (the live Lease holder for this exact Attempt, not expired),
-        // then assert the store applied the outcome EXACTLY when the reporter held that Lease.
-        // Reads hit _store directly so the oracle sees committed truth even under the sabotage.
         var reportNow = NodeNow(nodeIndex);
+        var (pre, fenceShouldApply) = FenceVerdict(jobId, workerId, attempt, reportNow);
+        var result = Get(_nodeFaulty[nodeIndex].ReportOutcomeAsync(jobId, workerId, attempt, outcome, reportNow));
+        ObserveOutcome(nodeIndex, jobId, workerId, attempt, outcome, pre, fenceShouldApply, result);
+    }
+
+    /// <summary>
+    /// Outcome-Provenance Oracle (issue 0068, ADR 0013): the fence verdict from the authoritative
+    /// pre-state (the live Lease holder for this exact Attempt, not expired), read BEFORE the report lands
+    /// so <see cref="ObserveOutcome"/> can assert the store applied the outcome EXACTLY when the reporter
+    /// held that Lease. Reads hit _store directly so the oracle sees committed truth even under the sabotage.
+    /// </summary>
+    private (JobRecord? Pre, bool FenceShouldApply) FenceVerdict(Guid jobId, string workerId, int attempt, DateTimeOffset reportNow)
+    {
         var pre = Get(_store.GetJobAsync(jobId));
         var fenceShouldApply = pre is { State: JobState.Leased }
             && pre.LeaseOwner == workerId
             && pre.Attempt == attempt
             && pre.LeaseExpiry > reportNow;
-        // SabotageBatchFence forces the row through a fence-dropping store; every real regime reports
-        // through the per-node faulty store on the same "ReportOutcome" fault axis.
-        var result = dropFence
-            ? Get(BatchFenceDroppingStore.ReportOutcomeAsync(jobId, workerId, attempt, outcome, reportNow))
-            : Get(_nodeFaulty[nodeIndex].ReportOutcomeAsync(jobId, workerId, attempt, outcome, reportNow));
+        return (pre, fenceShouldApply);
+    }
+
+    /// <summary>
+    /// Runs the per-row oracles over one reported outcome's result against the pre-state verdict from
+    /// <see cref="FenceVerdict"/>, then drives the OutcomeReported back into the Driver.
+    /// </summary>
+    private void ObserveOutcome(
+        int nodeIndex, Guid jobId, string workerId, int attempt, JobOutcome outcome,
+        JobRecord? pre, bool fenceShouldApply, OutcomeResult result)
+    {
         // Effect-Once: an applied outcome is caused only by the node holding the live Lease for
         // that Attempt; a healed node's stale report mutates nothing. Two nodes merely EXECUTING
         // the same job concurrently never reaches here as a violation — only a store WRITE does
@@ -3282,6 +3311,21 @@ internal sealed class FaultInjectingStore(IJobStore inner, Func<string, bool> sh
         return inner.ReportOutcomeAsync(jobId, workerId, attempt, outcome, now, failureDetail, addedTags, output, cancellationToken);
     }
 
+    // Forward the batch report so the inner store's own batch shape runs; one fault decision on the same
+    // "ReportOutcome" axis aborts the whole batch, and an armed ack loss commits the whole batch then throws.
+    public ValueTask<IReadOnlyList<OutcomeReportResult>> ReportOutcomesAsync(
+        IReadOnlyList<OutcomeReport> batch, DateTimeOffset now, CancellationToken cancellationToken = default)
+    {
+        if (AckLossArmed)
+        {
+            AckLossArmed = false;
+            inner.ReportOutcomesAsync(batch, now, cancellationToken).GetAwaiter().GetResult();
+            throw new SimTransientFault();
+        }
+        MaybeFault("ReportOutcome");
+        return inner.ReportOutcomesAsync(batch, now, cancellationToken);
+    }
+
     public ValueTask<ReadOnlyMemory<byte>?> GetJobOutputAsync(Guid jobId, CancellationToken cancellationToken = default)
         => inner.GetJobOutputAsync(jobId, cancellationToken);
 
@@ -3454,6 +3498,23 @@ internal sealed class FenceDroppingStore(IJobStore inner) : IJobStore
             return inner.ReportOutcomeAsync(jobId, holder, job.Attempt, outcome, now, failureDetail, addedTags, output, cancellationToken);
         }
         return inner.ReportOutcomeAsync(jobId, workerId, attempt, outcome, now, failureDetail, addedTags, output, cancellationToken);
+    }
+
+    // A batch drops the fence per row, the same way a single report does, so a stale row riding in a
+    // multi-row batch lands under the live holder's identity.
+    public async ValueTask<IReadOnlyList<OutcomeReportResult>> ReportOutcomesAsync(
+        IReadOnlyList<OutcomeReport> batch, DateTimeOffset now, CancellationToken cancellationToken = default)
+    {
+        var results = new OutcomeReportResult[batch.Count];
+        for (var i = 0; i < batch.Count; i++)
+        {
+            var row = batch[i];
+            var result = await ReportOutcomeAsync(
+                row.JobId, row.WorkerId, row.Attempt, row.Outcome, now,
+                row.FailureDetail, row.AddedTags, row.Output, cancellationToken).ConfigureAwait(false);
+            results[i] = new OutcomeReportResult(row.JobId, result);
+        }
+        return results;
     }
 
     public ValueTask<ReadOnlyMemory<byte>?> GetJobOutputAsync(Guid jobId, CancellationToken cancellationToken = default)

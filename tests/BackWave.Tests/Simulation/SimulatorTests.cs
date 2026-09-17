@@ -1773,11 +1773,9 @@ public class SimulatorTests
     public void FaultInjectingStore_DeclaresEveryFaultableJobStoreMember_SoNoDefaultBodyBypassesTheFaultGate()
     {
         // HistoryPolicy and Bounds are capability descriptors, not store round-trips, so there is nothing
-        // to fault. ReportOutcomesAsync is safe for a different reason: its default body delegates to
-        // ReportOutcomeAsync, which this wrapper does override, so every row still passes the gate. That
-        // makes the model fault per row where the real adapter writes the batch in one statement - a
-        // known and deliberately kept difference, because a per-row fault is the stricter of the two.
-        string[] deliberatelyInherited = ["get_HistoryPolicy", "get_Bounds", "ReportOutcomesAsync"];
+        // to fault. ReportOutcomesAsync is overridden so the batch passes the gate once and then runs the
+        // inner store's own batch shape, the way the host reports.
+        string[] deliberatelyInherited = ["get_HistoryPolicy", "get_Bounds"];
 
         var map = typeof(FaultInjectingStore).GetInterfaceMap(typeof(IJobStore));
 
