@@ -74,10 +74,10 @@ public sealed class SqliteStatementBudgetTests
         "ListJobsAsync over a full page of terminal jobs", Statements: 2);
 
     private static readonly Budget Enqueue = new(
-        "EnqueueAsync of one untagged job", Statements: 2);
+        "EnqueueAsync of one untagged job", Statements: 3);
 
     private static readonly Budget EnqueueTagged = new(
-        "EnqueueAsync of one job carrying three tags", Statements: 5);
+        "EnqueueAsync of one job carrying three tags", Statements: 6);
 
     [Fact]
     public async Task Claim_of_a_full_batch_stays_within_its_statement_budget()
@@ -101,10 +101,11 @@ public sealed class SqliteStatementBudgetTests
         // a queue with a configured concurrency limit pays one statement more than this.
         //
         // The batched transition write is TWO statements, not one: SQLite has no sequence, so the
-        // recorder reads the pre-batch MAX(position) and then does the set-based INSERT that assigns
-        // each row that base plus its ROW_NUMBER. It writes 32 Leased entries in that one INSERT. No
-        // prune: the batch recorder issues its DELETE only when some job in the batch reached
-        // MaxTransitionsPerJob, and a freshly claimed job is on its second transition.
+        // recorder reserves 32 positions on the transition-position high-water mark and then does the
+        // set-based INSERT that assigns each row the pre-batch mark plus its ROW_NUMBER. It writes 32
+        // Leased entries in that one INSERT. No prune: the batch recorder issues its DELETE only when
+        // some job in the batch reached MaxTransitionsPerJob, and a freshly claimed job is on its
+        // second transition.
         //
         // The tag hydration is one statement for all 32 job ids (a variadic IN list, SQLite's stand-in
         // for Postgres's = ANY), and it runs whether or not any job carries a tag.
@@ -154,8 +155,8 @@ public sealed class SqliteStatementBudgetTests
         // jobs has a child, so each returns nothing and the cascade stops there. A batch of retries
         // rather than successes skips this entirely and costs 34 - non-terminal rows gate nothing.
         //
-        // The transition write is 2, as in the claim: MAX(position) read plus one set-based INSERT
-        // covering all 32 rows, and no prune, since no job here is near the cap.
+        // The transition write is 2, as in the claim: one position reservation plus one set-based
+        // INSERT covering all 32 rows, and no prune, since no job here is near the cap.
         var batch = claimed
             .Select(job => new OutcomeReport(job.JobId, "budget-worker", job.Attempt, new JobOutcome.Success()))
             .ToArray();
@@ -237,7 +238,7 @@ public sealed class SqliteStatementBudgetTests
         // This is the budget that guards the batched lease sweep. Before the sweep's transition log was
         // batched it recorded one transition per reclaimed job, each of them its own INSERT ...
         // RETURNING, and this same call cost 65. The two-statement batch recorder replaced 32 of those
-        // with one set-based INSERT plus its MAX(position) read.
+        // with one set-based INSERT plus its position reservation.
         //
         // The sweep is the widest per-row path in the adapter - maxJobs is 500 by default where a claim
         // batch is 32 - so a per-row transition here holds the single write lock for up to 500 prepare
@@ -343,15 +344,20 @@ public sealed class SqliteStatementBudgetTests
         var store = temp.Store;
         await store.EnqueueAsync(Job(), T0); // warms the one-time schema check, off the measured path
 
-        // 1 job INSERT + 1 transition INSERT ... RETURNING = 2 statements.
+        // 1 job INSERT + 1 position reservation + 1 transition INSERT ... RETURNING = 3 statements.
         //
-        // This is the budget that guards the skipped prune. The single-row transition recorder returns
-        // the ordinal it just assigned and only issues its bounded DELETE when that ordinal reached
-        // MaxTransitionsPerJob. An enqueue writes ordinal 0, so the DELETE is skipped - and under the
-        // cap it could only ever have been a no-op, since its bound is MAX(ordinal) minus the cap,
-        // which is negative while the newest ordinal is below the cap. Take the skip away and every
-        // enqueue in the system pays a third statement, under the write lock, to delete nothing. That
-        // is a 50% increase on the hottest per-call path there is.
+        // The reservation is the UPDATE ... RETURNING on the transition-position high-water mark, the
+        // sequence SQLite does not have. It is the price of a position that never regresses: the
+        // MAX(position)+1 the recorder used to fold into its INSERT fell whenever a retention purge
+        // cascaded the newest transitions away, and a position handed out below an Observer cursor
+        // was a transition that Observer never saw.
+        //
+        // This is also the budget that guards the skipped prune. The single-row transition recorder
+        // returns the ordinal it just assigned and only issues its bounded DELETE when that ordinal
+        // reached MaxTransitionsPerJob. An enqueue writes ordinal 0, so the DELETE is skipped - and
+        // under the cap it could only ever have been a no-op, since its bound is MAX(ordinal) minus
+        // the cap, which is negative while the newest ordinal is below the cap. Take the skip away and
+        // every enqueue in the system pays a fourth statement, under the write lock, to delete nothing.
         //
         // Enqueue is a per-CALL path rather than a per-row one, so there is no batch here for a
         // set-based statement to collapse. That is exactly why the batching work behind the other
@@ -373,11 +379,11 @@ public sealed class SqliteStatementBudgetTests
         var store = temp.Store;
         await store.EnqueueAsync(Job(), T0);
 
-        // The untagged budget plus one statement per tag: 1 job INSERT + 3 tag INSERTs + 1 transition
-        // INSERT = 5. The tag write is a genuine per-row loop, and it is pinned here as it is rather
-        // than fixed - this is a budget, not an ambition. Three tags on one enqueue is a small,
-        // bounded loop; what the number is here for is to make it visible if the loop ever grows a
-        // statement per tag somewhere it is not bounded.
+        // The untagged budget plus one statement per tag: 1 job INSERT + 3 tag INSERTs + 1 position
+        // reservation + 1 transition INSERT = 6. The tag write is a genuine per-row loop, and it is
+        // pinned here as it is rather than fixed - this is a budget, not an ambition. Three tags on
+        // one enqueue is a small, bounded loop; what the number is here for is to make it visible if
+        // the loop ever grows a statement per tag somewhere it is not bounded.
         var tagged = Job() with
         {
             Tags = JobTags.Empty.WithTag("tenant", "acme").WithTag("region", "eu").WithTag("tier", "gold"),

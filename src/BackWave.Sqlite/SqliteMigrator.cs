@@ -18,7 +18,7 @@ namespace BackWave.Sqlite;
 public static class SqliteMigrator
 {
     /// <summary>The schema version this build of the adapter requires the database to be at.</summary>
-    public const int ExpectedSchemaVersion = 1;
+    public const int ExpectedSchemaVersion = 2;
 
     // 3.35 is the floor that ships UPDATE … RETURNING, which the claim path relies on (ADR 0019).
     internal static readonly Version MinimumEngineVersion = new(3, 35, 0);

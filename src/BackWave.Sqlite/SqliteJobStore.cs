@@ -1505,8 +1505,11 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
     // Appends one Transition Log entry (§5.12) for a job's resulting state, inside the SAME
     // transaction as the state change it records — a crash leaves neither or both (§4). The ordinal
     // is the per-job max + 1; the global position (which Postgres carries on a SEQUENCE) is
-    // assigned here as MAX(position)+1 over the whole table, race-free under whole-writer
-    // serialization (ADR 0019). `now` is always the caller's clock. The trailing bounded delete
+    // reserved from the backwave_transition_position high-water mark, bumped in this same
+    // transaction and race-free under whole-writer serialization. It is a mark of its own rather
+    // than MAX(position) over the log because a retention purge cascades transitions away: the
+    // MAX drops with them, and a position handed out below an Observer cursor is a transition
+    // that Observer never sees. `now` is always the caller's clock. The trailing bounded delete
     // enforces MaxTransitionsPerJob (§7), and it runs only when this entry put the cap in play.
     // Job History Policy gates writes, not schema: Off appends
     // nothing; Transitions appends the row but never the detail.
@@ -1523,20 +1526,22 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             failureDetail = null; // record the transition, but never the detail it would have carried
         }
 
+        var position = await ReserveTransitionPositionsAsync(connection, transaction, 1, cancellationToken).ConfigureAwait(false);
+
         // RETURNING the assigned ordinal lets the prune be skipped entirely (below) when the entry
         // just written has not reached the cap - the common 2-transition job pays no DELETE.
         long ordinal;
         await using (var insert = Cmd(
             """
             INSERT INTO backwave_job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail, position)
-            SELECT $id, COALESCE(MAX(ordinal) + 1, 0), $now, $state, $attempt, $detail,
-                   (SELECT COALESCE(MAX(position), 0) + 1 FROM backwave_job_transitions)
+            SELECT $id, COALESCE(MAX(ordinal) + 1, 0), $now, $state, $attempt, $detail, $position
             FROM backwave_job_transitions WHERE job_id = $id
             RETURNING ordinal
             """,
             connection, transaction))
         {
             insert.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
+            insert.Parameters.AddWithValue("$position", position);
             insert.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
             insert.Parameters.AddWithValue("$state", (int)state);
             insert.Parameters.AddWithValue("$attempt", attempt);
@@ -1571,8 +1576,9 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
     // recorder amortized for the claim, batched-report, and lease-sweep paths, where each job
     // appears exactly once per batch so its ordinal (the per-job MAX(ordinal)+1) is well-defined.
     // The rows ride a JSON parameter unpacked by json_each; the LEFT JOIN supplies each job's
-    // current MAX(ordinal). The global position (Postgres carries it on a SEQUENCE) is assigned as
-    // the pre-batch MAX plus a per-row offset, race-free under whole-writer serialization. Runs
+    // current MAX(ordinal). The global position (Postgres carries it on a SEQUENCE) is a block of
+    // rows.Count reserved from the backwave_transition_position high-water mark, each row taking the
+    // pre-batch mark plus its 1-based order, race-free under whole-writer serialization. Runs
     // inside the caller's transaction, so the whole batch is atomic with the lease/outcome write.
     // One set-based DELETE prunes the batch to MaxTransitionsPerJob (§7). Honors the history
     // policy: Off writes nothing; Transitions writes the rows but never the detail; the full rung
@@ -1599,13 +1605,9 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         }
         var payload = JsonSerializer.Serialize(payloadRows);
 
-        // The pre-batch global MAX(position); each row gets it plus its 1-based order in the batch.
-        long basePosition;
-        await using (var maxPosition = Cmd(
-            "SELECT COALESCE(MAX(position), 0) FROM backwave_job_transitions", connection, transaction))
-        {
-            basePosition = (long)(await maxPosition.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
-        }
+        // The pre-batch high-water mark; each row gets it plus its 1-based order in the batch.
+        var basePosition = await ReserveTransitionPositionsAsync(connection, transaction, rows.Count, cancellationToken).ConfigureAwait(false)
+            - rows.Count;
 
         // RETURNING the assigned ordinals lets the prune be skipped entirely (below) when no job in
         // the batch has reached the cap — the common 2-transition job pays no DELETE.
@@ -1671,6 +1673,22 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
     // The set-valued transition row for the batch INSERT, serialized to JSON and unpacked by
     // json_each; the property names are the json_extract '$.X' paths above.
     private sealed record TransitionRow(string JobId, int State, int Attempt, string? Detail);
+
+    // Reserves `count` consecutive Transition Log positions and returns the LAST of them: the
+    // high-water mark after the bump. The mark is the sequence SQLite does not have, and it only ever
+    // rises, so a position it hands out is strictly above every position the log has ever carried -
+    // including the ones a retention purge has since cascaded away, which an Observer cursor may
+    // already have passed. Runs inside the caller's write transaction, so the reservation and the
+    // rows it numbers commit or roll back together.
+    private async Task<long> ReserveTransitionPositionsAsync(
+        SqliteConnection connection, SqliteTransaction transaction, int count, CancellationToken cancellationToken)
+    {
+        await using var reserve = Cmd(
+            "UPDATE backwave_transition_position SET position = position + $count RETURNING position",
+            connection, transaction);
+        reserve.Parameters.AddWithValue("$count", count);
+        return (long)(await reserve.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
+    }
 
     // The set-valued dead-letter row for the hand-back UPDATE, serialized to JSON and unpacked by
     // json_each; the property names are the json_extract '$.X' paths above.

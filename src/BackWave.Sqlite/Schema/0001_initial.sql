@@ -113,9 +113,9 @@ CREATE INDEX IF NOT EXISTS ix_backwave_operator_audit_target
 
 -- The Transition Log (§5.12): append-only per-job history. `position` is the single global,
 -- monotonic order the Observer walk (§5.13) cursors over — Postgres carries it on a SEQUENCE
--- DEFAULT, but SQLite has no sequences, so the adapter assigns position = MAX(position)+1 inside
--- the write. Whole-writer serialization (ADR 0019) makes that read-then-write race-free: there is
--- only ever one writer holding the database write lock.
+-- DEFAULT, but SQLite has no sequences, so the adapter assigns it from the high-water mark v2 adds
+-- in backwave_transition_position, bumped inside the same write. Whole-writer serialization makes
+-- that read-then-write race-free: there is only ever one writer holding the database write lock.
 CREATE TABLE IF NOT EXISTS backwave_job_transitions (
     job_id         TEXT NOT NULL REFERENCES backwave_jobs (job_id) ON DELETE CASCADE,
     ordinal        INTEGER NOT NULL,

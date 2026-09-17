@@ -201,8 +201,9 @@ public sealed class SqliteTransitionPruneTests
 
     // Extends a job's Transition Log with filler entries so its highest ordinal is exactly
     // <paramref name="highestOrdinal"/>. Walking the log there through the store would be dozens of
-    // claim/report cycles of setup noise; the fixture writes the rows directly instead, and every
-    // assertion reads the log back through the store, so a fixture that lied would fail them.
+    // claim/report cycles of setup noise; the fixture writes the rows directly instead (moving the
+    // position high-water mark up past them, as the store's own writes do), and every assertion
+    // reads the log back through the store, so a fixture that lied would fail them.
     private static async Task FillTransitionsUpToAsync(string path, Guid jobId, int highestOrdinal)
     {
         await using var connection = new SqliteConnection($"Data Source={path}");
@@ -218,8 +219,10 @@ public sealed class SqliteTransitionPruneTests
             INSERT INTO backwave_job_transitions
                 (job_id, ordinal, recorded_at, state, attempt, failure_detail, position)
             SELECT $id, n, $now, $state, 0, NULL,
-                   (SELECT COALESCE(MAX(position), 0) FROM backwave_job_transitions) + n + 1
-            FROM ordinals WHERE n <= $top
+                   (SELECT position FROM backwave_transition_position) + n + 1
+            FROM ordinals WHERE n <= $top;
+            UPDATE backwave_transition_position
+            SET position = (SELECT MAX(position) FROM backwave_job_transitions)
             """;
         fill.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
         fill.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(T0));

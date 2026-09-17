@@ -14,10 +14,8 @@ namespace BackWave.SchemaGate.Tests;
 public sealed class SchemaGateTests
 {
     // Each adapter's assembly, reached through a type it ships, so the gate reads the SAME embedded
-    // scripts the migrator runs. SQLite is here too: it ships a single consolidated v1 script (no
-    // vN-1 → vN step yet), which the gate treats as vacuously additive — its one CREATE-only script
-    // introduces nothing destructive. When SQLite regains a real 0002, this same gate inspects it
-    // with zero extra wiring.
+    // scripts the migrator runs. SQLite is here too: its consolidated v1 script plus the v1 -> v2
+    // step that adds the transition-position high-water mark, inspected with zero extra wiring.
     public static TheoryData<string, Assembly> Adapters() => new()
     {
         { "Postgres", typeof(PostgresMigrator).Assembly },
@@ -48,15 +46,21 @@ public sealed class SchemaGateTests
     }
 
     [Fact]
-    public void Sqlite_ShipsSingleConsolidatedScript()
+    public void Sqlite_ShipsTheTransitionPositionStepAsItsFirstIncrementalMigration()
     {
-        // SQLite ships one consolidated v1 script and no vN-1 → vN step yet — the posture that held
-        // before (and again after) the short-lived 0002 Tag Suggest migration was folded back into v1.
-        // There is no incremental step for the gate to police here; EveryShippedMigrationIsAdditive
-        // still covers the single script (a CREATE-only script is vacuously additive). When SQLite
-        // gains a real 0002, re-arm a first-incremental-step assertion alongside the upgrade harness.
+        // SQLite's first real vN-1 -> vN step since its schema was consolidated into v1: 0002 adds the
+        // transition-position high-water mark. The script count is the version the adapter requires
+        // and the step stamps that same version, so the two cannot drift apart unnoticed; the gate
+        // above polices the step's DDL like any other adapter's.
         var scripts = SchemaScripts.Load(typeof(SqliteMigrator).Assembly);
-        Assert.Single(scripts);
+        Assert.Equal(SqliteMigrator.ExpectedSchemaVersion, scripts.Count);
+
+        var step = scripts[^1];
+        Assert.EndsWith("0002_transition_position.sql", step.ResourceName, StringComparison.Ordinal);
+        Assert.Contains("CREATE TABLE IF NOT EXISTS backwave_transition_position", step.Sql, StringComparison.Ordinal);
+        Assert.Contains(
+            $"UPDATE backwave_schema_version SET version = {SqliteMigrator.ExpectedSchemaVersion};",
+            step.Sql, StringComparison.Ordinal);
     }
 
     // ---- Sabotage self-tests: prove the gate turns RED on a synthetic non-additive migration. ----
