@@ -169,6 +169,17 @@ internal sealed class Auditor(IJobStore store, KeySpace keys, TortureOptions opt
         var renewals = journal
             .Where(e => e.Op == Ops.Heartbeat && e.Result == "Renewed" && e is { JobId: not null, LeaseExpiry: not null })
             .ToLookup(e => e.JobId!.Value);
+        // A relinquish hands back every lease of one owner, so from its call start the owner's leases
+        // are no longer definitely live. The request entry (not the return) carries that start: a
+        // relinquish that commits and then loses its reply still revoked the lease. The return, when
+        // there is one, bounds the call: a relinquish that returned before a claim's call began cannot
+        // have touched that lease.
+        var relinquishReturns = journal
+            .Where(e => e.Op == Ops.Relinquish)
+            .ToDictionary(e => (e.Client, e.T0), e => e.T1);
+        var relinquishRequests = journal
+            .Where(e => e.Op == Ops.RelinquishRequested && e.Detail is not null)
+            .ToLookup(e => e.Detail!);
         var intervals = claims
             .Select(claim =>
             {
@@ -177,6 +188,14 @@ internal sealed class Auditor(IJobStore store, KeySpace keys, TortureOptions opt
                 if (firstOutcomeStart.TryGetValue(key, out var outcomeStart))
                 {
                     end = Math.Min(end, outcomeStart);
+                }
+                foreach (var request in relinquishRequests[$"torture-{keys.Seed:x8}-{claim.Client}"])
+                {
+                    var callEnd = relinquishReturns.TryGetValue((request.Client, request.T0), out var t1) ? t1 : long.MaxValue;
+                    if (callEnd > claim.T0 && request.T0 < end)
+                    {
+                        end = Math.Min(end, request.T0);
+                    }
                 }
                 // Renewals are attributed by time containment (a stray heartbeat carries no attempt):
                 // one that lands inside this window renewed THIS lease and re-set its expiry.
