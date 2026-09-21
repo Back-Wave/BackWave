@@ -53,7 +53,10 @@ public sealed record SqlServerStoreOptions
     /// <summary>
     /// The size and batch limits the store enforces — maximum payload size, claim batch size, and the
     /// like. Defaults to <see cref="StoreBounds.Default"/>. Tighten or loosen these to match your
-    /// database's capacity and your jobs' payload sizes.
+    /// database's capacity and your jobs' payload sizes. The one exception is the tag bounds: the
+    /// job_tags key and value columns are nvarchar(200), so <see cref="StoreBounds.MaxTagKeyLength"/> and
+    /// <see cref="StoreBounds.MaxTagValueLength"/> can only be tightened here. A value above 200
+    /// is rejected when the store is created.
     /// </summary>
     public StoreBounds Bounds { get; init; } = StoreBounds.Default;
 

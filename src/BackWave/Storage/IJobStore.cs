@@ -1162,14 +1162,14 @@ public enum EnqueueResult
     /// <summary>The wire name exceeds the store's wire-name length bound; nothing was created.</summary>
     WireNameTooLong,
 
-    /// <summary>A tag's key or value exceeds the store's tag length bound; nothing was created (never truncated).</summary>
-    TagTooLong,
-
     /// <summary>A declared gating parent does not exist; nothing was created.</summary>
     UnknownParent,
 
     /// <summary>The declared parent set exceeds the store's maximum parent count; nothing was created.</summary>
     TooManyParents,
+
+    /// <summary>A tag's key or value exceeds the store's tag length bound; nothing was created (never truncated).</summary>
+    TagTooLong,
 }
 
 /// <summary>The parameters of one claim: who is claiming, from which Queues, how many, for how long, and the current instant.</summary>

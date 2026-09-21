@@ -15,13 +15,16 @@ public sealed record StoreBounds
     /// <summary>
     /// The longest accepted tag key, in characters. Enforced on every tag write (enqueue, workflow
     /// enqueue, and the outcome-reported tag delta): an over-limit tag is rejected, never truncated,
-    /// so no adapter can silently clip a key to fit its column.
+    /// so no adapter can silently clip a key to fit its column. The SQL Server and Oracle adapters
+    /// store tags in fixed-width columns (200 and 256 characters), so they reject a wider bound when
+    /// the store is created: on those adapters this bound can only be tightened.
     /// </summary>
     public int MaxTagKeyLength { get; init; } = 200;
 
     /// <summary>
     /// The longest accepted tag value (or label text), in characters. Enforced on every tag write the
-    /// same way as <see cref="MaxTagKeyLength"/>: an over-limit tag is rejected, never truncated.
+    /// same way as <see cref="MaxTagKeyLength"/>: an over-limit tag is rejected, never truncated, and
+    /// the SQL Server and Oracle adapters cap it at their column width.
     /// </summary>
     public int MaxTagValueLength { get; init; } = 200;
 

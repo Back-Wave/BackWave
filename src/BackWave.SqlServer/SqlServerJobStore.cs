@@ -98,7 +98,25 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
     public JobHistoryPolicy HistoryPolicy => _historyPolicy;
 
     /// <inheritdoc/>
-    public StoreBounds Bounds => options.Bounds;
+    public StoreBounds Bounds { get; } = RejectTagBoundsWiderThanColumn(options.Bounds);
+
+    // The job_tags key/value columns are nvarchar(200) and the schema is BackWave's to version, so on
+    // this adapter the tag bounds can only be tightened. A wider bound would pass the enqueue guard
+    // and the sized bind would clip the tag client-side, which is the truncation the bound exists to
+    // prevent - so reject it when the store is created.
+    private const int TagColumnLength = 200;
+
+    private static StoreBounds RejectTagBoundsWiderThanColumn(StoreBounds bounds)
+    {
+        if (bounds.MaxTagKeyLength > TagColumnLength || bounds.MaxTagValueLength > TagColumnLength)
+        {
+            throw new ArgumentException(
+                $"MaxTagKeyLength and MaxTagValueLength cannot exceed {TagColumnLength} on SQL Server: the job_tags " +
+                $"key and value columns are nvarchar({TagColumnLength}). These bounds can only be tightened on this adapter.",
+                nameof(options));
+        }
+        return bounds;
+    }
 
     /// <summary>Migrate (if opted in) and verify the schema version exactly once.</summary>
     private async ValueTask EnsureReadyAsync(CancellationToken cancellationToken)
