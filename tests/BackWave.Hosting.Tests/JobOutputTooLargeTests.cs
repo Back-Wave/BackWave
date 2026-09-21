@@ -187,6 +187,8 @@ public class JobOutputTooLargeTests
 
         var healthy = await client.EnqueueAsync(new OutputJob("small-1"), dueTime: DateTimeOffset.UtcNow);
         var oversized = await client.EnqueueAsync(new OutputJob("big-1"), dueTime: DateTimeOffset.UtcNow);
+        // The one claim pass this test needs: both jobs are due, so they land in the same batch.
+        store.Wake("default");
 
         await AwaitTerminalAsync(monitor, oversized, healthy);
 
@@ -241,10 +243,12 @@ public class JobOutputTooLargeTests
             {
                 Name = "workers",
                 Policy = new DispatchPolicy.Strict(["default"]),
-                // The buffer also flushes on a poll or heartbeat tick, so both must stay well outside the
-                // window between the two handlers finishing - otherwise the rows land in separate batches
-                // and the settled-row-ahead shape this test exists for never happens.
-                PollInterval = TimeSpan.FromSeconds(2),
+                // The buffer also flushes on a poll or heartbeat tick, so no tick may land between the two
+                // handlers finishing - otherwise the rows land in separate batches and the settled-row-ahead
+                // shape this test exists for never happens. A tick that only has to be "well outside" that
+                // window still lands inside it when the thread pool is slow, so the intervals are longer than
+                // the test and the claim is driven by a Wake-Up Hint instead.
+                PollInterval = TimeSpan.FromMinutes(10),
                 HeartbeatInterval = TimeSpan.FromMinutes(10),
                 MaintenanceInterval = TimeSpan.FromMinutes(10),
                 PoolSize = 2,

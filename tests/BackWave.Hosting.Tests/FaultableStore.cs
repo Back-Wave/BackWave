@@ -12,8 +12,9 @@ public sealed class TransientStoreException() : DbException("forced transient st
 }
 
 /// <summary>Wraps the In-Memory Store to force invariant violations on demand.</summary>
-public sealed class FaultableStore(IJobStore inner) : IJobStore
+public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSource
 {
+    private Action<string>? _onHint;
     private int _transientClaimFaults;
     private int _relinquishCalls;
     private int _misattributeObserverReports;
@@ -97,6 +98,32 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore
     {
         get => Volatile.Read(ref _transientClaimFaults);
         set => Volatile.Write(ref _transientClaimFaults, value);
+    }
+
+    /// <summary>
+    /// Wakes the subscribed pump for this Queue, as an adapter's Wake-Up Hint would. A test that must keep
+    /// every poll tick out of the window it exercises sets a long poll interval and claims through this.
+    /// </summary>
+    public void Wake(string queue)
+    {
+        var onHint = Volatile.Read(ref _onHint)
+            ?? throw new InvalidOperationException("No pump has subscribed to this store's Wake-Up Hints.");
+        onHint(queue);
+    }
+
+    public Task<IAsyncDisposable> SubscribeAsync(Action<string> onHint, CancellationToken cancellationToken = default)
+    {
+        Volatile.Write(ref _onHint, onHint);
+        return Task.FromResult<IAsyncDisposable>(new HintSubscription(this));
+    }
+
+    private sealed class HintSubscription(FaultableStore store) : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync()
+        {
+            Volatile.Write(ref store._onHint, null);
+            return ValueTask.CompletedTask;
+        }
     }
 
     private void ThrowIfFailing()
