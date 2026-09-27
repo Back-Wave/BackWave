@@ -499,3 +499,6 @@ StrykerOutput/
 
 # Lavish grill/review artifacts (throwaway)
 .lavish/
+
+# Verification skill evidence (verify-backwave)
+.verify-evidence/
