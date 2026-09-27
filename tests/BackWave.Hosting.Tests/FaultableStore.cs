@@ -14,6 +14,7 @@ public sealed class TransientStoreException() : DbException("forced transient st
 /// <summary>Wraps the In-Memory Store to force invariant violations on demand.</summary>
 public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSource
 {
+    private readonly TaskCompletionSource _subscribed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Action<string>? _onHint;
     private int _transientClaimFaults;
     private int _relinquishCalls;
@@ -103,17 +104,23 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
     /// <summary>
     /// Wakes the subscribed pump for this Queue, as an adapter's Wake-Up Hint would. A test that must keep
     /// every poll tick out of the window it exercises sets a long poll interval and claims through this.
+    /// <para>
+    /// The host starts the pump on a thread-pool thread, so the pump can subscribe after the host's
+    /// StartAsync returns. This waits for that subscription before it sends the hint.
+    /// </para>
     /// </summary>
-    public void Wake(string queue)
+    public async Task WakeAsync(string queue)
     {
+        await _subscribed.Task.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
         var onHint = Volatile.Read(ref _onHint)
-            ?? throw new InvalidOperationException("No pump has subscribed to this store's Wake-Up Hints.");
+            ?? throw new InvalidOperationException("The pump's Wake-Up Hint subscription is already disposed.");
         onHint(queue);
     }
 
     public Task<IAsyncDisposable> SubscribeAsync(Action<string> onHint, CancellationToken cancellationToken = default)
     {
         Volatile.Write(ref _onHint, onHint);
+        _subscribed.TrySetResult();
         return Task.FromResult<IAsyncDisposable>(new HintSubscription(this));
     }
 

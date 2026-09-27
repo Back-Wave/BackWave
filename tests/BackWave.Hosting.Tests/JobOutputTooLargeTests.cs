@@ -188,7 +188,7 @@ public class JobOutputTooLargeTests
         var healthy = await client.EnqueueAsync(new OutputJob("small-1"), dueTime: DateTimeOffset.UtcNow);
         var oversized = await client.EnqueueAsync(new OutputJob("big-1"), dueTime: DateTimeOffset.UtcNow);
         // The one claim pass this test needs: both jobs are due, so they land in the same batch.
-        store.Wake("default");
+        await store.WakeAsync("default");
 
         await AwaitTerminalAsync(monitor, oversized, healthy);
 
@@ -204,6 +204,10 @@ public class JobOutputTooLargeTests
         Assert.Contains("Job Output", dead.TerminalCause);
 
         // The settled row fences out on the second pass. Benign, so: Debug, no counter, group untouched.
+        // The pump logs only after the store write that made both jobs terminal, so wait for the log itself.
+        await WaitForAsync(
+            () => logs.Entries.Any(entry => entry.EventId == FencedOutEventId),
+            "the fenced-out outcome to be logged at Debug");
         var debug = Assert.Single(logs.Entries, entry => entry.EventId == FencedOutEventId);
         Assert.Contains(healthy.ToString(), debug.Message);
         Assert.Empty(violations.Measurements);
@@ -301,5 +305,19 @@ public class JobOutputTooLargeTests
             }
             await Task.Delay(25);
         }
+    }
+
+    private static async Task WaitForAsync(Func<bool> condition, string description)
+    {
+        var deadline = DateTimeOffset.UtcNow + TestTimeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (condition())
+            {
+                return;
+            }
+            await Task.Delay(25);
+        }
+        Assert.Fail($"Timed out waiting for: {description}");
     }
 }
