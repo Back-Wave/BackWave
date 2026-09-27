@@ -1,0 +1,450 @@
+#!/usr/bin/env bash
+# bwv - launch, drive, and clean up an isolated BackWave verification run.
+#
+# Every run owns exactly these things, all named after its run id:
+#   - a Sample.Api process   dotnet <scratch>/app/BackWave.Sample.Api.dll  (pinned by PID + path)
+#   - a scratch dir          ${TMPDIR}/bw-verify-<run>/  (app copy + SQLite file)
+#   - a free port            http://127.0.0.1:<port>
+#   - a browser session      CHROME_DEVTOOLS_AXI_SESSION=bw-verify-<run>
+#   - (postgres only)        container backwave-verify-<run>, label backwave.verify.run=<run>
+#   - an evidence dir        .verify-evidence/<run>/  (gitignored, survives cleanup)
+# Nothing shared is reused or killed. See ../SKILL.md for the full contract.
+#
+# Usage:
+#   bwv launch [--store sqlite|postgres|inmemory]  new run: build, copy, start, wait for READY
+#   bwv doctor                         read-only health check of the current run
+#   bwv url [path]                     print the run's base URL (plus an optional path)
+#   bwv api <METHOD> <path> [name] [json-body]   call the Sample API -> <run>/api/<name>.json
+#   bwv wait-job <jobId> <State> [timeout-s]     poll /monitor/jobs/<id> until it reaches <State>
+#   bwv browser <chrome-devtools-axi args...>    drive the run's own browser session
+#                                      ('open /backwave/jobs' expands to the run's base URL)
+#   bwv shot <name>                    screenshot + a11y snapshot -> <run>/ui/<name>.{png,txt}
+#   bwv sql <name> <query>             read-only query on the run's store -> <run>/db/<name>.txt
+#   bwv cleanup                        stop this run's app, browser, container; keep evidence
+#   bwv runs                           list runs in this worktree and whether they are live
+#
+# Run selection: BWV_RUN=<run-id> overrides the run recorded in .verify-evidence/.current.
+
+set -euo pipefail
+
+ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
+EVIDENCE_ROOT="$ROOT/.verify-evidence"
+PROJECT="$ROOT/samples/BackWave.Sample.Api/BackWave.Sample.Api.csproj"
+BUILD_OUT="$ROOT/samples/BackWave.Sample.Api/bin/Debug/net10.0"
+DLL="BackWave.Sample.Api.dll"
+PG_IMAGE="postgres:17-alpine"
+STATES=(Scheduled AwaitingParent Leased Succeeded Cancelled DeadLettered Quarantined)
+
+log()  { printf "\033[1;34mbwv:\033[0m %s\n" "$*" >&2; }
+die()  { printf "\033[1;31mbwv: %s\033[0m\n" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- run state
+
+run_id() {
+    if [[ -n "${BWV_RUN:-}" ]]; then echo "$BWV_RUN"; return; fi
+    [[ -f "$EVIDENCE_ROOT/.current" ]] || die "no current run - start one with 'bwv launch'"
+    cat "$EVIDENCE_ROOT/.current"
+}
+
+load_run() {
+    RUN="$(run_id)"
+    RUN_DIR="$EVIDENCE_ROOT/$RUN"
+    [[ -f "$RUN_DIR/run.env" ]] || die "run '$RUN' has no run.env at $RUN_DIR"
+    # shellcheck disable=SC1091
+    source "$RUN_DIR/run.env"
+}
+
+require_active() {
+    [[ "$STATUS" == active ]] || die "run $RUN is cleaned up; start a new one with 'bwv launch'"
+}
+
+set_var() { # set_var KEY VALUE - upsert into run.env
+    local file="$RUN_DIR/run.env"
+    grep -v "^$1=" "$file" > "$file.tmp" || true
+    printf '%s=%q\n' "$1" "$2" >> "$file.tmp"
+    mv "$file.tmp" "$file"
+    printf -v "$1" '%s' "$2"
+}
+
+base() { echo "http://127.0.0.1:$PORT"; }
+
+free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
+
+# Content hash of everything that can change the build: committed blobs, uncommitted
+# edits and untracked files. Docs, the skill itself and prose are left out, so editing
+# them never marks a running app stale.
+BUILD_PATHSPEC=(. ':(exclude).agents' ':(exclude).claude' ':(exclude)docs' ':(exclude)*.md')
+tree_fingerprint() {
+    { git -C "$ROOT" ls-files -s -- "${BUILD_PATHSPEC[@]}"
+      git -C "$ROOT" diff -- "${BUILD_PATHSPEC[@]}"
+      git -C "$ROOT" ls-files -z --others --exclude-standard -- "${BUILD_PATHSPEC[@]}" \
+        | (cd "$ROOT" && xargs -0 shasum 2>/dev/null)
+    } | shasum | cut -c1-12
+}
+
+# The app process is ours only while its command line still names this run's app copy.
+app_is_ours() {
+    [[ -n "${APP_PID:-}" ]] || return 1
+    local cmd
+    cmd="$(ps -p "$APP_PID" -o command= 2>/dev/null || true)"
+    [[ "$cmd" == *"$APP_DIR/$DLL"* ]]
+}
+
+container_is_ours() {
+    [[ -n "${CONTAINER:-}" ]] || return 1
+    [[ "$(docker inspect -f '{{index .Config.Labels "backwave.verify.run"}}' "$CONTAINER" 2>/dev/null)" == "$RUN" ]]
+}
+
+# A cold bridge start runs 'npx chrome-devtools-mcp@latest' and can take 20-40 s, more
+# than the 30 s default deadline.
+browser() {
+    CHROME_DEVTOOLS_AXI_SESSION="$BROWSER_SESSION" \
+    CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS="${CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS:-120000}" \
+        chrome-devtools-axi "$@"
+}
+
+# One build at a time per worktree: parallel runs share obj/ and bin/. The lock also
+# covers the copy, so no run clones a half-written build of another run.
+with_build_lock() {
+    local lock="$EVIDENCE_ROOT/.build.lock" waited=0
+    until mkdir "$lock" 2>/dev/null; do
+        local holder
+        holder="$(cat "$lock/pid" 2>/dev/null || true)"
+        if [[ -n "$holder" ]] && ! kill -0 "$holder" 2>/dev/null; then
+            log "removing stale build lock of dead pid $holder"
+            rm -rf "$lock"; continue
+        fi
+        (( waited % 30 == 0 )) && log "waiting for the build lock (held by pid ${holder:-?})"
+        (( waited >= 900 )) && die "build lock held for 15 min by pid ${holder:-?} - $lock"
+        sleep 1; waited=$((waited + 1))
+    done
+    echo $$ > "$lock/pid"
+    local code=0
+    "$@" || code=$?
+    rm -rf "$lock"
+    return "$code"
+}
+
+build_and_copy() {
+    set_var BUILT_TREE "$(tree_fingerprint)"
+    log "dotnet build (log: $RUN_DIR/build.log)"
+    dotnet build "$PROJECT" -c Debug -nologo --disable-build-servers > "$RUN_DIR/build.log" 2>&1 \
+        || { grep -E "error|Build FAILED" "$RUN_DIR/build.log" | head -20 >&2; return 1; }
+    # A private copy (an APFS clone on macOS): a later build by another run cannot
+    # change the files under this run's live process.
+    cp -cR "$BUILD_OUT" "$APP_DIR" 2>/dev/null || cp -R "$BUILD_OUT" "$APP_DIR"
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_launch() {
+    local store=sqlite
+    while (( $# )); do
+        case "$1" in
+            --store) store="${2:?--store needs sqlite|postgres|inmemory}"; shift 2 ;;
+            *) die "unknown launch flag '$1'" ;;
+        esac
+    done
+    [[ "$store" =~ ^(sqlite|postgres|inmemory)$ ]] || die "store must be sqlite, postgres or inmemory"
+    command -v dotnet >/dev/null || die "dotnet is not on PATH"
+    command -v chrome-devtools-axi >/dev/null || die "chrome-devtools-axi is not on PATH"
+    if [[ "$store" == postgres ]]; then docker info >/dev/null 2>&1 || die "Docker is not running"; fi
+
+    RUN="$(date +%Y%m%d-%H%M%S)-$$"
+    RUN_DIR="$EVIDENCE_ROOT/$RUN"
+    mkdir -p "$RUN_DIR"/{api,ui,db}
+    : > "$RUN_DIR/run.env"
+    echo "$RUN" > "$EVIDENCE_ROOT/.current"
+    # Record every resource name before creating it, so 'bwv cleanup' can undo
+    # a launch that dies half way.
+    local tmp="${TMPDIR:-/tmp}"
+    set_var RUN_ID "$RUN"
+    set_var STATUS active
+    set_var CREATED_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    set_var STORE "$store"
+    set_var SCRATCH "${tmp%/}/bw-verify-$RUN"
+    set_var APP_DIR "$SCRATCH/app"
+    set_var APP_PID ""
+    set_var PORT "$(free_port)"
+    set_var BROWSER_SESSION "bw-verify-$RUN"
+    set_var BROWSER_STARTED 0
+    set_var CONTAINER ""
+    set_var PG_PORT ""
+    set_var SQLITE_DB ""
+    log "run $RUN ($store) - evidence at $RUN_DIR"
+    mkdir -p "$SCRATCH"
+
+    with_build_lock build_and_copy || die "build failed - see $RUN_DIR/build.log, then run 'bwv cleanup'"
+
+    local store_args=()
+    case "$store" in
+        sqlite)
+            set_var SQLITE_DB "$SCRATCH/backwave.db"
+            store_args=(--BackWave:Store=Sqlite "--BackWave:Sqlite:DataSource=$SQLITE_DB")
+            set_var STORE_NAME SqliteCoResident ;;
+        inmemory)
+            store_args=(--BackWave:Store=InMemory)
+            set_var STORE_NAME InMemory ;;
+        postgres)
+            set_var CONTAINER "backwave-verify-$RUN"
+            log "starting $PG_IMAGE as $CONTAINER"
+            docker run -d --name "$CONTAINER" --label "backwave.verify.run=$RUN" \
+                -e POSTGRES_USER=backwave -e POSTGRES_PASSWORD=backwave -e POSTGRES_DB=backwave_sample \
+                -p 127.0.0.1::5432 "$PG_IMAGE" > /dev/null \
+                || die "docker run failed - run 'bwv cleanup'"
+            set_var PG_PORT "$(docker port "$CONTAINER" 5432/tcp | head -1 | awk -F: '{print $NF}')"
+            # TCP only answers after the image's init server restarts for real.
+            local i
+            for i in $(seq 1 60); do
+                docker exec "$CONTAINER" psql -h 127.0.0.1 -U backwave -d backwave_sample -tAc 'select 1' >/dev/null 2>&1 && break
+                (( i == 60 )) && die "Postgres did not accept TCP in 60 s - run 'bwv cleanup'"
+                sleep 1
+            done
+            store_args=(--BackWave:Store=Postgres
+                "--BackWave:Postgres:ConnectionString=Host=127.0.0.1;Port=$PG_PORT;Username=backwave;Password=backwave;Database=backwave_sample")
+            set_var STORE_NAME Postgres ;;
+    esac
+
+    log "starting Sample.Api on $(base) (log: $RUN_DIR/app.log)"
+    # reloadConfigOnChange=false: the appsettings FileSystemWatcher calls sync() on macOS,
+    # which blocks startup for as long as any mounted volume stalls (see SKILL.md Gotchas).
+    # --urls on the command line wins over the "Urls" key in appsettings.json.
+    cd "$APP_DIR"
+    DOTNET_hostBuilder__reloadConfigOnChange=false \
+        nohup dotnet "$APP_DIR/$DLL" --urls "$(base)" "${store_args[@]}" \
+        > "$RUN_DIR/app.log" 2>&1 < /dev/null &
+    set_var APP_PID "$!"
+    cd "$ROOT"
+
+    local i code
+    for i in $(seq 1 90); do
+        app_is_ours || { tail -30 "$RUN_DIR/app.log" >&2; die "app exited during startup - run 'bwv cleanup'"; }
+        code="$(curl -s -o /dev/null -w '%{http_code}' "$(base)/backwave" || true)"
+        [[ "$code" == 200 ]] && break
+        (( i == 90 )) && { tail -30 "$RUN_DIR/app.log" >&2; die "/backwave not 200 after 90 s - run 'bwv cleanup'"; }
+        sleep 1
+    done
+    grep -q "BackWave sample starting on the $STORE_NAME store" "$RUN_DIR/app.log" \
+        || die "app.log does not name the $STORE_NAME store - run 'bwv doctor'"
+    log "READY run=$RUN store=$STORE_NAME pid=$APP_PID url=$(base)/backwave"
+}
+
+cmd_doctor() {
+    load_run
+    local fail=0
+    ok()  { printf "  ok    %s\n" "$*"; }
+    bad() { printf "  FAIL  %s\n" "$*"; fail=1; }
+    echo "run $RUN ($STATUS, store $STORE) - evidence $RUN_DIR"
+    [[ "$STATUS" == active ]] || bad "run was cleaned up at ${CLEANED_AT:-?}; start a new one with 'bwv launch'"
+
+    if app_is_ours; then ok "app pid $APP_PID runs $APP_DIR/$DLL"
+    else bad "app pid ${APP_PID:-none} is not running this run's $APP_DIR/$DLL"; fi
+
+    if [[ -n "${APP_PID:-}" ]] && lsof -a -nP -p "$APP_PID" -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        ok "port $PORT is held by pid $APP_PID"
+    else
+        bad "port $PORT is not held by pid ${APP_PID:-none}"
+    fi
+
+    local body
+    if body="$(curl -sf "$(base)/backwave")" && [[ "$body" == *"Overview · BackWave"* ]]; then
+        ok "$(base)/backwave serves the Overview page"
+    else
+        bad "$(base)/backwave did not serve the Overview page"
+    fi
+
+    grep -q "BackWave sample starting on the ${STORE_NAME:-?} store" "$RUN_DIR/app.log" 2>/dev/null \
+        && ok "app.log: store is $STORE_NAME" || bad "app.log does not name the ${STORE_NAME:-?} store"
+
+    local now_tree
+    now_tree="$(tree_fingerprint)"
+    [[ "$now_tree" == "${BUILT_TREE:-}" ]] && ok "build matches worktree ($now_tree)" \
+        || bad "build is from ${BUILT_TREE:-?}, worktree is now $now_tree - 'bwv cleanup' then 'bwv launch'"
+
+    case "$STORE" in
+        sqlite)
+            [[ -f "$SQLITE_DB" ]] && ok "SQLite file $SQLITE_DB" || bad "SQLite file $SQLITE_DB missing" ;;
+        postgres)
+            if container_is_ours && [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" == true ]]; then
+                ok "container $CONTAINER running on 127.0.0.1:$PG_PORT (label run=$RUN)"
+            else
+                bad "container $CONTAINER is not running with label backwave.verify.run=$RUN"
+            fi ;;
+        inmemory) ok "in-memory store (no database to check)" ;;
+    esac
+
+    if [[ "${BROWSER_STARTED:-0}" == 1 ]]; then
+        local page
+        page="$(browser pages 2>&1 | head -3 | tr '\n' ' ' || true)"
+        ok "browser session $BROWSER_SESSION: $page"
+    else
+        ok "browser session $BROWSER_SESSION not started yet (starts on the first 'bwv browser')"
+    fi
+    return "$fail"
+}
+
+cmd_url() {
+    load_run
+    echo "$(base)${1:-}"
+}
+
+cmd_api() {
+    load_run; require_active
+    local method="${1:?usage: bwv api <METHOD> <path> [name] [json-body]}"
+    local path="${2:?usage: bwv api <METHOD> <path> [name] [json-body]}"
+    local name="${3:-}" body="${4:-}"
+    method="$(echo "$method" | tr '[:lower:]' '[:upper:]')"
+    if [[ -z "$name" ]]; then
+        name="$(date +%H%M%S)-$(echo "$method$path" | tr -c 'a-zA-Z0-9\n' '_' | sed 's/_*$//' | cut -c1-60)"
+        local n=2 stem="$name"
+        while [[ -e "$RUN_DIR/api/$name.json" ]]; do name="$stem-$n"; n=$((n + 1)); done
+    fi
+    local out="$RUN_DIR/api/$name.json"
+    [[ -e "$out" ]] && die "$out already exists - pick a new name so earlier evidence is not overwritten"
+    local args=(-s -X "$method" -o "$out.raw" -w '%{http_code}')
+    [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' --data "$body")
+    local status
+    status="$(curl "${args[@]}" "$(base)$path")" || die "curl failed for $method $path"
+    { python3 -m json.tool "$out.raw" 2>/dev/null || cat "$out.raw"; } > "$out"
+    rm -f "$out.raw"
+    printf '%s %s %s -> %s  (%s)\n' "$(date -u +%H:%M:%SZ)" "$method" "$path" "$status" "api/$name.json" >> "$RUN_DIR/api/requests.log"
+    cat "$out"; echo
+    log "$method $path -> $status (saved api/$name.json)"
+    [[ "$status" =~ ^[23] ]]
+}
+
+cmd_wait_job() {
+    load_run; require_active
+    local id="${1:?usage: bwv wait-job <jobId> <State> [timeout-s]}"
+    local want="${2:?usage: bwv wait-job <jobId> <State> [timeout-s]}"
+    local timeout="${3:-60}" i want_n="" json state
+    for i in "${!STATES[@]}"; do
+        [[ "$(echo "${STATES[$i]}" | tr '[:upper:]' '[:lower:]')" == "$(echo "$want" | tr -d '-' | tr '[:upper:]' '[:lower:]')" ]] && want_n=$i
+    done
+    [[ -n "$want_n" ]] || die "unknown state '$want' - one of: ${STATES[*]}"
+    for i in $(seq 1 "$timeout"); do
+        json="$(curl -sf "$(base)/monitor/jobs/$id" || true)"
+        state="$(python3 -c 'import sys,json; print(json.load(sys.stdin)["state"])' <<< "$json" 2>/dev/null || true)"
+        if [[ "$state" == "$want_n" ]]; then
+            python3 -m json.tool <<< "$json" > "$RUN_DIR/api/job-$id-${STATES[$want_n]}.json"
+            log "job $id is ${STATES[$want_n]} after ${i}s (saved api/job-$id-${STATES[$want_n]}.json)"
+            return 0
+        fi
+        sleep 1
+    done
+    die "job $id is ${STATES[${state:-0}]:-unknown} (state=${state:-none}), not ${STATES[$want_n]}, after ${timeout}s"
+}
+
+cmd_browser() {
+    load_run; require_active
+    (( $# )) || die "usage: bwv browser <chrome-devtools-axi args...>"
+    [[ "${BROWSER_STARTED:-0}" == 1 ]] || set_var BROWSER_STARTED 1
+    if [[ "$1" =~ ^(open|newpage)$ && "${2:-}" == /* ]]; then
+        set -- "$1" "$(base)$2" "${@:3}"
+    fi
+    browser "$@"
+}
+
+cmd_shot() {
+    load_run; require_active
+    local name="${1:?usage: bwv shot <name>}"
+    [[ "${BROWSER_STARTED:-0}" == 1 ]] || die "no browser page yet - run 'bwv browser open /backwave' first"
+    [[ -e "$RUN_DIR/ui/$name.png" ]] && die "ui/$name.png already exists - pick a new name"
+    browser screenshot "$RUN_DIR/ui/$name.png" > /dev/null
+    browser snapshot > "$RUN_DIR/ui/$name.txt"
+    echo "$RUN_DIR/ui/$name.png"
+    echo "$RUN_DIR/ui/$name.txt"
+}
+
+cmd_sql() {
+    load_run; require_active
+    local name="${1:?usage: bwv sql <name> <query>}"
+    local query="${2:?usage: bwv sql <name> <query>}"
+    local out="$RUN_DIR/db/$name.txt"
+    [[ -e "$out" ]] && die "$out already exists - pick a new name"
+    [[ "$STORE" != inmemory ]] || die "the in-memory store has no database to query - use 'bwv api GET /monitor/...'"
+    { echo "-- $STORE_NAME, $(date -u +%H:%M:%SZ)"; echo "-- $query"
+      case "$STORE" in
+          sqlite) sqlite3 -header -column -cmd '.timeout 5000' "$SQLITE_DB" "PRAGMA query_only=1; $query" ;;
+          postgres) docker exec -e PGOPTIONS='-c default_transaction_read_only=on' "$CONTAINER" \
+                        psql -U backwave -d backwave_sample -v ON_ERROR_STOP=1 -c "$query" ;;
+      esac
+    } > "$out" 2>&1 || { cat "$out"; die "query failed (saved db/$name.txt)"; }
+    cat "$out"
+}
+
+cmd_cleanup() {
+    load_run
+    # A launch that died before it recorded the PID: find the app by this run's own
+    # app path, which holds the run id. Never by a process name.
+    if [[ -z "${APP_PID:-}" && -n "${APP_DIR:-}" ]]; then
+        APP_PID="$(pgrep -f "$APP_DIR/$DLL" | head -1 || true)"
+        [[ -n "$APP_PID" ]] && log "found this run's app at pid $APP_PID by its path $APP_DIR"
+    fi
+    {
+        echo "cleanup $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        # The browser goes first: an open dashboard page holds a live SSE request, and the
+        # host waits for open requests before it stops.
+        if [[ "${BROWSER_STARTED:-0}" == 1 ]]; then
+            browser stop >/dev/null 2>&1 && echo "stopped browser session $BROWSER_SESSION" \
+                || echo "browser session $BROWSER_SESSION was not running"
+        fi
+
+        if app_is_ours; then
+            kill -TERM "$APP_PID" 2>/dev/null || true
+            local i
+            for i in $(seq 1 20); do app_is_ours || break; sleep 1; done
+            if app_is_ours; then
+                kill -KILL "$APP_PID" 2>/dev/null || true
+                for i in $(seq 1 5); do app_is_ours || break; sleep 1; done
+                echo "app pid $APP_PID did not stop in 20 s - sent SIGKILL"
+            else
+                echo "stopped app pid $APP_PID"
+            fi
+        elif [[ -n "${APP_PID:-}" ]] && ps -p "$APP_PID" >/dev/null 2>&1; then
+            echo "REFUSED: pid $APP_PID now runs '$(ps -p "$APP_PID" -o command=)' - left alone"
+        else
+            echo "app pid ${APP_PID:-none} already gone"
+        fi
+
+        if [[ -n "${CONTAINER:-}" ]]; then
+            if container_is_ours; then
+                docker rm -f -v "$CONTAINER" >/dev/null && echo "removed container $CONTAINER and its volumes"
+            elif docker inspect "$CONTAINER" >/dev/null 2>&1; then
+                echo "REFUSED: container $CONTAINER has no label backwave.verify.run=$RUN - left alone"
+            else
+                echo "container $CONTAINER already gone"
+            fi
+        fi
+
+        if [[ -n "${SQLITE_DB:-}" && -f "$SQLITE_DB" ]] && ! app_is_ours; then
+            cp "$SQLITE_DB" "$RUN_DIR/db/final-backwave.db" && echo "kept the final SQLite file as db/final-backwave.db"
+        fi
+        if [[ -n "${SCRATCH:-}" && "$SCRATCH" == */bw-verify-"$RUN" && -d "$SCRATCH" ]]; then
+            if app_is_ours; then
+                echo "WARNING: app still running - scratch $SCRATCH left in place"
+            else
+                rm -rf "$SCRATCH" && echo "removed scratch $SCRATCH"
+            fi
+        fi
+    } | tee -a "$RUN_DIR/cleanup.log"
+    set_var STATUS cleaned
+    set_var CLEANED_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    log "evidence kept at $RUN_DIR ($(find "$RUN_DIR" -type f | wc -l | tr -d ' ') files)"
+}
+
+cmd_runs() {
+    local dir
+    for dir in "$EVIDENCE_ROOT"/*/; do
+        [[ -f "$dir/run.env" ]] || continue
+        ( source "$dir/run.env"
+          live=no; ps -p "${APP_PID:-0}" -o command= 2>/dev/null | grep -qF "$APP_DIR/$DLL" && live=yes
+          printf "%-24s %-8s store=%-9s port=%-6s app-live=%s\n" "$RUN_ID" "$STATUS" "$STORE" "$PORT" "$live" )
+    done
+}
+
+case "${1:-}" in
+    launch|doctor|url|api|browser|shot|sql|cleanup|runs) cmd="$1"; shift; "cmd_$cmd" "$@" ;;
+    wait-job) shift; cmd_wait_job "$@" ;;
+    *) sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 64 ;;
+esac
