@@ -11,6 +11,7 @@ using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 namespace BackWave.Dashboard;
 
@@ -446,11 +447,17 @@ internal static class DashboardRequestHandler
     /// <summary>Holds the response open and pushes the re-rendered #bw-live fragment as Server-Sent
     /// Events, every <paramref name="interval"/>, but only when the markup changed since the last
     /// push (a comment heartbeat keeps the connection warm otherwise). Ends when the browser
-    /// disconnects.</summary>
+    /// disconnects or the application starts to stop.</summary>
     private static async Task StreamAsync(
         HttpContext context, LiveView view, TimeSpan interval, Dictionary<string, object?>? seed)
     {
-        var ct = context.RequestAborted;
+        // The server waits for open requests before the hosted services stop, so a stream that only
+        // ends on disconnect makes an open dashboard tab spend the host's whole shutdown window. The
+        // worker groups then have no time left to give their leases back on a clean stop.
+        var stopping = context.RequestServices.GetService<IHostApplicationLifetime>()?.ApplicationStopping
+            ?? CancellationToken.None;
+        using var streamEnd = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, stopping);
+        var ct = streamEnd.Token;
         context.Response.ContentType = "text/event-stream";
         context.Response.Headers.CacheControl = "no-cache";
         context.Response.Headers["X-Accel-Buffering"] = "no"; // don't let a reverse proxy buffer the stream
@@ -496,7 +503,7 @@ internal static class DashboardRequestHandler
         }
         catch (OperationCanceledException)
         {
-            // The browser navigated away or closed the tab — a normal end to the stream.
+            // The browser navigated away or closed the tab, or the application is stopping - a normal end to the stream.
         }
     }
 

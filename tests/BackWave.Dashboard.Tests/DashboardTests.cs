@@ -305,6 +305,31 @@ public class DashboardTests
     }
 
     [Fact]
+    public async Task LiveView_EndsTheSseStream_WhenTheApplicationStartsToStop()
+    {
+        // The server waits for open requests before it stops the hosted services. A stream that
+        // outlives ApplicationStopping makes one open dashboard tab spend the whole shutdown window,
+        // and the worker groups then cannot give their leases back on a clean stop.
+        var (app, _, http) = await StartAsync(new BackWaveDashboardOptions { LiveRefreshInterval = TimeSpan.FromMilliseconds(50) });
+        await using (app)
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            using var response = await http.GetAsync(
+                "/backwave/?live=1", HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            await using var stream = await response.Content.ReadAsStreamAsync(cts.Token);
+            using var reader = new StreamReader(stream);
+            Assert.Equal("event: update", await reader.ReadLineAsync(cts.Token));
+
+            app.Lifetime.StopApplication();
+
+            // Without the stop link the stream pings every interval until the test times out.
+            while (await reader.ReadLineAsync(cts.Token) is not null)
+            {
+            }
+        }
+    }
+
+    [Fact]
     public async Task LiveView_ClosesTheSseStreamOnNavigation_SoItNeverStrandsAConnection()
     {
         var (app, store, http) = await StartAsync();
