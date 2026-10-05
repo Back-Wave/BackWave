@@ -499,6 +499,98 @@ public class DashboardTests
         }
     }
 
+    /// <summary>
+    /// Seeds one job per way a job can be Scheduled: a handler failure the policy retries, a lapsed
+    /// lease the sweep reschedules, a clean-stop hand-back, and a fresh enqueue. Each lives on its own
+    /// Queue so each claim takes only its own job.
+    /// </summary>
+    private static async Task SeedRetryCasesAsync(InMemoryJobStore store)
+    {
+        var disposition = new RetryPolicy { MaxAttempts = 5, Backoff = _ => TimeSpan.FromMinutes(1) }.ToDisposition();
+
+        await store.EnqueueAsync(Job(wireName: "flaky-charge", queue: "q-failed"), now: T0);
+        var failed = Assert.Single(await store.ClaimAsync(new ClaimRequest("w1", ["q-failed"], 32, Lease, T0)));
+        await store.ReportOutcomeAsync(failed.JobId, "w1", failed.Attempt, new JobOutcome.Failure(T0.AddMinutes(5), "card declined"), T0);
+
+        await store.EnqueueAsync(Job(wireName: "stalled-export", queue: "q-expired"), now: T0);
+        Assert.Single(await store.ClaimAsync(new ClaimRequest("w2", ["q-expired"], 32, Lease, T0)));
+        await store.ExpireLeasesAsync(T0 + Lease + TimeSpan.FromSeconds(1), 32, ["q-expired"], disposition);
+
+        await store.EnqueueAsync(Job(wireName: "handed-back", queue: "q-relinquished"), now: T0);
+        Assert.Single(await store.ClaimAsync(new ClaimRequest("w3", ["q-relinquished"], 32, Lease, T0)));
+        await store.RelinquishLeasesAsync("w3", T0.AddSeconds(5), disposition);
+
+        await store.EnqueueAsync(Job(wireName: "brand-new", queue: "q-fresh"), now: T0);
+    }
+
+    [Fact]
+    public async Task Failures_RetryingTab_ListsOnlyJobsAnAttemptWentWrongFor()
+    {
+        var (app, store, http) = await StartAsync();
+        await using (app)
+        {
+            await SeedRetryCasesAsync(store);
+
+            // The default tab still opens on Dead-Lettered, with Retrying as a counted third tab.
+            var html = await http.GetStringAsync("/backwave/failures");
+            Assert.Contains("/backwave/failures?tab=retrying", html);
+            Assert.DoesNotContain("flaky-charge", html);
+
+            var retrying = await http.GetStringAsync("/backwave/failures?tab=retrying");
+            Assert.Contains("flaky-charge", retrying);
+            Assert.Contains("stalled-export", retrying);
+            Assert.DoesNotContain("handed-back", retrying); // a clean stop is not a problem
+            Assert.DoesNotContain("brand-new", retrying);
+            // The row says when the next attempt runs and why the job came back.
+            Assert.Contains("data-label=\"Next Attempt\"", retrying);
+            Assert.Contains("data-label=\"Retry Cause\"", retrying);
+            Assert.Contains("Handler failed", retrying);
+            Assert.Contains("Lease expired", retrying);
+            Assert.Contains("<span class=\"bw-tab__count\">2</span>", retrying);
+        }
+    }
+
+    [Fact]
+    public async Task JobSearch_RetryingFilter_NarrowsScheduledToTheRetryingJobs()
+    {
+        var (app, store, http) = await StartAsync();
+        await using (app)
+        {
+            await SeedRetryCasesAsync(store);
+
+            var html = await http.GetStringAsync("/backwave/jobs?state=Retrying");
+            Assert.Contains("""<option value="Retrying" selected>Retrying</option>""", html);
+            Assert.Contains("flaky-charge", html);
+            Assert.Contains("stalled-export", html);
+            Assert.DoesNotContain("handed-back", html);
+            Assert.DoesNotContain("brand-new", html);
+            Assert.Contains("data-label=\"Retry Cause\"", html);
+
+            // Plain Scheduled still lists every Scheduled job, problem or not.
+            var scheduled = await http.GetStringAsync("/backwave/jobs?state=Scheduled");
+            Assert.Contains("handed-back", scheduled);
+            Assert.Contains("brand-new", scheduled);
+            Assert.Contains("flaky-charge", scheduled);
+        }
+    }
+
+    [Fact]
+    public async Task JobDetail_ShowsTheRetryCause_OfARetryingJob()
+    {
+        var (app, store, http) = await StartAsync();
+        await using (app)
+        {
+            await SeedRetryCasesAsync(store);
+            var flaky = Assert.Single(await store.ListJobsAsync(new JobQuery { Queue = "q-failed" }));
+            var fresh = Assert.Single(await store.ListJobsAsync(new JobQuery { Queue = "q-fresh" }));
+
+            var html = await http.GetStringAsync($"/backwave/jobs/{flaky.JobId}");
+            Assert.Contains("<tr><th>Retry cause</th><td>Handler failed</td></tr>", html);
+
+            Assert.DoesNotContain("Retry cause", await http.GetStringAsync($"/backwave/jobs/{fresh.JobId}"));
+        }
+    }
+
     [Fact]
     public async Task Failures_RenderTags_DeepLinkingToTheJobsListFilteredByStateAndTag()
     {

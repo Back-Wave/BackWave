@@ -476,7 +476,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 RETURNING j.job_id, j.wire_name, j.payload, j.queue, j.state, j.due_time, j.attempt,
                           j.lease_owner, j.lease_expiry, j.cancel_requested, j.terminal_at,
                           j.terminal_cause, j.schedule_id, j.parents_remaining, j.mode, j.trace_context,
-                          j.sequence, j.workflow_id,
+                          j.sequence, j.workflow_id, j.retry_cause,
                           -- Job Tags (ADR 0022) ride back with the claim as a correlated aggregate in
                           -- THIS round-trip — never a second SELECT — so the no-tags hot path pays only a
                           -- PK-indexed empty lookup (NULL) and is never N+1. The empty-string-key => Label
@@ -502,10 +502,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                             InvariantTrigger.ClaimedRowNotLeasedToWorker,
                             $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
                     }
-                    // Column 18 is the correlated tag aggregate (json or NULL when the job has none).
-                    if (!reader.IsDBNull(18))
+                    // Column 19 is the correlated tag aggregate (json or NULL when the job has none).
+                    if (!reader.IsDBNull(19))
                     {
-                        job = job with { Tags = ParseTagsJson(reader.GetString(18)) };
+                        job = job with { Tags = ParseTagsJson(reader.GetString(19)) };
                     }
                     queueClaims.Add(job);
                 }
@@ -675,7 +675,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                         }
                     })),
             JobOutcome.Failure { NextDueTime: { } retryAt } =>
-                ("state = 0, due_time = @retryAt, lease_owner = NULL, lease_expiry = NULL",
+                ("state = 0, due_time = @retryAt, lease_owner = NULL, lease_expiry = NULL, retry_cause = 1",
                     command => command.Parameters.AddWithValue("retryAt", retryAt.ToUniversalTime())),
             JobOutcome.Failure failure =>
                 ("state = 5, lease_owner = NULL, lease_expiry = NULL, terminal_at = @now, terminal_cause = @cause",
@@ -828,6 +828,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // nothing (StaleLease); a matched row applies and is returned via RETURNING, keyed by job id.
         // due_time moves only for a retry row (COALESCE keeps it for everyone else); cancel_requested
         // clears only for a Cancelled row. terminal_at/terminal_cause carry per-row (null for retry).
+        // retry_cause records a handler-failure retry and is left alone on every terminal row.
         var matched = new Dictionary<Guid, int>();
         await using (var update = Cmd(
             """
@@ -838,7 +839,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 terminal_at = d.terminal_at,
                 terminal_cause = d.cause,
                 due_time = COALESCE(d.due, j.due_time),
-                cancel_requested = CASE WHEN d.state = 4 THEN false ELSE j.cancel_requested END
+                cancel_requested = CASE WHEN d.state = 4 THEN false ELSE j.cancel_requested END,
+                retry_cause = CASE WHEN d.state = 0 THEN 1 ELSE j.retry_cause END
             FROM unnest(@ids::uuid[], @workers::text[], @attempts::int[], @states::int[],
                         @causes::text[], @dues::timestamptz[], @terminalAts::timestamptz[])
                  AS d(job_id, worker, attempt, state, cause, due, terminal_at)
@@ -1219,7 +1221,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             await using var reschedule = Cmd(
                 """
                 UPDATE backwave.jobs j
-                SET state = 0, due_time = d.due, lease_owner = NULL, lease_expiry = NULL
+                SET state = 0, due_time = d.due, lease_owner = NULL, lease_expiry = NULL, retry_cause = 2
                 FROM unnest(@ids::uuid[], @dues::timestamptz[]) AS d(job_id, due)
                 WHERE j.job_id = d.job_id
                 """,
@@ -1519,7 +1521,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             """
             UPDATE backwave.jobs
             SET state = 0, attempt = 0, due_time = @now, lease_owner = NULL, lease_expiry = NULL,
-                cancel_requested = false, terminal_at = NULL, terminal_cause = NULL
+                cancel_requested = false, terminal_at = NULL, terminal_cause = NULL, retry_cause = NULL
             WHERE job_id = @id AND state IN (5, 6)
             RETURNING job_id
             """,
@@ -2202,6 +2204,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         {
             conditions.Add("schedule_id = @scheduleId");
             command.Parameters.AddWithValue("scheduleId", scheduleId);
+        }
+        if (query.Retrying)
+        {
+            conditions.Add("state = 0 AND retry_cause IS NOT NULL");
         }
         for (var i = 0; i < query.TagPredicates.Count; i++)
         {
@@ -3477,7 +3483,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     private const string JobColumns =
         "job_id, wire_name, payload, queue, state, due_time, attempt, lease_owner, lease_expiry, " +
         "cancel_requested, terminal_at, terminal_cause, schedule_id, parents_remaining, mode, trace_context, " +
-        "sequence, workflow_id";
+        "sequence, workflow_id, retry_cause";
 
     private static JobRecord ReadJob(NpgsqlDataReader reader)
     {
@@ -3515,6 +3521,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             TraceContext = reader.IsDBNull(15) ? null : reader.GetString(15),
             Sequence = reader.GetInt64(16),
             WorkflowId = reader.IsDBNull(17) ? null : reader.GetGuid(17),
+            RetryCause = ReadRetryCause(reader, 18),
         };
     }
 
@@ -3530,6 +3537,24 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 $"A stored column holds state {storedState}, which is not a defined JobState.");
         }
         return (JobState)storedState;
+    }
+
+    // The retry cause is nullable (no cause is NULL, never a number), and a stored number outside the
+    // enum surfaces as the named violation, the same as an undefined state.
+    private static RetryCause? ReadRetryCause(NpgsqlDataReader reader, int ordinal)
+    {
+        if (reader.IsDBNull(ordinal))
+        {
+            return null;
+        }
+        var storedCause = reader.GetInt32(ordinal);
+        if (!Enum.IsDefined((RetryCause)storedCause))
+        {
+            throw Invariant.Halt(
+                InvariantTrigger.UndefinedEnumValueStored,
+                $"Job {reader.GetGuid(0)} stores retry cause {storedCause}, which is not a defined RetryCause.");
+        }
+        return (RetryCause)storedCause;
     }
 
     // ── Job Tags (ADR 0022) ─────────────────────────────────────────────────────

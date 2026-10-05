@@ -226,6 +226,14 @@ _Avoid_: Release (that word belongs to the Concurrency-Limit slot), return the L
 One execution try of a job, numbered and visible to the handler. A lease expiry counts as an attempt, the same as a thrown exception.
 _Avoid_: Retry (retry is attempts after the first; counting "retries" invites off-by-one ambiguity)
 
+**Retry Cause**:
+Why a job last went back to Scheduled because an Attempt went wrong: the handler failed and the retry policy scheduled another Attempt (**handler failed**), or the Lease lapsed before the worker reported an outcome (**lease expired**). Recorded on the job row by the store, atomically with the reschedule. Sticky: a claim, a Relinquish, a Cancel and a terminal outcome leave it as it is (a terminal job keeps it as a record of its last retry); only an operator requeue clears it, because the requeued job starts over. A new job has none. It names the kind of problem only; the message is the Failure Detail on the Transition Log.
+_Avoid_: Retry reason, last error (it is a kind, not a message), Attempt > 0 (a relinquished or requeued job has Attempts but no problem)
+
+**Retrying**:
+A Scheduled job that carries a Retry Cause: still live, waiting for another Attempt because the last one went wrong. Not a state of its own but a view of Scheduled, so an operator sees trouble before it ends as Dead-Lettered. A new job, a requeued job and a job a stopping worker handed back are Scheduled but not Retrying, so a deploy raises no false alarm. Leaves the view when the job is claimed again.
+_Avoid_: Failed (the job is not terminal), Retried (it has not run again yet), Retry state (there is no such state)
+
 **At-Least-Once Execution**:
 BackWave's delivery contract: a job's handler body may run more than once, and idempotency is the handler author's responsibility. The field standard — Hangfire, Sidekiq, River, Celery (acks-late), RabbitMQ-with-acks, and Temporal *activities* all land here. Exactly-once *body* execution is not offered, because the only two roads to it are both rejected: at-most-once (accept job loss on crash) or durable execution. What BackWave still guarantees exactly once is the Effect-Once property.
 _Avoid_: Exactly-once execution, at-most-once, deliver-once

@@ -1795,6 +1795,196 @@ public abstract class ConformanceSuite
         Assert.Contains(new QueueStateCount("other", JobState.Scheduled, 1), counts);
     }
 
+    // ── §5.9 Retrying: the jobs an attempt went wrong for ───────────────────────
+
+    private static async Task<IReadOnlyList<JobRecord>> ListRetryingAsync(IJobStore store, string? queue = null)
+        => await store.ListJobsAsync(new JobQuery { Retrying = true, Queue = queue, SortDirection = JobSortDirection.OldestFirst });
+
+    /// <summary>
+    /// Certifies that a handler failure the retry policy reschedules records the HandlerFailed cause, so
+    /// the Scheduled job lists as Retrying, and that the Retrying filter ANDs with the other filters.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_9_Retrying_AFailureRetry_IsRetrying_WithTheHandlerFailedCause()
+    {
+        var store = await CreateStoreAsync();
+        await store.EnqueueAsync(Job(), now: T0);
+        var claimed = Assert.Single(await ClaimAsync(store, T0));
+
+        var retryAt = T0.AddMinutes(5);
+        await store.ReportOutcomeAsync(claimed.JobId, "w1", claimed.Attempt, new JobOutcome.Failure(retryAt, "transient"), T0);
+
+        var job = await store.GetJobAsync(claimed.JobId);
+        Assert.Equal(JobState.Scheduled, job!.State);
+        Assert.Equal(RetryCause.HandlerFailed, job.RetryCause);
+        var listed = Assert.Single(await ListRetryingAsync(store));
+        Assert.Equal(claimed.JobId, listed.JobId);
+        Assert.Equal(RetryCause.HandlerFailed, listed.RetryCause);
+        Assert.Equal(retryAt, listed.DueTime);
+        Assert.Equal(1, listed.Attempt);
+        Assert.Empty(await ListRetryingAsync(store, queue: "other"));
+    }
+
+    /// <summary>
+    /// Certifies that the batched outcome path records the same HandlerFailed cause as a single report
+    /// for a failure it reschedules, and records none for a success or a dead-letter in the same batch.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_9_Retrying_ABatchedFailureRetry_IsRetrying_LikeASingleReport()
+    {
+        var store = await CreateStoreAsync();
+        var retried = Job();
+        var succeeded = Job();
+        var dead = Job();
+        await store.EnqueueAsync(retried, now: T0);
+        await store.EnqueueAsync(succeeded, now: T0);
+        await store.EnqueueAsync(dead, now: T0);
+        var claimed = await ClaimAsync(store, T0);
+        OutcomeReport Report(NewJob job, JobOutcome outcome)
+            => new(job.JobId, "w1", claimed.Single(j => j.JobId == job.JobId).Attempt, outcome);
+
+        await store.ReportOutcomesAsync(
+        [
+            Report(retried, new JobOutcome.Failure(T0.AddMinutes(5), "transient")),
+            Report(succeeded, new JobOutcome.Success()),
+            Report(dead, new JobOutcome.Failure(null, "fatal")),
+        ], T0);
+
+        Assert.Equal(RetryCause.HandlerFailed, (await store.GetJobAsync(retried.JobId))!.RetryCause);
+        Assert.Null((await store.GetJobAsync(succeeded.JobId))!.RetryCause);
+        Assert.Null((await store.GetJobAsync(dead.JobId))!.RetryCause);
+        Assert.Equal(retried.JobId, Assert.Single(await ListRetryingAsync(store)).JobId);
+    }
+
+    /// <summary>
+    /// Certifies that a lapsed lease the expiry sweep reschedules records the LeaseExpired cause, so the
+    /// Scheduled job lists as Retrying.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_9_Retrying_ALeaseExpiry_IsRetrying_WithTheLeaseExpiredCause()
+    {
+        var store = await CreateStoreAsync();
+        await store.EnqueueAsync(Job(), now: T0);
+        var claimed = Assert.Single(await ClaimAsync(store, T0));
+
+        var afterExpiry = T0 + Lease + TimeSpan.FromSeconds(1);
+        Assert.Equal(1, await store.ExpireLeasesAsync(afterExpiry, maxJobs: 32, DefaultQueues, TwoAttempts));
+
+        var job = await store.GetJobAsync(claimed.JobId);
+        Assert.Equal(JobState.Scheduled, job!.State);
+        Assert.Equal(RetryCause.LeaseExpired, job.RetryCause);
+        var listed = Assert.Single(await ListRetryingAsync(store));
+        Assert.Equal(claimed.JobId, listed.JobId);
+        Assert.Equal(RetryCause.LeaseExpired, listed.RetryCause);
+    }
+
+    /// <summary>
+    /// Certifies that a clean-stop hand-back is not a problem: a job that never went wrong comes back
+    /// Scheduled without a cause and does not list as Retrying, while a job that was already Retrying
+    /// keeps its cause through the hand-back, so a deploy neither raises nor hides an alarm.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_9_Retrying_ARelinquish_IsNotRetrying_AndKeepsAnEarlierCause()
+    {
+        var store = await CreateStoreAsync();
+        var healthy = Job();
+        var failing = Job();
+        await store.EnqueueAsync(healthy, now: T0);
+        await store.EnqueueAsync(failing, now: T0);
+        var first = await ClaimAsync(store, T0);
+        var failed = first.Single(j => j.JobId == failing.JobId);
+        await store.ReportOutcomeAsync(failed.JobId, "w1", failed.Attempt, new JobOutcome.Failure(T0, "transient"), T0);
+        Assert.Single(await ClaimAsync(store, T0)); // the failing job's second attempt; both are now leased
+
+        // Three attempts, so the failing job's second attempt is below the ceiling and is handed back
+        // rather than dead-lettered.
+        var threeAttempts = new RetryPolicy { MaxAttempts = 3, Backoff = _ => TimeSpan.FromMinutes(1) }.ToDisposition();
+        var handBack = T0.AddSeconds(5);
+        if (!Declares(ConformanceCapabilities.LeaseRelinquish))
+        {
+            await AssertRelinquishIsANoOpAsync(store, handBack, threeAttempts, healthy.JobId, failing.JobId);
+            return;
+        }
+        Assert.Equal(2, await store.RelinquishLeasesAsync("w1", handBack, threeAttempts));
+
+        var handedBack = await store.GetJobAsync(healthy.JobId);
+        Assert.Equal(JobState.Scheduled, handedBack!.State);
+        Assert.Null(handedBack.RetryCause);
+        Assert.Equal(RetryCause.HandlerFailed, (await store.GetJobAsync(failing.JobId))!.RetryCause);
+        Assert.Equal(failing.JobId, Assert.Single(await ListRetryingAsync(store)).JobId);
+    }
+
+    /// <summary>
+    /// Certifies that a terminal outcome keeps the last retry cause as a record, and that an operator
+    /// requeue clears it: the requeued job starts over and does not list as Retrying.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_9_Retrying_ARequeue_IsNotRetrying_AndClearsTheCause()
+    {
+        var store = await CreateStoreAsync();
+        await store.EnqueueAsync(Job(), now: T0);
+        var first = Assert.Single(await ClaimAsync(store, T0));
+        await store.ReportOutcomeAsync(first.JobId, "w1", first.Attempt, new JobOutcome.Failure(T0, "transient"), T0);
+        var second = Assert.Single(await ClaimAsync(store, T0));
+        await store.ReportOutcomeAsync(second.JobId, "w1", second.Attempt, new JobOutcome.Failure(null, "fatal"), T0);
+
+        var dead = await store.GetJobAsync(first.JobId);
+        Assert.Equal(JobState.DeadLettered, dead!.State);
+        Assert.Equal(RetryCause.HandlerFailed, dead.RetryCause); // kept as the record of the last retry
+        Assert.Empty(await ListRetryingAsync(store)); // terminal, so not Retrying
+
+        var requeueTime = T0.AddMinutes(1);
+        Assert.Equal(RequeueResult.Requeued, await store.RequeueAsync(first.JobId, "alice", requeueTime));
+
+        var requeued = await store.GetJobAsync(first.JobId);
+        Assert.Equal(JobState.Scheduled, requeued!.State);
+        Assert.Null(requeued.RetryCause);
+        Assert.Empty(await ListRetryingAsync(store));
+    }
+
+    /// <summary>
+    /// Certifies that new work is never Retrying: a job enqueued due now, one enqueued for later, and one
+    /// awaiting a parent all carry no cause.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_9_Retrying_AFreshEnqueue_IsNotRetrying()
+    {
+        var store = await CreateStoreAsync();
+        var dueNow = Job();
+        var later = Job(dueTime: T0.AddHours(1));
+        await store.EnqueueAsync(dueNow, now: T0);
+        await store.EnqueueAsync(later, now: T0);
+        var child = Job() with { Parents = [dueNow.JobId] };
+        await store.EnqueueAsync(child, now: T0);
+
+        foreach (var id in (Guid[])[dueNow.JobId, later.JobId, child.JobId])
+        {
+            Assert.Null((await store.GetJobAsync(id))!.RetryCause);
+        }
+        Assert.Empty(await ListRetryingAsync(store));
+    }
+
+    /// <summary>
+    /// Certifies that a Retrying job leaves the Retrying list once it is claimed again, and stays gone
+    /// when that attempt succeeds.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_9_Retrying_ClaimedAgainAndSucceeded_LeavesTheRetryingList()
+    {
+        var store = await CreateStoreAsync();
+        await store.EnqueueAsync(Job(), now: T0);
+        var first = Assert.Single(await ClaimAsync(store, T0));
+        await store.ReportOutcomeAsync(first.JobId, "w1", first.Attempt, new JobOutcome.Failure(T0, "transient"), T0);
+        Assert.Single(await ListRetryingAsync(store));
+
+        var second = Assert.Single(await ClaimAsync(store, T0));
+        Assert.Empty(await ListRetryingAsync(store)); // running, not waiting
+
+        await store.ReportOutcomeAsync(second.JobId, "w1", second.Attempt, new JobOutcome.Success(), T0);
+        Assert.Equal(JobState.Succeeded, (await store.GetJobAsync(first.JobId))!.State);
+        Assert.Empty(await ListRetryingAsync(store));
+    }
+
     // ── Mutation teeth: boundary/misc contract facts (issue 0235) ────────────────
 
     /// <summary>

@@ -872,7 +872,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                         }
                     }), 3),
             JobOutcome.Failure { NextDueTime: { } retryAt } =>
-                ("state = 0, due_time = :retryAt, lease_owner = NULL, lease_expiry = NULL",
+                ("state = 0, due_time = :retryAt, lease_owner = NULL, lease_expiry = NULL, retry_cause = 1",
                     command => command.Parameters.Add(Tstz("retryAt", retryAt)), 0),
             JobOutcome.Failure failure =>
                 ("state = 5, lease_owner = NULL, lease_expiry = NULL, terminal_at = :now, terminal_cause = :cause",
@@ -1071,6 +1071,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         // authorizes every write - the verdict above only decides what the caller is told. due_time
         // moves only for a retry row (COALESCE keeps it otherwise); cancel_requested clears only for a
         // Cancelled row (CASE); terminal_at and terminal_cause carry per row and are null for a retry.
+        // retry_cause records a handler-failure retry and is left alone on every terminal row.
         // Both instants travel as ISO text under an explicit format. A JSON_TABLE column declared
         // TIMESTAMP WITH TIME ZONE takes second precision 6 and rounds away the seventh digit, which is
         // a digit this store hands back; TO_TIMESTAMP_TZ over the text keeps all of them.
@@ -1098,7 +1099,8 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     j.terminal_at = d.terminal_at,
                     j.terminal_cause = d.cause,
                     j.due_time = COALESCE(d.due, j.due_time),
-                    j.cancel_requested = CASE WHEN d.state = 4 THEN 0 ELSE j.cancel_requested END
+                    j.cancel_requested = CASE WHEN d.state = 4 THEN 0 ELSE j.cancel_requested END,
+                    j.retry_cause = CASE WHEN d.state = 0 THEN 1 ELSE j.retry_cause END
                 WHERE j.state = 2 AND j.lease_owner = d.worker AND j.attempt = d.attempt
                   AND j.lease_expiry > :now
                 """,
@@ -1540,7 +1542,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                                 due VARCHAR2(40) PATH '$.Due')) d) d
                 ON (j.job_id = d.job_id)
                 WHEN MATCHED THEN UPDATE SET
-                    j.state = 0, j.due_time = d.due, j.lease_owner = NULL, j.lease_expiry = NULL
+                    j.state = 0, j.due_time = d.due, j.lease_owner = NULL, j.lease_expiry = NULL, j.retry_cause = 2
                 """,
                 connection, transaction);
             reschedule.Parameters.Add(Clob("payload", JsonSerializer.Serialize(
@@ -1856,7 +1858,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             """
             UPDATE backwave.jobs
             SET state = 0, attempt = 0, due_time = :now, lease_owner = NULL, lease_expiry = NULL,
-                cancel_requested = 0, terminal_at = NULL, terminal_cause = NULL
+                cancel_requested = 0, terminal_at = NULL, terminal_cause = NULL, retry_cause = NULL
             WHERE job_id = :id AND state IN (5, 6)
             """,
             connection, transaction);
@@ -2614,6 +2616,10 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         {
             conditions.Add("schedule_id = :scheduleId");
             command.Parameters.Add(Str("scheduleId", scheduleId));
+        }
+        if (query.Retrying)
+        {
+            conditions.Add("state = 0 AND retry_cause IS NOT NULL");
         }
         for (var i = 0; i < query.TagPredicates.Count; i++)
         {
@@ -3841,7 +3847,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
     private const string JobColumns =
         "job_id, wire_name, payload, queue, state, due_time, attempt, lease_owner, lease_expiry, " +
         "cancel_requested, terminal_at, terminal_cause, schedule_id, parents_remaining, job_mode, trace_context, " +
-        "sequence, workflow_id";
+        "sequence, workflow_id, retry_cause";
 
     private static JobRecord ReadJob(OracleDataReader reader)
     {
@@ -3879,7 +3885,26 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             TraceContext = reader.IsDBNull(15) ? null : reader.GetString(15),
             Sequence = reader.GetInt64(16),
             WorkflowId = reader.IsDBNull(17) ? null : ReadGuid(reader, 17),
+            RetryCause = ReadRetryCause(reader, 18),
         };
+    }
+
+    // The retry cause is nullable (no cause is NULL, never a number), and a stored number outside the
+    // enum surfaces as the named violation, the same as an undefined state.
+    private static RetryCause? ReadRetryCause(OracleDataReader reader, int ordinal)
+    {
+        if (reader.IsDBNull(ordinal))
+        {
+            return null;
+        }
+        var storedCause = reader.GetInt32(ordinal);
+        if (!Enum.IsDefined((RetryCause)storedCause))
+        {
+            throw Invariant.Halt(
+                InvariantTrigger.UndefinedEnumValueStored,
+                $"Job {ReadGuid(reader, 0)} stores retry cause {storedCause}, which is not a defined RetryCause.");
+        }
+        return (RetryCause)storedCause;
     }
 
     // ── Job Tags ──────────────────────────────────────────────────────────────────

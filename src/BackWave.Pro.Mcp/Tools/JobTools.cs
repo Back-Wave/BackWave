@@ -37,6 +37,8 @@ internal sealed class JobTools(
     public async Task<SearchJobsResult> SearchJobsAsync(
         [Description("Only jobs in this state: Scheduled, AwaitingParent, Leased, Succeeded, Cancelled, DeadLettered, or Quarantined. Omit to match any state.")]
         string? state = null,
+        [Description("When true, only Retrying jobs: Scheduled jobs waiting for another attempt because the handler failed or the lease expired. A new job, a requeued job, and a job a worker handed back on a clean stop are not Retrying. Combine with state only as Scheduled; any other state matches nothing. Omit or false to match jobs whether Retrying or not.")]
+        bool? retrying = null,
         [Description("Only jobs on this queue. Omit to match any queue.")]
         string? queue = null,
         [Description("Only jobs of this wire name (the job type's stable string identity; list_wire_names enumerates them). Omit to match any type.")]
@@ -93,6 +95,7 @@ internal sealed class JobTools(
         var query = new JobQuery
         {
             State = parsedState,
+            Retrying = retrying ?? false,
             Queue = queue,
             WireName = wire_name,
             ScheduleId = schedule_id,
@@ -413,6 +416,10 @@ internal sealed record JobRow
     [Description("A short reason for the terminal outcome (for example why it was dead-lettered); null while still active.")]
     public string? TerminalCause { get; init; }
 
+    /// <summary>Why the job last went back to Scheduled after an attempt went wrong; null when none has.</summary>
+    [Description("Why the job last went back to Scheduled after an attempt went wrong: HandlerFailed or LeaseExpired. Null when no attempt has gone wrong since the job was enqueued or last requeued. A Scheduled job with a retry cause is Retrying.")]
+    public string? RetryCause { get; init; }
+
     /// <summary>The recurring schedule that minted this instance, when any.</summary>
     [Description("The recurring schedule that minted this instance; null for a directly enqueued job.")]
     public string? ScheduleId { get; init; }
@@ -442,6 +449,7 @@ internal sealed record JobRow
         CancelRequested = snapshot.CancelRequested,
         TerminalAt = snapshot.TerminalAt,
         TerminalCause = snapshot.TerminalCause,
+        RetryCause = snapshot.RetryCause?.ToString(),
         ScheduleId = snapshot.ScheduleId,
         Sequence = snapshot.Sequence,
         WorkflowId = snapshot.WorkflowId,

@@ -15,8 +15,16 @@ else
                 <th>Queue</th>
                 <th>State</th>
                 <th class="num">Attempt</th>
-                <th>Due Time</th>
-                <th>Terminal At</th>
+                @if (ShowRetryCause)
+                {
+                    <th>Next Attempt</th>
+                    <th>Retry Cause</th>
+                }
+                else
+                {
+                    <th>Due Time</th>
+                    <th>Terminal At</th>
+                }
                 @if (ShowTags)
                 {
                     <th>Tags</th>
@@ -42,8 +50,16 @@ else
                         </span>
                     </td>
                     <td class="num" data-label="Attempt">@job.Attempt</td>
-                    <td class="mono nowrap" data-label="Due Time">@DashboardGlossary.Instant(job.DueTime)</td>
-                    <td class="mono nowrap" data-label="Terminal At">@(job.TerminalAt is { } terminalAt ? DashboardGlossary.Instant(terminalAt) : "—")</td>
+                    @if (ShowRetryCause)
+                    {
+                        <td class="mono nowrap" data-label="Next Attempt">@DashboardGlossary.Instant(job.DueTime)</td>
+                        <td class="nowrap" data-label="Retry Cause">@(job.RetryCause is { } retryCause ? DashboardGlossary.RetryCauseName(retryCause) : "-")</td>
+                    }
+                    else
+                    {
+                        <td class="mono nowrap" data-label="Due Time">@DashboardGlossary.Instant(job.DueTime)</td>
+                        <td class="mono nowrap" data-label="Terminal At">@(job.TerminalAt is { } terminalAt ? DashboardGlossary.Instant(terminalAt) : "—")</td>
+                    }
                     @if (TagHref is { } tagHref)
                     {
                         @* Tag pills (ADR 0022, issue 0113): an empty tag set renders NOTHING — no empty
@@ -94,6 +110,12 @@ else
     /// filter; when null the Tags column is not shown at all (views that don't filter by Tag).
     /// </summary>
     [Parameter] public Func<JobTag, string>? TagHref { get; set; }
+
+    /// <summary>
+    /// Show the Retrying columns: the due time reads as the next attempt, and the retry cause (handler
+    /// failed or lease expired) takes the place of the terminal instant, which a live job never has.
+    /// </summary>
+    [Parameter] public bool ShowRetryCause { get; set; }
 
     private bool ShowTags => TagHref is not null;
 }

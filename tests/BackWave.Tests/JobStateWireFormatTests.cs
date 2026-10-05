@@ -34,13 +34,14 @@ public class JobStateWireFormatTests
         ["ix_backwave_jobs_claim"] = JobState.Scheduled,
         ["ix_backwave_jobs_leased_queue"] = JobState.Leased,
         ["ix_backwave_jobs_lease_owner"] = JobState.Leased,
+        ["ix_backwave_jobs_retrying"] = JobState.Scheduled,
     };
 
-    // Postgres, SQL Server, and SQLite each carry the claim and leased-queue predicates, SQL Server carries
-    // the lease-owner one as well, and Oracle carries none, because it has no partial index. Pinned so that
+    // Postgres, SQL Server, and SQLite each carry the claim, leased-queue, and retrying predicates, SQL Server
+    // carries the lease-owner one as well, and Oracle carries none, because it has no partial index. Pinned so that
     // dropping a predicate, or adding an adapter that needs one, is a deliberate edit here rather than a
     // silent loss of coverage.
-    private const int GuardedPredicateCount = 7;
+    private const int GuardedPredicateCount = 10;
 
     // The `-- States: 0 Scheduled, ...` gloss each schema carries above its jobs table, which is the one
     // comment that has to spell the numbers out: it is the only documentation a DBA reading the canonical

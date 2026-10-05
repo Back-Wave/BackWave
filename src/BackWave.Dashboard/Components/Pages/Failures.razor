@@ -1,7 +1,9 @@
 @* Failures: Dead-Lettered and Quarantined as distinct categories (invariant I5, never
    collapsed) — ran-and-kept-failing vs could-not-be-routed/decoded. Two tabs so a long
    Dead-Lettered list never buries the Quarantined one; the active tab rides the URL
-   (?tab=quarantine) so it survives each live SSE tick. Via the Monitor API. *@
+   (?tab=quarantine) so it survives each live SSE tick. A third tab (?tab=retrying) lists the
+   Retrying jobs: still live, but waiting for another attempt because the handler failed or the
+   lease expired. Via the Monitor API. *@
 <DashboardLayout BasePath="@BasePath" Title="Failures" Active="failures" ContentOnly="@ContentOnly" Live="@Live">
     <div class="screen" data-screen-label="Failures">
         <header class="screen__head">
@@ -11,17 +13,22 @@
         </header>
 
         <div class="bw-tabs">
-            @Tab(JobState.DeadLettered, "Dead-Lettered", $"{BasePath}/failures", DeadLettered.Count)
-            @Tab(JobState.Quarantined, "Quarantined", $"{BasePath}/failures?tab=quarantine", Quarantined.Count)
+            @Tab(Category.DeadLettered, "Dead-Lettered", $"{BasePath}/failures", DeadLettered.Count)
+            @Tab(Category.Quarantined, "Quarantined", $"{BasePath}/failures?tab=quarantine", Quarantined.Count)
+            @Tab(Category.Retrying, "Retrying", $"{BasePath}/failures?tab=retrying", Retrying.Count)
         </div>
 
-        @if (ShowQuarantined)
+        @switch (Active)
         {
-            @Section(JobState.Quarantined, "Quarantined", Quarantined)
-        }
-        else
-        {
-            @Section(JobState.DeadLettered, "Dead-Lettered", DeadLettered)
+            case Category.Quarantined:
+                @Section(JobState.Quarantined, "Quarantined", Quarantined)
+                break;
+            case Category.Retrying:
+                @RetryingSection
+                break;
+            default:
+                @Section(JobState.DeadLettered, "Dead-Lettered", DeadLettered)
+                break;
         }
     </div>
 </DashboardLayout>
@@ -30,11 +37,15 @@
     [Parameter, EditorRequired] public string BasePath { get; set; } = "";
     [Parameter, EditorRequired] public IReadOnlyList<JobSnapshot> DeadLettered { get; set; } = [];
     [Parameter, EditorRequired] public IReadOnlyList<JobSnapshot> Quarantined { get; set; } = [];
+
+    /// <summary>The Retrying jobs: Scheduled again because the handler failed or the lease expired.</summary>
+    [Parameter, EditorRequired] public IReadOnlyList<JobSnapshot> Retrying { get; set; } = [];
     [Parameter, EditorRequired] public int PageSize { get; set; }
     [Parameter, EditorRequired] public DashboardActions Actions { get; set; } = DashboardActions.None;
 
-    /// <summary>Which category tab is open — "quarantine" shows Quarantined, anything else (the default)
-    /// shows Dead-Lettered. Carried in the URL so it survives every live SSE re-render.</summary>
+    /// <summary>Which category tab is open - "quarantine" shows Quarantined, "retrying" shows Retrying,
+    /// anything else (the default) shows Dead-Lettered. Carried in the URL so it survives every live SSE
+    /// re-render.</summary>
     [Parameter] public string ActiveTab { get; set; } = "";
 
     /// <summary>Render only the live region (SSE fragment) rather than the full document.</summary>
@@ -43,7 +54,12 @@
     /// <summary>Wrap in the #bw-live region and inline the SSE client.</summary>
     [Parameter] public bool Live { get; set; }
 
-    private bool ShowQuarantined => string.Equals(ActiveTab, "quarantine", StringComparison.OrdinalIgnoreCase);
+    private enum Category { DeadLettered, Quarantined, Retrying }
+
+    private Category Active =>
+        string.Equals(ActiveTab, "quarantine", StringComparison.OrdinalIgnoreCase) ? Category.Quarantined
+        : string.Equals(ActiveTab, "retrying", StringComparison.OrdinalIgnoreCase) ? Category.Retrying
+        : Category.DeadLettered;
 
     // Requeue: a Dead-Lettered/Quarantined job back to Scheduled (Attempt reset). Rendered
     // only where AuthorizeRequeue passed.
@@ -60,10 +76,10 @@
     // many" — shown as "50+" rather than an exact count that would under-report.
     private string TabCount(int count) => count >= PageSize ? $"{PageSize}+" : count.ToString();
 
-    private RenderFragment Tab(JobState state, string label, string href, int count) =>@<a
-        class="bw-tab @(ShowQuarantined == (state == JobState.Quarantined) ? "bw-tab--active" : "")" href="@href">
+    private RenderFragment Tab(Category category, string label, string href, int count) =>@<a
+        class="bw-tab @(Active == category ? "bw-tab--active" : "")" href="@href">
         @label<span class="bw-tab__count">@TabCount(count)</span>
-        @if (ShowQuarantined == (state == JobState.Quarantined))
+        @if (Active == category)
         {
             <span class="bw-tab__ink"></span>
         }
@@ -74,6 +90,17 @@
         @if (jobs.Count >= PageSize)
         {
             <p><a class="mono" href="@($"{BasePath}/jobs?state={state}")">Search all @title jobs →</a></p>
+        }
+    </div>;
+
+    // A Retrying job is live, so it has nothing to requeue; the row shows when it runs next and why it
+    // came back instead. A tag pill deep-links to the Jobs list filtered to Retrying AND the clicked Tag.
+    private RenderFragment RetryingSection =>@<div class="bw-card">
+        <JobTable BasePath="@BasePath" Jobs="Retrying" EmptyText="No Retrying jobs." ShowRetryCause="true"
+                  TagHref="@(tag => $"{BasePath}/jobs?state={DashboardGlossary.RetryingFilterValue}&{TagFilterUrl.ToQueryPart(tag)}")" />
+        @if (Retrying.Count >= PageSize)
+        {
+            <p><a class="mono" href="@($"{BasePath}/jobs?state={DashboardGlossary.RetryingFilterValue}")">Search all Retrying jobs →</a></p>
         }
     </div>;
 }

@@ -545,15 +545,25 @@ internal static class DashboardRequestHandler
                 ? parsedSize
                 : PageSize;
 
+        // Retrying is not a state but a narrower view of Scheduled (a job waiting for another attempt
+        // because the handler failed or the lease expired), offered in the same State filter.
         JobState? state = null;
+        var retrying = false;
         if (query["state"] is [{ Length: > 0 } rawState])
         {
-            if (!Enum.TryParse<JobState>(rawState, ignoreCase: true, out var parsed))
+            if (string.Equals(rawState, DashboardGlossary.RetryingFilterValue, StringComparison.OrdinalIgnoreCase))
+            {
+                retrying = true;
+            }
+            else if (!Enum.TryParse<JobState>(rawState, ignoreCase: true, out var parsed))
             {
                 await BadRequestAsync(context, $"Unknown state '{rawState}'.").ConfigureAwait(false);
                 return;
             }
-            state = parsed;
+            else
+            {
+                state = parsed;
+            }
         }
         long? after = null;
         if (query["after"] is [{ Length: > 0 } rawAfter])
@@ -577,6 +587,7 @@ internal static class DashboardRequestHandler
             Queue = NonEmpty(query["queue"]),
             WireName = NonEmpty(query["wire"]),
             ScheduleId = NonEmpty(query["schedule"]),
+            Retrying = retrying,
             TagPredicates = tagPredicates,
             AfterSequence = after,
             SortDirection = JobSortDirection.NewestFirst, // historical table: most recent jobs first
@@ -716,10 +727,15 @@ internal static class DashboardRequestHandler
         // Glossary distinction, never collapsed (invariant I5): Dead-Lettered jobs ran and
         // kept failing; Quarantined jobs could not be routed or decoded. Both lists load every
         // tick — the inactive tab still shows a live count badge — but only the active tab's
-        // table renders, so a long Dead-Lettered list never buries the Quarantined one.
+        // table renders, so a long Dead-Lettered list never buries the Quarantined one. Retrying
+        // jobs are the third list: still live, waiting for another attempt because the handler
+        // failed or the lease expired, so trouble shows before it ends in a dead letter. Oldest
+        // job first, so a job stuck in a retry loop does not sink below newer ones.
         async () => new Dictionary<string, object?>
         {
             ["BasePath"] = basePath,
+            ["Retrying"] = await monitor.ListJobsAsync(
+                new JobQuery { Retrying = true, MaxResults = PageSize }).ConfigureAwait(false),
             ["DeadLettered"] = await monitor.ListJobsAsync(
                 new JobQuery { State = JobState.DeadLettered, SortDirection = JobSortDirection.NewestFirst, MaxResults = PageSize }).ConfigureAwait(false),
             ["Quarantined"] = await monitor.ListJobsAsync(

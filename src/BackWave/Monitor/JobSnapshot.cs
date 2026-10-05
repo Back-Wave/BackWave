@@ -41,6 +41,14 @@ public sealed record JobSnapshot
     /// <summary>A short reason for the terminal outcome (for example why it was dead-lettered); null while still active.</summary>
     public string? TerminalCause { get; init; }
 
+    /// <summary>
+    /// Why the job most recently went back to Scheduled after an attempt went wrong: the handler failed,
+    /// or the lease expired. Null when no attempt has gone wrong since the job was enqueued or last
+    /// requeued. A job handed back by a worker on a clean stop (for example during a deploy) keeps
+    /// whatever it had, so a deploy alone never sets it. A Scheduled job with a cause is Retrying.
+    /// </summary>
+    public RetryCause? RetryCause { get; init; }
+
     /// <summary>The recurring schedule that minted this instance; null for a directly enqueued job.</summary>
     public string? ScheduleId { get; init; }
 
