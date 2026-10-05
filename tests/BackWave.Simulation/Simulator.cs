@@ -3422,6 +3422,9 @@ internal sealed class FaultInjectingStore(IJobStore inner, Func<string, bool> sh
     public ValueTask<IReadOnlyList<QueueStateCount>> CountJobsAsync(CancellationToken cancellationToken = default)
         => inner.CountJobsAsync(cancellationToken);
 
+    public ValueTask<long> CountMatchingJobsAsync(JobQuery query, CancellationToken cancellationToken = default)
+        => inner.CountMatchingJobsAsync(query, cancellationToken);
+
     public ValueTask<IReadOnlyList<TagFacet>> FacetAsync(
         string key, JobQuery? baseQuery = null, int maxResults = int.MaxValue, CancellationToken cancellationToken = default)
         => inner.FacetAsync(key, baseQuery, maxResults, cancellationToken);
@@ -3610,6 +3613,9 @@ internal sealed class FenceDroppingStore(IJobStore inner) : IJobStore
 
     public ValueTask<IReadOnlyList<QueueStateCount>> CountJobsAsync(CancellationToken cancellationToken = default)
         => inner.CountJobsAsync(cancellationToken);
+
+    public ValueTask<long> CountMatchingJobsAsync(JobQuery query, CancellationToken cancellationToken = default)
+        => inner.CountMatchingJobsAsync(query, cancellationToken);
 
     public ValueTask<IReadOnlyList<TagFacet>> FacetAsync(
         string key, JobQuery? baseQuery = null, int maxResults = int.MaxValue, CancellationToken cancellationToken = default)

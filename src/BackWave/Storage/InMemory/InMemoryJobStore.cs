@@ -1712,9 +1712,18 @@ public sealed class InMemoryJobStore(
         }
     }
 
+    /// <inheritdoc/>
+    public ValueTask<long> CountMatchingJobsAsync(JobQuery query, CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+        {
+            return ValueTask.FromResult((long)_jobs.Values.Count(j => MatchesScope(j, query)));
+        }
+    }
+
     /// <summary>
-    /// The <em>scope</em> predicate shared by <see cref="ListJobsAsync"/> and
-    /// <see cref="FacetAsync"/>: the scalar filters AND-ed with the tag predicates. Pagination
+    /// The <em>scope</em> predicate shared by <see cref="ListJobsAsync"/>, <see cref="CountMatchingJobsAsync"/>,
+    /// and <see cref="FacetAsync"/>: the scalar filters AND-ed with the tag predicates. Pagination
     /// (cursor/sort/take) is NOT part of the scope — facets count the whole matching population.
     /// </summary>
     private static bool MatchesScope(JobRecord j, JobQuery query)

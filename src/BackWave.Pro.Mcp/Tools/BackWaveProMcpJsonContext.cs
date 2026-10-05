@@ -15,6 +15,7 @@ namespace BackWave.Pro.Mcp.Tools;
 [JsonSerializable(typeof(AuditRecordsResult))]
 [JsonSerializable(typeof(CancelJobResult))]
 [JsonSerializable(typeof(CancelWorkflowToolResult))]
+[JsonSerializable(typeof(CountJobsResult))]
 [JsonSerializable(typeof(GetJobDependenciesResult))]
 [JsonSerializable(typeof(GetJobHistoryResult))]
 [JsonSerializable(typeof(GetJobResult))]
