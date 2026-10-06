@@ -2034,15 +2034,15 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
     }
 
     // Per-job-life cap (§7) for a batch whose highest new ordinal is maxNewOrdinal. payload gives the
-    // batch as TransitionRow JSON, and only a prune that runs asks for it.
+    // batch as a JSON array of rows with a JobId, and only a prune that runs asks for it.
     private async Task PruneTransitionsAsync(
         SqlConnection connection, SqlTransaction transaction, long maxNewOrdinal, Func<string> payload,
         CancellationToken cancellationToken)
     {
-        // Per-job-life cap (§7): skip the prune entirely unless some job's new ordinal reached the
-        // cap — a job nowhere near MaxTransitionsPerJob never pays the DELETE. When some job did
-        // reach it, one set-based DELETE keeps only the newest MaxTransitionsPerJob per job (the
-        // correlated MAX no-ops for the jobs still under the cap).
+        // Skip the prune entirely unless some job's new ordinal reached the cap — a job nowhere near
+        // MaxTransitionsPerJob never pays the DELETE. When some job did reach it, one set-based DELETE
+        // keeps only the newest MaxTransitionsPerJob per job (the correlated MAX no-ops for the jobs
+        // still under the cap).
         if (maxNewOrdinal < options.Bounds.MaxTransitionsPerJob)
         {
             return;

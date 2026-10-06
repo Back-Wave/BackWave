@@ -120,7 +120,7 @@ public sealed class SqlServerRoundTripBudgetTests
         // and OUTPUT reports which rows matched, so the per-row Effect-Once verdict costs no extra trip.
         // The child-latch probe runs because Succeeded is terminal: one lookup asks whether ANY of the
         // 32 ids parents a Dependency, and the answer here is no, so nothing cascades.
-        // As above, no job in this batch is near the cap, so the batch recorder issues no prune DELETE.
+        // As above, no job in this batch is near the cap, so the report issues no prune DELETE.
         var batch = claimed
             .Select(job => new OutcomeReport(job.JobId, "budget-worker", job.Attempt, new JobOutcome.Success()))
             .ToArray();
