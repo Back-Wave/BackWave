@@ -49,10 +49,10 @@ public sealed class SqlServerRoundTripBudgetTests
         "ClaimBatchAsync of 32 jobs (one queue, cold caches)", Statements: 5);
 
     private static readonly Budget ReportOutcomes = new(
-        "ReportOutcomesAsync of 32 succeeded rows", Statements: 3);
+        "ReportOutcomesAsync of 32 succeeded rows", Statements: 2);
 
     private static readonly Budget ReportOutcomesWithOutput = new(
-        "ReportOutcomesAsync of 32 succeeded rows, every one carrying job output", Statements: 35);
+        "ReportOutcomesAsync of 32 succeeded rows, every one carrying job output", Statements: 34);
 
     private static readonly Budget ExpireLeases = new(
         "ExpireLeasesAsync over 32 expired leases, all rescheduled", Statements: 3);
@@ -114,10 +114,10 @@ public sealed class SqlServerRoundTripBudgetTests
 
         // The plain drain: every row succeeded, none carries output or a tag delta, so nothing but the
         // fenced state write and the transition log runs.
-        // 1 fenced batch UPDATE ... OUTPUT + 1 batched transition insert + 1 child-latch probe = 3,
-        // independent of batch size. The fence is applied per row inside that one UPDATE - OPENJSON
-        // unpacks the payload and the WHERE tests each row's (worker, attempt) independently - and
-        // OUTPUT reports which rows matched, so the per-row Effect-Once verdict costs no extra trip.
+        // 1 fenced batch + 1 child-latch probe = 2, independent of batch size. The fenced batch writes
+        // the transition log and the outcomes in one trip. The fence is applied per row inside it -
+        // OPENJSON unpacks the payload and the WHERE tests each row's (worker, attempt) independently -
+        // and OUTPUT reports which rows matched, so the per-row Effect-Once verdict costs no extra trip.
         // The child-latch probe runs because Succeeded is terminal: one lookup asks whether ANY of the
         // 32 ids parents a Dependency, and the answer here is no, so nothing cascades.
         // As above, no job in this batch is near the cap, so the batch recorder issues no prune DELETE.
@@ -148,7 +148,7 @@ public sealed class SqlServerRoundTripBudgetTests
         var claimed = await store.ClaimAsync(new ClaimRequest("budget-worker", ["budget"], ClaimBatch, Lease, T0));
         Assert.Equal(ClaimBatch, claimed.Count);
 
-        // The drain budget above plus ONE STATEMENT PER ROW: 3 + 32 = 35. Output is the one write on
+        // The drain budget above plus ONE STATEMENT PER ROW: 2 + 32 = 34. Output is the one write on
         // this path that is still a per-row loop on this adapter - the fenced UPDATE cannot carry the
         // blob, because OPENJSON has no varbinary(max) column type, so a blob would have to go over as
         // base64 text and be converted back per row.
