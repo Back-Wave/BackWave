@@ -558,9 +558,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         //
         // Transition Log (§5.12): one Leased entry per claimed job at its post-claim Attempt, in the
         // same batch and transaction as the lease write. The entries go in while the candidates hold
-        // only U locks, before the UPDATE takes X. The FK check of that INSERT can scan jobs, and its
-        // S locks pass through the U locks of concurrent claimers but wait behind their X locks. Two
-        // claimers that each wrote the lease first then wait on each other, and SQL Server kills one.
+        // only U locks, before the UPDATE takes X - see the note in ExpireLeasesUntracedAsync.
         var recordTransitions = _historyPolicy != JobHistoryPolicy.Off;
         await using var claim = Cmd(
             $"""
@@ -977,10 +975,8 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         // terminal_at/terminal_cause carry per-row (null for a retry).
         //
         // Transition Log (§5.12): one entry per fenced row for its resulting state at this Attempt,
-        // written between the fence and the UPDATE. The FK check of that INSERT can scan jobs, and its
-        // S locks pass through the U locks of concurrent reporters but wait behind their X locks. Two
-        // reporters that each wrote their outcomes first then wait on each other, and SQL Server
-        // kills one. The history policy Off appends nothing.
+        // written between the fence and the UPDATE - see the note in ExpireLeasesUntracedAsync. The
+        // history policy Off appends nothing.
         var matched = new Dictionary<Guid, int>();
         var recordTransitions = _historyPolicy != JobHistoryPolicy.Off;
         var maxNewOrdinal = -1L;
@@ -2003,7 +1999,9 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         "DECLARE @batch TABLE (job_id uniqueidentifier PRIMARY KEY, state int, attempt int, detail nvarchar(max));";
 
     // Appends one Transition Log entry per @batch row at the job's next ordinal and returns the
-    // assigned ordinals. The batch recorder and the claim both write through this one statement.
+    // assigned ordinals. The batch recorder, the claim, and the report write through this one
+    // statement. The caller declares @batch with at least the columns of DeclareTransitionBatch -
+    // job_id (the key), state, attempt, and detail - and binds @now.
     private const string InsertTransitionsFromBatch =
         """
         INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
