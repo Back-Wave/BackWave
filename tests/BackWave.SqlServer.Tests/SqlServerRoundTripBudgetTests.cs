@@ -46,7 +46,7 @@ public sealed class SqlServerRoundTripBudgetTests
     // arithmetic behind each number is in its test.
 
     private static readonly Budget Claim = new(
-        "ClaimBatchAsync of 32 jobs (one queue, cold caches)", Statements: 6);
+        "ClaimBatchAsync of 32 jobs (one queue, cold caches)", Statements: 5);
 
     private static readonly Budget ReportOutcomes = new(
         "ReportOutcomesAsync of 32 succeeded rows", Statements: 3);
@@ -79,12 +79,11 @@ public sealed class SqlServerRoundTripBudgetTests
             await store.EnqueueAsync(Job(), T0); // also warms the one-time schema check, off the measured path
         }
 
-        // 1 queue-config applock + 1 queue_limits read + 1 claim UPDATE ... OUTPUT
-        // + 1 batched transition insert + 1 tags-in-use probe + 1 next-due read = 6, independent of
-        // batch size. The claim is a single UPDATE with OUTPUT, so 32 leased rows come back on the same
-        // trip that writes them, and the transition insert is set-based over OPENJSON, so 32 log entries
-        // cost one statement. No prune: the batch recorder issues a DELETE only when some job in it
-        // reached MaxTransitionsPerJob, and a freshly claimed job is on its second transition.
+        // 1 queue-config applock + 1 queue_limits read + 1 claim batch + 1 tags-in-use probe
+        // + 1 next-due read = 5, independent of batch size. The claim batch writes the transition log
+        // and the lease in one trip, and its UPDATE with OUTPUT returns the 32 leased rows on the same
+        // trip. No prune: the claim issues a DELETE only when some job in it reached
+        // MaxTransitionsPerJob, and a freshly claimed job is on its second transition.
         //
         // ClaimBatchAsync, not ClaimAsync: the extra statement over the plain claim is the next-due read,
         // which is this adapter's ONLY idle-wakeup mechanism (SQL Server has no Wake-Up Hint channel), so
