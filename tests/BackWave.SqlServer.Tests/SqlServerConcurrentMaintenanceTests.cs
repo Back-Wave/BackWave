@@ -71,25 +71,39 @@ public sealed class SqlServerConcurrentMaintenanceTests
         Assert.Equal(0, faults.Terminal);
     }
 
-    // Every writer shares one transition-log INSERT, so its plan is compiled once and then reused. A
-    // wide lease sweep compiles it at 96 rows, where the optimizer serves the foreign-key check to
-    // backwave.jobs with a full scan, and every later caller inherits that plan whatever its own batch
-    // size holds. This test poisons the plan cache that way on purpose, then reports the narrow outcome
-    // batches a real fleet reports. That is the shape that lost a deadlock before the bounded retry.
+    // SQL Server caches one plan per batch text, and the report is one batch whose plan every later
+    // report reuses. When the first report compiles it at 96 rows, the optimizer serves the
+    // foreign-key check of the transition INSERT to backwave.jobs with a full scan, and every later
+    // report inherits that scan whatever its own batch size holds. This test clears the plan cache and
+    // poisons it that way on purpose, then reports the narrow outcome batches a real fleet reports.
+    // That is the shape that lost a deadlock before the bounded retry.
     [Fact]
     public async Task Concurrent_outcome_reports_never_deadlock()
     {
         const int Poison = 96, Rounds = 30, Workers = 6, PerWorker = 16;
         var store = await SqlServerTestDatabase.CreateFreshStoreAsync(JobHistoryPolicy.TransitionsAndFailureDetail);
-        var deadLetter = new RetryPolicy { MaxAttempts = 1, Backoff = _ => TimeSpan.FromMinutes(1) }.ToDisposition();
 
+        // Without the clear, an earlier test in the run can leave a narrow plan in the cache, and this
+        // test then passes on any lock order.
+        await using (var connection = new SqlConnection(SqlServerTestDatabase.ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var clear = new SqlCommand("ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE", connection);
+            await clear.ExecuteNonQueryAsync();
+        }
         for (var i = 0; i < Poison; i++)
         {
             await store.EnqueueAsync(new NewJob(Guid.NewGuid(), "t", "{}"u8.ToArray(), "poison", T0), T0);
         }
-        await store.ClaimAsync(new ClaimRequest("sweeper", ["poison"], Poison, Lease, T0));
-        // MaxAttempts 1 dead-letters the swept jobs, so they never return to the claimable set.
-        await store.ExpireLeasesAsync(T0 + Lease + TimeSpan.FromSeconds(1), Poison, ["poison"], deadLetter);
+        // One claim never returns more than Bounds.MaxClaimBatch rows, so the poison is claimed in passes.
+        var poison = new List<JobRecord>();
+        while (poison.Count < Poison)
+        {
+            poison.AddRange(await store.ClaimAsync(new ClaimRequest("poisoner", ["poison"], Poison, Lease, T0)));
+        }
+        // Success is terminal, so the poison jobs never return to the claimable set.
+        await store.ReportOutcomesAsync(
+            [.. poison.Select(job => new OutcomeReport(job.JobId, "poisoner", job.Attempt, new JobOutcome.Success()))], T0);
 
         using var faults = new StoreFaultCounter();
         var escaped = 0;
