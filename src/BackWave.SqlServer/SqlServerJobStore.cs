@@ -467,11 +467,10 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
 
         // Tags hydrate in one batched round-trip (ADR 0022) — but only when tags are actually in
         // use (issue 0169). T-SQL's OUTPUT forbids the correlated subquery the Postgres RETURNING
-        // uses to fold tags into the claim, and capturing the claim into a table variable to read
-        // them in-transaction widens the lease's row locks enough to deadlock the transition write,
-        // so SQL Server instead GATES the existing post-commit hydration: under the no-tags
-        // configuration the job_tags table is empty, the gate skips the round-trip entirely, and the
-        // claim hot path pays nothing. See TagsInUseAsync for the cheap, sound presence signal.
+        // uses to fold tags into the claim, so SQL Server instead GATES the existing post-commit
+        // hydration: under the no-tags configuration the job_tags table is empty, the gate skips the
+        // round-trip entirely, and the claim hot path pays nothing. See TagsInUseAsync for the cheap,
+        // sound presence signal.
         var tagged = claimed.Count == 0 || !await TagsInUseAsync(connection, cancellationToken).ConfigureAwait(false)
             ? claimed
             : await WithTagsAsync(connection, claimed, cancellationToken).ConfigureAwait(false);
@@ -556,14 +555,22 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         }
 
         // The single contended operation: UPDLOCK/READPAST is the dialect's skip-locked.
+        //
+        // Transition Log (§5.12): one Leased entry per claimed job at its post-claim Attempt, in the
+        // same batch and transaction as the lease write. The entries go in while the candidates hold
+        // only U locks, before the UPDATE takes X - see the note in ExpireLeasesUntracedAsync.
+        var recordTransitions = _historyPolicy != JobHistoryPolicy.Off;
         await using var claim = Cmd(
-            """
-            WITH candidates AS (
-                SELECT TOP (@take) job_id
-                FROM backwave.jobs WITH (UPDLOCK, READPAST, ROWLOCK)
-                WHERE queue = @queue AND state = 0 AND due_time <= @now
-                ORDER BY due_time, [sequence]
-            )
+            $"""
+            {DeclareTransitionBatch}
+            INSERT INTO @batch (job_id, state, attempt, detail)
+            SELECT TOP (@take) job_id, 2, attempt + 1, NULL
+            FROM backwave.jobs WITH (UPDLOCK, READPAST, ROWLOCK)
+            WHERE queue = @queue AND state = 0 AND due_time <= @now
+            ORDER BY due_time, [sequence];
+
+            {(recordTransitions ? InsertTransitionsFromBatch : "")}
+
             UPDATE j
             SET state = 2, attempt = j.attempt + 1, lease_owner = @worker, lease_expiry = @expiry
             OUTPUT inserted.job_id, inserted.wire_name, inserted.payload, inserted.queue,
@@ -572,8 +579,8 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                    inserted.terminal_cause, inserted.schedule_id, inserted.parents_remaining,
                    inserted.mode, inserted.trace_context, inserted.[sequence], inserted.workflow_id,
                    inserted.retry_cause
-            FROM backwave.jobs j
-            INNER JOIN candidates c ON j.job_id = c.job_id
+            FROM @batch c
+            INNER LOOP JOIN backwave.jobs j ON j.job_id = c.job_id;
             """,
             connection, transaction);
         claim.Parameters.AddWithValue("queue", queue);
@@ -582,8 +589,14 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         claim.Parameters.AddWithValue("worker", request.WorkerId);
         claim.Parameters.AddWithValue("expiry", request.Now + request.LeaseDuration);
         var queueClaims = new List<JobRecord>();
+        var maxNewOrdinal = -1L;
         await using (var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
         {
+            if (recordTransitions)
+            {
+                maxNewOrdinal = await ReadMaxOrdinalAsync(reader, cancellationToken).ConfigureAwait(false);
+                await reader.NextResultAsync(cancellationToken).ConfigureAwait(false);
+            }
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var job = ReadJob(reader);
@@ -598,12 +611,10 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         }
         // Crash after the lease write, before commit: rollback must un-lease every row (issue 0034).
         await FailpointAsync("claim", cancellationToken).ConfigureAwait(false);
-        // Transition Log (§5.12): one Leased entry per claimed job at its post-claim Attempt, in
-        // ONE set-based INSERT in this same transaction (atomic with the lease write).
-        await RecordTransitionsBatchAsync(
-            connection, transaction,
-            [.. queueClaims.Select(j => (j.JobId, JobState.Leased, j.Attempt, (string?)null))],
-            request.Now, cancellationToken).ConfigureAwait(false);
+        await PruneTransitionsAsync(
+            connection, transaction, maxNewOrdinal,
+            () => JsonSerializer.Serialize(queueClaims.Select(j => new TransitionRow(j.JobId, (int)JobState.Leased, j.Attempt, null)).ToArray()),
+            cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
         // OUTPUT does not guarantee order; the contract's per-Queue (DueTime, enqueue
@@ -943,8 +954,12 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 JobOutcome.Unroutable unroutable => (6, unroutable.Reason, null, now),
                 _ => throw new ArgumentOutOfRangeException(nameof(batch)),
             };
+            // Failure Detail rides only a failing transition, and only on the full history rung.
+            var detail = row.Outcome is JobOutcome.Failure && _historyPolicy == JobHistoryPolicy.TransitionsAndFailureDetail
+                ? options.Bounds.ClampFailureDetail(row.FailureDetail)
+                : null;
             rows[i] = new OutcomeRow(
-                row.JobId, row.WorkerId, row.Attempt, target.State, target.Cause, target.Due, target.TerminalAt);
+                row.JobId, row.WorkerId, row.Attempt, target.State, target.Cause, target.Due, target.TerminalAt, detail);
         }
         var payload = JsonSerializer.Serialize(rows);
 
@@ -952,21 +967,44 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         await using var transaction = (SqlTransaction)await connection
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-        // One fenced multi-row UPDATE: OPENJSON unpacks the payload into a set, and the WHERE applies
-        // the per-(worker, attempt) Effect-Once fence to every row INDEPENDENTLY. A row whose lease is
-        // no longer live simply fails to join and changes nothing (StaleLease); a matched row applies
-        // and is returned via OUTPUT, keyed by job id. due_time moves only for a retry row (COALESCE
-        // keeps it for everyone else); cancel_requested clears only for a Cancelled row (CASE).
+        // One fenced batch: OPENJSON unpacks the payload into a set, and the WHERE applies the
+        // per-(worker, attempt) Effect-Once fence to every row INDEPENDENTLY. A row whose lease is no
+        // longer live simply fails to join and changes nothing (StaleLease). The fenced rows go into
+        // @batch under UPDLOCK, so they hold only U locks until the UPDATE. The UPDATE returns each
+        // applied row via OUTPUT, keyed by job id. due_time moves only for a retry row (COALESCE keeps
+        // it for everyone else); cancel_requested clears only for a Cancelled row (CASE).
         // terminal_at/terminal_cause carry per-row (null for a retry). retry_cause records a
         // handler-failure retry and is left alone on every terminal row.
+        //
+        // Transition Log (§5.12): one entry per fenced row for its resulting state at this Attempt,
+        // written between the fence and the UPDATE - see the note in ExpireLeasesUntracedAsync. The
+        // history policy Off appends nothing.
         var matched = new Dictionary<Guid, int>();
+        var recordTransitions = _historyPolicy != JobHistoryPolicy.Off;
+        var maxNewOrdinal = -1L;
         // The payload leads the join and INNER LOOP JOIN pins the shape, so this seeks the clustered
         // PK once per row and locks only the batch's own jobs. Left to itself the optimizer reads no
         // cardinality from OPENJSON or from a VALUES list, picks a merge join over a full scan of
         // backwave.jobs, and takes a U lock on every row it passes. Two concurrent writers each
         // holding rows the other must scan past then deadlock (§5.5).
         await using (var update = Cmd(
-            """
+            $"""
+            DECLARE @batch TABLE (
+                job_id uniqueidentifier PRIMARY KEY, state int, attempt int, detail nvarchar(max),
+                cause nvarchar(max), due datetimeoffset, terminal_at datetimeoffset);
+            INSERT INTO @batch (job_id, state, attempt, detail, cause, due, terminal_at)
+            SELECT d.job_id, d.state, d.attempt, d.detail, d.cause, d.due, d.terminal_at
+            FROM OPENJSON(@payload)
+                WITH (job_id uniqueidentifier '$.JobId', worker nvarchar(450) '$.WorkerId',
+                      attempt int '$.Attempt', state int '$.State', cause nvarchar(max) '$.Cause',
+                      due datetimeoffset '$.Due', terminal_at datetimeoffset '$.TerminalAt',
+                      detail nvarchar(max) '$.Detail') d
+            INNER LOOP JOIN backwave.jobs j WITH (UPDLOCK, ROWLOCK) ON j.job_id = d.job_id
+            WHERE j.state = 2 AND j.lease_owner = d.worker AND j.attempt = d.attempt
+              AND j.lease_expiry > @now;
+
+            {(recordTransitions ? InsertTransitionsFromBatch : "")}
+
             UPDATE j
             SET state = d.state,
                 lease_owner = NULL,
@@ -977,24 +1015,28 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 cancel_requested = CASE WHEN d.state = 4 THEN 0 ELSE j.cancel_requested END,
                 retry_cause = CASE WHEN d.state = 0 THEN 1 ELSE j.retry_cause END
             OUTPUT inserted.job_id, inserted.state
-            FROM OPENJSON(@payload)
-                WITH (job_id uniqueidentifier '$.JobId', worker nvarchar(450) '$.WorkerId',
-                      attempt int '$.Attempt', state int '$.State', cause nvarchar(max) '$.Cause',
-                      due datetimeoffset '$.Due', terminal_at datetimeoffset '$.TerminalAt') d
-            INNER LOOP JOIN backwave.jobs j ON j.job_id = d.job_id
-            WHERE j.state = 2 AND j.lease_owner = d.worker AND j.attempt = d.attempt
-              AND j.lease_expiry > @now
+            FROM @batch d
+            INNER LOOP JOIN backwave.jobs j ON j.job_id = d.job_id;
             """,
             connection, transaction))
         {
             update.Parameters.Add("payload", SqlDbType.NVarChar, -1).Value = payload;
             update.Parameters.AddWithValue("now", now);
             await using var reader = await update.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            if (recordTransitions)
+            {
+                maxNewOrdinal = await ReadMaxOrdinalAsync(reader, cancellationToken).ConfigureAwait(false);
+                await reader.NextResultAsync(cancellationToken).ConfigureAwait(false);
+            }
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 matched[reader.GetGuid(0)] = reader.GetInt32(1);
             }
         }
+        await PruneTransitionsAsync(
+            connection, transaction, maxNewOrdinal,
+            () => JsonSerializer.Serialize(rows.Where(r => matched.ContainsKey(r.JobId)).ToArray()),
+            cancellationToken).ConfigureAwait(false);
 
         // Output and Tag deltas land ONLY for matched rows — a fenced-out (StaleLease) row leaves
         // nothing a stale node buffered. Output persists only on a Success outcome; Tags union onto
@@ -1019,22 +1061,6 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 await InsertTagsAsync(connection, transaction, row.JobId, addedTags, cancellationToken).ConfigureAwait(false);
             }
         }
-
-        // Transition Log (§5.12): one entry per matched row for its resulting state at this Attempt,
-        // in ONE set-based INSERT atomic with the outcome write. Failure Detail rides only a failing
-        // transition; every other outcome records null. The batch honors the history policy (Off
-        // appends nothing), so the noop-drain hot path adds no transition statements at all.
-        var transitionRows = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(matched.Count);
-        foreach (var row in batch)
-        {
-            if (matched.TryGetValue(row.JobId, out var newState))
-            {
-                transitionRows.Add((row.JobId, (JobState)newState, row.Attempt,
-                    row.Outcome is JobOutcome.Failure ? row.FailureDetail : null));
-            }
-        }
-        await RecordTransitionsBatchAsync(connection, transaction, transitionRows, now, cancellationToken)
-            .ConfigureAwait(false);
 
         // First-level child-latch resolution for the matched TERMINAL ids only (a retry row stays
         // non-terminal and gates nothing). One lookup finds the few terminal parents that actually
@@ -1099,7 +1125,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
     // Property names are the OPENJSON '$.X' paths above; the CLR types map to the WITH column types.
     private sealed record OutcomeRow(
         Guid JobId, string WorkerId, int Attempt, int State, string? Cause,
-        DateTimeOffset? Due, DateTimeOffset? TerminalAt);
+        DateTimeOffset? Due, DateTimeOffset? TerminalAt, string? Detail);
 
     /// <summary>
     /// The latch (invariant I2), inside the same transaction as the terminal transition.
@@ -1939,7 +1965,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
 
         // OUTPUT the assigned ordinals so the prune can be skipped entirely (below) when no job in
         // the batch has reached the cap — the common 2-transition job pays no DELETE round-trip.
-        var maxNewOrdinal = -1L;
+        long maxNewOrdinal;
         // Materialize the payload into a keyed table variable before the INSERT. OPENJSON carries no
         // cardinality, and the key lets the optimizer cost the join to job_transitions.
         // The key does not settle the FK check to jobs. That plan stays the optimizer's to pick, and
@@ -1949,44 +1975,75 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         // records transitions while it holds only U locks passes through concurrent scans, because U
         // and S are compatible - see the note in ExpireLeasesUntracedAsync.
         await using (var insert = Cmd(
-            """
-            DECLARE @batch TABLE (job_id uniqueidentifier PRIMARY KEY, state int, attempt int, detail nvarchar(max));
+            $"""
+            {DeclareTransitionBatch}
             INSERT INTO @batch (job_id, state, attempt, detail)
             SELECT job_id, state, attempt, detail
             FROM OPENJSON(@payload)
                 WITH (job_id uniqueidentifier '$.JobId', state int '$.State',
                       attempt int '$.Attempt', detail nvarchar(max) '$.Detail');
 
-            INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
-            OUTPUT inserted.ordinal
-            SELECT d.job_id, COALESCE(t.maxord, -1) + 1, @now, d.state, d.attempt, d.detail
-            FROM @batch d
-            LEFT JOIN (
-                SELECT job_id, MAX(ordinal) AS maxord
-                FROM backwave.job_transitions
-                WHERE job_id IN (SELECT job_id FROM @batch)
-                GROUP BY job_id
-            ) t ON t.job_id = d.job_id
+            {InsertTransitionsFromBatch}
             """,
             connection, transaction))
         {
             insert.Parameters.Add("payload", SqlDbType.NVarChar, -1).Value = payload;
             insert.Parameters.Add("now", SqlDbType.DateTimeOffset).Value = now;
             await using var reader = await insert.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            {
-                var ordinal = reader.GetInt64(0);
-                if (ordinal > maxNewOrdinal)
-                {
-                    maxNewOrdinal = ordinal;
-                }
-            }
+            maxNewOrdinal = await ReadMaxOrdinalAsync(reader, cancellationToken).ConfigureAwait(false);
         }
 
-        // Per-job-life cap (§7): skip the prune entirely unless some job's new ordinal reached the
-        // cap — a job nowhere near MaxTransitionsPerJob never pays the DELETE. When some job did
-        // reach it, one set-based DELETE keeps only the newest MaxTransitionsPerJob per job (the
-        // correlated MAX no-ops for the jobs still under the cap).
+        await PruneTransitionsAsync(connection, transaction, maxNewOrdinal, () => payload, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    // The keyed table variable the Transition Log INSERT reads its rows from.
+    private const string DeclareTransitionBatch =
+        "DECLARE @batch TABLE (job_id uniqueidentifier PRIMARY KEY, state int, attempt int, detail nvarchar(max));";
+
+    // Appends one Transition Log entry per @batch row at the job's next ordinal and returns the
+    // assigned ordinals. The batch recorder, the claim, and the report write through this one
+    // statement. The caller declares @batch with at least the columns of DeclareTransitionBatch -
+    // job_id (the key), state, attempt, and detail - and binds @now.
+    private const string InsertTransitionsFromBatch =
+        """
+        INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
+        OUTPUT inserted.ordinal
+        SELECT d.job_id, COALESCE(t.maxord, -1) + 1, @now, d.state, d.attempt, d.detail
+        FROM @batch d
+        LEFT JOIN (
+            SELECT job_id, MAX(ordinal) AS maxord
+            FROM backwave.job_transitions
+            WHERE job_id IN (SELECT job_id FROM @batch)
+            GROUP BY job_id
+        ) t ON t.job_id = d.job_id;
+        """;
+
+    // Reads the ordinals InsertTransitionsFromBatch returned and gives the highest, or -1 for none.
+    private static async ValueTask<long> ReadMaxOrdinalAsync(SqlDataReader reader, CancellationToken cancellationToken)
+    {
+        var maxNewOrdinal = -1L;
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var ordinal = reader.GetInt64(0);
+            if (ordinal > maxNewOrdinal)
+            {
+                maxNewOrdinal = ordinal;
+            }
+        }
+        return maxNewOrdinal;
+    }
+
+    // Per-job-life cap (§7) for a batch whose highest new ordinal is maxNewOrdinal. payload gives the
+    // batch as a JSON array of rows with a JobId, and only a prune that runs asks for it.
+    private async Task PruneTransitionsAsync(
+        SqlConnection connection, SqlTransaction transaction, long maxNewOrdinal, Func<string> payload,
+        CancellationToken cancellationToken)
+    {
+        // Skip the prune entirely unless some job's new ordinal reached the cap — a job nowhere near
+        // MaxTransitionsPerJob never pays the DELETE. When some job did reach it, one set-based DELETE
+        // keeps only the newest MaxTransitionsPerJob per job (the correlated MAX no-ops for the jobs
+        // still under the cap).
         if (maxNewOrdinal < options.Bounds.MaxTransitionsPerJob)
         {
             return;
@@ -1999,7 +2056,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
               AND jt.ordinal <= (SELECT MAX(ordinal) FROM backwave.job_transitions x WHERE x.job_id = jt.job_id) - @cap
             """,
             connection, transaction);
-        prune.Parameters.Add("payload", SqlDbType.NVarChar, -1).Value = payload;
+        prune.Parameters.Add("payload", SqlDbType.NVarChar, -1).Value = payload();
         prune.Parameters.AddWithValue("cap", options.Bounds.MaxTransitionsPerJob);
         await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }

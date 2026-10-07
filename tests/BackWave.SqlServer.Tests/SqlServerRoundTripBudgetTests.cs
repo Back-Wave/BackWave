@@ -46,13 +46,13 @@ public sealed class SqlServerRoundTripBudgetTests
     // arithmetic behind each number is in its test.
 
     private static readonly Budget Claim = new(
-        "ClaimBatchAsync of 32 jobs (one queue, cold caches)", Statements: 6);
+        "ClaimBatchAsync of 32 jobs (one queue, cold caches)", Statements: 5);
 
     private static readonly Budget ReportOutcomes = new(
-        "ReportOutcomesAsync of 32 succeeded rows", Statements: 3);
+        "ReportOutcomesAsync of 32 succeeded rows", Statements: 2);
 
     private static readonly Budget ReportOutcomesWithOutput = new(
-        "ReportOutcomesAsync of 32 succeeded rows, every one carrying job output", Statements: 35);
+        "ReportOutcomesAsync of 32 succeeded rows, every one carrying job output", Statements: 34);
 
     private static readonly Budget ExpireLeases = new(
         "ExpireLeasesAsync over 32 expired leases, all rescheduled", Statements: 3);
@@ -79,12 +79,11 @@ public sealed class SqlServerRoundTripBudgetTests
             await store.EnqueueAsync(Job(), T0); // also warms the one-time schema check, off the measured path
         }
 
-        // 1 queue-config applock + 1 queue_limits read + 1 claim UPDATE ... OUTPUT
-        // + 1 batched transition insert + 1 tags-in-use probe + 1 next-due read = 6, independent of
-        // batch size. The claim is a single UPDATE with OUTPUT, so 32 leased rows come back on the same
-        // trip that writes them, and the transition insert is set-based over OPENJSON, so 32 log entries
-        // cost one statement. No prune: the batch recorder issues a DELETE only when some job in it
-        // reached MaxTransitionsPerJob, and a freshly claimed job is on its second transition.
+        // 1 queue-config applock + 1 queue_limits read + 1 claim batch + 1 tags-in-use probe
+        // + 1 next-due read = 5, independent of batch size. The claim batch writes the transition log
+        // and the lease in one trip, and its UPDATE with OUTPUT returns the 32 leased rows on the same
+        // trip. No prune: the claim issues a DELETE only when some job in it reached
+        // MaxTransitionsPerJob, and a freshly claimed job is on its second transition.
         //
         // ClaimBatchAsync, not ClaimAsync: the extra statement over the plain claim is the next-due read,
         // which is this adapter's ONLY idle-wakeup mechanism (SQL Server has no Wake-Up Hint channel), so
@@ -115,13 +114,13 @@ public sealed class SqlServerRoundTripBudgetTests
 
         // The plain drain: every row succeeded, none carries output or a tag delta, so nothing but the
         // fenced state write and the transition log runs.
-        // 1 fenced batch UPDATE ... OUTPUT + 1 batched transition insert + 1 child-latch probe = 3,
-        // independent of batch size. The fence is applied per row inside that one UPDATE - OPENJSON
-        // unpacks the payload and the WHERE tests each row's (worker, attempt) independently - and
-        // OUTPUT reports which rows matched, so the per-row Effect-Once verdict costs no extra trip.
+        // 1 fenced batch + 1 child-latch probe = 2, independent of batch size. The fenced batch writes
+        // the transition log and the outcomes in one trip. The fence is applied per row inside it -
+        // OPENJSON unpacks the payload and the WHERE tests each row's (worker, attempt) independently -
+        // and OUTPUT reports which rows matched, so the per-row Effect-Once verdict costs no extra trip.
         // The child-latch probe runs because Succeeded is terminal: one lookup asks whether ANY of the
         // 32 ids parents a Dependency, and the answer here is no, so nothing cascades.
-        // As above, no job in this batch is near the cap, so the batch recorder issues no prune DELETE.
+        // As above, no job in this batch is near the cap, so the report issues no prune DELETE.
         var batch = claimed
             .Select(job => new OutcomeReport(job.JobId, "budget-worker", job.Attempt, new JobOutcome.Success()))
             .ToArray();
@@ -149,7 +148,7 @@ public sealed class SqlServerRoundTripBudgetTests
         var claimed = await store.ClaimAsync(new ClaimRequest("budget-worker", ["budget"], ClaimBatch, Lease, T0));
         Assert.Equal(ClaimBatch, claimed.Count);
 
-        // The drain budget above plus ONE STATEMENT PER ROW: 3 + 32 = 35. Output is the one write on
+        // The drain budget above plus ONE STATEMENT PER ROW: 2 + 32 = 34. Output is the one write on
         // this path that is still a per-row loop on this adapter - the fenced UPDATE cannot carry the
         // blob, because OPENJSON has no varbinary(max) column type, so a blob would have to go over as
         // base64 text and be converted back per row.

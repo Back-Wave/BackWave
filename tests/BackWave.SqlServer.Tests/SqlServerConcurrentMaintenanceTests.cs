@@ -71,25 +71,39 @@ public sealed class SqlServerConcurrentMaintenanceTests
         Assert.Equal(0, faults.Terminal);
     }
 
-    // Every writer shares one transition-log INSERT, so its plan is compiled once and then reused. A
-    // wide lease sweep compiles it at 96 rows, where the optimizer serves the foreign-key check to
-    // backwave.jobs with a full scan, and every later caller inherits that plan whatever its own batch
-    // size holds. This test poisons the plan cache that way on purpose, then reports the narrow outcome
-    // batches a real fleet reports. That is the shape that lost a deadlock before the bounded retry.
+    // SQL Server caches one plan per batch text, and the report is one batch whose plan every later
+    // report reuses. When the first report compiles it at 96 rows, the optimizer serves the
+    // foreign-key check of the transition INSERT to backwave.jobs with a full scan, and every later
+    // report inherits that scan whatever its own batch size holds. This test clears the plan cache and
+    // poisons it that way on purpose, then reports the narrow outcome batches a real fleet reports.
+    // That is the shape that lost a deadlock before the bounded retry.
     [Fact]
     public async Task Concurrent_outcome_reports_never_deadlock()
     {
         const int Poison = 96, Rounds = 30, Workers = 6, PerWorker = 16;
         var store = await SqlServerTestDatabase.CreateFreshStoreAsync(JobHistoryPolicy.TransitionsAndFailureDetail);
-        var deadLetter = new RetryPolicy { MaxAttempts = 1, Backoff = _ => TimeSpan.FromMinutes(1) }.ToDisposition();
 
+        // Without the clear, an earlier test in the run can leave a narrow plan in the cache, and this
+        // test then passes on any lock order.
+        await using (var connection = new SqlConnection(SqlServerTestDatabase.ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var clear = new SqlCommand("ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE", connection);
+            await clear.ExecuteNonQueryAsync();
+        }
         for (var i = 0; i < Poison; i++)
         {
             await store.EnqueueAsync(new NewJob(Guid.NewGuid(), "t", "{}"u8.ToArray(), "poison", T0), T0);
         }
-        await store.ClaimAsync(new ClaimRequest("sweeper", ["poison"], Poison, Lease, T0));
-        // MaxAttempts 1 dead-letters the swept jobs, so they never return to the claimable set.
-        await store.ExpireLeasesAsync(T0 + Lease + TimeSpan.FromSeconds(1), Poison, ["poison"], deadLetter);
+        // One claim never returns more than Bounds.MaxClaimBatch rows, so the poison is claimed in passes.
+        var poison = new List<JobRecord>();
+        while (poison.Count < Poison)
+        {
+            poison.AddRange(await store.ClaimAsync(new ClaimRequest("poisoner", ["poison"], Poison, Lease, T0)));
+        }
+        // Success is terminal, so the poison jobs never return to the claimable set.
+        await store.ReportOutcomesAsync(
+            [.. poison.Select(job => new OutcomeReport(job.JobId, "poisoner", job.Attempt, new JobOutcome.Success()))], T0);
 
         using var faults = new StoreFaultCounter();
         var escaped = 0;
@@ -258,6 +272,57 @@ public sealed class SqlServerConcurrentMaintenanceTests
             + "own batch. ix_backwave_jobs_lease_owner (schema v2) is missing, or the relinquish read no "
             + "longer seeks it.");
         Assert.Equal(1, relinquished);
+    }
+
+    // The two race pins above need the plan to lose the race before the counter moves. These two pin the
+    // lock order the races depend on, with one writer and no timing window: the claim and the report
+    // write the Transition Log while they hold only U locks, before the UPDATE takes X.
+    //
+    // A rival session holds an S lock on ONE row of the batch. U is compatible with S, so the lock step
+    // passes it and the transition INSERT runs. X is not, so the UPDATE waits on that row. A dirty read
+    // taken while the store waits then shows the order: the new entries are already there. A store that
+    // takes X before the INSERT waits at the same row with no entry written.
+    [Fact]
+    public async Task A_claim_writes_its_transitions_before_it_takes_X_locks()
+    {
+        const int Batch = 4;
+        var store = await SqlServerTestDatabase.CreateFreshStoreAsync();
+        var jobs = new List<Guid>();
+        for (var i = 0; i < Batch; i++)
+        {
+            var id = Guid.NewGuid();
+            await store.EnqueueAsync(new NewJob(id, "t", "{}"u8.ToArray(), "default", T0), T0);
+            jobs.Add(id);
+        }
+
+        var written = await TransitionsWrittenWhileBlocked(
+            jobs[^1],
+            () => store.ClaimAsync(new ClaimRequest("w", ["default"], Batch, Lease, T0)).AsTask(),
+            JobState.Leased);
+
+        Assert.Equal(Batch, written);
+    }
+
+    [Fact]
+    public async Task A_report_writes_its_transitions_before_it_takes_X_locks()
+    {
+        const int Batch = 4;
+        var store = await SqlServerTestDatabase.CreateFreshStoreAsync();
+        for (var i = 0; i < Batch; i++)
+        {
+            await store.EnqueueAsync(new NewJob(Guid.NewGuid(), "t", "{}"u8.ToArray(), "default", T0), T0);
+        }
+        var claimed = await store.ClaimAsync(new ClaimRequest("w", ["default"], Batch, Lease, T0));
+        Assert.Equal(Batch, claimed.Count);
+
+        var written = await TransitionsWrittenWhileBlocked(
+            claimed[^1].JobId,
+            () => store.ReportOutcomesAsync(
+                [.. claimed.Select(job => new OutcomeReport(job.JobId, "w", job.Attempt, new JobOutcome.Success()))],
+                T0).AsTask(),
+            JobState.Succeeded);
+
+        Assert.Equal(Batch, written);
     }
 
     // The two pins above are worth nothing unless a real absorbed deadlock would move the counter. This
@@ -498,6 +563,38 @@ public sealed class SqlServerConcurrentMaintenanceTests
             await Task.Delay(25);
         }
         Assert.Fail($"No session blocked on {session} within 30 s, so the deadlock cycle was never set up.");
+    }
+
+    // Holds an S lock on one job while the write runs, waits until the write blocks on it, and counts the
+    // Transition Log entries in the given state that the blocked write already inserted. The rival only
+    // ever holds the one S lock, so it can never be half of a cycle.
+    private static async Task<int> TransitionsWrittenWhileBlocked(Guid held, Func<Task> write, JobState state)
+    {
+        await using var rival = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await rival.OpenAsync();
+        var rivalSession = (short)(await Scalar(rival, null, "SELECT @@SPID"))!;
+        await using var rivalTx = (SqlTransaction)await rival.BeginTransactionAsync();
+        await Execute(rival, rivalTx,
+            "SELECT job_id FROM backwave.jobs WITH (REPEATABLEREAD, ROWLOCK) WHERE job_id = @id", held);
+
+        var writing = Task.Run(write);
+        int written;
+        try
+        {
+            await WaitUntilBlockedBy(rivalSession);
+            await using var reader = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+            await reader.OpenAsync();
+            written = (int)(await Scalar(reader, null,
+                $"SELECT count(*) FROM backwave.job_transitions WITH (NOLOCK) WHERE state = {(int)state}"))!;
+        }
+        finally
+        {
+            // Release the row whatever happened, so the blocked write can finish and be awaited.
+            await rivalTx.RollbackAsync();
+        }
+
+        await writing.WaitAsync(TimeSpan.FromSeconds(60));
+        return written;
     }
 
     // One scalar query on a caller's session.
