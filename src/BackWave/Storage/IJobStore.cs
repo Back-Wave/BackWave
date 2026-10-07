@@ -465,6 +465,39 @@ public interface IJobStore
     ValueTask<IReadOnlyList<JobRecord>> ListJobsAsync(JobQuery query, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Counts the jobs matching a filter, for monitoring. The count uses exactly the filter predicates
+    /// <see cref="ListJobsAsync"/> applies (state, queue, wire name, schedule id, and AND-ed tag
+    /// predicates). The query's pagination and sort fields (<see cref="JobQuery.AfterSequence"/>,
+    /// <see cref="JobQuery.SortDirection"/>, <see cref="JobQuery.MaxResults"/>) do not apply: the count
+    /// always spans the whole matching population, never a single page, and the monitor page cap does
+    /// not bound it.
+    /// <para>
+    /// The default implementation pages through <see cref="ListJobsAsync"/> oldest-first and counts the
+    /// rows, so an adapter that does not override it still returns the correct number, at the cost of
+    /// one read per page. An overriding adapter counts in the store (for example a single
+    /// <c>SELECT COUNT(*)</c> over the same predicates).
+    /// </para>
+    /// </summary>
+    /// <param name="query">The filter to count. Its pagination and sort fields are ignored.</param>
+    /// <param name="cancellationToken">Cancels the operation.</param>
+    /// <returns>The number of jobs that match the filter; zero when nothing matches.</returns>
+    async ValueTask<long> CountMatchingJobsAsync(JobQuery query, CancellationToken cancellationToken = default)
+    {
+        var scope = query with { AfterSequence = null, SortDirection = JobSortDirection.OldestFirst, MaxResults = int.MaxValue };
+        long count = 0;
+        while (true)
+        {
+            var page = await ListJobsAsync(scope, cancellationToken).ConfigureAwait(false);
+            if (page.Count == 0)
+            {
+                return count;
+            }
+            count += page.Count;
+            scope = scope with { AfterSequence = page[^1].Sequence };
+        }
+    }
+
+    /// <summary>
     /// Reads job counts grouped by Queue and state — the queue depths — for monitoring.
     /// </summary>
     /// <param name="cancellationToken">Cancels the operation.</param>
@@ -780,6 +813,15 @@ public sealed record JobQuery
 
     /// <summary>Match only jobs minted by this recurring schedule; null matches jobs from any source.</summary>
     public string? ScheduleId { get; init; }
+
+    /// <summary>
+    /// When true, match only Retrying jobs: jobs that are Scheduled and carry a
+    /// <see cref="JobRecord.RetryCause"/>, so they are waiting for another attempt because the handler
+    /// failed or the lease expired. A new job and a requeued job do not match, and a clean-stop hand-back
+    /// of the lease does not make a job match. False (the default) adds no constraint. Like every filter it is AND-ed with the
+    /// others, so a <see cref="State"/> other than Scheduled together with this flag matches nothing.
+    /// </summary>
+    public bool Retrying { get; init; }
 
     /// <summary>
     /// Tag predicates AND-ed together and AND-composed with the scalar filters above: a job matches

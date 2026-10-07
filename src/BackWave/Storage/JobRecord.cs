@@ -42,6 +42,14 @@ public sealed record JobRecord
     /// <summary>A short human-readable reason for the terminal state (the failure error, cancel actor, or unroutable reason), or null while live.</summary>
     public string? TerminalCause { get; init; }
 
+    /// <summary>
+    /// Why the job most recently went back to Scheduled after an attempt went wrong: the handler failed,
+    /// or the lease expired. Null when no attempt has gone wrong since the job was enqueued or last
+    /// requeued. A clean-stop hand-back of the lease does not change it, and a terminal outcome keeps it
+    /// as a record of the last retry. A Scheduled job with a cause is Retrying.
+    /// </summary>
+    public RetryCause? RetryCause { get; init; }
+
     /// <summary>The id of the recurring schedule that minted this instance, or null for a directly enqueued job.</summary>
     public string? ScheduleId { get; init; }
 

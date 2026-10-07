@@ -7,8 +7,8 @@ using ModelContextProtocol.Server;
 
 namespace BackWave.Pro.Mcp.Tools;
 
-// The job read tools (mcp-0003 inventory, issue 0225): search_jobs, get_job, get_job_history,
-// get_job_dependencies — all behind the view gate, all wrapping BackWaveMonitor reads 1:1.
+// The job read tools (mcp-0003 inventory, issue 0225): search_jobs, count_jobs, get_job,
+// get_job_history, get_job_dependencies — all behind the view gate, all wrapping BackWaveMonitor reads 1:1.
 // Internal: the tool surface is wire-level (MCP), never a C# API. Registered explicitly via
 // WithTools<JobTools>() in AddMcp; never assembly scanning. Input parameter names are snake_case
 // (the wire contract), which is why the C# parameters carry underscores.
@@ -37,6 +37,8 @@ internal sealed class JobTools(
     public async Task<SearchJobsResult> SearchJobsAsync(
         [Description("Only jobs in this state: Scheduled, AwaitingParent, Leased, Succeeded, Cancelled, DeadLettered, or Quarantined. Omit to match any state.")]
         string? state = null,
+        [Description("When true, only Retrying jobs: Scheduled jobs waiting for another attempt because the handler failed or the lease expired. A new job, a requeued job, and a job a worker handed back on a clean stop are not Retrying. Combine with state only as Scheduled; any other state matches nothing. Omit or false to match jobs whether Retrying or not.")]
+        bool? retrying = null,
         [Description("Only jobs on this queue. Omit to match any queue.")]
         string? queue = null,
         [Description("Only jobs of this wire name (the job type's stable string identity; list_wire_names enumerates them). Omit to match any type.")]
@@ -53,17 +55,6 @@ internal sealed class JobTools(
         int? max_results = null,
         CancellationToken cancellationToken = default)
     {
-        JobState? parsedState = null;
-        if (state is not null)
-        {
-            if (!Enum.TryParse<JobState>(state, ignoreCase: true, out var s) || !Enum.IsDefined(s))
-            {
-                throw new McpException(
-                    $"Unknown state '{state}'. Valid states: {string.Join(", ", Enum.GetNames<JobState>())}.");
-            }
-            parsedState = s;
-        }
-
         var direction = sort switch
         {
             null => JobSortDirection.NewestFirst,
@@ -92,7 +83,8 @@ internal sealed class JobTools(
 
         var query = new JobQuery
         {
-            State = parsedState,
+            State = ParseState(state),
+            Retrying = retrying ?? false,
             Queue = queue,
             WireName = wire_name,
             ScheduleId = schedule_id,
@@ -112,6 +104,45 @@ internal sealed class JobTools(
             Jobs = jobs,
             NextCursor = hasMore ? jobs[^1].Sequence : null,
             HasMore = hasMore,
+        };
+    }
+
+    [McpServerTool(
+        Name = ToolNames.CountJobs,
+        Title = "Count jobs",
+        UseStructuredContent = true,
+        ReadOnly = true,
+        Idempotent = true,
+        OpenWorld = false)]
+    [Description(
+        "Count the jobs that match a filter, across all matches rather than one page. Takes the " +
+        "same filters as search_jobs: every filter is optional and omitted filters match " +
+        "everything; supplied filters are AND-ed together. Use it to answer \"how many\" " +
+        "questions without paging through search_jobs.")]
+    public async Task<CountJobsResult> CountJobsAsync(
+        [Description("Only jobs in this state: Scheduled, AwaitingParent, Leased, Succeeded, Cancelled, DeadLettered, or Quarantined. Omit to match any state.")]
+        string? state = null,
+        [Description("Only jobs on this queue. Omit to match any queue.")]
+        string? queue = null,
+        [Description("Only jobs of this wire name (the job type's stable string identity; list_wire_names enumerates them). Omit to match any type.")]
+        string? wire_name = null,
+        [Description("Only jobs minted by this recurring schedule. Omit to match jobs from any source.")]
+        string? schedule_id = null,
+        [Description("Tag predicates, AND-ed together. Each is one of three forms: \"key=value\" (the job carries that keyed tag), \"key=*\" (the job carries any value under that key), or a bare \"value\" (the job carries that label). A label containing '=' cannot be expressed here.")]
+        string[]? tags = null,
+        CancellationToken cancellationToken = default)
+    {
+        var query = new JobQuery
+        {
+            State = ParseState(state),
+            Queue = queue,
+            WireName = wire_name,
+            ScheduleId = schedule_id,
+            TagPredicates = ParseTagPredicates(tags),
+        };
+        return new CountJobsResult
+        {
+            Count = await monitor.GetJobCountAsync(query, cancellationToken).ConfigureAwait(false),
         };
     }
 
@@ -242,6 +273,20 @@ internal sealed class JobTools(
             : throw new McpException(
                 $"Invalid job_id '{jobId}': expected a GUID, e.g. \"7f4df6f2-8c3a-4a0e-9d1a-2f6b8c1d5e3f\".");
 
+    private static JobState? ParseState(string? state)
+    {
+        if (state is null)
+        {
+            return null;
+        }
+        if (!Enum.TryParse<JobState>(state, ignoreCase: true, out var parsed) || !Enum.IsDefined(parsed))
+        {
+            throw new McpException(
+                $"Unknown state '{state}'. Valid states: {string.Join(", ", Enum.GetNames<JobState>())}.");
+        }
+        return parsed;
+    }
+
     // The compact tag-predicate grammar (mcp-0003): "key=value" keyed, "key=*" any-value-under-key,
     // bare "value" a label. Split on the FIRST '=' only, so a value containing '=' stays intact.
     private static IReadOnlyList<JobTagPredicate> ParseTagPredicates(string[]? tags)
@@ -299,6 +344,14 @@ internal sealed record SearchJobsResult
     /// <summary>Whether more matching jobs exist beyond this page.</summary>
     [Description("Whether more matching jobs exist beyond this page.")]
     public required bool HasMore { get; init; }
+}
+
+/// <summary>The structured result of <c>count_jobs</c>.</summary>
+internal sealed record CountJobsResult
+{
+    /// <summary>The number of jobs that match the filter.</summary>
+    [Description("The number of jobs that match the filter, across all matches; zero when nothing matches.")]
+    public required long Count { get; init; }
 }
 
 /// <summary>The structured result of <c>get_job</c>.</summary>
@@ -413,6 +466,10 @@ internal sealed record JobRow
     [Description("A short reason for the terminal outcome (for example why it was dead-lettered); null while still active.")]
     public string? TerminalCause { get; init; }
 
+    /// <summary>Why the job last went back to Scheduled after an attempt went wrong; null when none has.</summary>
+    [Description("Why the job last went back to Scheduled after an attempt went wrong: HandlerFailed or LeaseExpired. Null when no attempt has gone wrong since the job was enqueued or last requeued. A Scheduled job with a retry cause is Retrying.")]
+    public string? RetryCause { get; init; }
+
     /// <summary>The recurring schedule that minted this instance, when any.</summary>
     [Description("The recurring schedule that minted this instance; null for a directly enqueued job.")]
     public string? ScheduleId { get; init; }
@@ -442,6 +499,7 @@ internal sealed record JobRow
         CancelRequested = snapshot.CancelRequested,
         TerminalAt = snapshot.TerminalAt,
         TerminalCause = snapshot.TerminalCause,
+        RetryCause = snapshot.RetryCause?.ToString(),
         ScheduleId = snapshot.ScheduleId,
         Sequence = snapshot.Sequence,
         WorkflowId = snapshot.WorkflowId,

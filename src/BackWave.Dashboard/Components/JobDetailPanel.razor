@@ -22,6 +22,10 @@
             {
                 <tr><th>Terminal cause</th><td>@cause</td></tr>
             }
+            @if (Job.RetryCause is { } retryCause)
+            {
+                <tr><th>Retry cause</th><td>@DashboardGlossary.RetryCauseName(retryCause)</td></tr>
+            }
             @if (Job.ScheduleId is { } scheduleId)
             {
                 <tr>

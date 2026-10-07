@@ -12,16 +12,17 @@ namespace BackWave.Pro.Mcp.Tests;
 
 /// <summary>
 /// The job read tools end-to-end through the mounted MCP endpoint (issue 0225): search_jobs with
-/// its tag-predicate grammar and cursor paging, get_job's found-not-error contract, the
-/// self-explaining get_job_history response, and get_job_dependencies edges.
+/// its tag-predicate grammar and cursor paging, count_jobs over the same filters, get_job's
+/// found-not-error contract, the self-explaining get_job_history response, and get_job_dependencies
+/// edges.
 /// </summary>
 public sealed class JobToolsTests
 {
     private static readonly string[] JobToolNames =
-        ["search_jobs", "get_job", "get_job_history", "get_job_dependencies"];
+        ["search_jobs", "count_jobs", "get_job", "get_job_history", "get_job_dependencies"];
 
     [Fact]
-    public async Task ToolsList_ShowsAllFourJobTools_WithOutputSchemas()
+    public async Task ToolsList_ShowsAllFiveJobTools_WithOutputSchemas()
     {
         await using var server = await McpTestServer.StartAsync();
 
@@ -40,6 +41,7 @@ public sealed class JobToolsTests
         Assert.True(OutputProperties("search_jobs").TryGetProperty("jobs", out _));
         Assert.True(OutputProperties("search_jobs").TryGetProperty("nextCursor", out _));
         Assert.True(OutputProperties("search_jobs").TryGetProperty("hasMore", out _));
+        Assert.True(OutputProperties("count_jobs").TryGetProperty("count", out _));
         Assert.True(OutputProperties("get_job").TryGetProperty("found", out _));
         Assert.True(OutputProperties("get_job_history").TryGetProperty("transitions", out _));
         Assert.True(OutputProperties("get_job_history").TryGetProperty("historyPolicy", out _));
@@ -49,10 +51,16 @@ public sealed class JobToolsTests
         // The input contract is snake_case (the fixed tool shapes).
         var searchInputs = tools.Single(t => t.Name == "search_jobs").InputSchema!.Value.GetProperty("properties");
         foreach (var parameter in new[]
-                 { "state", "queue", "wire_name", "schedule_id", "tags", "after_cursor", "sort", "max_results" })
+                 { "state", "retrying", "queue", "wire_name", "schedule_id", "tags", "after_cursor", "sort", "max_results" })
         {
             Assert.True(searchInputs.TryGetProperty(parameter, out _), $"search_jobs is missing input '{parameter}'");
         }
+
+        // count_jobs takes the search filters but none of the paging inputs.
+        var countInputs = tools.Single(t => t.Name == "count_jobs").InputSchema!.Value.GetProperty("properties");
+        Assert.Equal(
+            ["queue", "schedule_id", "state", "tags", "wire_name"],
+            countInputs.EnumerateObject().Select(p => p.Name).Order());
     }
 
     [Fact]
@@ -391,6 +399,34 @@ public sealed class JobToolsTests
     }
 
     [Fact]
+    public async Task SearchJobs_Retrying_ListsOnlyJobsAnAttemptWentWrongFor_WithTheirCause()
+    {
+        await using var server = await McpTestServer.StartAsync();
+        var failing = await server.SeedJobAsync("critical");
+        var claimed = Assert.Single(await server.Store.ClaimAsync(
+            new ClaimRequest("w1", ["critical"], 32, TimeSpan.FromMinutes(1), DateTimeOffset.UtcNow)));
+        await server.Store.ReportOutcomeAsync(
+            claimed.JobId, "w1", claimed.Attempt, new JobOutcome.Failure(DateTimeOffset.UtcNow.AddMinutes(5), "boom"), DateTimeOffset.UtcNow);
+        var fresh = await server.SeedJobAsync("critical");
+
+        var jobs = (await server.Client.CallToolAsync("search_jobs", new Dictionary<string, object?>
+        {
+            ["retrying"] = true,
+        })).StructuredContent!.Value.GetProperty("jobs").EnumerateArray().ToList();
+
+        var job = Assert.Single(jobs);
+        Assert.Equal(failing, job.GetProperty("jobId").GetGuid());
+        Assert.Equal("Scheduled", job.GetProperty("state").GetString());
+        Assert.Equal("HandlerFailed", job.GetProperty("retryCause").GetString());
+
+        // Without the filter the fresh job lists too, and carries no cause.
+        var all = (await server.Client.CallToolAsync("search_jobs")).StructuredContent!.Value
+            .GetProperty("jobs").EnumerateArray().ToList();
+        var freshRow = Assert.Single(all, j => j.GetProperty("jobId").GetGuid() == fresh);
+        Assert.True(!freshRow.TryGetProperty("retryCause", out var cause) || cause.ValueKind == JsonValueKind.Null);
+    }
+
+    [Fact]
     public async Task SearchJobs_OldestFirst_ReversesTheOrder()
     {
         await using var server = await McpTestServer.StartAsync();
@@ -404,6 +440,52 @@ public sealed class JobToolsTests
 
         Assert.Equal(first, jobs[0].GetProperty("jobId").GetGuid());
         Assert.Equal(second, jobs[1].GetProperty("jobId").GetGuid());
+    }
+
+    [Fact]
+    public async Task CountJobs_CountsEveryMatch_PastTheStoreCap_WithTheSearchFilters()
+    {
+        // The count spans every match, not one page: seed past the store's page cap and the total
+        // still comes back whole. Each filter narrows the count exactly as it narrows search_jobs.
+        await using var server = await McpTestServer.StartAsync(
+            bounds: StoreBounds.Default with { MaxMonitorPageSize = 10 });
+        for (var i = 0; i < 12; i++)
+        {
+            await server.SeedJobAsync("critical", "send-email");
+        }
+        await server.SeedJobAsync("bulk", "resize-image");
+        await SeedTaggedJobAsync(server.Store, JobTags.Empty.WithLabel("urgent").WithTag("tenant", "acme"));
+        await SeedTaggedJobAsync(server.Store, JobTags.Empty.WithTag("tenant", "globex"));
+
+        Assert.Equal(15, await CountAsync(server, []));
+        Assert.Equal(14, await CountAsync(server, new() { ["queue"] = "critical" }));
+        Assert.Equal(12, await CountAsync(server, new() { ["wire_name"] = "send-email" }));
+        Assert.Equal(15, await CountAsync(server, new() { ["state"] = "scheduled" }));
+        Assert.Equal(0, await CountAsync(server, new() { ["state"] = "Succeeded" }));
+        Assert.Equal(0, await CountAsync(server, new() { ["schedule_id"] = "nightly" }));
+        Assert.Equal(2, await CountAsync(server, new() { ["tags"] = new[] { "tenant=*" } }));
+        Assert.Equal(1, await CountAsync(server, new() { ["tags"] = new[] { "tenant=acme", "urgent" } }));
+        Assert.Equal(0, await CountAsync(server, new() { ["queue"] = "bulk", ["tags"] = new[] { "urgent" } }));
+    }
+
+    [Fact]
+    public async Task CountJobs_InvalidStateAndTag_AreInvalidInputErrors()
+    {
+        await using var server = await McpTestServer.StartAsync();
+
+        var badState = await server.Client.CallToolAsync("count_jobs", new Dictionary<string, object?>
+        {
+            ["state"] = "Exploded",
+        });
+        Assert.True(badState.IsError);
+        Assert.Contains("Scheduled", badState.Text);
+
+        var badTag = await server.Client.CallToolAsync("count_jobs", new Dictionary<string, object?>
+        {
+            ["tags"] = new[] { "=acme" },
+        });
+        Assert.True(badTag.IsError);
+        Assert.Contains("key=value", badTag.Text);
     }
 
     [Fact]
@@ -560,6 +642,9 @@ public sealed class JobToolsTests
         var result = await server.Client.CallToolAsync("search_jobs");
         Assert.True(result.IsError);
         Assert.Contains("Permission denied", result.Text);
+        var count = await server.Client.CallToolAsync("count_jobs");
+        Assert.True(count.IsError);
+        Assert.Contains("Permission denied", count.Text);
     }
 
     private static async Task<Guid> SeedTaggedJobAsync(InMemoryJobStore store, JobTags tags)
@@ -570,6 +655,13 @@ public sealed class JobToolsTests
             now: DateTimeOffset.UtcNow);
         Assert.Equal(EnqueueResult.Ok, result);
         return id;
+    }
+
+    private static async Task<long> CountAsync(McpTestServer server, Dictionary<string, object?> args)
+    {
+        var result = await server.Client.CallToolAsync("count_jobs", args);
+        Assert.False(result.IsError);
+        return result.StructuredContent!.Value.GetProperty("count").GetInt64();
     }
 
     private static async Task<Guid[]> SearchByTagsAsync(McpTestServer server, string[] tags)

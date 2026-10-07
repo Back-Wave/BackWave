@@ -783,6 +783,7 @@ public sealed class InMemoryJobStore(
                     DueTime = retryAt,
                     LeaseOwner = null,
                     LeaseExpiry = null,
+                    RetryCause = RetryCause.HandlerFailed,
                 },
                 JobOutcome.Failure failure => job with
                 {
@@ -939,6 +940,7 @@ public sealed class InMemoryJobStore(
                         DueTime = dueTime,
                         LeaseOwner = null,
                         LeaseExpiry = null,
+                        RetryCause = RetryCause.LeaseExpired,
                     }
                     : job with
                     {
@@ -1069,6 +1071,7 @@ public sealed class InMemoryJobStore(
                 CancelRequested = false,
                 TerminalAt = null,
                 TerminalCause = null,
+                RetryCause = null,
             };
             RecordTransition(jobId, JobState.Scheduled, 0, now); // Attempt budget reset (§3)
             AppendAudit(actor, OperatorAction.Requeue, jobId.ToString(), now);
@@ -1712,9 +1715,18 @@ public sealed class InMemoryJobStore(
         }
     }
 
+    /// <inheritdoc/>
+    public ValueTask<long> CountMatchingJobsAsync(JobQuery query, CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+        {
+            return ValueTask.FromResult((long)_jobs.Values.Count(j => MatchesScope(j, query)));
+        }
+    }
+
     /// <summary>
-    /// The <em>scope</em> predicate shared by <see cref="ListJobsAsync"/> and
-    /// <see cref="FacetAsync"/>: the scalar filters AND-ed with the tag predicates. Pagination
+    /// The <em>scope</em> predicate shared by <see cref="ListJobsAsync"/>, <see cref="CountMatchingJobsAsync"/>,
+    /// and <see cref="FacetAsync"/>: the scalar filters AND-ed with the tag predicates. Pagination
     /// (cursor/sort/take) is NOT part of the scope — facets count the whole matching population.
     /// </summary>
     private static bool MatchesScope(JobRecord j, JobQuery query)
@@ -1722,6 +1734,7 @@ public sealed class InMemoryJobStore(
             && (query.Queue is null || j.Queue == query.Queue)
             && (query.WireName is null || j.WireName == query.WireName)
             && (query.ScheduleId is null || j.ScheduleId == query.ScheduleId)
+            && (!query.Retrying || (j.State == JobState.Scheduled && j.RetryCause is not null))
             // Tag predicates are AND-ed (ADR 0022): a job must satisfy EVERY predicate.
             // An empty list adds no constraint (All over empty is true). OR is out of scope.
             && query.TagPredicates.All(p => p.Matches(j.Tags));

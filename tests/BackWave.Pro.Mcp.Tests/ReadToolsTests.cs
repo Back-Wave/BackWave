@@ -23,11 +23,12 @@ public sealed class ReadToolsTests
 
         var tools = await server.Client.ListToolsAsync();
 
-        // The complete 14-tool non-sensitive read surface (the 12 plain reads plus the two
+        // The complete 15-tool non-sensitive read surface (the 13 plain reads plus the two
         // workflow reads of 0228); this assertion is exact so it fails loudly if a sensitive or
         // write tool ever leaks into the unconfigured default.
         string[] expected =
         [
+            "count_jobs",
             "get_job",
             "get_job_dependencies",
             "get_job_history",

@@ -577,7 +577,8 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                    inserted.state, inserted.due_time, inserted.attempt, inserted.lease_owner,
                    inserted.lease_expiry, inserted.cancel_requested, inserted.terminal_at,
                    inserted.terminal_cause, inserted.schedule_id, inserted.parents_remaining,
-                   inserted.mode, inserted.trace_context, inserted.[sequence], inserted.workflow_id
+                   inserted.mode, inserted.trace_context, inserted.[sequence], inserted.workflow_id,
+                   inserted.retry_cause
             FROM @batch c
             INNER LOOP JOIN backwave.jobs j ON j.job_id = c.job_id;
             """,
@@ -817,7 +818,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                         }
                     })),
             JobOutcome.Failure { NextDueTime: { } retryAt } =>
-                ("state = 0, due_time = @retryAt, lease_owner = NULL, lease_expiry = NULL",
+                ("state = 0, due_time = @retryAt, lease_owner = NULL, lease_expiry = NULL, retry_cause = 1",
                     command => command.Parameters.AddWithValue("retryAt", retryAt)),
             JobOutcome.Failure failure =>
                 ("state = 5, lease_owner = NULL, lease_expiry = NULL, terminal_at = @now, terminal_cause = @cause",
@@ -972,7 +973,8 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         // @batch under UPDLOCK, so they hold only U locks until the UPDATE. The UPDATE returns each
         // applied row via OUTPUT, keyed by job id. due_time moves only for a retry row (COALESCE keeps
         // it for everyone else); cancel_requested clears only for a Cancelled row (CASE).
-        // terminal_at/terminal_cause carry per-row (null for a retry).
+        // terminal_at/terminal_cause carry per-row (null for a retry). retry_cause records a
+        // handler-failure retry and is left alone on every terminal row.
         //
         // Transition Log (§5.12): one entry per fenced row for its resulting state at this Attempt,
         // written between the fence and the UPDATE - see the note in ExpireLeasesUntracedAsync. The
@@ -1010,7 +1012,8 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                 terminal_at = d.terminal_at,
                 terminal_cause = d.cause,
                 due_time = COALESCE(d.due, j.due_time),
-                cancel_requested = CASE WHEN d.state = 4 THEN 0 ELSE j.cancel_requested END
+                cancel_requested = CASE WHEN d.state = 4 THEN 0 ELSE j.cancel_requested END,
+                retry_cause = CASE WHEN d.state = 0 THEN 1 ELSE j.retry_cause END
             OUTPUT inserted.job_id, inserted.state
             FROM @batch d
             INNER LOOP JOIN backwave.jobs j ON j.job_id = d.job_id;
@@ -1395,7 +1398,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             var rows = string.Join(", ", retries.Select((_, i) => $"(@rid{i}, @rdue{i})"));
             await using var reschedule = Cmd(
                 $"""
-                UPDATE j SET state = 0, due_time = d.due, lease_owner = NULL, lease_expiry = NULL
+                UPDATE j SET state = 0, due_time = d.due, lease_owner = NULL, lease_expiry = NULL, retry_cause = 2
                 FROM (VALUES {rows}) AS d(job_id, due)
                 INNER LOOP JOIN backwave.jobs j ON j.job_id = d.job_id
                 """,
@@ -1701,7 +1704,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             """
             UPDATE backwave.jobs
             SET state = 0, attempt = 0, due_time = @now, lease_owner = NULL, lease_expiry = NULL,
-                cancel_requested = 0, terminal_at = NULL, terminal_cause = NULL
+                cancel_requested = 0, terminal_at = NULL, terminal_cause = NULL, retry_cause = NULL
             OUTPUT inserted.job_id
             WHERE job_id = @id AND state IN (5, 6)
             """,
@@ -2411,7 +2414,21 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         return counts;
     }
 
-    // Builds the §5.9 scope conditions shared by ListJobsAsync and FacetAsync — the scalar filters
+    /// <inheritdoc/>
+    public async ValueTask<long> CountMatchingJobsAsync(JobQuery query, CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = new SqlCommand { Connection = connection };
+        var conditions = new List<string>();
+        AppendScopeConditions(query, conditions, command);
+        var where = conditions.Count > 0 ? $"WHERE {string.Join(" AND ", conditions)}" : string.Empty;
+        command.CommandText = _schema.Rewrite($"SELECT COUNT_BIG(*) FROM backwave.jobs {where}");
+        return (long)(await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
+    }
+
+    // Builds the §5.9 scope conditions shared by the job list, count, and facet reads — the scalar filters
     // plus the AND-ed tag predicates (ADR 0022), each an EXISTS over job_tags correlated to the job
     // row (has-key-any-value omits the value condition). Everything is parameterized onto `command`.
     // Pagination is NOT a scope condition — the caller adds it. The empty-string key sentinel carries
@@ -2437,6 +2454,10 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         {
             conditions.Add("schedule_id = @scheduleId");
             command.Parameters.Add("scheduleId", SqlDbType.NVarChar, 450).Value = scheduleId;
+        }
+        if (query.Retrying)
+        {
+            conditions.Add("state = 0 AND retry_cause IS NOT NULL");
         }
         for (var i = 0; i < query.TagPredicates.Count; i++)
         {
@@ -3674,7 +3695,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
     private const string JobColumns =
         "job_id, wire_name, payload, queue, state, due_time, attempt, lease_owner, lease_expiry, " +
         "cancel_requested, terminal_at, terminal_cause, schedule_id, parents_remaining, mode, trace_context, " +
-        "[sequence], workflow_id";
+        "[sequence], workflow_id, retry_cause";
 
     private static JobRecord ReadJob(SqlDataReader reader)
     {
@@ -3712,7 +3733,26 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             TraceContext = reader.IsDBNull(15) ? null : reader.GetString(15),
             Sequence = reader.GetInt64(16),
             WorkflowId = reader.IsDBNull(17) ? null : reader.GetGuid(17),
+            RetryCause = ReadRetryCause(reader, 18),
         };
+    }
+
+    // The retry cause is nullable (no cause is NULL, never a number), and a stored number outside the
+    // enum surfaces as the named violation, the same as an undefined state.
+    private static RetryCause? ReadRetryCause(SqlDataReader reader, int ordinal)
+    {
+        if (reader.IsDBNull(ordinal))
+        {
+            return null;
+        }
+        var storedCause = reader.GetInt32(ordinal);
+        if (!Enum.IsDefined((RetryCause)storedCause))
+        {
+            throw Invariant.Halt(
+                InvariantTrigger.UndefinedEnumValueStored,
+                $"Job {reader.GetGuid(0)} stores retry cause {storedCause}, which is not a defined RetryCause.");
+        }
+        return (RetryCause)storedCause;
     }
 
     // Every read of a state column an out-of-band write can reach goes through here: a value outside the
