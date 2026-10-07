@@ -128,6 +128,25 @@ public sealed class BackWaveMonitor(
     }
 
     /// <summary>
+    /// The number of jobs matching a filter, across the whole matching population. Use it to show a
+    /// total next to a filtered <see cref="ListJobsAsync"/> page (for example "1,204 quarantined jobs
+    /// on the <c>lab</c> queue"). The count uses the same filters as <see cref="ListJobsAsync"/>:
+    /// state, queue, wire name, schedule id, and tag predicates, each narrowing the count.
+    /// <para>
+    /// The query's paging fields do not apply: <see cref="JobQuery.AfterSequence"/>,
+    /// <see cref="JobQuery.SortDirection"/>, and <see cref="JobQuery.MaxResults"/> are ignored, and
+    /// <see cref="MaxMonitorPageSize"/> does not cap the count.
+    /// </para>
+    /// </summary>
+    /// <param name="query">
+    /// The filter. When <c>null</c>, an empty query is used, which counts all jobs.
+    /// </param>
+    /// <param name="cancellationToken">Cancels the read.</param>
+    /// <returns>The number of matching jobs; zero when nothing matches.</returns>
+    public ValueTask<long> GetJobCountAsync(JobQuery? query = null, CancellationToken cancellationToken = default)
+        => store.CountMatchingJobsAsync(query ?? new JobQuery(), cancellationToken);
+
+    /// <summary>
     /// One job's payload bytes, rendered best-effort for display. The payload is opaque to BackWave —
     /// serialized by your own serializer and never parsed here — so it is decoded as UTF-8 with a hex
     /// dump fallback for non-text bytes. A <see cref="JobSnapshot"/> never carries payload bytes; this

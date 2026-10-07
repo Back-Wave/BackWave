@@ -641,6 +641,18 @@ monitor.MapGet("/jobs", async (BackWaveMonitor m, JobState? state, string? queue
     Results.Ok(await m.ListJobsAsync(new JobQuery { State = state, Queue = queue })))
     .WithSummary("List jobs, optionally filtered by state and/or queue.");
 
+monitor.MapGet("/jobs/count", async (BackWaveMonitor m, JobState? state, string? queue, string? tenant) =>
+    Results.Ok(new
+    {
+        count = await m.GetJobCountAsync(new JobQuery
+        {
+            State = state,
+            Queue = queue,
+            TagPredicates = tenant is null ? [] : [JobTagPredicate.HasKeyValue("tenant", tenant)],
+        }),
+    }))
+    .WithSummary("Count the jobs that match the filters: ?state=, ?queue=, ?tenant=. Not capped by the page size.");
+
 monitor.MapGet("/queues", async (BackWaveMonitor m) => Results.Ok(await m.GetQueueDepthsAsync()))
     .WithSummary("Queue depths: job counts by queue and state.");
 

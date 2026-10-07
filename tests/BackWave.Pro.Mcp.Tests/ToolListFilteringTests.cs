@@ -20,11 +20,11 @@ public sealed class ToolListFilteringTests
     // literals, deliberately NOT the ToolNames constants, so a rename of a tool's wire value breaks
     // this test instead of silently sliding through. It catches the rename-ships-ungated trap two
     // ways: a write tool whose attribute Name drifts from its gate key would surface in the default
-    // (ungranted) list and fail DefaultServer_PresentsExactlyTheFourteenReadTools; a read tool
+    // (ungranted) list and fail DefaultServer_PresentsExactlyTheFifteenReadTools; a read tool
     // dropped or renamed would fail the same set-equality. The all-granted set pins the full surface.
     private static readonly string[] DefaultReadTools =
     [
-        "search_jobs", "get_job", "get_job_history", "get_job_dependencies",
+        "search_jobs", "count_jobs", "get_job", "get_job_history", "get_job_dependencies",
         "get_observer_lag", "list_observer_dead_letters",
         "list_workflows", "get_workflow",
         "get_queue_settings", "get_tag_facet", "list_wire_names", "list_schedules", "list_audit_records",
@@ -33,11 +33,11 @@ public sealed class ToolListFilteringTests
 
     private static readonly string[] SensitiveDataTools = ["get_job_payload", "get_job_output"];
 
-    private static readonly string[] AllTwentyThreeTools =
+    private static readonly string[] AllTwentyFourTools =
         [.. DefaultReadTools, .. AllWriteTools, "cancel_workflow", .. SensitiveDataTools];
 
     [Fact]
-    public async Task DefaultServer_PresentsExactlyTheFourteenReadTools()
+    public async Task DefaultServer_PresentsExactlyTheFifteenReadTools()
     {
         // No write grants and sensitive data not authorized: tools/list is exactly the read surface.
         // Set-equality (not Contains) is the point — an accidentally-ungated write tool would appear,
@@ -50,7 +50,7 @@ public sealed class ToolListFilteringTests
     }
 
     [Fact]
-    public async Task EveryGateGranted_PresentsExactlyTheFullTwentyThreeTools()
+    public async Task EveryGateGranted_PresentsExactlyTheFullTwentyFourTools()
     {
         // Every write callback granted AND sensitive data exposed: tools/list is the entire surface,
         // no more and no less. This pins the full membership so an added or removed tool is caught.
@@ -69,7 +69,7 @@ public sealed class ToolListFilteringTests
 
         var tools = (await server.Client.ListToolsAsync()).Select(t => t.Name).ToHashSet();
 
-        Assert.Equal(AllTwentyThreeTools.ToHashSet(), tools);
+        Assert.Equal(AllTwentyFourTools.ToHashSet(), tools);
     }
 
     [Fact]

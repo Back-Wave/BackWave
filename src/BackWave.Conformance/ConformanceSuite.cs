@@ -1795,6 +1795,89 @@ public abstract class ConformanceSuite
         Assert.Contains(new QueueStateCount("other", JobState.Scheduled, 1), counts);
     }
 
+    /// <summary>
+    /// Certifies that the filtered count equals the size of the filtered listing for every filter kind -
+    /// state, queue, wire name, schedule id, each tag predicate shape, and a combination - and is zero
+    /// for a filter that matches nothing.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_9_CountMatchingJobs_EqualsTheListing_ForEveryFilterKind()
+    {
+        var store = await CreateStoreAsync();
+        await store.EnqueueAsync(Job() with { Tags = JobTags.Empty.WithTag("tenant", "acme").WithLabel("urgent") }, T0);
+        await store.EnqueueAsync(Job() with { Tags = JobTags.Empty.WithTag("tenant", "globex") }, T0);
+        await store.EnqueueAsync(Job(), T0);
+        await store.EnqueueAsync(Job(queue: "other", wireName: "other-job") with { Tags = JobTags.Empty.WithTag("tenant", "acme") }, T0);
+        var claimed = Assert.Single(await ClaimAsync(store, T0, maxJobs: 1));
+        await store.ReportOutcomeAsync(claimed.JobId, "w1", claimed.Attempt, new JobOutcome.Success(), T0);
+        await store.UpsertScheduleAsync(Schedule("nightly", cursor: T0));
+        var tick = T0.AddDays(1).AddHours(3);
+        Assert.Equal(1, await store.MintDueAsync(
+            [new MintDecision("nightly", ExpectedCursor: T0, NewCursor: tick, Ticks: [tick], SkippedTicks: [])]));
+
+        (JobQuery Query, long Expected)[] cases =
+        [
+            (new JobQuery(), 5),
+            (new JobQuery { State = JobState.Succeeded }, 1),
+            (new JobQuery { State = JobState.Scheduled }, 4),
+            (new JobQuery { Queue = "other" }, 1),
+            (new JobQuery { WireName = "other-job" }, 1),
+            (new JobQuery { ScheduleId = "nightly" }, 1),
+            (new JobQuery { TagPredicates = [JobTagPredicate.HasKeyValue("tenant", "acme")] }, 2),
+            (new JobQuery { TagPredicates = [JobTagPredicate.HasKey("tenant")] }, 3),
+            (new JobQuery { TagPredicates = [JobTagPredicate.HasLabel("urgent")] }, 1),
+            (new JobQuery
+            {
+                Queue = "default",
+                TagPredicates = [JobTagPredicate.HasKeyValue("tenant", "acme"), JobTagPredicate.HasLabel("urgent")],
+            }, 1),
+            (new JobQuery { Queue = "nowhere" }, 0),
+        ];
+        foreach (var (query, expected) in cases)
+        {
+            Assert.Equal(expected, await store.CountMatchingJobsAsync(query));
+            Assert.Equal((await store.ListJobsAsync(query)).Count, await store.CountMatchingJobsAsync(query));
+        }
+    }
+
+    /// <summary>
+    /// Certifies that the filtered count ignores the query's paging fields - the after-cursor, the sort
+    /// direction, and the page size - and is never capped by the monitor page bound.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_9_CountMatchingJobs_IgnoresPaging_AndIsNotCappedByThePageBound()
+    {
+        var store = await CreateStoreAsync();
+        var total = store.Bounds.MaxMonitorPageSize + 1;
+        for (var i = 0; i < total; i++)
+        {
+            await store.EnqueueAsync(Job(), now: T0);
+        }
+        await store.EnqueueAsync(Job(queue: "other"), now: T0);
+        var first = (await store.ListJobsAsync(new JobQuery { Queue = "default", MaxResults = 1 }))[0];
+
+        Assert.Equal(total, await store.CountMatchingJobsAsync(new JobQuery { Queue = "default" }));
+        Assert.Equal(total, await store.CountMatchingJobsAsync(new JobQuery { Queue = "default", MaxResults = 1 }));
+        Assert.Equal(total, await store.CountMatchingJobsAsync(
+            new JobQuery { Queue = "default", AfterSequence = first.Sequence }));
+        Assert.Equal(total, await store.CountMatchingJobsAsync(
+            new JobQuery { Queue = "default", SortDirection = JobSortDirection.NewestFirst, AfterSequence = first.Sequence }));
+        Assert.Equal(total + 1, await store.CountMatchingJobsAsync(new JobQuery { MaxResults = 1 }));
+    }
+
+    /// <summary>
+    /// Certifies that the filtered count of an empty store is zero, with or without a filter.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_9_CountMatchingJobs_EmptyStore_IsZero()
+    {
+        var store = await CreateStoreAsync();
+
+        Assert.Equal(0, await store.CountMatchingJobsAsync(new JobQuery()));
+        Assert.Equal(0, await store.CountMatchingJobsAsync(
+            new JobQuery { State = JobState.Scheduled, TagPredicates = [JobTagPredicate.HasLabel("urgent")] }));
+    }
+
     // ── §5.9 Retrying: the jobs an attempt went wrong for ───────────────────────
 
     private static async Task<IReadOnlyList<JobRecord>> ListRetryingAsync(IJobStore store, string? queue = null)

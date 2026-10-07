@@ -12,6 +12,7 @@ internal static class ToolNames
 {
     // JobTools
     public const string SearchJobs = "search_jobs";
+    public const string CountJobs = "count_jobs";
     public const string GetJob = "get_job";
     public const string GetJobHistory = "get_job_history";
     public const string GetJobDependencies = "get_job_dependencies";
