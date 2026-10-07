@@ -131,6 +131,8 @@ enqueued atomically (ADR 0023). Each renders as a graph at `/backwave/workflows/
 
 **Monitor** (`/monitor`)
 - `GET /monitor/jobs/{id}` · `GET /monitor/jobs?state=&queue=` · `GET /monitor/queues`
+- `GET /monitor/jobs/count?state=&queue=&tenant=` - the number of jobs that match the filters.
+  The page size does not cap it.
 - `GET /monitor/workflows` — every Workflow with its derived status + member count.
 - `GET /monitor/workflows/{id}` — one Workflow's graph: members, structural Dependency edges, status.
 - `GET /monitor/tagged?tenant=&label=` — filter jobs by Tags; predicates **AND** (a Keyed

@@ -2042,7 +2042,21 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         return counts;
     }
 
-    // Builds the §5.9 scope conditions shared by ListJobsAsync and FacetAsync — the scalar filters
+    /// <inheritdoc/>
+    public async ValueTask<long> CountMatchingJobsAsync(JobQuery query, CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        var conditions = new List<string>();
+        AppendScopeConditions(query, conditions, command);
+        var where = conditions.Count > 0 ? $"WHERE {string.Join(" AND ", conditions)}" : string.Empty;
+        command.CommandText = _schema.Rewrite($"SELECT count(*) FROM backwave_jobs {where}");
+        return (long)(await command.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
+    }
+
+    // Builds the §5.9 scope conditions shared by the job list, count, and facet reads — the scalar filters
     // plus the AND-ed tag predicates (ADR 0022), each an EXISTS over backwave_job_tags correlated to
     // the job row. Pagination is NOT a scope condition — the caller adds it. The empty-string key
     // sentinel carries Labels.
