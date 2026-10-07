@@ -815,6 +815,15 @@ public sealed record JobQuery
     public string? ScheduleId { get; init; }
 
     /// <summary>
+    /// When true, match only Retrying jobs: jobs that are Scheduled and carry a
+    /// <see cref="JobRecord.RetryCause"/>, so they are waiting for another attempt because the handler
+    /// failed or the lease expired. A new job and a requeued job do not match, and a clean-stop hand-back
+    /// of the lease does not make a job match. False (the default) adds no constraint. Like every filter it is AND-ed with the
+    /// others, so a <see cref="State"/> other than Scheduled together with this flag matches nothing.
+    /// </summary>
+    public bool Retrying { get; init; }
+
+    /// <summary>
     /// Tag predicates AND-ed together and AND-composed with the scalar filters above: a job matches
     /// only when it satisfies EVERY predicate. An empty list adds no constraint (matches everything).
     /// OR and arbitrary boolean trees are out of scope — a caller wanting OR runs two queries.

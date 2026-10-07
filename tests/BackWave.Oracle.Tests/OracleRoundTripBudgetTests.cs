@@ -43,7 +43,9 @@ public sealed class OracleRoundTripBudgetTests
         new(Guid.NewGuid(), "budget-test", "{}"u8.ToArray(), queue, T0);
 
     // The recorded budgets: measured 2026-08-22 against Oracle Free 23 on ODP.NET 23.9.1, at schema
-    // version 1. Each is the cost of ONE call; the arithmetic behind each number is in its test.
+    // version 1. The fetch window was measured again 2026-10-06 at schema version 2, where the jobs row
+    // gained the 22-byte retry cause column. Each is the cost of ONE call; the arithmetic behind each
+    // number is in its test.
 
     private static readonly Budget Claim = new(
         "ClaimBatchAsync of 32 jobs (one queue, cold caches)",
@@ -74,12 +76,12 @@ public sealed class OracleRoundTripBudgetTests
         Statements: 3, LobReads: 0, FetchWindowBytes: 0);
 
     // The window a statement selecting the full jobs column set declares: 32 rows (one claim batch) of
-    // 140,447 bytes, which is the driver's own size for that row - both LOB columns at the 65,536
+    // 140,469 bytes, which is the driver's own size for that row - both LOB columns at the 65,536
     // payload prefetch, plus about 9 KB of scalars. Claim and job list select the same columns, so they
     // share it. The page size does NOT enter it: a 200-row page arrives in seven windows of this size
     // rather than one window seven times as wide, which is what keeps the monitor listing off the
     // memory ceiling.
-    private const long JobPageWindow = 4_494_304;
+    private const long JobPageWindow = 4_495_008;
 
     [Fact]
     public async Task Claim_of_a_full_batch_stays_within_its_round_trip_budget()

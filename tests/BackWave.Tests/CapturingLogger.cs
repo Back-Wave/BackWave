@@ -12,22 +12,39 @@ internal sealed record LogRecord(
 
 internal sealed class LogCapture
 {
-    public List<LogRecord> Records { get; } = [];
+    private readonly List<LogRecord> _records = [];
+
+    // A handler the pump abandoned unwinds on a pool thread and can log while the test reads, so a read
+    // takes a copy under the same lock the logger writes under.
+    public IReadOnlyList<LogRecord> Records
+    {
+        get
+        {
+            lock (_records)
+            {
+                return [.. _records];
+            }
+        }
+    }
+
+    public void Add(LogRecord record)
+    {
+        lock (_records)
+        {
+            _records.Add(record);
+        }
+    }
 
     public bool Enabled { get; set; } = true;
 }
 
 internal sealed class CapturingLogger(LogCapture capture) : ILogger
 {
-    // The pump drives one execution at a time and scopes open/close in order, so a simple stack is enough
-    // for these single-job tests.
-    private readonly List<object?> _scopes = [];
+    // Scopes follow the async flow that opened them, as in a real logging provider, so a handler that
+    // unwinds on a pool thread neither sees nor closes the scopes of the code that drives the pump.
+    private readonly LoggerExternalScopeProvider _scopes = new();
 
-    public IDisposable BeginScope<TState>(TState state) where TState : notnull
-    {
-        _scopes.Add(state);
-        return new Pop(_scopes);
-    }
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => _scopes.Push(state);
 
     public bool IsEnabled(LogLevel logLevel) => capture.Enabled;
 
@@ -36,19 +53,16 @@ internal sealed class CapturingLogger(LogCapture capture) : ILogger
         Func<TState, Exception?, string> formatter)
     {
         var scope = new List<KeyValuePair<string, object?>>();
-        foreach (var open in _scopes)
-        {
-            if (open is IEnumerable<KeyValuePair<string, object?>> pairs)
+        _scopes.ForEachScope(
+            (open, collected) =>
             {
-                scope.AddRange(pairs);
-            }
-        }
-        capture.Records.Add(new LogRecord(logLevel, eventId.Id, formatter(state, exception), scope));
-    }
-
-    private sealed class Pop(List<object?> scopes) : IDisposable
-    {
-        public void Dispose() => scopes.RemoveAt(scopes.Count - 1);
+                if (open is IEnumerable<KeyValuePair<string, object?>> pairs)
+                {
+                    collected.AddRange(pairs);
+                }
+            },
+            scope);
+        capture.Add(new LogRecord(logLevel, eventId.Id, formatter(state, exception), scope));
     }
 }
 

@@ -16,10 +16,9 @@ namespace BackWave.Upgrade.Tests;
 public sealed class UpgradeHarnessTests
 {
     // Short workload per prior version keeps the shipped-prior-version sweep battery-friendly while still
-    // running a real concurrent workload across the freshly migrated schema. SQL Server ships v2, so its
-    // sweep carries one real step (v1 -> v2) that populates, migrates, works and audits. Postgres is still
-    // at the re-baselined consolidated v1, so its sweep (v1..v(current-1)) is legitimately empty and that
-    // clean fact passes vacuously; the sabotage fact below still exercises the oracle end to end.
+    // running a real concurrent workload across the freshly migrated schema. Each prior version in the
+    // sweep (v1..v(current-1)) populates, migrates to current, works and audits: SQL Server carries v1 and
+    // v2, Postgres carries v1. The sabotage fact below proves the oracle turns red on a broken upgrade.
     private static readonly TimeSpan BatteryWorkload = TimeSpan.FromSeconds(3);
 
     [Fact]
@@ -47,8 +46,7 @@ public sealed class UpgradeHarnessTests
     [Fact]
     public async Task Sabotage_LosingAPopulatedJobDuringMigration_TurnsTheHarnessRed()
     {
-        // Hand-break the migration on the consolidated v1 (the only shipped version, so the empty sweep
-        // cannot exercise the oracle on its own): populate the base v1 fixture inventory, run the real
+        // Hand-break the migration from the consolidated v1: populate the base v1 fixture inventory, run the real
         // idempotent migrate-to-current, delete a populated fixture job, and prove the conservation oracle
         // goes RED. Proves the harness has teeth — a broken upgrade cannot pass green.
         var exit = await UpgradeRun.RunAsync(new UpgradeOptions

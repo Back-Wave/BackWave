@@ -182,7 +182,7 @@ public sealed class SqlServerCoordinatedMigrationTests
     // so a v2 script that inserted again would leave the row at 1 and every node would fail-stop on
     // skew. Pinning both the row count and the version is what catches that.
     [Fact]
-    public async Task AV1Database_UpgradesInPlaceToV2()
+    public async Task AV1Database_UpgradesInPlaceToTheCurrentVersion()
     {
         await DropSchemaAsync();
         await ApplyScriptAsync("0001_initial.sql");
@@ -191,7 +191,6 @@ public sealed class SqlServerCoordinatedMigrationTests
         await SqlServerMigrator.MigrateAsync(SqlServerTestDatabase.ConnectionString, Schema);
 
         Assert.Equal(1, await SchemaVersionRowCountAsync());
-        Assert.Equal(2, await DeployedVersionAsync());
         Assert.Equal(SqlServerMigrator.ExpectedSchemaVersion, await DeployedVersionAsync());
         Assert.Equal("lease_owner", await LeaseOwnerIndexKeyColumnAsync());
     }

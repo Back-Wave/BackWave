@@ -783,6 +783,7 @@ public sealed class InMemoryJobStore(
                     DueTime = retryAt,
                     LeaseOwner = null,
                     LeaseExpiry = null,
+                    RetryCause = RetryCause.HandlerFailed,
                 },
                 JobOutcome.Failure failure => job with
                 {
@@ -939,6 +940,7 @@ public sealed class InMemoryJobStore(
                         DueTime = dueTime,
                         LeaseOwner = null,
                         LeaseExpiry = null,
+                        RetryCause = RetryCause.LeaseExpired,
                     }
                     : job with
                     {
@@ -1069,6 +1071,7 @@ public sealed class InMemoryJobStore(
                 CancelRequested = false,
                 TerminalAt = null,
                 TerminalCause = null,
+                RetryCause = null,
             };
             RecordTransition(jobId, JobState.Scheduled, 0, now); // Attempt budget reset (§3)
             AppendAudit(actor, OperatorAction.Requeue, jobId.ToString(), now);
@@ -1731,6 +1734,7 @@ public sealed class InMemoryJobStore(
             && (query.Queue is null || j.Queue == query.Queue)
             && (query.WireName is null || j.WireName == query.WireName)
             && (query.ScheduleId is null || j.ScheduleId == query.ScheduleId)
+            && (!query.Retrying || (j.State == JobState.Scheduled && j.RetryCause is not null))
             // Tag predicates are AND-ed (ADR 0022): a job must satisfy EVERY predicate.
             // An empty list adds no constraint (All over empty is true). OR is out of scope.
             && query.TagPredicates.All(p => p.Matches(j.Tags));

@@ -18,7 +18,7 @@ namespace BackWave.Sqlite;
 public static class SqliteMigrator
 {
     /// <summary>The schema version this build of the adapter requires the database to be at.</summary>
-    public const int ExpectedSchemaVersion = 2;
+    public const int ExpectedSchemaVersion = 3;
 
     // 3.35 is the floor that ships UPDATE … RETURNING, which the claim path relies on (ADR 0019).
     internal static readonly Version MinimumEngineVersion = new(3, 35, 0);
@@ -131,15 +131,21 @@ public static class SqliteMigrator
 
     // Runs every embedded schema script in version order on the given connection, optionally inside a
     // transaction. Shared by the coordinated (in-transaction) and opt-out (autocommit) paths. The WAL
-    // pragma is intentionally NOT here — it runs once, before, outside any transaction.
+    // pragma is intentionally NOT here - it runs once, before, outside any transaction. A script is
+    // step N of the schema (its position in version order), and a step at or below the version the file
+    // is already stamped at is skipped: SQLite has no ADD COLUMN IF NOT EXISTS, so a step that adds a
+    // column cannot be made safe to run twice in SQL alone.
     private static async Task ApplyScriptsAsync(
         SqliteConnection connection, SqliteTransaction? transaction, SchemaRewriter rewriter,
         CancellationToken cancellationToken)
     {
+        var deployed = await ReadDeployedVersionAsync(connection, transaction, rewriter, cancellationToken)
+            .ConfigureAwait(false);
         var assembly = typeof(SqliteMigrator).Assembly;
         var scripts = assembly.GetManifestResourceNames()
             .Where(name => name.EndsWith(".sql", StringComparison.Ordinal))
-            .OrderBy(name => name, StringComparer.Ordinal);
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .Skip((int)Math.Max(deployed, 0));
 
         foreach (var script in scripts)
         {
@@ -166,6 +172,13 @@ public static class SqliteMigrator
     private static async Task<bool> IsSchemaCurrentAsync(
         SqliteConnection connection, SqliteTransaction? transaction, SchemaRewriter rewriter,
         CancellationToken cancellationToken)
+        => await ReadDeployedVersionAsync(connection, transaction, rewriter, cancellationToken).ConfigureAwait(false)
+            >= ExpectedSchemaVersion;
+
+    // The version the file is stamped at, or 0 when it carries no BackWave schema yet.
+    private static async Task<long> ReadDeployedVersionAsync(
+        SqliteConnection connection, SqliteTransaction? transaction, SchemaRewriter rewriter,
+        CancellationToken cancellationToken)
     {
         await using (var probe = connection.CreateCommand())
         {
@@ -177,7 +190,7 @@ public static class SqliteMigrator
             var exists = (long)(await probe.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
             if (exists == 0)
             {
-                return false;
+                return 0;
             }
         }
 
@@ -188,7 +201,7 @@ public static class SqliteMigrator
         // connection. It decides whether the scripts still need running, which is boot work, not store
         // work.
         var version = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-        return version is long deployed && deployed >= ExpectedSchemaVersion;
+        return version is long deployed ? deployed : 0;
     }
 
     /// <summary>

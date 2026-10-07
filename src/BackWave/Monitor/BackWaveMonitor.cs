@@ -402,6 +402,7 @@ public sealed class BackWaveMonitor(
         CancelRequested = record.CancelRequested,
         TerminalAt = record.TerminalAt,
         TerminalCause = record.TerminalCause,
+        RetryCause = record.RetryCause,
         ScheduleId = record.ScheduleId,
         Sequence = record.Sequence,
         Tags = record.Tags,

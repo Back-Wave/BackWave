@@ -17,7 +17,7 @@ namespace BackWave.Postgres;
 public static class PostgresMigrator
 {
     /// <summary>The schema version this build of the adapter requires.</summary>
-    public const int ExpectedSchemaVersion = 1;
+    public const int ExpectedSchemaVersion = 2;
 
     // Reserved advisory-lock classid for migration coordination (ADR 0046). pg_advisory_xact_lock has
     // a two-int32 key space that is DISJOINT from the single-bigint per-queue config lock (issue 0193),

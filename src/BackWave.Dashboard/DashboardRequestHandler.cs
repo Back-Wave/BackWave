@@ -11,6 +11,7 @@ using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 namespace BackWave.Dashboard;
 
@@ -446,11 +447,17 @@ internal static class DashboardRequestHandler
     /// <summary>Holds the response open and pushes the re-rendered #bw-live fragment as Server-Sent
     /// Events, every <paramref name="interval"/>, but only when the markup changed since the last
     /// push (a comment heartbeat keeps the connection warm otherwise). Ends when the browser
-    /// disconnects.</summary>
+    /// disconnects or the application starts to stop.</summary>
     private static async Task StreamAsync(
         HttpContext context, LiveView view, TimeSpan interval, Dictionary<string, object?>? seed)
     {
-        var ct = context.RequestAborted;
+        // The server waits for open requests before the hosted services stop, so a stream that only
+        // ends on disconnect makes an open dashboard tab spend the host's whole shutdown window. The
+        // worker groups then have no time left to give their leases back on a clean stop.
+        var stopping = context.RequestServices.GetService<IHostApplicationLifetime>()?.ApplicationStopping
+            ?? CancellationToken.None;
+        using var streamEnd = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, stopping);
+        var ct = streamEnd.Token;
         context.Response.ContentType = "text/event-stream";
         context.Response.Headers.CacheControl = "no-cache";
         context.Response.Headers["X-Accel-Buffering"] = "no"; // don't let a reverse proxy buffer the stream
@@ -496,7 +503,7 @@ internal static class DashboardRequestHandler
         }
         catch (OperationCanceledException)
         {
-            // The browser navigated away or closed the tab — a normal end to the stream.
+            // The browser navigated away or closed the tab, or the application is stopping - a normal end to the stream.
         }
     }
 
@@ -538,15 +545,25 @@ internal static class DashboardRequestHandler
                 ? parsedSize
                 : PageSize;
 
+        // Retrying is not a state but a narrower view of Scheduled (a job waiting for another attempt
+        // because the handler failed or the lease expired), offered in the same State filter.
         JobState? state = null;
+        var retrying = false;
         if (query["state"] is [{ Length: > 0 } rawState])
         {
-            if (!Enum.TryParse<JobState>(rawState, ignoreCase: true, out var parsed))
+            if (string.Equals(rawState, DashboardGlossary.RetryingFilterValue, StringComparison.OrdinalIgnoreCase))
+            {
+                retrying = true;
+            }
+            else if (!Enum.TryParse<JobState>(rawState, ignoreCase: true, out var parsed))
             {
                 await BadRequestAsync(context, $"Unknown state '{rawState}'.").ConfigureAwait(false);
                 return;
             }
-            state = parsed;
+            else
+            {
+                state = parsed;
+            }
         }
         long? after = null;
         if (query["after"] is [{ Length: > 0 } rawAfter])
@@ -570,6 +587,7 @@ internal static class DashboardRequestHandler
             Queue = NonEmpty(query["queue"]),
             WireName = NonEmpty(query["wire"]),
             ScheduleId = NonEmpty(query["schedule"]),
+            Retrying = retrying,
             TagPredicates = tagPredicates,
             AfterSequence = after,
             SortDirection = JobSortDirection.NewestFirst, // historical table: most recent jobs first
@@ -709,10 +727,15 @@ internal static class DashboardRequestHandler
         // Glossary distinction, never collapsed (invariant I5): Dead-Lettered jobs ran and
         // kept failing; Quarantined jobs could not be routed or decoded. Both lists load every
         // tick — the inactive tab still shows a live count badge — but only the active tab's
-        // table renders, so a long Dead-Lettered list never buries the Quarantined one.
+        // table renders, so a long Dead-Lettered list never buries the Quarantined one. Retrying
+        // jobs are the third list: still live, waiting for another attempt because the handler
+        // failed or the lease expired, so trouble shows before it ends in a dead letter. Oldest
+        // job first, so a job stuck in a retry loop does not sink below newer ones.
         async () => new Dictionary<string, object?>
         {
             ["BasePath"] = basePath,
+            ["Retrying"] = await monitor.ListJobsAsync(
+                new JobQuery { Retrying = true, MaxResults = PageSize }).ConfigureAwait(false),
             ["DeadLettered"] = await monitor.ListJobsAsync(
                 new JobQuery { State = JobState.DeadLettered, SortDirection = JobSortDirection.NewestFirst, MaxResults = PageSize }).ConfigureAwait(false),
             ["Quarantined"] = await monitor.ListJobsAsync(

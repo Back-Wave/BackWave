@@ -17,7 +17,7 @@ namespace BackWave.Oracle;
 public static class OracleMigrator
 {
     /// <summary>The schema version this build of the adapter requires the database to be at.</summary>
-    public const int ExpectedSchemaVersion = 1;
+    public const int ExpectedSchemaVersion = 2;
 
     // Transient connection faults a cold-booting fleet can hit that the bounded retry should ride out
     // rather than surface: the shared listener/handshake-storm and connection-lost connectivity set.
@@ -100,8 +100,19 @@ public static class OracleMigrator
     private static async Task ApplyScriptsAsync(
         string connectionString, SchemaRewriter rewriter, CancellationToken cancellationToken)
     {
-        await using var connection = new OracleConnection(connectionString);
+        // A later script alters a table that other nodes can still be creating indexes and constraints on
+        // during a cold boot, or that live workers write to during an upgrade. DDL therefore waits for the
+        // table lock instead of failing at once with ORA-00054. The session does not go back to the pool,
+        // so the wait never reaches a store connection.
+        var unpooled = new OracleConnectionStringBuilder(connectionString) { Pooling = false };
+        await using var connection = new OracleConnection(unpooled.ConnectionString);
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using (var wait = connection.CreateCommand())
+        {
+            wait.CommandText = "ALTER SESSION SET ddl_lock_timeout = 30";
+            // uncounted round trip: part of the one-time migration, like the scripts below.
+            await wait.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         var assembly = typeof(OracleMigrator).Assembly;
         var scripts = assembly.GetManifestResourceNames()

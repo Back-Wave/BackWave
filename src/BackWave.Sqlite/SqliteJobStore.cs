@@ -685,7 +685,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                         }
                     })),
             JobOutcome.Failure { NextDueTime: { } retryAt } =>
-                ($"state = {(int)JobState.Scheduled}, due_time = $retryAt, lease_owner = NULL, lease_expiry = NULL",
+                ($"state = {(int)JobState.Scheduled}, due_time = $retryAt, lease_owner = NULL, lease_expiry = NULL, retry_cause = {(int)RetryCause.HandlerFailed}",
                     command => command.Parameters.AddWithValue("$retryAt", SqliteValueCodec.ToTicks(retryAt))),
             JobOutcome.Failure failure =>
                 ($"state = {(int)JobState.DeadLettered}, lease_owner = NULL, lease_expiry = NULL, terminal_at = $now, terminal_cause = $cause",
@@ -1069,7 +1069,8 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
                 await using var reschedule = Cmd(
                     $"""
                     UPDATE backwave_jobs
-                    SET state = {(int)JobState.Scheduled}, due_time = $due, lease_owner = NULL, lease_expiry = NULL
+                    SET state = {(int)JobState.Scheduled}, due_time = $due, lease_owner = NULL, lease_expiry = NULL,
+                        retry_cause = {(int)RetryCause.LeaseExpired}
                     WHERE job_id = $id
                     """,
                     connection, transaction);
@@ -1359,7 +1360,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
             $"""
             UPDATE backwave_jobs
             SET state = {(int)JobState.Scheduled}, attempt = 0, due_time = $now, lease_owner = NULL, lease_expiry = NULL,
-                cancel_requested = 0, terminal_at = NULL, terminal_cause = NULL
+                cancel_requested = 0, terminal_at = NULL, terminal_cause = NULL, retry_cause = NULL
             WHERE job_id = $id AND state IN ({(int)JobState.DeadLettered}, {(int)JobState.Quarantined})
             RETURNING job_id
             """,
@@ -2081,6 +2082,10 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         {
             conditions.Add("schedule_id = $scheduleId");
             command.Parameters.AddWithValue("$scheduleId", scheduleId);
+        }
+        if (query.Retrying)
+        {
+            conditions.Add($"state = {(int)JobState.Scheduled} AND retry_cause IS NOT NULL");
         }
         for (var i = 0; i < query.TagPredicates.Count; i++)
         {
@@ -3265,7 +3270,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
     private const string JobColumns =
         "sequence, job_id, wire_name, payload, trace_context, queue, state, due_time, attempt, " +
         "lease_owner, lease_expiry, cancel_requested, terminal_at, terminal_cause, schedule_id, " +
-        "parents_remaining, mode, workflow_id";
+        "parents_remaining, mode, workflow_id, retry_cause";
 
     private static JobRecord ReadJob(SqliteDataReader reader) => new()
     {
@@ -3287,6 +3292,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         ParentsRemaining = reader.GetInt32(15),
         Mode = SqliteValueCodec.ToEnum<DependencyMode>(reader.GetInt64(16)),
         WorkflowId = reader.IsDBNull(17) ? null : SqliteValueCodec.ToGuid(reader.GetString(17)),
+        RetryCause = reader.IsDBNull(18) ? null : SqliteValueCodec.ToEnum<RetryCause>(reader.GetInt64(18)),
     };
 
     // ── Job Tags (ADR 0022) ─────────────────────────────────────────────────────

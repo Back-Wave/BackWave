@@ -51,7 +51,7 @@ public sealed class JobToolsTests
         // The input contract is snake_case (the fixed tool shapes).
         var searchInputs = tools.Single(t => t.Name == "search_jobs").InputSchema!.Value.GetProperty("properties");
         foreach (var parameter in new[]
-                 { "state", "queue", "wire_name", "schedule_id", "tags", "after_cursor", "sort", "max_results" })
+                 { "state", "retrying", "queue", "wire_name", "schedule_id", "tags", "after_cursor", "sort", "max_results" })
         {
             Assert.True(searchInputs.TryGetProperty(parameter, out _), $"search_jobs is missing input '{parameter}'");
         }
@@ -396,6 +396,34 @@ public sealed class JobToolsTests
         Assert.True(badSort.IsError);
         Assert.Contains("newest_first", badSort.Text);
         Assert.Contains("oldest_first", badSort.Text);
+    }
+
+    [Fact]
+    public async Task SearchJobs_Retrying_ListsOnlyJobsAnAttemptWentWrongFor_WithTheirCause()
+    {
+        await using var server = await McpTestServer.StartAsync();
+        var failing = await server.SeedJobAsync("critical");
+        var claimed = Assert.Single(await server.Store.ClaimAsync(
+            new ClaimRequest("w1", ["critical"], 32, TimeSpan.FromMinutes(1), DateTimeOffset.UtcNow)));
+        await server.Store.ReportOutcomeAsync(
+            claimed.JobId, "w1", claimed.Attempt, new JobOutcome.Failure(DateTimeOffset.UtcNow.AddMinutes(5), "boom"), DateTimeOffset.UtcNow);
+        var fresh = await server.SeedJobAsync("critical");
+
+        var jobs = (await server.Client.CallToolAsync("search_jobs", new Dictionary<string, object?>
+        {
+            ["retrying"] = true,
+        })).StructuredContent!.Value.GetProperty("jobs").EnumerateArray().ToList();
+
+        var job = Assert.Single(jobs);
+        Assert.Equal(failing, job.GetProperty("jobId").GetGuid());
+        Assert.Equal("Scheduled", job.GetProperty("state").GetString());
+        Assert.Equal("HandlerFailed", job.GetProperty("retryCause").GetString());
+
+        // Without the filter the fresh job lists too, and carries no cause.
+        var all = (await server.Client.CallToolAsync("search_jobs")).StructuredContent!.Value
+            .GetProperty("jobs").EnumerateArray().ToList();
+        var freshRow = Assert.Single(all, j => j.GetProperty("jobId").GetGuid() == fresh);
+        Assert.True(!freshRow.TryGetProperty("retryCause", out var cause) || cause.ValueKind == JsonValueKind.Null);
     }
 
     [Fact]

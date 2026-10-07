@@ -118,6 +118,20 @@ internal static class DashboardGlossary
     /// </summary>
     public static string TagLabel(JobTag tag) => tag.IsLabel ? tag.Value : $"{tag.Key}:{tag.Value}";
 
+    /// <summary>
+    /// The State-filter value that selects Retrying jobs. Retrying is not a state: it is a Scheduled job
+    /// that carries a retry cause, so it is waiting for another attempt because something went wrong.
+    /// </summary>
+    public const string RetryingFilterValue = "Retrying";
+
+    /// <summary>A retry cause in plain words, for the Retrying list and the job detail.</summary>
+    public static string RetryCauseName(RetryCause cause) => cause switch
+    {
+        RetryCause.HandlerFailed => "Handler failed",
+        RetryCause.LeaseExpired => "Lease expired",
+        _ => cause.ToString(),
+    };
+
     /// <summary>Terminal states are settled; only non-terminal jobs can be Cancelled.</summary>
     public static bool IsTerminal(JobState state) => state is
         JobState.Succeeded or JobState.Cancelled or JobState.DeadLettered or JobState.Quarantined;

@@ -1,4 +1,4 @@
-@* Jobs list: filters (state, Queue, Wire Name, Recurring Schedule) and §5.9 cursor
+@* Jobs list: filters (state or Retrying, Queue, Wire Name, Recurring Schedule) and §5.9 cursor
    pagination (?after={sequence}), ported verbatim from the prior hand-written view onto
    the render spine. All data arrives via the Monitor API. *@
 <DashboardLayout BasePath="@BasePath" Title="Jobs" Active="jobs">
@@ -20,6 +20,12 @@
                                 @foreach (var state in DashboardGlossary.StateOrder)
                                 {
                                     <option value="@state" selected="@(Filter.State == state)">@DashboardGlossary.StateName(state)</option>
+                                    @if (state == JobState.Scheduled)
+                                    {
+                                        @* Retrying narrows Scheduled to the jobs waiting for another
+                                           attempt because the handler failed or the lease expired. *@
+                                        <option value="@DashboardGlossary.RetryingFilterValue" selected="@Filter.Retrying">Retrying</option>
+                                    }
                                 }
                             </select>
                             @Chevron
@@ -158,7 +164,7 @@
         }
 
         <div class="bw-card">
-            <JobTable BasePath="@BasePath" Jobs="Shown" RowAction="@RowAction" TagHref="@TagHref" />
+            <JobTable BasePath="@BasePath" Jobs="Shown" RowAction="@RowAction" TagHref="@TagHref" ShowRetryCause="@Filter.Retrying" />
         </div>
 
         @if (NextHref is { } next)
@@ -243,6 +249,10 @@
         {
             query.Add($"state={state}");
         }
+        if (Filter.Retrying)
+        {
+            query.Add($"state={DashboardGlossary.RetryingFilterValue}");
+        }
         if (Filter.Queue is { } queue)
         {
             query.Add($"queue={Uri.EscapeDataString(queue)}");
@@ -273,6 +283,10 @@
         if (Filter.State is { } state)
         {
             parts.Add($"state={state}");
+        }
+        if (Filter.Retrying)
+        {
+            parts.Add($"state={DashboardGlossary.RetryingFilterValue}");
         }
         if (Filter.Queue is { } queue)
         {
