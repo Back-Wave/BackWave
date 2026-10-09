@@ -31,6 +31,7 @@
     <Project Path="src/BackWave/BackWave.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/BackWave.AotConsumer/BackWave.AotConsumer.csproj" />
     <Project Path="tests/BackWave.Benchmarks.Tests/BackWave.Benchmarks.Tests.csproj" />
     <Project Path="tests/BackWave.Dashboard.Tests/BackWave.Dashboard.Tests.csproj" />
     <Project Path="tests/BackWave.EntityFrameworkCore.Tests/BackWave.EntityFrameworkCore.Tests.csproj" />

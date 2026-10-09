@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- A consumer that runs the AOT and trim analyzers over the generated job codecs. Any warning fails the
+       build, so the generated code must stay trim- and AOT-safe on every ship TFM. CI also publishes it with
+       native AOT and runs it: the program round-trips each job through its generated codec. -->
+  <PropertyGroup>
+    <TargetFrameworks>$(ShipTfms)</TargetFrameworks>
+    <TargetFramework></TargetFramework>
+    <OutputType>Exe</OutputType>
+    <PublishAot>true</PublishAot>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\BackWave\BackWave.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.SourceGenerators\BackWave.SourceGenerators.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+</Project>

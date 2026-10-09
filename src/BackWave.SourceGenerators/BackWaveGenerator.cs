@@ -17,17 +17,17 @@ namespace BackWave.SourceGenerators;
 /// output is NativeAOT- and trim-clean by construction.
 /// </summary>
 [Generator(LanguageNames.CSharp)]
-public sealed class BackWaveGenerator : IIncrementalGenerator
+public sealed partial class BackWaveGenerator : IIncrementalGenerator
 {
     private const string JobAttributeName = "BackWave.Jobs.JobAttribute";
     private const string RetryAttributeName = "BackWave.Jobs.RetryAttribute";
-    private const string JsonSerializableAttributeName = "System.Text.Json.Serialization.JsonSerializableAttribute";
 
     /// <summary>Tracked-step names, used by the incrementality test to assert cached reuse.</summary>
     public const string ParseStep = "BackWaveParse";
     public const string ModelsStep = "BackWaveModels";
     public const string HandlersStep = "BackWaveHandlers";
     public const string EmitInputStep = "BackWaveEmitInput";
+    public const string JsonContextsStep = "BackWaveJsonContexts";
 
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
@@ -58,10 +58,11 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
 
         // Diagnostics travel in their own pipeline branch — never inside the cached models.
         var parseDiagnostics = parseResults
-            .Select(static (result, _) => result.Diagnostic)
-            .Where(static diagnostic => diagnostic is not null);
+            .SelectMany(static (result, _) => result.Diagnostic is null
+                ? result.Warnings.AsImmutableArray()
+                : result.Warnings.AsImmutableArray().Insert(0, result.Diagnostic));
         context.RegisterSourceOutput(
-            parseDiagnostics, static (spc, diagnostic) => spc.ReportDiagnostic(diagnostic!.ToDiagnostic()));
+            parseDiagnostics, static (spc, diagnostic) => spc.ReportDiagnostic(diagnostic.ToDiagnostic()));
 
         // [Retry] is read only inside the [Job] pipeline above, so a [Retry] on a type or method with no
         // [Job] would be silently ignored - the same silent drop the loud-failure design prevents. This
@@ -90,9 +91,10 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
         // context here, so a missing serializer is caught at compile time rather than at run time.
         var jsonContexts = context.SyntaxProvider
             .ForAttributeWithMetadataName(
-                JsonSerializableAttributeName,
+                JsonSerializerContextRule.JsonSerializableAttributeName,
                 predicate: static (_, _) => true,
                 transform: static (ctx, _) => ExtractJsonContext(ctx))
+            .WithTrackingName(JsonContextsStep)
             .Where(static jsonContext => jsonContext is not null)
             .Collect();
 
@@ -147,27 +149,40 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
     /// The JsonSerializerContext-derived class and every type it lists via [JsonSerializable]. All
     /// applications on this declaration are read; a first constructor argument is the listed type's
     /// typeof(...) - its symbol becomes the global::-qualified FQN the completeness check matches on.
+    /// A listing the generated codec cannot use is kept apart with its reason, so it never binds a codec.
+    /// A [JsonSerializable] class that is not a JsonSerializerContext gives null.
     /// </summary>
     private static JsonContextInfo? ExtractJsonContext(GeneratorAttributeSyntaxContext context)
     {
-        if (context.TargetSymbol is not INamedTypeSymbol contextType)
+        if (context.TargetSymbol is not INamedTypeSymbol contextType
+            || !JsonSerializerContextRule.IsJsonSerializerContext(contextType))
         {
             return null;
         }
 
+        var compilation = context.SemanticModel.Compilation;
         var listed = ImmutableArray.CreateBuilder<string>();
+        var unusable = ImmutableArray.CreateBuilder<UnusableListing>();
         foreach (var attribute in context.Attributes)
         {
             if (attribute.ConstructorArguments.Length > 0
                 && attribute.ConstructorArguments[0].Value is ITypeSymbol listedType)
             {
-                listed.Add(listedType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat));
+                var typeFqn = listedType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+                if (JsonSerializerContextRule.UnusableReason(contextType, compilation, attribute) is { } reason)
+                {
+                    unusable.Add(new UnusableListing(typeFqn, reason));
+                    continue;
+                }
+                listed.Add(typeFqn);
             }
         }
 
         return new JsonContextInfo(
             contextType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
-            new EquatableArray<string>(listed.ToImmutable()));
+            new EquatableArray<string>(listed.ToImmutable()),
+            new EquatableArray<UnusableListing>(unusable.ToImmutable()),
+            JsonSerializerContextRule.SerializationOnlyReason(contextType));
     }
 
     private static ParseResult Parse(GeneratorAttributeSyntaxContext context)
@@ -209,10 +224,19 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
                 JobDiagnostics.InvalidRetryBackoff, location, backoffProblem));
         }
 
+        // The generated code names the payload type and calls the handler method with no type arguments.
+        switch (context.TargetSymbol)
+        {
+            case INamedTypeSymbol type when IsOrIsInGenericType(type):
+                return new ParseResult(null, DiagnosticInfo.Create(JobDiagnostics.GenericJobType, location, type.Name));
+            case IMethodSymbol method when method.IsGenericMethod || IsOrIsInGenericType(method.ContainingType):
+                return new ParseResult(null, DiagnosticInfo.Create(JobDiagnostics.InvalidJobMethod, location, method.Name));
+        }
+
         return context.TargetSymbol switch
         {
             INamedTypeSymbol type => ParseRecordJob(
-                type, wireName!, queue, labels, retryMaxAttempts, retryBackoffSeconds, location),
+                type, context.SemanticModel.Compilation, wireName!, queue, labels, retryMaxAttempts, retryBackoffSeconds, location),
             IMethodSymbol method => ParseMethodJob(
                 method, wireName!, queue, labels, retryMaxAttempts, retryBackoffSeconds, location),
             _ => new ParseResult(null, null),
@@ -321,13 +345,27 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
     }
 
     private static ParseResult ParseRecordJob(
-        INamedTypeSymbol type, string wireName, string queue, EquatableArray<string> labels,
+        INamedTypeSymbol type, Compilation compilation, string wireName, string queue, EquatableArray<string> labels,
         int retryMaxAttempts, EquatableArray<double> retryBackoffSeconds, LocationInfo? location)
     {
-        var members = ParseMembers(type, location, out var failure);
+        var warnings = ImmutableArray.CreateBuilder<DiagnosticInfo>();
+        var members = ParseMembers(type, compilation, warnings, out var failure);
         if (failure is not null)
         {
-            return new ParseResult(null, failure);
+            return new ParseResult(null, failure, warnings.ToImmutable());
+        }
+
+        // STJ generates no metadata for the member types of a type with a type-level converter, so a delegated
+        // member would fail at run time. The converter would never run anyway: the generated codec writes the
+        // members itself. A scalar-only payload needs no STJ metadata, so there the converter is only a warning.
+        if (HasTypeLevelJsonConverter(type))
+        {
+            if (members.Any(m => m.Kind == MemberKind.Delegated))
+            {
+                return new ParseResult(null, DiagnosticInfo.Create(
+                    JobDiagnostics.JsonConverterOnDelegatingPayload, location, type.Name), warnings.ToImmutable());
+            }
+            warnings.Add(DiagnosticInfo.Create(JobDiagnostics.JsonConverterOnScalarPayload, location, type.Name));
         }
 
         return new ParseResult(new JobModel
@@ -345,7 +383,7 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
             Members = members,
             OutputTypeFqn = OutputTypeFqn(type),
             Location = location,
-        }, null);
+        }, null, warnings.ToImmutable());
     }
 
     /// <summary>
@@ -369,7 +407,8 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
 
     /// <summary>Maps a payload type's single richest public constructor plus settable extras.</summary>
     private static EquatableArray<PayloadMember> ParseMembers(
-        INamedTypeSymbol type, LocationInfo? location, out DiagnosticInfo? failure)
+        INamedTypeSymbol type, Compilation compilation, ImmutableArray<DiagnosticInfo>.Builder warnings,
+        out DiagnosticInfo? failure)
     {
         failure = null;
 
@@ -395,22 +434,31 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
             {
                 var property = properties.FirstOrDefault(
                     p => string.Equals(p.Name, parameter.Name, StringComparison.OrdinalIgnoreCase));
-                if (property is null || !TryClassify(parameter.Type, out var kind, out var isNullable))
+                if (property is null)
                 {
                     failure = DiagnosticInfo.Create(
-                        JobDiagnostics.UnsupportedPayloadMember, location,
-                        parameter.Name, type.Name, parameter.Type.ToDisplayString());
+                        JobDiagnostics.UnsupportedPayloadMember, LocationInfo.CreateFrom(parameter.Locations[0]),
+                        parameter.Name, type.Name, DisplayFqn(parameter.Type),
+                        "no public property has the name of this constructor parameter, so the codec cannot read it back - " +
+                        "add the property, or " + JobDiagnostics.RegisterJobByHand);
+                    return default;
+                }
+                var asPropertyType = !SymbolEqualityComparer.Default.Equals(parameter.Type, property.Type);
+                var member = asPropertyType
+                    ? ClassifyAsPropertyType(property, parameter, compilation, type.Name, out failure)
+                    : ClassifyMember(property.Name, property.Name, parameter.Type, property.Locations[0], type.Name, out failure);
+                failure ??= DetectJsonAttribute(member, property, type.Name, warnings);
+                if (failure is not null)
+                {
                     return default;
                 }
                 claimed.Add(property.Name);
-                members.Add(new PayloadMember
+                members.Add(member! with
                 {
-                    Name = property.Name,
-                    TypeFqn = parameter.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
-                    Kind = kind,
-                    IsNullableValue = isNullable,
                     CtorPosition = parameter.Ordinal,
-                    MissingLiteral = MissingLiteral(parameter, kind, isNullable),
+                    MissingLiteral = MissingLiteral(parameter),
+                    ParameterTypeFqn = asPropertyType ? parameter.Type.ToDisplayString(AnnotatedFormat) : null,
+                    ParameterIsUnannotatedReference = asPropertyType && IsUnannotatedReference(parameter.Type),
                 });
             }
         }
@@ -421,24 +469,28 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
             {
                 continue; // computed property: not part of the wire shape
             }
-            if (!TryClassify(property.Type, out var kind, out var isNullable))
+            var member = ClassifyMember(property.Name, property.Name, property.Type, property.Locations[0], type.Name, out failure);
+            failure ??= DetectJsonAttribute(member, property, type.Name, warnings);
+            if (failure is not null)
             {
-                failure = DiagnosticInfo.Create(
-                    JobDiagnostics.UnsupportedPayloadMember, location,
-                    property.Name, type.Name, property.Type.ToDisplayString());
                 return default;
             }
-            members.Add(new PayloadMember
-            {
-                Name = property.Name,
-                TypeFqn = property.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
-                Kind = kind,
-                IsNullableValue = isNullable,
-                MissingLiteral = DefaultLiteral(kind, isNullable, property.Type),
-            });
+            members.Add(member!);
         }
 
         return members.ToImmutable();
+    }
+
+    private static bool IsOrIsInGenericType(INamedTypeSymbol? type)
+    {
+        for (; type is not null; type = type.ContainingType)
+        {
+            if (type.IsGenericType)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static ParseResult ParseMethodJob(
@@ -472,22 +524,18 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
                 callArguments.Add("cancellationToken");
                 continue;
             }
-            if (!TryClassify(parameter.Type, out var kind, out var isNullable))
-            {
-                return new ParseResult(null, DiagnosticInfo.Create(
-                    JobDiagnostics.UnsupportedPayloadMember, location,
-                    parameter.Name, recordName, parameter.Type.ToDisplayString()));
-            }
             var memberName = char.ToUpperInvariant(parameter.Name[0]) + parameter.Name.Substring(1);
-            callArguments.Add(memberName);
-            members.Add(new PayloadMember
+            var member = ClassifyMember(
+                memberName, parameter.Name, parameter.Type, parameter.Locations[0], recordName, out var failure);
+            if (failure is not null)
             {
-                Name = memberName,
-                TypeFqn = parameter.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
-                Kind = kind,
-                IsNullableValue = isNullable,
+                return new ParseResult(null, failure);
+            }
+            callArguments.Add(memberName);
+            members.Add(member! with
+            {
                 CtorPosition = members.Count,
-                MissingLiteral = MissingLiteral(parameter, kind, isNullable),
+                MissingLiteral = MissingLiteral(parameter),
             });
         }
 
@@ -513,72 +561,13 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
                 ContainingTypeFqn = containingType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
                 MethodName = method.Name,
                 IsStatic = method.IsStatic,
-                Accessibility = containingType.DeclaredAccessibility == Accessibility.Public ? "public" : "internal",
+                Accessibility = IsPublicOutsideTheAssembly(containingType)
+                    && method.Parameters.All(p => IsPublicOutsideTheAssembly(p.Type)) ? "public" : "internal",
                 CallArguments = callArguments.ToImmutable(),
             },
             Location = location,
         }, null);
     }
-
-    private static bool TryClassify(ITypeSymbol type, out MemberKind kind, out bool isNullableValue)
-    {
-        isNullableValue = false;
-        if (type is INamedTypeSymbol { OriginalDefinition.SpecialType: SpecialType.System_Nullable_T } nullable)
-        {
-            isNullableValue = true;
-            type = nullable.TypeArguments[0];
-        }
-
-        if (type.TypeKind == TypeKind.Enum)
-        {
-            kind = MemberKind.Enum;
-            return true;
-        }
-
-        kind = type.SpecialType switch
-        {
-            SpecialType.System_String => MemberKind.String,
-            SpecialType.System_Boolean => MemberKind.Boolean,
-            SpecialType.System_Byte or SpecialType.System_SByte
-                or SpecialType.System_Int16 or SpecialType.System_UInt16
-                or SpecialType.System_Int32 or SpecialType.System_UInt32
-                or SpecialType.System_Int64 or SpecialType.System_UInt64
-                or SpecialType.System_Single or SpecialType.System_Double
-                or SpecialType.System_Decimal => MemberKind.Number,
-            SpecialType.System_DateTime => MemberKind.DateTime,
-            _ => type.ToDisplayString() switch
-            {
-                "System.Guid" => MemberKind.Guid,
-                "System.DateTimeOffset" => MemberKind.DateTimeOffset,
-                _ => (MemberKind)(-1),
-            },
-        };
-        return kind >= 0 && !(kind == MemberKind.String && isNullableValue);
-    }
-
-    private static string MissingLiteral(IParameterSymbol parameter, MemberKind kind, bool isNullable)
-        => parameter.HasExplicitDefaultValue
-            ? ExplicitLiteral(parameter.ExplicitDefaultValue, parameter.Type)
-            : DefaultLiteral(kind, isNullable, parameter.Type);
-
-    private static string DefaultLiteral(MemberKind kind, bool isNullable, ITypeSymbol type)
-        => isNullable || kind == MemberKind.String ? "null" : "default";
-
-    private static string ExplicitLiteral(object? value, ITypeSymbol type)
-        => value switch
-        {
-            null => type.IsValueType && type.OriginalDefinition.SpecialType != SpecialType.System_Nullable_T
-                ? "default"
-                : "null",
-            string s => SymbolDisplay.FormatLiteral(s, quote: true),
-            bool b => b ? "true" : "false",
-            decimal m => m.ToString(CultureInfo.InvariantCulture) + "m",
-            float f => f.ToString("R", CultureInfo.InvariantCulture) + "f",
-            double d => d.ToString("R", CultureInfo.InvariantCulture) + "d",
-            _ when type.TypeKind == TypeKind.Enum || (type is INamedTypeSymbol { OriginalDefinition.SpecialType: SpecialType.System_Nullable_T } n && n.TypeArguments[0].TypeKind == TypeKind.Enum)
-                => $"({type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)}){Convert.ToString(value, CultureInfo.InvariantCulture)}",
-            _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? "default",
-        };
 
     private static void Emit(
         SourceProductionContext context,
@@ -652,26 +641,21 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
                 JobDiagnostics.DuplicateJobType, job.Location?.ToLocation(), job.JobTypeFqn));
         }
 
+        var jsonContextIndex = new JsonContextIndex(jsonContexts);
+
+        emitted = emitted
+            .Select(job => ResolveDelegatedMembers(context, job, jsonContextIndex))
+            .Where(job => job is not null)
+            .Select(job => job!)
+            .ToList();
+
         // Resolve every workflow output type and Workflow Input seed to the JsonSerializerContext that
         // lists it, so the emitted codecs read from the consumer's own STJ metadata (any shape, AOT-safe).
-        // A type listed by more than one context binds to the first by ordinal context FQN - a stable,
-        // arbitrary pick, no diagnostic. These completeness diagnostics fire UNCONDITIONALLY, before the
-        // emitted.Count gate, so a missing serializer is a build error even when no registry is emitted.
-        var contextByType = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var jsonContext in jsonContexts
-                     .Where(c => c is not null)
-                     .Select(c => c!)
-                     .OrderBy(c => c.ContextFqn, StringComparer.Ordinal))
-        {
-            foreach (var typeFqn in jsonContext.ListedTypeFqns)
-            {
-                if (!contextByType.ContainsKey(typeFqn))
-                {
-                    contextByType[typeFqn] = jsonContext.ContextFqn;
-                }
-            }
-        }
-
+        // A type listed by more than one context is BW0012: the contexts can apply different options, and a
+        // silent pick would change the wire format when a context is added. These completeness diagnostics
+        // fire UNCONDITIONALLY, before the emitted.Count gate, so a missing or ambiguous serializer is a build
+        // error even when no registry is emitted. A type that only unusable listings name gives BW0013, which
+        // says why, instead of "not listed".
         emitted = emitted
             .Select(job =>
             {
@@ -679,9 +663,19 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
                 {
                     return job;
                 }
-                if (contextByType.TryGetValue(outputTypeFqn, out var contextFqn))
+                var resolution = jsonContextIndex.Resolve(outputTypeFqn);
+                var usage = $"the Job Output of step '{job.WireName}'";
+                switch (resolution.Kind)
                 {
-                    return job with { OutputContextFqn = contextFqn };
+                    case JsonContextResolutionKind.Bound:
+                        return job with { OutputContextFqn = resolution.ContextFqn };
+                    case JsonContextResolutionKind.Ambiguous:
+                        ReportAmbiguousContext(
+                            context, job.Location, outputTypeFqn, usage, resolution.Contexts, JobDiagnostics.RegisterJobByHand);
+                        return job;
+                    case JsonContextResolutionKind.Unusable:
+                        ReportUnusableListing(context, job.Location, outputTypeFqn, usage, resolution);
+                        return job;
                 }
                 // Stash the offending type FQN in Properties so the BW0007 code fix recovers it
                 // precisely: for an output the type to list is NOT the type at the diagnostic
@@ -689,7 +683,7 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
                 context.ReportDiagnostic(Diagnostic.Create(
                     JobDiagnostics.WorkflowTypeNotSerializable, job.Location?.ToLocation(),
                     ImmutableDictionary<string, string?>.Empty.Add("TypeFqn", outputTypeFqn),
-                    outputTypeFqn, $"the Job Output of step '{job.WireName}'"));
+                    outputTypeFqn, usage));
                 return job;
             })
             .ToList();
@@ -707,10 +701,21 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
             {
                 continue;
             }
-            if (contextByType.TryGetValue(seed.TypeFqn, out var contextFqn))
+            var resolution = jsonContextIndex.Resolve(seed.TypeFqn);
+            switch (resolution.Kind)
             {
-                seedCodecs.Add((seed.TypeFqn, contextFqn));
-                continue;
+                case JsonContextResolutionKind.Bound:
+                    seedCodecs.Add((seed.TypeFqn, resolution.ContextFqn!));
+                    continue;
+                case JsonContextResolutionKind.Ambiguous:
+                    ReportAmbiguousContext(
+                        context, seed.Location, seed.TypeFqn, "a Workflow Input seed", resolution.Contexts,
+                        "remove IWorkflowInput from the type and pass its JsonTypeInfo explicitly to start the " +
+                        "workflow and to read the seed");
+                    continue;
+                case JsonContextResolutionKind.Unusable:
+                    ReportUnusableListing(context, seed.Location, seed.TypeFqn, "a Workflow Input seed", resolution);
+                    continue;
             }
             context.ReportDiagnostic(Diagnostic.Create(
                 JobDiagnostics.WorkflowTypeNotSerializable, seed.Location?.ToLocation(),
@@ -727,6 +732,143 @@ public sealed class BackWaveGenerator : IIncrementalGenerator
             context.AddSource("BackWave.Jobs.g.cs", JobEmitter.EmitRegistry(emitted, seedCodecs));
         }
     }
+
+    /// <summary>
+    /// Binds each delegated member to the JsonSerializerContext that serves its metadata. A class payload binds
+    /// every member to the context that lists the payload, because STJ generates metadata for every type that a
+    /// listed type reaches. Listings of the member types in other contexts do not count, so that a new listing
+    /// cannot change the wire format of queued jobs. The STJ generator cannot see a generated method-sugar record,
+    /// so a sugar job binds each member to the context that lists the member type. A context that a member binds
+    /// to gives BW0013 when it has any serialization-only listing or default, because STJ gives each type the mode
+    /// of the first listing that reaches it: once at the payload for a class payload, and once at the first member
+    /// that binds to it for method sugar. A type without a listing gives BW0017, a type with only unusable
+    /// listings gives BW0013, and a type that more than one context lists gives BW0012. Then the job is not
+    /// emitted, and this method returns null.
+    /// </summary>
+    private static JobModel? ResolveDelegatedMembers(
+        SourceProductionContext context,
+        JobModel job,
+        JsonContextIndex jsonContextIndex)
+    {
+        var delegated = job.Members.Where(m => m.Kind == MemberKind.Delegated).ToList();
+        if (delegated.Count == 0)
+        {
+            return job;
+        }
+
+        if (job.Sugar is null)
+        {
+            var payload = jsonContextIndex.ResolveDelegated(job.JobTypeFqn);
+            switch (payload.Kind)
+            {
+                case JsonContextResolutionKind.Bound:
+                    return job with
+                    {
+                        Members = job.Members
+                            .Select(m => m.Delegation is { } delegation
+                                ? m with { Delegation = delegation with { ContextFqn = payload.ContextFqn } }
+                                : m)
+                            .ToImmutableArray(),
+                    };
+                case JsonContextResolutionKind.Ambiguous:
+                    ReportAmbiguousContext(
+                        context, job.Location, job.JobTypeFqn, $"the payload of job '{job.WireName}'", payload.Contexts,
+                        JobDiagnostics.RegisterJobByHand);
+                    return null;
+                case JsonContextResolutionKind.Unusable:
+                    ReportUnusableListing(context, job.Location, job.JobTypeFqn, $"the payload of job '{job.WireName}'", payload);
+                    return null;
+                default:
+                    ReportUnlisted(context, job.Location, job, delegated, job.JobTypeFqn);
+                    return null;
+            }
+        }
+
+        var resolved = true;
+        var members = ImmutableArray.CreateBuilder<PayloadMember>(job.Members.Count);
+        var unlisted = new List<PayloadMember>();
+        // One report per cause, as for BW0017: BW0012 names the type, and BW0013 names the context.
+        var ambiguousTypes = new HashSet<string>(StringComparer.Ordinal);
+        var rejectedContexts = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var member in job.Members)
+        {
+            if (member.Delegation is not { } delegation)
+            {
+                members.Add(member);
+                continue;
+            }
+            var memberResolution = jsonContextIndex.ResolveDelegated(delegation.TypeFqn);
+            switch (memberResolution.Kind)
+            {
+                case JsonContextResolutionKind.Bound:
+                    members.Add(member with { Delegation = delegation with { ContextFqn = memberResolution.ContextFqn } });
+                    continue;
+                case JsonContextResolutionKind.Ambiguous:
+                    if (ambiguousTypes.Add(delegation.TypeFqn))
+                    {
+                        ReportAmbiguousContext(
+                            context, member.Location, delegation.TypeFqn,
+                            $"member '{member.SourceName}' of job payload '{job.JobTypeName}'", memberResolution.Contexts,
+                            SugarAmbiguousFix);
+                    }
+                    break;
+                case JsonContextResolutionKind.Unusable:
+                    if (rejectedContexts.Add(memberResolution.ContextFqn!))
+                    {
+                        ReportUnusableListing(
+                            context, member.Location, delegation.TypeFqn,
+                            $"the type of member '{member.SourceName}' of job payload '{job.JobTypeName}'", memberResolution);
+                    }
+                    break;
+                default:
+                    unlisted.Add(member);
+                    break;
+            }
+            resolved = false;
+        }
+
+        foreach (var sameType in unlisted.GroupBy(m => m.Delegation!.TypeFqn, StringComparer.Ordinal))
+        {
+            ReportUnlisted(context, sameType.First().Location, job, sameType.ToList(), sameType.Key);
+        }
+        return resolved ? job with { Members = members.ToImmutable() } : null;
+    }
+
+    /// <summary>
+    /// BW0017 for the type that the unlisted members need listed: the class payload, or for method sugar the
+    /// member type. The code fix reads the type from Properties["TypeFqn"].
+    /// </summary>
+    private static void ReportUnlisted(
+        SourceProductionContext context, LocationInfo? location, JobModel job, IReadOnlyList<PayloadMember> members,
+        string typeToList)
+        => context.ReportDiagnostic(Diagnostic.Create(
+            JobDiagnostics.UnlistedPayloadType, location?.ToLocation(),
+            ImmutableDictionary<string, string?>.Empty.Add("TypeFqn", typeToList),
+            (members.Count == 1 ? "member " : "members ") + string.Join(", ", members.Select(m => $"'{m.SourceName}'")),
+            job.JobTypeName, DisplayFqn(typeToList)));
+
+    /// <summary>
+    /// The other BW0012 fix for a method-sugar member. A class payload binds its members to the context that lists
+    /// the payload, so other listings of the member type do not count.
+    /// </summary>
+    private const string SugarAmbiguousFix =
+        "put [Job] on a payload record and list that record in one JsonSerializerContext, or " +
+        JobDiagnostics.RegisterJobByHand;
+
+    /// <summary>BW0012 for a type that more than one JsonSerializerContext lists.</summary>
+    private static void ReportAmbiguousContext(
+        SourceProductionContext context, LocationInfo? location, string typeFqn, string usage, IReadOnlyList<string> contexts,
+        string otherFix)
+        => context.ReportDiagnostic(Diagnostic.Create(
+            JobDiagnostics.AmbiguousJsonContext, location?.ToLocation(),
+            DisplayFqn(typeFqn), usage, string.Join(", ", contexts.Select(DisplayFqn)), otherFix));
+
+    /// <summary>BW0013 for a type that only listings the generated codec cannot use name.</summary>
+    private static void ReportUnusableListing(
+        SourceProductionContext context, LocationInfo? location, string typeFqn, string usage, JsonContextResolution unusable)
+        => context.ReportDiagnostic(Diagnostic.Create(
+            JobDiagnostics.UnusableJsonContext, location?.ToLocation(),
+            DisplayFqn(typeFqn), usage, DisplayFqn(unusable.ContextFqn!), unusable.Reason));
 
     /// <summary>
     /// A unique, file-name-safe source hint per job, keyed on the fully qualified payload type.

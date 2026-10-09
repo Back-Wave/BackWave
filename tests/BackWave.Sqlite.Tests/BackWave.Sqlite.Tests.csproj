@@ -27,6 +27,9 @@
     <ProjectReference Include="..\..\src\BackWave.Sqlite\BackWave.Sqlite.csproj" />
     <ProjectReference Include="..\..\src\BackWave.Conformance\BackWave.Conformance.csproj" />
     <ProjectReference Include="..\..\src\BackWave.OpenTelemetry\BackWave.OpenTelemetry.csproj" />
+    <!-- The generated payload codec, so a [Job] with complex members runs through a real store end to end. -->
+    <ProjectReference Include="..\..\src\BackWave.SourceGenerators\BackWave.SourceGenerators.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

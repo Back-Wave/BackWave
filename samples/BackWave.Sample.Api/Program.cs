@@ -336,6 +336,32 @@ jobs.MapPost("/order-notification", async (BackWaveClient client, OrderNotificat
     });
 }).WithSummary("Example body → observability + observer: enqueue a structured 'order-notification' document, watch the dummy Slack Observer log the terminal transition (with payload body) to the console, then view its payload card, timeline, and (with ?fail=true) Failure Detail in the dashboard.");
 
+jobs.MapPost("/dispatch-parcel", async (BackWaveClient client, int lines = 3, bool express = false) =>
+{
+    if (lines is < 1 or > 100)
+    {
+        return Results.BadRequest("lines must be from 1 to 100.");
+    }
+
+    var parcelRef = $"PCL-{Random.Shared.Next(10000, 99999)}";
+    var parcel = new DispatchParcel(
+        parcelRef,
+        express ? ParcelSpeed.Express : ParcelSpeed.Standard,
+        [.. Enumerable.Range(1, lines).Select(i => new ParcelLine($"SKU-{i:D3}", i % 3 + 1,
+            [.. Enumerable.Range(1, i % 3 + 1).Select(unit => $"{parcelRef}-{i:D3}-{unit}")]))],
+        new() { ["A1"] = lines, ["B4"] = 2 },
+        new ParcelAddress("221B Baker Street", "London", null),
+        ["fragile", "leave at door"]);
+    var id = await client.EnqueueAsync(parcel, dueTime: DateTimeOffset.UtcNow);
+    return Results.Ok(new
+    {
+        jobId = id,
+        parcelRef,
+        lines,
+        note = $"A [Job] payload with complex members (a list of nested records, a dictionary, a nullable record, an array). Open /backwave/jobs/{id} to see the nested payload JSON.",
+    });
+}).WithSummary("Complex payload: enqueue a 'dispatch-parcel' job whose payload holds nested records, a dictionary, and arrays. lines (1 to 100) sets the length of the Lines list.");
+
 jobs.MapPost("/tagged-report", async (BackWaveClient client, string tenant = "acme", decimal amount = 1500m, bool priority = false) =>
 {
     // Enqueue-time Tags (ADR 0022): a Keyed 'tenant' dimension plus an optional 'priority' Label.

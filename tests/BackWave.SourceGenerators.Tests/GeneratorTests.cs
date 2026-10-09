@@ -150,7 +150,7 @@ public class GeneratorTests
     }
 
     [Fact]
-    public void UnsupportedPayloadMember_IsACompileError()
+    public void UnlistedComplexMember_IsACompileErrorThatNamesTheTypeToList()
     {
         var run = GeneratorHarness.Run("""
             using System.Collections.Generic;
@@ -169,8 +169,15 @@ public class GeneratorTests
             """);
 
         var diagnostic = Assert.Single(run.GeneratorDiagnostics);
-        Assert.Equal("BW0004", diagnostic.Id);
-        Assert.Contains("JobRegistration.Create", diagnostic.GetMessage());
+        Assert.Equal("BW0017", diagnostic.Id);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+        Assert.Equal(
+            "No JsonSerializerContext in this assembly lists type 'Listy', which the generated codec needs for member " +
+            "'Items' of job payload 'Listy'. Add [JsonSerializable(typeof(Listy))] to a JsonSerializerContext in this " +
+            "assembly, or register this job by hand with JobRegistration.Create.",
+            diagnostic.GetMessage());
+        Assert.Equal("global::Listy", diagnostic.Properties["TypeFqn"]);
+        Assert.Empty(run.GeneratedSources);
     }
 
     [Fact]
@@ -193,7 +200,7 @@ public class GeneratorTests
             """);
 
         var message = Assert.Single(run.GeneratorDiagnostics).GetMessage();
-        Assert.Contains("Member 'Items' of job payload 'Listy'", message);
+        Assert.Contains("member 'Items' of job payload 'Listy'", message);
         Assert.DoesNotContain("listy-job", message);
     }
 
@@ -220,7 +227,7 @@ public class GeneratorTests
             """);
 
         var message = Assert.Single(run.GeneratorDiagnostics).GetMessage();
-        Assert.Contains("Member 'Items' of job payload 'Propy'", message);
+        Assert.Contains("member 'Items' of job payload 'Propy'", message);
         Assert.DoesNotContain("propy-job", message);
     }
 
@@ -239,9 +246,11 @@ public class GeneratorTests
             }
             """);
 
-        var message = Assert.Single(run.GeneratorDiagnostics).GetMessage();
-        Assert.Contains("Member 'recipients' of job payload 'SendBatch'", message);
-        Assert.DoesNotContain("methody-job", message);
+        var diagnostic = Assert.Single(run.GeneratorDiagnostics);
+        // The member is named as the user wrote the parameter, not as the generated record property.
+        Assert.Contains("member 'recipients' of job payload 'SendBatch'", diagnostic.GetMessage());
+        Assert.DoesNotContain("methody-job", diagnostic.GetMessage());
+        Assert.Equal("recipients", SourceAt(run, diagnostic));
     }
 
     [Fact]
@@ -261,13 +270,68 @@ public class GeneratorTests
         Assert.Equal("BW0005", diagnostic.Id);
     }
 
+    [Theory]
+    [InlineData("public class Worker { [Job(\"send\")] public Task Send<T>(string id) => Task.CompletedTask; }")]
+    [InlineData("public class Worker<T> { [Job(\"send\")] public Task Send(string id) => Task.CompletedTask; }")]
+    [InlineData("public class Outer<T> { public class Worker { [Job(\"send\")] public Task Send(string id) => Task.CompletedTask; } }")]
+    public void GenericJobMethod_IsBW0005(string declaration)
+    {
+        // The generated handler calls the method with no type argument, so it could never compile.
+        var run = GeneratorHarness.Run($$"""
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+
+            {{declaration}}
+            """);
+
+        var diagnostic = Assert.Single(run.GeneratorDiagnostics);
+        Assert.Equal("BW0005", diagnostic.Id);
+        Assert.Contains("must not be generic", diagnostic.GetMessage());
+        Assert.Empty(run.CompilationDiagnostics.Where(d => d.Severity == DiagnosticSeverity.Error));
+    }
+
+    [Theory]
+    [InlineData(
+        "[Job(\"wrap\")] public sealed record Wrap<T>(string Id);",
+        "public sealed class WrapHandler<T> : IJobHandler<Wrap<T>>",
+        "Wrap<T>")]
+    [InlineData(
+        "public class Outer<T> { [Job(\"wrap\")] public sealed record Wrap(string Id); }",
+        "public sealed class WrapHandler<T> : IJobHandler<Outer<T>.Wrap>",
+        "Outer<T>.Wrap")]
+    public void GenericJobType_IsBW0014(string declaration, string handler, string payload)
+    {
+        // A queued job names one concrete payload type, and an open generic type is not one.
+        var run = GeneratorHarness.Run($$"""
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+
+            {{declaration}}
+
+            {{handler}}
+            {
+                public Task HandleAsync({{payload}} job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+            """);
+
+        var diagnostic = Assert.Single(run.GeneratorDiagnostics);
+        Assert.Equal("BW0014", diagnostic.Id);
+        Assert.Empty(run.CompilationDiagnostics.Where(d => d.Severity == DiagnosticSeverity.Error));
+    }
+
     [Fact]
     public void EditingAnUnrelatedFile_ReusesCachedGenerationOutputs()
+        => AssertUnrelatedEditReusesCachedOutputs(CanonicalSource);
+
+    /// <summary>Adds an unrelated file to a compilation of <paramref name="source"/>: no pipeline step re-runs.</summary>
+    internal static void AssertUnrelatedEditReusesCachedOutputs(string source)
     {
         var parseOptions = new CSharpParseOptions(LanguageVersion.Latest);
         var compilation = CSharpCompilation.Create(
             "Incremental",
-            [CSharpSyntaxTree.ParseText(CanonicalSource, parseOptions)],
+            [CSharpSyntaxTree.ParseText(source, parseOptions)],
             GeneratorHarness.MetadataReferences,
             new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, nullableContextOptions: NullableContextOptions.Enable));
 
@@ -835,6 +899,149 @@ public class GeneratorTests
     }
 
     [Fact]
+    public void WorkflowStepOutputAndSeed_ListedInTwoJsonContexts_AreBW0012()
+    {
+        // Each context can apply its own options, so a silent pick between them would change the wire format
+        // of stored outputs and seeds when a context is added. Both types are a build error instead.
+        var run = GeneratorHarness.Run("""
+            using System.Text.Json.Serialization;
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+            using BackWave.Pro;
+
+            namespace Acme;
+
+            public sealed record CheckoutSeed(string OrderId) : IWorkflowInput;
+
+            public sealed record InvoiceResult(string OrderId, int Cents);
+
+            [Job("make-invoice")]
+            public sealed record MakeInvoice(string OrderId) : IWorkflowStep<InvoiceResult>;
+
+            public sealed class MakeInvoiceHandler : IJobHandler<MakeInvoice>
+            {
+                public Task HandleAsync(MakeInvoice job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+
+            [JsonSerializable(typeof(CheckoutSeed))]
+            [JsonSerializable(typeof(InvoiceResult))]
+            internal sealed partial class AppJson : JsonSerializerContext;
+
+            [JsonSerializable(typeof(CheckoutSeed))]
+            [JsonSerializable(typeof(InvoiceResult))]
+            internal sealed partial class ApiJson : JsonSerializerContext;
+            """);
+
+        Assert.All(run.GeneratorDiagnostics, d => Assert.Equal("BW0012", d.Id));
+        Assert.Collection(
+            run.GeneratorDiagnostics.Select(d => d.GetMessage()),
+            message => Assert.Equal(
+                "Type 'Acme.InvoiceResult' (the Job Output of step 'make-invoice') is listed in more than one " +
+                "JsonSerializerContext: Acme.ApiJson, Acme.AppJson. The contexts can serialize it differently, so " +
+                "BackWave does not pick one - list the type in only one JsonSerializerContext, or register this job " +
+                "by hand with JobRegistration.Create.", message),
+            message => Assert.Equal(
+                "Type 'Acme.CheckoutSeed' (a Workflow Input seed) is listed in more than one JsonSerializerContext: " +
+                "Acme.ApiJson, Acme.AppJson. The contexts can serialize it differently, so BackWave does not pick " +
+                "one - list the type in only one JsonSerializerContext, or remove IWorkflowInput from the type and " +
+                "pass its JsonTypeInfo explicitly to start the workflow and to read the seed.", message));
+        var registry = run.GeneratedSources["BackWave.Jobs.g.cs"];
+        Assert.DoesNotContain("OutputTypeInfo = ", registry);
+        Assert.DoesNotContain("[typeof(global::Acme.CheckoutSeed)]", registry);
+    }
+
+
+    [Fact]
+    public void WorkflowOutputAndSeed_ListedOnlyForSerialization_AreBW0013()
+    {
+        // A serialization-only listing generates no metadata to read the value back with, so the codec it
+        // would wire throws on every decode. Each workflow type gets its own build error instead.
+        var run = GeneratorHarness.Run("""
+            using System.Text.Json.Serialization;
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+            using BackWave.Pro;
+
+            namespace Acme;
+
+            public sealed record CheckoutSeed(string OrderId) : IWorkflowInput;
+
+            public sealed record InvoiceResult(string OrderId, int Cents);
+
+            [Job("make-invoice")]
+            public sealed record MakeInvoice(string OrderId) : IWorkflowStep<InvoiceResult>;
+
+            public sealed class MakeInvoiceHandler : IJobHandler<MakeInvoice>
+            {
+                public Task HandleAsync(MakeInvoice job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+
+            [JsonSourceGenerationOptions(GenerationMode = JsonSourceGenerationMode.Serialization)]
+            [JsonSerializable(typeof(CheckoutSeed))]
+            [JsonSerializable(typeof(InvoiceResult))]
+            internal sealed partial class AppJson : JsonSerializerContext;
+            """);
+
+        Assert.Equal(2, run.GeneratorDiagnostics.Length);
+        Assert.All(run.GeneratorDiagnostics, d => Assert.Equal("BW0013", d.Id));
+        var messages = run.GeneratorDiagnostics.Select(d => d.GetMessage()).ToList();
+        Assert.Contains(messages, m => m.Contains("'Acme.InvoiceResult'") && m.Contains("the Job Output of step 'make-invoice'"));
+        Assert.Contains(messages, m => m.Contains("'Acme.CheckoutSeed'") && m.Contains("a Workflow Input seed"));
+        Assert.All(messages, m => Assert.Contains("GenerationMode = Serialization", m));
+        Assert.DoesNotContain("OutputTypeInfo", run.GeneratedSources["BackWave.Jobs.g.cs"]);
+        Assert.DoesNotContain("CheckoutSeed", run.GeneratedSources["BackWave.Jobs.g.cs"]);
+    }
+
+    [Fact]
+    public void WorkflowOutputAndSeed_ListedOnlyByAPrivateContext_AreBW0013()
+    {
+        // The generated registry cannot name a private nested context, so wiring it would fail the build
+        // with CS0122 inside generated code. Each workflow type gets a build error that says why instead.
+        var run = GeneratorHarness.Run("""
+            using System.Text.Json.Serialization;
+            using System.Threading;
+            using System.Threading.Tasks;
+            using BackWave.Jobs;
+            using BackWave.Pro;
+
+            namespace Acme;
+
+            public sealed record CheckoutSeed(string OrderId) : IWorkflowInput;
+
+            public sealed record InvoiceResult(string OrderId, int Cents);
+
+            [Job("make-invoice")]
+            public sealed record MakeInvoice(string OrderId) : IWorkflowStep<InvoiceResult>;
+
+            public sealed class MakeInvoiceHandler : IJobHandler<MakeInvoice>
+            {
+                public Task HandleAsync(MakeInvoice job, JobContext context, CancellationToken cancellationToken)
+                    => Task.CompletedTask;
+            }
+
+            public partial class Outer
+            {
+                [JsonSerializable(typeof(CheckoutSeed))]
+                [JsonSerializable(typeof(InvoiceResult))]
+                private sealed partial class AppJson : JsonSerializerContext;
+            }
+            """, withJsonGenerator: true);
+
+        Assert.Equal(2, run.GeneratorDiagnostics.Length);
+        Assert.All(run.GeneratorDiagnostics, d => Assert.Equal("BW0013", d.Id));
+        var messages = run.GeneratorDiagnostics.Select(d => d.GetMessage()).ToList();
+        Assert.Contains(messages, m => m.Contains("'Acme.InvoiceResult'") && m.Contains("the Job Output of step 'make-invoice'"));
+        Assert.Contains(messages, m => m.Contains("'Acme.CheckoutSeed'") && m.Contains("a Workflow Input seed"));
+        Assert.All(messages, m => Assert.Contains("'Acme.Outer.AppJson'", m));
+        Assert.All(messages, m => Assert.Contains("not accessible", m));
+        Assert.Empty(run.CompilationDiagnostics.Where(d => d.Severity == DiagnosticSeverity.Error));
+    }
+
+    [Fact]
     public void WorkflowStepArrayOutput_ListedInJsonContext_WiresItsCodec()
     {
         // A step whose Job Output is an array (IWorkflowStep<InvoiceResult[]>), listed as
@@ -936,4 +1143,14 @@ public class GeneratorTests
         Assert.Contains("Could not decode property 'Fallback' as enum", source);
         Assert.Contains("JsonTokenType.Null", source);
     }
+
+    /// <summary>
+    /// The source text that a diagnostic points at. A generator diagnostic carries a file location with no
+    /// syntax tree, so the text comes from the tree of the run that has the same path.
+    /// </summary>
+    internal static string SourceAt(GeneratorRun run, Diagnostic diagnostic)
+        => run.OutputCompilation.SyntaxTrees
+            .Single(t => t.FilePath == diagnostic.Location.GetLineSpan().Path)
+            .GetText()
+            .ToString(diagnostic.Location.SourceSpan);
 }

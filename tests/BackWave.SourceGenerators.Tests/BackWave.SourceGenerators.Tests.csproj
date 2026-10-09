@@ -1,7 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <!-- Runs on every shipped TFM: the tests compile payloads against the BCL and the System.Text.Json source
+         generator of the framework they run on, and STJ behavior differs between versions. -->
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>$(ShipTfms)</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
@@ -33,5 +36,16 @@
     <Compile Remove="Snapshots\**" />
     <None Include="Snapshots\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+
+  <!--
+    The real System.Text.Json source generator, from the targeting pack of this framework. The harness runs it
+    beside the BackWave generator, so a test can compile a payload with delegated members end to end.
+  -->
+  <Target Name="CopyJsonSourceGenerator" AfterTargets="ResolveTargetingPackAssets">
+    <ItemGroup>
+      <None Include="@(Analyzer)" Condition="'%(Filename)' == 'System.Text.Json.SourceGeneration'"
+            Link="JsonSourceGenerator\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
 
 </Project>

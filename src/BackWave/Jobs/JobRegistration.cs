@@ -12,17 +12,21 @@ namespace BackWave.Jobs;
 /// <para>
 /// The source generator emits this same shape, but not this same serialization. A generated
 /// registration serializes through a per-job-type <c>Utf8JsonWriter</c> codec the generator also
-/// emits. <see cref="Create{TJob,THandler}"/> serializes through the
-/// <see cref="JsonTypeInfo{T}"/> the caller passes. The two encodings are not interchangeable: the
-/// generated codec writes an enum as its string name and tolerates a JSON null for a non-nullable
-/// member, and System.Text.Json writes an enum as a number by default and applies the naming policy of
-/// the caller's context. Moving a live job type from one path to the other rewrites its wire format.
+/// emits; that codec writes each scalar member itself and hands each other member to the application's
+/// <c>JsonSerializerContext</c>. <see cref="Create{TJob,THandler}"/> serializes the whole payload through
+/// the <see cref="JsonTypeInfo{T}"/> the caller passes. The two encodings are not interchangeable: the
+/// generated codec writes a top-level enum as its string name and tolerates a JSON null for a
+/// non-nullable member, and System.Text.Json writes an enum as a number by default and applies the
+/// naming policy of the caller's context to every property. Moving a live job type from one path to
+/// the other rewrites its wire format.
 /// </para>
 /// <para>
 /// A host contributes a hand-built registration by registering it in the container:
 /// <c>services.AddSingleton(JobRegistration.Create&lt;TJob, THandler&gt;(...))</c>. <c>AddBackWave</c>
 /// folds every contributed registration into the registry that <c>UseRegistry(...)</c> supplied, so a
-/// type that generated serialization cannot express lives alongside the generated ones.
+/// type whose whole payload System.Text.Json must own - a property-level converter or naming attribute,
+/// a polymorphic payload, a custom converter for the payload type itself - lives alongside the
+/// generated ones.
 /// </para>
 /// </remarks>
 public sealed class JobRegistration

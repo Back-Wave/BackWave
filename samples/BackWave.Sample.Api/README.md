@@ -89,6 +89,10 @@ file) — see `appsettings.json`.
   line** per terminal delivery, carrying the transition metadata *and* fields read from the payload
   **body** (`orderRef`, `customerEmail`). Success → a Slack line on the **Succeeded** transition;
   `?fail=true` → a Slack line on the **Dead-Lettered** terminal transition.
+- `POST /jobs/dispatch-parcel?lines=&express=` - a `[Job]` payload with **complex members**
+  (`dispatch-parcel`, queue `low`): a list of nested records, a dictionary, a nullable record, and an
+  array. `ParcelJsonContext` lists the payload type, so the generated codec hands each complex
+  member to it. `lines` sets the length of the list. View `/backwave/jobs/{id}` for the nested payload.
 - `POST /jobs/quarantine` — enqueues an unregistered Wire Name → **Quarantined**.
 - `POST /jobs/tagged-report?tenant=&amount=&priority=` — **Job Tags** showcase (`tagged-report`,
   queue `bulk`). One job collects Tags from all three sources, both kinds (bare **Label** vs **Keyed**

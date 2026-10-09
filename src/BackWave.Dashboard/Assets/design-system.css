@@ -894,7 +894,7 @@ html, body { height: 100%; }
 code, .mono { font-family: var(--font-mono); }
 
 /* ---- JSON payload highlighting (best-effort, server-rendered spans) ---- */
-.bw-json { white-space: pre; overflow-x: auto; margin: 0; }
+.bw-json { white-space: pre; overflow: auto; max-height: min(480px, 60vh); margin: 0; }
 .bw-json__key  { color: var(--ink-700); }
 .bw-json__str  { color: var(--pen-green); }
 .bw-json__num  { color: var(--wave-600); }

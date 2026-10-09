@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Reflection;
 using BackWave.SourceGenerators;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -8,7 +9,8 @@ namespace BackWave.SourceGenerators.Tests;
 internal sealed record GeneratorRun(
     ImmutableArray<Diagnostic> GeneratorDiagnostics,
     ImmutableArray<Diagnostic> CompilationDiagnostics,
-    IReadOnlyDictionary<string, string> GeneratedSources);
+    IReadOnlyDictionary<string, string> GeneratedSources,
+    Compilation OutputCompilation);
 
 /// <summary>Runs the generator over a source string against the real BCL + BackWave references.</summary>
 internal static class GeneratorHarness
@@ -29,7 +31,24 @@ internal static class GeneratorHarness
     /// <summary>The same reference set the single-run harness uses — for the incrementality test's own driver.</summary>
     public static IReadOnlyList<MetadataReference> MetadataReferences => References.Value;
 
-    public static GeneratorRun Run(string source)
+    /// <summary>
+    /// The System.Text.Json source generator from the targeting pack (the csproj copies it to the output). The
+    /// STJ generator runs on the same input as the BackWave generator, so, as in a real build, it cannot see the
+    /// sources that BackWave generates.
+    /// </summary>
+    private static readonly Lazy<ISourceGenerator> JsonGenerator = new(() =>
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "JsonSourceGenerator", "System.Text.Json.SourceGeneration.dll");
+        var generatorType = Assembly.LoadFrom(path).GetTypes()
+            .Single(t => !t.IsAbstract && typeof(IIncrementalGenerator).IsAssignableFrom(t));
+        return ((IIncrementalGenerator)Activator.CreateInstance(generatorType)!).AsSourceGenerator();
+    });
+
+    /// <summary>
+    /// Runs the BackWave generator over <paramref name="source"/>. With <paramref name="withJsonGenerator"/>, the
+    /// System.Text.Json generator runs too, so the output compilation holds real JsonSerializerContext metadata.
+    /// </summary>
+    public static GeneratorRun Run(string source, bool withJsonGenerator = false)
     {
         var compilation = CSharpCompilation.Create(
             "GeneratorTests",
@@ -39,8 +58,11 @@ internal static class GeneratorHarness
                 OutputKind.DynamicallyLinkedLibrary,
                 nullableContextOptions: NullableContextOptions.Enable));
 
+        ISourceGenerator[] generators = withJsonGenerator
+            ? [new BackWaveGenerator().AsSourceGenerator(), JsonGenerator.Value]
+            : [new BackWaveGenerator().AsSourceGenerator()];
         var driver = CSharpGeneratorDriver
-            .Create(new BackWaveGenerator())
+            .Create(generators)
             .RunGeneratorsAndUpdateCompilation(compilation, out var outputCompilation, out var generatorDiagnostics);
 
         var generated = driver.GetRunResult().Results[0].GeneratedSources
@@ -49,6 +71,7 @@ internal static class GeneratorHarness
         return new GeneratorRun(
             generatorDiagnostics,
             outputCompilation.GetDiagnostics(),
-            generated);
+            generated,
+            outputCompilation);
     }
 }

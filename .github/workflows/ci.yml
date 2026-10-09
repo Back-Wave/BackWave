@@ -76,6 +76,7 @@ jobs:
       - name: Restore
         run: dotnet restore
       - name: Build
+        id: build
         run: dotnet build --no-restore -c Release
       - name: Test (includes the Simulator seed battery; the Soak category runs in soak.yml)
         run: |
@@ -94,3 +95,13 @@ jobs:
             dotnet test "$proj" --no-build -c Release --filter "Category!=Soak" || rc=1
           done
           exit $rc
+      - name: Native AOT publish and run of the generated job codecs
+        # Runs after a test failure too, so that a failed test does not hide an AOT failure.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang zlib1g-dev
+          for tfm in net8.0 net9.0 net10.0; do
+            dotnet publish tests/BackWave.AotConsumer -c Release -f "$tfm" -o "aot-out/$tfm"
+            "aot-out/$tfm/BackWave.AotConsumer"
+          done

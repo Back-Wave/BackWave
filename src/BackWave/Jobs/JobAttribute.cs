@@ -7,6 +7,12 @@ namespace BackWave.Jobs;
 /// boilerplate from the method's signature. The Wire Name is mandatory and explicit — never derived
 /// from CLR names — so a renamed type or method never silently changes the identity stored with a
 /// job.
+/// <para>
+/// The generator writes scalar members itself: string, bool, numbers, Guid, DateTime, DateTimeOffset, enums, and
+/// their nullable forms. A member of any other type, for example a list or a record, needs a JsonSerializerContext
+/// in the same assembly. On a payload record, list the record in the context. On a method, list the parameter
+/// type. Without a listing, the build fails with BW0017.
+/// </para>
 /// </summary>
 /// <param name="wireName">
 /// The stable Wire Name identifying this job type on the wire and in storage. Must be unique across
@@ -31,6 +37,7 @@ namespace BackWave.Jobs;
 ///     => /* ... */;
 /// </code>
 /// </example>
+/// <seealso cref="System.Text.Json.Serialization.JsonSerializerContext"/>
 [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Method, AllowMultiple = false, Inherited = false)]
 public sealed class JobAttribute(string wireName) : Attribute
 {

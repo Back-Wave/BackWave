@@ -104,6 +104,9 @@ public sealed class LatencyProxyTests
         await using var proxy = LatencyProxy.Start("127.0.0.1", echo.Port, Delay);
         const int connections = 8;
 
+        // One untimed trip first, so the timing does not include the cold start.
+        await ExchangeAsync(proxy.Port, Payload(64));
+
         var stopwatch = Stopwatch.StartNew();
         await Task.WhenAll(Enumerable.Range(0, connections).Select(_ => ExchangeAsync(proxy.Port, Payload(64))));
         stopwatch.Stop();
@@ -129,6 +132,10 @@ public sealed class LatencyProxyTests
         var stream = client.GetStream();
         var request = Payload(8);
         var response = new byte[request.Length];
+
+        // One untimed trip first, so the timing does not include the cold start.
+        await stream.WriteAsync(request);
+        await stream.ReadExactlyAsync(response);
 
         var stopwatch = Stopwatch.StartNew();
         for (var trip = 0; trip < trips; trip++)

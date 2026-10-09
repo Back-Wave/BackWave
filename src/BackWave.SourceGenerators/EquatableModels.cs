@@ -114,10 +114,23 @@ internal sealed record SeedTypeInfo(string TypeFqn, LocationInfo? Location) : IE
 /// <summary>
 /// One JsonSerializerContext and the set of types listed on it via [JsonSerializable]. Discovered via
 /// the attribute provider so the completeness check can prove every workflow output/seed type has a
-/// serializer without walking the whole Compilation.
+/// serializer without walking the whole Compilation. A listing the generated codec cannot use is in
+/// UnusableListings, not in ListedTypeFqns. SerializationOnlyReason says why the context cannot serve a delegated
+/// payload member, or is null when it can.
 /// </summary>
-internal sealed record JsonContextInfo(string ContextFqn, EquatableArray<string> ListedTypeFqns)
+internal sealed record JsonContextInfo(
+    string ContextFqn,
+    EquatableArray<string> ListedTypeFqns,
+    EquatableArray<UnusableListing> UnusableListings,
+    string? SerializationOnlyReason)
     : IEquatable<JsonContextInfo>;
 
-/// <summary>The value-equal result of parsing one [Job] declaration: a model, or a diagnostic, or neither.</summary>
-internal sealed record ParseResult(JobModel? Model, DiagnosticInfo? Diagnostic);
+/// <summary>A [JsonSerializable] listing the generated codec cannot use, and the reason with its fix.</summary>
+internal sealed record UnusableListing(string TypeFqn, string Reason) : IEquatable<UnusableListing>;
+
+/// <summary>
+/// The value-equal result of parsing one [Job] declaration: a model, or a diagnostic, or neither, plus the
+/// warnings, which do not stop the model.
+/// </summary>
+internal sealed record ParseResult(
+    JobModel? Model, DiagnosticInfo? Diagnostic, EquatableArray<DiagnosticInfo> Warnings = default);
