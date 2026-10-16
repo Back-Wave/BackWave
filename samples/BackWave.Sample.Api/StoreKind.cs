@@ -1,3 +1,4 @@
+using BackWave.Oracle;
 using BackWave.Postgres;
 using BackWave.Sqlite;
 using BackWave.SqlServer;
@@ -20,6 +21,7 @@ internal abstract class StoreKind
     public static readonly StoreKind InMemory = new InMemoryStore();
     public static readonly StoreKind Postgres = new PostgresStore();
     public static readonly StoreKind SqlServer = new SqlServerStore();
+    public static readonly StoreKind Oracle = new OracleStore();
 
     /// <summary>The SQLite Embedded Adapter, co-resident: BackWave's tables live in the app's OWN file.</summary>
     public static readonly StoreKind Sqlite = new SqliteCoResidentStore();
@@ -33,6 +35,7 @@ internal abstract class StoreKind
         var configured = configuration["BackWave:Store"] ?? nameof(InMemory);
         return configured.Equals(nameof(Postgres), StringComparison.OrdinalIgnoreCase) ? Postgres
             : configured.Equals(nameof(SqlServer), StringComparison.OrdinalIgnoreCase) ? SqlServer
+            : configured.Equals(nameof(Oracle), StringComparison.OrdinalIgnoreCase) ? Oracle
             : configured.Equals(nameof(SqliteDedicated), StringComparison.OrdinalIgnoreCase) ? SqliteDedicated
             : configured.Equals(nameof(Sqlite), StringComparison.OrdinalIgnoreCase) ? Sqlite
             : InMemory;
@@ -153,6 +156,31 @@ internal abstract class StoreKind
 
         private static string ConnectionString(IConfiguration configuration)
             => configuration["BackWave:SqlServer:ConnectionString"] ?? DefaultConnectionString;
+    }
+
+    /// <summary>
+    /// The Oracle adapter. The sample registers no EF provider for Oracle, so it has no business table and
+    /// forgoes Transactional Enqueue: <c>POST /tx</c> answers 409.
+    /// </summary>
+    private sealed class OracleStore : StoreKind
+    {
+        private const string DefaultConnectionString =
+            "User Id=backwave;Password=backwave;Data Source=localhost:15210/FREEPDB1";
+
+        public override string Name => "Oracle";
+        public override bool SupportsTransactionalEnqueue => false;
+
+        public override IJobStore CreateStore(IConfiguration configuration, ILoggerFactory loggerFactory)
+            => new OracleJobStore(new OracleStoreOptions
+            {
+                ConnectionString = configuration["BackWave:Oracle:ConnectionString"] ?? DefaultConnectionString,
+                AutoMigrate = true,
+                LoggerFactory = loggerFactory, // opts in to the migration log; null (the default) is silent
+            });
+
+        public override void AddAdapterTracing(TracerProviderBuilder tracing) => tracing.AddBackWaveOracleInstrumentation();
+
+        public override void AddAdapterMetrics(MeterProviderBuilder metrics) => metrics.AddBackWaveOracleInstrumentation();
     }
 
     /// <summary>

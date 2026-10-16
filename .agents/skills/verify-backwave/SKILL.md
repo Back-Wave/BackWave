@@ -1,6 +1,6 @@
 ---
 name: verify-backwave
-description: Launch the real BackWave Sample.Api (the sample host with the BackWave dashboard at /backwave) on a private port with its own SQLite file or Postgres container, create real jobs through the sample's HTTP endpoints, drive the dashboard in a private headless Chrome, capture screenshot, accessibility, API, and database evidence, and clean up. Use to prove a BackWave change works end to end, to reproduce a bug that a user or operator would see, or whenever you need to see or screenshot the dashboard running.
+description: Launch the real BackWave Sample.Api (the sample host with the BackWave dashboard at /backwave) on a private port with its own SQLite file, Postgres container, or Oracle container, create real jobs through the sample's HTTP endpoints, drive the dashboard in a private headless Chrome, capture screenshot, accessibility, API, and database evidence, and clean up. Use to prove a BackWave change works end to end, to reproduce a bug that a user or operator would see, or whenever you need to see or screenshot the dashboard running.
 ---
 
 # Verify BackWave
@@ -32,6 +32,7 @@ Each run owns these resources. All of them use the same run id (`YYYYMMDD-HHMMSS
 | HTTP port | `http://127.0.0.1:<port>` | A free port from the OS. `bwv` never uses the default `5283` from `appsettings.json`. |
 | Scratch directory | `${TMPDIR}/bw-verify-<run>/` | Holds the app copy and the SQLite file `backwave.db`. |
 | Postgres (only with `--store postgres`) | container `backwave-verify-<run>`, label `backwave.verify.run=<run>` | `postgres:17-alpine` on a free loopback port. It never uses the compose containers on `5398` or `14331`. |
+| Oracle (only with `--store oracle`) | container `backwave-verify-<run>`, label `backwave.verify.run=<run>` | `gvenzl/oracle-free:23-slim` on a fixed free loopback port. It never uses the compose container on `15210`. |
 | Browser | `CHROME_DEVTOOLS_AXI_SESSION=bw-verify-<run>` | A private bridge and an isolated headless Chrome profile. `bwv` never uses the `default` session. |
 | Evidence | `.verify-evidence/<run>/` at the worktree root | Gitignored. Cleanup never deletes it. |
 
@@ -44,6 +45,7 @@ Parallel runs in one worktree share `bin/` and `obj/`. For this reason, `bwv lau
 ```bash
 bwv launch                    # SQLite co-resident store (the default)
 bwv launch --store postgres   # a private Postgres container
+bwv launch --store oracle     # a private Oracle container (first boot 30-90 s)
 bwv launch --store inmemory   # no database, fastest start
 ```
 
@@ -51,7 +53,7 @@ This command does these steps:
 
 1. Records the run in `.verify-evidence/<run>/run.env` and makes it the current run. It records each resource name before it creates the resource.
 2. Runs `dotnet build` on `samples/BackWave.Sample.Api` under the build lock, and copies `bin/Debug/net10.0` to the scratch directory.
-3. For `--store postgres`, starts the run's container and waits until Postgres accepts TCP connections.
+3. For `--store postgres`, starts the run's container and waits until Postgres accepts TCP connections. For `--store oracle`, starts the run's container and waits until its `healthcheck.sh` passes.
 4. Starts the app copy with `--urls http://127.0.0.1:<port>` and the store flags. It sets `DOTNET_hostBuilder__reloadConfigOnChange=false` (see [Gotchas](#gotchas)).
 5. Waits until `/backwave` returns 200, then makes sure that `app.log` names the expected store.
 
@@ -75,9 +77,9 @@ This is a read-only check. Run it after launch, before every proof, and first wh
 - The recorded PID still runs this run's `<scratch>/app/BackWave.Sample.Api.dll`.
 - That PID holds the listening socket on the run's port.
 - `/backwave` serves the page with the title `Overview · BackWave`.
-- `app.log` names the store: `SqliteCoResident`, `Postgres`, or `InMemory`.
+- `app.log` names the store: `SqliteCoResident`, `Postgres`, `Oracle`, or `InMemory`.
 - The build matches the worktree. The fingerprint covers the committed files, the uncommitted edits, and the untracked files. It ignores docs, `*.md`, `.agents`, and `.claude`. If you edit product code after the launch, this check fails.
-- The store exists: the SQLite file, or the Postgres container with the run's label.
+- The store exists: the SQLite file, or the Postgres or Oracle container with the run's label.
 - The state of the run's browser session.
 
 The exit code is not zero when a check fails. Do not drive a run that fails doctor. Correct the cause, or run `bwv cleanup` and then `bwv launch`.
@@ -166,7 +168,7 @@ Run cleanup after every failed iteration too. `bwv runs` lists every run in this
 
 | Helper | Invocation |
 |---|---|
-| `scripts/bwv` | `bwv launch [--store sqlite\|postgres\|inmemory] \| doctor \| url [path] \| api <METHOD> <path> [name] [json] \| wait-job <jobId> <State> [timeout-s] \| browser <args...> \| shot <name> \| sql <name> <query> \| cleanup \| runs`. Run `bwv` with no arguments to see the usage. |
+| `scripts/bwv` | `bwv launch [--store sqlite\|postgres\|oracle\|inmemory] \| doctor \| url [path] \| api <METHOD> <path> [name] [json] \| wait-job <jobId> <State> [timeout-s] \| browser <args...> \| shot <name> \| sql <name> <query> \| cleanup \| runs`. Run `bwv` with no arguments to see the usage. |
 | `chrome-devtools-axi` | Through `bwv browser` only, so that the run's session is always set. Run `chrome-devtools-axi --help` for the full command list. |
 | Swagger UI | `bwv url /swagger` prints the URL. The page lists every sample endpoint and its parameters. |
 
@@ -181,4 +183,6 @@ Run cleanup after every failed iteration too. `bwv runs` lists every run in this
 - **The Overview counts only queues that hold jobs.** The Queues page also lists `limited` (concurrency limit 1, set at startup by the actor `startup`).
 - **SQL Server is not wired into `bwv`.** The sample supports `--BackWave:Store=SqlServer`, but `bwv` does not start a private SQL Server container. Do not point a run at the compose container on port `14331`: other test runs share it.
 - **`sqlite3 -readonly` fails on this WAL database.** `bwv sql` uses `PRAGMA query_only=1` instead.
+- **To reproduce a store outage,** stop and start the run's own container: `docker stop -t 2 <CONTAINER>`, then `docker start <CONTAINER>`. `CONTAINER` is in `run.env`. The Oracle port is fixed, so the app finds the database again. On Oracle, `SHUTDOWN IMMEDIATE` and `STARTUP` through `docker exec -i <CONTAINER> sqlplus -S / as sysdba` give the restart codes (`ORA-01089`, `ORA-01109`). A host-run app cannot lose DNS, so `ORA-12545` needs the app in a container on a private Docker network.
+- **The Oracle store has no business table.** `POST /tx` answers 409, and `bwv sql` queries the `backwave` schema, for example `SELECT RAWTOHEX(job_id), state, attempt FROM jobs`.
 - **macOS has no `timeout` command.** Use `bwv wait-job` or a loop with `sleep` to wait.

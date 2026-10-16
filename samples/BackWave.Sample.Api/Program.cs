@@ -23,7 +23,7 @@ using OpenTelemetry.Trace;
 var builder = WebApplication.CreateBuilder(args);
 
 // ── Storage selection ────────────────────────────────────────────────────────
-// BackWave:Store = InMemory (default) | Postgres | SqlServer. In-Memory is F5-and-go with
+// BackWave:Store = InMemory (default) | Postgres | SqlServer | Oracle. In-Memory is F5-and-go with
 // zero infra; the relational stores need the sample's own `docker compose up -d` first. Each
 // kind carries its own store/DbContext/schema behavior (see StoreKind.cs).
 var store = StoreKind.FromConfiguration(builder.Configuration);
