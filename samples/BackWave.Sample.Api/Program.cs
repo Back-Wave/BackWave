@@ -632,6 +632,12 @@ ops.MapPost("/jobs/{id:guid}/requeue", async (BackWaveOperator op, Guid id) =>
     Results.Ok(new { result = (await op.RequeueAsync(id, actor)).ToString() }))
     .WithSummary("Requeue a Dead-Lettered or Quarantined job.");
 
+ops.MapPost("/jobs/{id:guid}/reschedule", async (BackWaveOperator op, Guid id, int seconds) =>
+{
+    var dueTime = DateTimeOffset.UtcNow.AddSeconds(seconds);
+    return Results.Ok(new { result = (await op.RescheduleAsync(id, dueTime, actor)).ToString(), dueTime });
+}).WithSummary("Move a Scheduled or AwaitingParent job's due time to now + seconds (0 or less runs it at once).");
+
 ops.MapPost("/jobs/{id:guid}/cancel", async (BackWaveOperator op, Guid id) =>
     Results.Ok(new { result = (await op.CancelJobAsync(id, actor)).ToString() }))
     .WithSummary("Cancel a job (cooperative if it is executing).");
@@ -747,5 +753,48 @@ app.MapPost("/tx", async (IServiceProvider sp, BackWaveClient client, bool fail)
     return Results.Ok(new { rowId, jobId, committed = true, note = "The business row and the job committed atomically." });
 }).WithTags("Transactional Enqueue")
   .WithSummary("Commit/roll back a business row and a job together (relational stores only).");
+
+app.MapPost("/tx/reschedule", async (IServiceProvider sp, BackWaveOperator op, Guid jobId, int seconds, bool fail) =>
+{
+    if (!store.SupportsTransactionalEnqueue)
+    {
+        return Results.Conflict(new
+        {
+            error = "This store deployment does not support a transactional reschedule.",
+            guidance = "Use a co-resident relational store: BackWave:Store=Sqlite, Postgres, or SqlServer.",
+        });
+    }
+
+    using var scope = sp.CreateScope();
+    var db = scope.ServiceProvider.GetRequiredService<SampleDbContext>();
+
+    var dueTime = DateTimeOffset.UtcNow.AddSeconds(seconds);
+    var rowId = Guid.NewGuid();
+    await using var transaction = await db.Database.BeginTransactionAsync();
+
+    db.BusinessRows.Add(new SampleBusinessRow { Id = rowId, Note = $"job {jobId} moved to {dueTime:O}" });
+    await db.SaveChangesAsync();
+
+    // The new due time rides on the EF transaction: it commits or rolls back atomically with the row.
+    var result = await op.RescheduleAsync(jobId, dueTime, actor, db);
+
+    if (fail || result == RescheduleResult.NotReschedulable)
+    {
+        await transaction.RollbackAsync();
+        return Results.Ok(new
+        {
+            rowId, jobId, result = result.ToString(), committed = false,
+            note = "Both the business row and the new due time were rolled back.",
+        });
+    }
+
+    await transaction.CommitAsync();
+    return Results.Ok(new
+    {
+        rowId, jobId, result = result.ToString(), dueTime, committed = true,
+        note = "The business row and the new due time committed atomically.",
+    });
+}).WithTags("Transactional Enqueue")
+  .WithSummary("Move a waiting job's due time in the same transaction as a business row (relational stores only).");
 
 app.Run();

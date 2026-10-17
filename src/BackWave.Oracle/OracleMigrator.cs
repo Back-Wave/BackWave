@@ -18,7 +18,7 @@ namespace BackWave.Oracle;
 public static class OracleMigrator
 {
     /// <summary>The schema version this build of the adapter requires the database to be at.</summary>
-    public const int ExpectedSchemaVersion = 2;
+    public const int ExpectedSchemaVersion = 3;
 
     // Transient faults a cold-booting fleet can hit that the bounded retry should ride out rather than
     // surface: the shared listener/handshake-storm and connection-lost connectivity set, and a deadlock.

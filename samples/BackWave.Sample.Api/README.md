@@ -134,6 +134,7 @@ enqueued atomically (ADR 0023). Each renders as a graph at `/backwave/workflows/
 
 **Operator Actions** (`/ops`)
 - `POST /ops/jobs/{id}/requeue` · `POST /ops/jobs/{id}/cancel`
+- `POST /ops/jobs/{id}/reschedule?seconds=` - move a waiting job's due time to now + `seconds`.
 - `POST /ops/queues/{queue}/pause` · `POST /ops/queues/{queue}/resume`
 - `POST /ops/schedules/{id}/trigger`
 - `POST /ops/workflows/{id}/cancel` — cancel a whole Workflow (fans the per-job Cancel out over its
@@ -152,6 +153,8 @@ enqueued atomically (ADR 0023). Each renders as a graph at `/backwave/workflows/
 
 **Transactional Enqueue**
 - `POST /tx?fail=false` commits a business row and a job atomically; `?fail=true` rolls both back.
+- `POST /tx/reschedule?jobId=&seconds=&fail=false` moves a waiting job's due time in the same
+  transaction as a business row. `?fail=true` rolls both back, so the job keeps its old due time.
   Relational stores only — `409` on In-Memory.
 
 ## MCP server (BackWave Pro)

@@ -4,14 +4,15 @@ using System.Data.Common;
 namespace BackWave.Storage.InMemory;
 
 /// <summary>
-/// The in-memory store's transactional-enqueue scope. Enqueues buffer here and become visible
-/// atomically on <see cref="Commit"/>; rolling back — explicitly or by disposing without committing —
-/// means the jobs never existed: never claimable, never visible to reads, no trace.
+/// The in-memory store's transactional-enqueue scope. Enqueues and reschedules buffer here and become
+/// visible atomically on <see cref="Commit"/>. A rollback, explicit or by disposing without a commit,
+/// means they never happened: the jobs never existed and no due time moved, with no trace.
 /// </summary>
 public sealed class InMemoryTransaction : DbTransaction
 {
     private readonly List<(NewJob Job, DateTimeOffset Now)> _pending = [];
     private readonly List<(WorkflowDefinition Def, DateTimeOffset Now)> _pendingWorkflows = [];
+    private readonly List<PendingReschedule> _pendingReschedules = [];
     private bool _completed;
 
     internal InMemoryTransaction(InMemoryJobStore store) => Store = store;
@@ -24,9 +25,14 @@ public sealed class InMemoryTransaction : DbTransaction
     /// <inheritdoc/>
     protected override DbConnection? DbConnection => null;
 
-    internal bool HasPending(Guid jobId)
-        => _pending.Any(p => p.Job.JobId == jobId)
-            || _pendingWorkflows.Any(w => w.Def.Members.Any(m => m.JobId == jobId));
+    internal bool HasPending(Guid jobId) => FindPending(jobId) is not null;
+
+    /// <summary>Every buffered job, plain or a workflow member, in the order buffered.</summary>
+    internal IEnumerable<NewJob> PendingJobs
+        => _pending.Select(p => p.Job).Concat(_pendingWorkflows.SelectMany(w => w.Def.Members));
+
+    /// <summary>The job buffered under <paramref name="jobId"/>, plain or a workflow member; null when none is.</summary>
+    internal NewJob? FindPending(Guid jobId) => PendingJobs.FirstOrDefault(j => j.JobId == jobId);
 
     internal bool HasPendingWorkflow(Guid workflowId) => _pendingWorkflows.Any(w => w.Def.WorkflowId == workflowId);
 
@@ -42,14 +48,21 @@ public sealed class InMemoryTransaction : DbTransaction
         _pendingWorkflows.Add((def, now));
     }
 
+    internal void AddPendingReschedule(PendingReschedule reschedule)
+    {
+        ThrowIfCompleted();
+        _pendingReschedules.Add(reschedule);
+    }
+
     /// <inheritdoc/>
     public override void Commit()
     {
         ThrowIfCompleted();
-        Store.CommitTransaction(_pending, _pendingWorkflows);
+        Store.CommitTransaction(_pending, _pendingWorkflows, _pendingReschedules, PendingJobs);
         _completed = true;
         _pending.Clear();
         _pendingWorkflows.Clear();
+        _pendingReschedules.Clear();
     }
 
     /// <inheritdoc/>
@@ -59,6 +72,7 @@ public sealed class InMemoryTransaction : DbTransaction
         _completed = true;
         _pending.Clear();
         _pendingWorkflows.Clear();
+        _pendingReschedules.Clear();
     }
 
     /// <inheritdoc/>
@@ -79,3 +93,11 @@ public sealed class InMemoryTransaction : DbTransaction
         }
     }
 }
+
+/// <summary>
+/// One reschedule buffered in an <see cref="InMemoryTransaction"/> until it commits. <paramref name="Seen"/>
+/// is the committed job as the call saw it, so the commit can tell whether it changed in between; null for
+/// a job enqueued earlier in the same transaction.
+/// </summary>
+internal readonly record struct PendingReschedule(
+    Guid JobId, DateTimeOffset DueTime, string Actor, DateTimeOffset Now, JobRecord? Seen);

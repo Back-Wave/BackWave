@@ -136,7 +136,9 @@ public sealed class InMemoryJobStore(
     /// <summary>Applies a transaction's buffered enqueues atomically with respect to readers.</summary>
     internal void CommitTransaction(
         IReadOnlyList<(NewJob Job, DateTimeOffset Now)> pending,
-        IReadOnlyList<(WorkflowDefinition Def, DateTimeOffset Now)> pendingWorkflows)
+        IReadOnlyList<(WorkflowDefinition Def, DateTimeOffset Now)> pendingWorkflows,
+        IReadOnlyList<PendingReschedule> pendingReschedules,
+        IEnumerable<NewJob> pendingJobs)
     {
         lock (_gate)
         {
@@ -190,6 +192,37 @@ public sealed class InMemoryJobStore(
                 }
             }
 
+            // A buffered reschedule checked its job at the call, but this store holds no row lock
+            // across the gap, so a claim, cancel, or purge may have moved the job since. Fail the
+            // commit before anything applies, like a constraint failing a real database commit.
+            // A database holds the row lock, so every such write waits for the commit and then applies
+            // on top of the new due time. This store cannot replay a write that is already done, so a
+            // committed job that changed its State, Attempt, or due time since the call fails the
+            // commit too: a claim, failed Attempt, and retry (the retry due time would be lost), a latch
+            // release (which clamps the due time to the release time), or another reschedule.
+            foreach (var reschedule in pendingReschedules)
+            {
+                var state = ResolveStateLocked(reschedule.JobId, pendingJobs);
+                if (state is null)
+                {
+                    throw new InvalidOperationException(
+                        $"Transactional reschedule commit failed for job {reschedule.JobId}: it no longer exists.");
+                }
+                if (!IsReschedulable(state.Value))
+                {
+                    throw new InvalidOperationException(
+                        $"Transactional reschedule commit failed for job {reschedule.JobId}: it is now {state}.");
+                }
+                if (reschedule.Seen is { } seen && _jobs[reschedule.JobId] is var current
+                    && (current.State != seen.State || current.Attempt != seen.Attempt || current.DueTime != seen.DueTime))
+                {
+                    throw new InvalidOperationException(
+                        $"Transactional reschedule commit failed for job {reschedule.JobId}: it changed since the call " +
+                        $"(was {seen.State}, Attempt {seen.Attempt}, due {seen.DueTime:O}; " +
+                        $"is {current.State}, Attempt {current.Attempt}, due {current.DueTime:O}).");
+                }
+            }
+
             // Apply Workflows first so a plain pending job may legitimately depend on a member.
             foreach (var (def, now) in pendingWorkflows)
             {
@@ -204,6 +237,21 @@ public sealed class InMemoryJobStore(
                     throw new InvalidOperationException(
                         $"Transactional Enqueue commit failed for job {job.JobId}: {applied}.");
                 }
+            }
+
+            // Reschedules go last, so one may move a job enqueued earlier in the same transaction.
+            // The check above resolved every target the way the enqueues just applied it, so each
+            // one exists and still waits.
+            foreach (var reschedule in pendingReschedules)
+            {
+                if (!_jobs.TryGetValue(reschedule.JobId, out var target) || !IsReschedulable(target.State))
+                {
+                    throw Invariant.Halt(
+                        InvariantTrigger.RescheduleTargetNotWaiting,
+                        $"Transactional reschedule of job {reschedule.JobId} found it " +
+                        $"{(target is null ? "absent" : target.State.ToString())} at apply, after the same commit checked it.");
+                }
+                RescheduleLocked(reschedule.JobId, reschedule.DueTime, reschedule.Actor, reschedule.Now);
             }
         }
     }
@@ -240,20 +288,8 @@ public sealed class InMemoryJobStore(
 
         // Resolve parents already terminal at enqueue: each is an edge that will never
         // fire later, so it must count against the latch (or cancel) right now.
-        var pendingParents = new List<Guid>();
-        var cancelledByParent = (JobState?)null;
-        foreach (var parentId in job.Parents)
-        {
-            var parentState = _jobs[parentId].State;
-            if (!parentState.IsTerminal())
-            {
-                pendingParents.Add(parentId);
-            }
-            else if (job.Mode == DependencyMode.OnSuccess && parentState != JobState.Succeeded)
-            {
-                cancelledByParent = parentState;
-            }
-        }
+        var pendingParents = job.Parents.Where(p => !_jobs[p].State.IsTerminal()).ToList();
+        var (firstState, cancelledByParent) = FirstState(job.Mode, job.Parents.Select(p => _jobs[p].State));
 
         var record = new JobRecord
         {
@@ -262,9 +298,7 @@ public sealed class InMemoryJobStore(
             Payload = job.Payload,
             TraceContext = job.TraceContext,
             Queue = job.Queue,
-            State = cancelledByParent is not null ? JobState.Cancelled
-                : pendingParents.Count > 0 ? JobState.AwaitingParent
-                : JobState.Scheduled,
+            State = firstState,
             DueTime = job.DueTime,
             ParentsRemaining = pendingParents.Count,
             Mode = job.Mode,
@@ -292,6 +326,76 @@ public sealed class InMemoryJobStore(
     }
 
     private static string ParentFailureCause(JobState parentState) => $"parent-failure:{parentState}";
+
+    /// <summary>
+    /// The state a new job enters at enqueue, given its parents' states: Cancelled when an on-success
+    /// parent already ended other than Succeeded (that parent's state is the cause), AwaitingParent
+    /// while any parent is live, else Scheduled.
+    /// </summary>
+    private static (JobState State, JobState? CancelledByParent) FirstState(
+        DependencyMode mode, IEnumerable<JobState> parentStates)
+    {
+        var anyLive = false;
+        var cancelledByParent = (JobState?)null;
+        foreach (var parentState in parentStates)
+        {
+            if (!parentState.IsTerminal())
+            {
+                anyLive = true;
+            }
+            else if (mode == DependencyMode.OnSuccess && parentState != JobState.Succeeded)
+            {
+                cancelledByParent = parentState;
+            }
+        }
+        var state = cancelledByParent is not null ? JobState.Cancelled
+            : anyLive ? JobState.AwaitingParent
+            : JobState.Scheduled;
+        return (state, cancelledByParent);
+    }
+
+    /// <summary>
+    /// The state of a committed job, or the state a job buffered in a transaction will enter when the
+    /// commit enqueues it (its buffered parents resolved the same way); null when it is neither, or
+    /// when a parent of the buffered job no longer exists.
+    /// The caller must hold the gate.
+    /// </summary>
+    private JobState? ResolveStateLocked(Guid jobId, IEnumerable<NewJob> pendingJobs)
+    {
+        if (_jobs.TryGetValue(jobId, out var record))
+        {
+            return record.State;
+        }
+        var pendingById = new Dictionary<Guid, NewJob>();
+        foreach (var job in pendingJobs)
+        {
+            pendingById.TryAdd(job.JobId, job);
+        }
+        return ResolveStateLocked(jobId, pendingById, []);
+    }
+
+    // Each buffered job resolves once per call, so a diamond-shaped graph costs one visit per job, not one per path.
+    private JobState? ResolveStateLocked(
+        Guid jobId, Dictionary<Guid, NewJob> pendingById, Dictionary<Guid, JobState?> resolved)
+    {
+        if (_jobs.TryGetValue(jobId, out var record))
+        {
+            return record.State;
+        }
+        if (resolved.TryGetValue(jobId, out var known))
+        {
+            return known;
+        }
+        if (!pendingById.TryGetValue(jobId, out var job))
+        {
+            return null;
+        }
+        var parentStates = job.Parents.Select(p => ResolveStateLocked(p, pendingById, resolved)).ToList();
+        // A parent purged since the buffered enqueue: the commit fails as UnknownParent.
+        JobState? state = parentStates.Any(s => s is null) ? null : FirstState(job.Mode, parentStates.Select(s => s!.Value)).State;
+        resolved[jobId] = state;
+        return state;
+    }
 
     // ── Workflows (ADR 0023) ─────────────────────────────────────────────────────
 
@@ -1049,6 +1153,58 @@ public sealed class InMemoryJobStore(
     // ── §5.8 Operator Actions ────────────────────────────────────────────────────
 
     /// <inheritdoc/>
+    public ValueTask<RescheduleResult> RescheduleAsync(
+        Guid jobId, DateTimeOffset dueTime, string actor, DateTimeOffset now,
+        DbTransaction? transaction = null, CancellationToken cancellationToken = default)
+    {
+        if (transaction is not null)
+        {
+            if (transaction is not InMemoryTransaction memoryTransaction || memoryTransaction.Store != this)
+            {
+                throw new ArgumentException(
+                    "The In-Memory Store only enlists in transactions created by its own BeginTransaction().",
+                    nameof(transaction));
+            }
+
+            lock (_gate)
+            {
+                // Check now (the result at the call site), apply at commit. A job enqueued earlier in
+                // the same transaction is visible to it in the state its enqueue resolves to, as it is
+                // on a real database.
+                if (ResolveStateLocked(jobId, memoryTransaction.PendingJobs) is not { } state || !IsReschedulable(state))
+                {
+                    return ValueTask.FromResult(RescheduleResult.NotReschedulable);
+                }
+                memoryTransaction.AddPendingReschedule(
+                    new PendingReschedule(jobId, dueTime, actor, now, _jobs.GetValueOrDefault(jobId)));
+                return ValueTask.FromResult(RescheduleResult.Rescheduled);
+            }
+        }
+
+        lock (_gate)
+        {
+            if (!_jobs.TryGetValue(jobId, out var job) || !IsReschedulable(job.State))
+            {
+                return ValueTask.FromResult(RescheduleResult.NotReschedulable);
+            }
+            RescheduleLocked(jobId, dueTime, actor, now);
+            return ValueTask.FromResult(RescheduleResult.Rescheduled);
+        }
+    }
+
+    // Only a waiting job's due time can move (§5.8); a Leased job is running and a terminal one is done.
+    private static bool IsReschedulable(JobState state) => state is JobState.Scheduled or JobState.AwaitingParent;
+
+    // The due time is the only field a reschedule writes. The state does not change, so no Transition
+    // Log entry. The caller must hold the gate and has checked the state.
+    private void RescheduleLocked(Guid jobId, DateTimeOffset dueTime, string actor, DateTimeOffset now)
+    {
+        var job = _jobs[jobId];
+        _jobs[jobId] = job with { DueTime = dueTime };
+        AppendAudit(actor, OperatorAction.Reschedule, jobId.ToString(), now, new RescheduleAuditDetail(job.DueTime, dueTime));
+    }
+
+    /// <inheritdoc/>
     public ValueTask<RequeueResult> RequeueAsync(
         Guid jobId, string actor, DateTimeOffset now, CancellationToken cancellationToken = default)
     {
@@ -1149,8 +1305,9 @@ public sealed class InMemoryJobStore(
     }
 
     /// <summary>Append-only audit log; the caller must hold the gate.</summary>
-    private void AppendAudit(string actor, OperatorAction action, string target, DateTimeOffset now)
-        => _audit.Add(new OperatorAuditRecord(actor, action, target, now));
+    private void AppendAudit(
+        string actor, OperatorAction action, string target, DateTimeOffset now, OperatorAuditDetail? detail = null)
+        => _audit.Add(new OperatorAuditRecord(actor, action, target, now) { Detail = detail });
 
     /// <inheritdoc/>
     public ValueTask SetConcurrencyLimitAsync(

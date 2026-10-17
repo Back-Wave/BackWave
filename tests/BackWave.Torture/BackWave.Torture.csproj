@@ -14,6 +14,8 @@
          thin xUnit entry that runs the contract in the PR battery; that test project reaches the harness
          types through this grant. Nothing else is exposed. -->
     <InternalsVisibleTo Include="BackWave.Upgrade.Tests" />
+    <!-- The oracle unit tests feed the Auditor hand-made journals through this grant. -->
+    <InternalsVisibleTo Include="BackWave.Torture.Tests" />
   </ItemGroup>
 
   <ItemGroup>

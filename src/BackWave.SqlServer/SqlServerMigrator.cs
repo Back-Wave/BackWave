@@ -16,7 +16,7 @@ namespace BackWave.SqlServer;
 public static class SqlServerMigrator
 {
     /// <summary>The schema version this build of the adapter requires the database to be at.</summary>
-    public const int ExpectedSchemaVersion = 3;
+    public const int ExpectedSchemaVersion = 4;
 
     /// <summary>
     /// Runs every schema script in version order, bringing the database up to the version this

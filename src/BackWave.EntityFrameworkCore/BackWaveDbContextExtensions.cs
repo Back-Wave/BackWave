@@ -39,7 +39,7 @@ public static class BackWaveDbContextExtensions
     /// for another reason (for example, a duplicate job id).
     /// </exception>
     /// <exception cref="NotSupportedException">The storage adapter does not support transactional enqueue.</exception>
-    /// <exception cref="ArgumentException">The serialized payload exceeds the store's maximum payload size; store a reference (an id or blob key) instead of the data itself.</exception>
+    /// <exception cref="ArgumentException">The serialized payload exceeds the store's maximum payload size (store a reference, an id or blob key, instead of the data itself), or the transaction on <paramref name="unitOfWork"/> is not a transaction of the storage adapter's database provider.</exception>
     /// <example>
     /// <code>
     /// await using var tx = await context.Database.BeginTransactionAsync();

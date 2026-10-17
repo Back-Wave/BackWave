@@ -1,13 +1,14 @@
+using System.Data.Common;
 using BackWave.Storage;
 
 namespace BackWave.Operations;
 
 /// <summary>
 /// The operator-actions surface: the administrative peer of the enqueue client and the monitor.
-/// Cancel a job, requeue a failed job, pause and resume a queue, cap a queue's concurrency, and
-/// trigger a recurring schedule on demand. Every action is stamped with the acting operator's
-/// identity and recorded in the append-only audit log, so reach for this rather than mutating the
-/// store directly.
+/// Cancel a job, move a waiting job's due time, requeue a failed job, pause and resume a queue, cap
+/// a queue's concurrency, and trigger a recurring schedule on demand. Every action is stamped with
+/// the acting operator's identity and recorded in the append-only audit log, so reach for this
+/// rather than mutating the store directly.
 /// </summary>
 /// <param name="store">The storage adapter the actions are applied to.</param>
 /// <param name="clock">
@@ -52,6 +53,61 @@ public sealed class BackWaveOperator(IJobStore store, TimeProvider? clock = null
     public ValueTask<RequeueResult> RequeueAsync(
         Guid jobId, string actor, DateTimeOffset? now = null, CancellationToken cancellationToken = default)
         => store.RequeueAsync(jobId, actor, now ?? _clock.GetUtcNow(), cancellationToken);
+
+    /// <summary>
+    /// Moves a waiting job's due time: a job that is scheduled, or waiting on its parents, gets
+    /// <paramref name="dueTime"/> as its new due time and keeps its id, payload, queue, and attempt
+    /// count. A job that waits on parents starts no earlier than the new due time once its parents
+    /// finish. A due time at or before now makes the job run as soon as a worker is free. A running,
+    /// finished, or unknown job is rejected unchanged, so a rejection means it is too late to move the
+    /// job. Pass <paramref name="transaction"/> to move the job atomically with your own database
+    /// writes: both commit or roll back together. The action is recorded against the acting operator.
+    /// </summary>
+    /// <remarks>
+    /// Keep a <paramref name="transaction"/> short. The job row stays locked until you commit. When the
+    /// job waits on a parent, the parent's outcome report waits for your commit, because the report
+    /// locks the child rows to release them. On SQLite, your transaction holds the database write lock,
+    /// so every other write waits for your commit. Under REPEATABLE READ, SERIALIZABLE, or SNAPSHOT
+    /// isolation, your transaction can get a serialization error from the database instead of
+    /// <see cref="RescheduleResult.NotReschedulable"/>.
+    /// </remarks>
+    /// <param name="jobId">The id of the job to reschedule.</param>
+    /// <param name="dueTime">The job's new due time.</param>
+    /// <param name="actor">The acting operator's identity, recorded in the audit log.</param>
+    /// <param name="transaction">
+    /// An optional open transaction on the same database as the storage adapter. The new due time and
+    /// the audit record are written on it and share its commit or rollback. Null moves the job at once.
+    /// </param>
+    /// <param name="now">The instant to stamp the action with. Defaults to the current instant.</param>
+    /// <param name="cancellationToken">Cancels the request.</param>
+    /// <returns>Whether the job was rescheduled, or was not in a state whose due time can move.</returns>
+    /// <exception cref="NotSupportedException">A <paramref name="transaction"/> was supplied but the storage adapter does not support transactional writes, or the storage adapter does not implement reschedule.</exception>
+    /// <exception cref="ArgumentException">The <paramref name="transaction"/> is not a transaction of the storage adapter's database provider, or, for the in-memory store, was not created by that store.</exception>
+    /// <example>
+    /// <code>
+    /// var result = await backWaveOperator.RescheduleAsync(campaign.SendJobId, newSendAt, actor: userId);
+    /// if (result == RescheduleResult.NotReschedulable)
+    /// {
+    ///     // The campaign is already sending or sent.
+    /// }
+    /// </code>
+    /// </example>
+    public ValueTask<RescheduleResult> RescheduleAsync(
+        Guid jobId,
+        DateTimeOffset dueTime,
+        string actor,
+        DbTransaction? transaction = null,
+        DateTimeOffset? now = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (transaction is not null && !store.SupportsTransactionalEnqueue)
+        {
+            throw new NotSupportedException(
+                "This storage adapter does not support transactional writes " +
+                "(SupportsTransactionalEnqueue is false); reschedule without a transaction instead.");
+        }
+        return store.RescheduleAsync(jobId, dueTime, actor, now ?? _clock.GetUtcNow(), transaction, cancellationToken);
+    }
 
     /// <summary>
     /// Pauses a queue across the whole cluster: no worker claims work from it until it is resumed.

@@ -49,6 +49,7 @@
     <Project Path="tests/BackWave.Testing.Tests/BackWave.Testing.Tests.csproj" />
     <Project Path="tests/BackWave.Tests/BackWave.Tests.csproj" />
     <Project Path="tests/BackWave.Torture/BackWave.Torture.csproj" />
+    <Project Path="tests/BackWave.Torture.Tests/BackWave.Torture.Tests.csproj" />
     <Project Path="tests/BackWave.Upgrade.Tests/BackWave.Upgrade.Tests.csproj" />
     <Project Path="tests/BackWave.Vopr/BackWave.Vopr.csproj" />
   </Folder>

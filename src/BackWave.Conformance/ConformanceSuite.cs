@@ -3104,6 +3104,537 @@ public abstract class ConformanceSuite
         Assert.Equal(RequeueResult.NotRequeueable, await store.RequeueAsync(Guid.NewGuid(), "alice", requeueTime));
     }
 
+    // ── §5.8 Reschedule ─────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Certifies that rescheduling a Scheduled job later moves only its due time: the job is not
+    /// claimable at its old due time, is claimable at the new one, and keeps its id, payload, Queue,
+    /// Attempt, Tags, and enqueue order.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_Reschedule_MovesAScheduledJobLater_KeepingEverythingElse()
+    {
+        var store = await CreateStoreAsync();
+        var payload = new byte[] { 0x7B, 0x22, 0x6E, 0x22, 0x3A, 0x37, 0x7D }; // {"n":7}
+        var job = Job(queue: "default", dueTime: T0.AddMinutes(10)) with
+        {
+            Payload = payload,
+            Tags = JobTags.Empty.WithTag("tenant", "acme").WithLabel("campaign"),
+        };
+        await store.EnqueueAsync(job, now: T0);
+        var before = (await store.GetJobAsync(job.JobId))!;
+
+        var newDue = T0.AddHours(3);
+        Assert.Equal(RescheduleResult.Rescheduled, await store.RescheduleAsync(job.JobId, newDue, "alice", T0));
+
+        var after = (await store.GetJobAsync(job.JobId))!;
+        Assert.Equal(JobState.Scheduled, after.State);
+        Assert.Equal(newDue, after.DueTime);
+        Assert.Equal(before.Attempt, after.Attempt);
+        Assert.Equal(before.Queue, after.Queue);
+        Assert.Equal(before.WireName, after.WireName);
+        Assert.Equal(before.Sequence, after.Sequence);
+        Assert.Null(after.RetryCause);
+        Assert.Equal(payload, after.Payload.ToArray());
+        Assert.Equal(job.Tags, after.Tags);
+
+        Assert.Empty(await ClaimAsync(store, T0.AddMinutes(10))); // the old due time no longer applies
+        Assert.Empty(await ClaimAsync(store, newDue.AddTicks(-TimeSpan.TicksPerMillisecond)));
+        var claimed = Assert.Single(await ClaimAsync(store, newDue));
+        Assert.Equal(job.JobId, claimed.JobId);
+        Assert.Equal(payload, claimed.Payload.ToArray());
+    }
+
+    /// <summary>
+    /// Certifies that rescheduling a Scheduled job earlier, including to an instant before now, makes it
+    /// claimable at once.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_Reschedule_MovesAScheduledJobEarlier_ClaimableAtOnce()
+    {
+        var store = await CreateStoreAsync();
+        var job = Job(dueTime: T0.AddDays(7));
+        await store.EnqueueAsync(job, now: T0);
+
+        var now = T0.AddMinutes(1);
+        Assert.Empty(await ClaimAsync(store, now));
+        Assert.Equal(RescheduleResult.Rescheduled, await store.RescheduleAsync(job.JobId, T0.AddHours(-1), "alice", now));
+
+        Assert.Equal(T0.AddHours(-1), (await store.GetJobAsync(job.JobId))!.DueTime);
+        Assert.Equal(job.JobId, Assert.Single(await ClaimAsync(store, now)).JobId);
+    }
+
+    /// <summary>
+    /// Certifies that a rescheduled AwaitingParent child starts no earlier than its new due time once its
+    /// parent succeeds, and that a child moved to before the release becomes due at the release.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_Reschedule_AnAwaitingParentChild_StartsNoEarlierThanTheNewDueTime()
+    {
+        var store = await CreateStoreAsync();
+        var parent = Job();
+        var later = Job() with { Parents = [parent.JobId] };
+        var earlier = Job(dueTime: T0.AddHours(5)) with { Parents = [parent.JobId] };
+        await store.EnqueueAsync(parent, now: T0);
+        await store.EnqueueAsync(later, now: T0);
+        await store.EnqueueAsync(earlier, now: T0);
+        Assert.Equal(JobState.AwaitingParent, (await store.GetJobAsync(later.JobId))!.State);
+
+        Assert.Equal(RescheduleResult.Rescheduled, await store.RescheduleAsync(later.JobId, T0.AddHours(2), "alice", T0));
+        Assert.Equal(RescheduleResult.Rescheduled, await store.RescheduleAsync(earlier.JobId, T0.AddHours(-1), "alice", T0));
+        Assert.Equal(JobState.AwaitingParent, (await store.GetJobAsync(later.JobId))!.State);
+
+        var release = T0.AddSeconds(30); // inside the parent's lease
+        var claimedParent = Assert.Single(await ClaimAsync(store, T0));
+        await store.ReportOutcomeAsync(claimedParent.JobId, "w1", claimedParent.Attempt, new JobOutcome.Success(), release);
+
+        // The child moved before the release runs at the release; the one moved later still waits.
+        Assert.Equal(earlier.JobId, Assert.Single(await ClaimAsync(store, release)).JobId);
+        Assert.Empty(await ClaimAsync(store, T0.AddHours(1)));
+        Assert.Equal(later.JobId, Assert.Single(await ClaimAsync(store, T0.AddHours(2))).JobId);
+    }
+
+    /// <summary>
+    /// Certifies that a Leased job, a job in each terminal state, and an unknown id are refused without
+    /// effect: the row is unchanged and no audit record is appended.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_Reschedule_RefusesRunningTerminalAndUnknownJobs_WithoutEffect()
+    {
+        var store = await CreateStoreAsync();
+
+        var leased = Job() with
+        {
+            Payload = new byte[] { 0x7B, 0x22, 0x6E, 0x22, 0x3A, 0x37, 0x7D }, // {"n":7}
+            Tags = JobTags.Empty.WithTag("tenant", "acme").WithLabel("campaign"),
+        };
+        await store.EnqueueAsync(leased, now: T0);
+        Assert.Single(await ClaimAsync(store, T0));
+
+        var succeeded = await RunToAsync(store, new JobOutcome.Success());
+        var dead = await RunToAsync(store, new JobOutcome.Failure(null, "boom"));
+        var quarantined = await RunToAsync(store, new JobOutcome.Unroutable("no handler"));
+        var cancelled = Job(dueTime: T0.AddHours(1));
+        await store.EnqueueAsync(cancelled, now: T0);
+        await store.CancelJobAsync(cancelled.JobId, "bob", T0);
+
+        foreach (var id in new[] { leased.JobId, succeeded, dead, quarantined, cancelled.JobId })
+        {
+            var before = (await store.GetJobAsync(id))!;
+            Assert.Equal(RescheduleResult.NotReschedulable, await store.RescheduleAsync(id, T0.AddDays(1), "alice", T0));
+            var after = (await store.GetJobAsync(id))!;
+            Assert.Equal(before.State, after.State);
+            Assert.Equal(before.DueTime, after.DueTime);
+            Assert.Equal(before.Attempt, after.Attempt);
+            Assert.Equal(before.LeaseOwner, after.LeaseOwner);
+            Assert.Equal(before.LeaseExpiry, after.LeaseExpiry);
+            Assert.Equal(before.RetryCause, after.RetryCause);
+            Assert.Equal(before.Payload.ToArray(), after.Payload.ToArray());
+            Assert.Equal(before.Queue, after.Queue);
+            Assert.Equal(before.Tags, after.Tags);
+            Assert.DoesNotContain(
+                await store.ListAuditRecordsAsync(id.ToString()), a => a.Action == OperatorAction.Reschedule);
+        }
+
+        var unknown = Guid.NewGuid();
+        Assert.Equal(RescheduleResult.NotReschedulable, await store.RescheduleAsync(unknown, T0.AddDays(1), "alice", T0));
+        Assert.Null(await store.GetJobAsync(unknown));
+        Assert.Empty(await store.ListAuditRecordsAsync(unknown.ToString()));
+
+        async Task<Guid> RunToAsync(IJobStore target, JobOutcome outcome)
+        {
+            var job = Job();
+            await target.EnqueueAsync(job, now: T0);
+            var claimed = Assert.Single(await ClaimAsync(target, T0));
+            await target.ReportOutcomeAsync(claimed.JobId, "w1", claimed.Attempt, outcome, T0);
+            return job.JobId;
+        }
+    }
+
+    /// <summary>
+    /// Certifies that a reschedule appends exactly one Reschedule audit record naming the actor under the
+    /// job target, and appends no Transition Log entry, because the job's state does not change.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_Reschedule_AppendsOneAuditRecord_AndNoTransition()
+    {
+        var store = await CreateStoreAsync();
+        var job = Job(dueTime: T0.AddHours(1));
+        await store.EnqueueAsync(job, now: T0);
+        var history = await store.GetJobHistoryAsync(job.JobId);
+
+        var at = T0.AddMinutes(5);
+        Assert.Equal(RescheduleResult.Rescheduled, await store.RescheduleAsync(job.JobId, T0.AddHours(2), "alice", at));
+        Assert.Equal(RescheduleResult.Rescheduled, await store.RescheduleAsync(job.JobId, T0.AddHours(2), "bob", at.AddMinutes(1)));
+
+        Assert.Equal(
+            [(OperatorAction.Reschedule, "alice", at), (OperatorAction.Reschedule, "bob", at.AddMinutes(1))],
+            (await store.ListAuditRecordsAsync(job.JobId.ToString())).Select(a => (a.Action, a.Actor, a.RecordedAt)).ToList());
+        Assert.Equal(
+            history.Select(t => (t.Ordinal, t.State, t.Attempt)).ToList(),
+            (await store.GetJobHistoryAsync(job.JobId)).Select(t => (t.Ordinal, t.State, t.Attempt)).ToList());
+    }
+
+    /// <summary>
+    /// Certifies that a reschedule's audit record keeps the due time before and after the move, and that
+    /// a second reschedule of the same job starts where the first one ended.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_Reschedule_AuditDetailKeepsTheOldAndNewDueTime()
+    {
+        var store = await CreateStoreAsync();
+        var job = Job(dueTime: T0.AddHours(1));
+        await store.EnqueueAsync(job, now: T0);
+
+        Assert.Equal(RescheduleResult.Rescheduled, await store.RescheduleAsync(job.JobId, T0.AddHours(3), "alice", T0));
+        Assert.Equal(RescheduleResult.Rescheduled, await store.RescheduleAsync(job.JobId, T0.AddMinutes(-30), "bob", T0));
+
+        Assert.Equal(
+            [new RescheduleAuditDetail(T0.AddHours(1), T0.AddHours(3)), new RescheduleAuditDetail(T0.AddHours(3), T0.AddMinutes(-30))],
+            (await store.ListAuditRecordsAsync(job.JobId.ToString())).Select(a => a.Detail).ToList());
+    }
+
+    /// <summary>
+    /// Certifies that a reschedule's audit detail names the due time the store kept, even when the store
+    /// keeps less precision than the caller gave, so a second reschedule's From is the first one's To.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_Reschedule_AuditDetailToIsTheStoredDueTime()
+    {
+        var store = await CreateStoreAsync();
+        var job = Job(dueTime: T0.AddHours(1));
+        await store.EnqueueAsync(job, now: T0);
+
+        Assert.Equal(RescheduleResult.Rescheduled, await store.RescheduleAsync(job.JobId, T0.AddHours(3).AddTicks(7), "alice", T0));
+        var firstDue = (await store.GetJobAsync(job.JobId))!.DueTime;
+        Assert.Equal(RescheduleResult.Rescheduled, await store.RescheduleAsync(job.JobId, T0.AddHours(2).AddTicks(13), "bob", T0));
+        var secondDue = (await store.GetJobAsync(job.JobId))!.DueTime;
+
+        Assert.Equal(
+            [new RescheduleAuditDetail(T0.AddHours(1), firstDue), new RescheduleAuditDetail(firstDue, secondDue)],
+            (await store.ListAuditRecordsAsync(job.JobId.ToString())).Select(a => a.Detail).ToList());
+    }
+
+    /// <summary>
+    /// Certifies that a transactional reschedule's audit detail commits and rolls back with the move: a
+    /// rolled-back move leaves no detail behind, and the committed move's detail starts from the due time
+    /// that was committed, not from the rolled-back one.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_TransactionalReschedule_CommitsItsAuditDetail()
+    {
+        var store = await CreateStoreAsync();
+        if (!store.SupportsTransactionalEnqueue)
+        {
+            return;
+        }
+        var oldDue = T0.AddHours(1);
+        var job = Job(dueTime: oldDue);
+        await store.EnqueueAsync(job, now: T0);
+
+        using (var transaction = BeginTransaction(store))
+        {
+            await store.RescheduleAsync(job.JobId, T0.AddHours(5), "alice", T0, transaction);
+            transaction.Rollback();
+        }
+        Assert.Empty(await store.ListAuditRecordsAsync(job.JobId.ToString()));
+
+        var newDue = T0.AddHours(3);
+        using (var transaction = BeginTransaction(store))
+        {
+            await store.RescheduleAsync(job.JobId, newDue, "carol", T0, transaction);
+            transaction.Commit();
+        }
+        Assert.Equal(
+            new RescheduleAuditDetail(oldDue, newDue),
+            Assert.Single(await store.ListAuditRecordsAsync(job.JobId.ToString())).Detail);
+    }
+
+    /// <summary>
+    /// Certifies that rescheduling a Retrying job keeps its Retry Cause and its Attempt, so it stays in the
+    /// Retrying view at its new due time.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_Reschedule_KeepsARetryingJobRetrying()
+    {
+        var store = await CreateStoreAsync();
+        await store.EnqueueAsync(Job(), now: T0);
+        var claimed = Assert.Single(await ClaimAsync(store, T0));
+        await store.ReportOutcomeAsync(claimed.JobId, "w1", claimed.Attempt, new JobOutcome.Failure(T0.AddMinutes(5), "transient"), T0);
+
+        var newDue = T0.AddHours(1);
+        Assert.Equal(RescheduleResult.Rescheduled, await store.RescheduleAsync(claimed.JobId, newDue, "alice", T0));
+
+        var job = (await store.GetJobAsync(claimed.JobId))!;
+        Assert.Equal(RetryCause.HandlerFailed, job.RetryCause);
+        Assert.Equal(claimed.Attempt, job.Attempt);
+        var listed = Assert.Single(await ListRetryingAsync(store));
+        Assert.Equal(newDue, listed.DueTime);
+    }
+
+    /// <summary>
+    /// Certifies that a reschedule in a caller transaction that rolls back leaves the old due time and no
+    /// audit record, and that one that commits applies both.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_TransactionalReschedule_CommitsAndRollsBackWithTheCaller()
+    {
+        var store = await CreateStoreAsync();
+        if (!store.SupportsTransactionalEnqueue)
+        {
+            return;
+        }
+        var oldDue = T0.AddHours(1);
+        var job = Job(dueTime: oldDue);
+        await store.EnqueueAsync(job, now: T0);
+
+        using (var transaction = BeginTransaction(store))
+        {
+            Assert.Equal(
+                RescheduleResult.Rescheduled,
+                await store.RescheduleAsync(job.JobId, T0.AddHours(5), "alice", T0, transaction));
+            transaction.Rollback();
+        }
+        Assert.Equal(oldDue, (await store.GetJobAsync(job.JobId))!.DueTime);
+        Assert.Empty(await store.ListAuditRecordsAsync(job.JobId.ToString()));
+
+        var newDue = T0.AddHours(5);
+        using (var transaction = BeginTransaction(store))
+        {
+            Assert.Equal(
+                RescheduleResult.Rescheduled,
+                await store.RescheduleAsync(job.JobId, newDue, "carol", T0, transaction));
+            transaction.Commit();
+        }
+        Assert.Equal(newDue, (await store.GetJobAsync(job.JobId))!.DueTime);
+        Assert.Equal("carol", Assert.Single(await store.ListAuditRecordsAsync(job.JobId.ToString())).Actor);
+        Assert.Empty(await ClaimAsync(store, oldDue));
+        Assert.Single(await ClaimAsync(store, newDue));
+    }
+
+    /// <summary>
+    /// Certifies that a transaction cannot reschedule a job it enqueued that its enqueue already cancelled:
+    /// an on-success child of a cancelled parent, and that child's own on-success child, are refused, and
+    /// once the transaction commits both are Cancelled at their old due time with no audit record.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_TransactionalReschedule_RefusesAJobItsEnqueueCancelled()
+    {
+        var store = await CreateStoreAsync();
+        if (!store.SupportsTransactionalEnqueue)
+        {
+            return;
+        }
+        var parent = Job(dueTime: T0.AddHours(1));
+        await store.EnqueueAsync(parent, now: T0);
+        await store.CancelJobAsync(parent.JobId, "bob", T0);
+
+        var child = Job(dueTime: T0) with { Parents = [parent.JobId] };
+        var grandchild = Job(dueTime: T0) with { Parents = [child.JobId] };
+        using (var transaction = BeginTransaction(store))
+        {
+            Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(child, now: T0, transaction));
+            Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(grandchild, now: T0, transaction));
+            Assert.Equal(
+                RescheduleResult.NotReschedulable,
+                await store.RescheduleAsync(child.JobId, T0.AddHours(2), "alice", T0, transaction));
+            Assert.Equal(
+                RescheduleResult.NotReschedulable,
+                await store.RescheduleAsync(grandchild.JobId, T0.AddHours(2), "alice", T0, transaction));
+            transaction.Commit();
+        }
+
+        foreach (var id in new[] { child.JobId, grandchild.JobId })
+        {
+            var stored = (await store.GetJobAsync(id))!;
+            Assert.Equal(JobState.Cancelled, stored.State);
+            Assert.Equal(T0, stored.DueTime);
+            Assert.DoesNotContain(
+                await store.ListAuditRecordsAsync(id.ToString()), a => a.Action == OperatorAction.Reschedule);
+        }
+    }
+
+    /// <summary>
+    /// Certifies that a transaction can enqueue a job and then reschedule it before it commits, and that
+    /// the committed job carries the new due time.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_TransactionalReschedule_CanMoveAJobEnqueuedInTheSameTransaction()
+    {
+        var store = await CreateStoreAsync();
+        if (!store.SupportsTransactionalEnqueue)
+        {
+            return;
+        }
+        var job = Job(dueTime: T0);
+        var newDue = T0.AddHours(2);
+        using (var transaction = BeginTransaction(store))
+        {
+            Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(job, now: T0, transaction));
+            Assert.Equal(
+                RescheduleResult.Rescheduled,
+                await store.RescheduleAsync(job.JobId, newDue, "alice", T0, transaction));
+            transaction.Commit();
+        }
+
+        Assert.Equal(newDue, (await store.GetJobAsync(job.JobId))!.DueTime);
+        Assert.Empty(await ClaimAsync(store, T0));
+        Assert.Single(await ClaimAsync(store, newDue));
+    }
+
+    /// <summary>
+    /// Certifies that a claim from another connection never leases a job at its old due time while a
+    /// reschedule of it is open in a caller transaction that then commits. The claim can skip the job,
+    /// wait for the transaction, or lease it and fail the commit. After a rollback, the job keeps its
+    /// old due time and is claimable at it.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_TransactionalReschedule_HeldOpen_KeepsAConcurrentClaimToTheCommittedDueTime()
+    {
+        var store = await CreateStoreAsync();
+        if (!store.SupportsTransactionalEnqueue)
+        {
+            return;
+        }
+        foreach (var commit in new[] { true, false })
+        {
+            var queue = commit ? "held-commit" : "held-rollback";
+            var job = Job(queue: queue, dueTime: T0);
+            await store.EnqueueAsync(job, now: T0);
+            var newDue = T0.AddDays(1);
+
+            Task<IReadOnlyList<JobRecord>> claim;
+            var commitFailed = false;
+            using (var transaction = BeginTransaction(store))
+            {
+                Assert.Equal(
+                    RescheduleResult.Rescheduled,
+                    await store.RescheduleAsync(job.JobId, newDue, "alice", T0, transaction));
+                claim = Task.Run(async () => await ClaimAsync(store, T0, queue: queue));
+                // A store that skips a locked row answers at once. One that waits for the lock answers
+                // only after the transaction ends, so the wait is a bound, not a result.
+                await Task.WhenAny(claim, Task.Delay(TimeSpan.FromSeconds(1)));
+                if (!commit)
+                {
+                    transaction.Rollback();
+                }
+                else
+                {
+                    try
+                    {
+                        transaction.Commit();
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        commitFailed = true;
+                    }
+                }
+            }
+
+            var leased = (await claim).Any(r => r.JobId == job.JobId);
+            var stored = (await store.GetJobAsync(job.JobId))!;
+            var audit = await store.ListAuditRecordsAsync(job.JobId.ToString());
+            if (leased)
+            {
+                // Only legal when the move never committed.
+                Assert.True(!commit || commitFailed, "The claim leased the job at its old due time, and the reschedule still committed.");
+                Assert.Equal((JobState.Leased, T0), (stored.State, stored.DueTime));
+                Assert.Empty(audit);
+            }
+            else if (commit)
+            {
+                Assert.False(commitFailed);
+                Assert.Equal((JobState.Scheduled, newDue), (stored.State, stored.DueTime));
+                Assert.Equal("alice", Assert.Single(audit).Actor);
+                Assert.Empty(await ClaimAsync(store, newDue.AddMinutes(-1), queue: queue));
+            }
+            else
+            {
+                Assert.Equal((JobState.Scheduled, T0), (stored.State, stored.DueTime));
+                Assert.Empty(audit);
+                Assert.Equal(job.JobId, Assert.Single(await ClaimAsync(store, T0, queue: queue)).JobId);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Certifies that a claim and a reschedule that race on the same due job never both win: in every
+    /// round either the claim leases the job and the reschedule is refused, or the reschedule moves the
+    /// job and the claim leaves it. A claimed job is always due at the claim's instant. Each side must
+    /// win at least once, so the race is real on every store.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_8_Reschedule_RacingAClaim_NeverBothWin()
+    {
+        var store = await CreateStoreAsync();
+        const int BaseStep = 4_000;
+        const int MaxSpins = 4_000_000;
+        var claimWins = 0;
+        var rescheduleWins = 0;
+        // A positive offset delays the reschedule, a negative one delays the claim. Where the two meet
+        // differs per store, so each round moves the offset toward the side that lost, doubling the step
+        // while one side keeps winning: the rounds find the window where the two meet and stay in it.
+        var offset = 0;
+        var step = BaseStep;
+        bool? claimWonLast = null;
+        var round = 0;
+        for (; round < 40 || ((claimWins == 0 || rescheduleWins == 0) && round < 200); round++)
+        {
+            var now = T0.AddMinutes(round);
+            var job = Job(dueTime: now);
+            await store.EnqueueAsync(job, now: now);
+
+            using var start = new ManualResetEventSlim();
+            var claimSpins = Math.Max(0, -offset);
+            var rescheduleSpins = Math.Max(0, offset);
+            var worker = $"w{round}";
+            var claim = Task.Run(async () =>
+            {
+                start.Wait();
+                Thread.SpinWait(claimSpins);
+                return await ClaimAsync(store, now, worker: worker);
+            });
+            var reschedule = Task.Run(async () =>
+            {
+                start.Wait();
+                Thread.SpinWait(rescheduleSpins);
+                return await store.RescheduleAsync(job.JobId, now.AddDays(1), "alice", now);
+            });
+            start.Set();
+
+            var claimed = await claim;
+            var result = await reschedule;
+            foreach (var record in claimed)
+            {
+                Assert.True(record.DueTime <= now, $"Round {round}: the claim leased job {record.JobId} due {record.DueTime:O}, after the claim's instant {now:O}.");
+            }
+            var won = claimed.Any(r => r.JobId == job.JobId);
+            var stored = (await store.GetJobAsync(job.JobId))!;
+            if (won)
+            {
+                Assert.Equal(RescheduleResult.NotReschedulable, result);
+                Assert.Equal(JobState.Leased, stored.State);
+                Assert.Equal(now, stored.DueTime);
+            }
+            else
+            {
+                Assert.Equal(RescheduleResult.Rescheduled, result);
+                Assert.Equal(JobState.Scheduled, stored.State);
+                Assert.Equal(now.AddDays(1), stored.DueTime);
+            }
+
+            step = won == claimWonLast ? Math.Min(MaxSpins, step * 2) : BaseStep;
+            offset = Math.Clamp(won ? offset - step : offset + step, -MaxSpins, MaxSpins);
+            claimWonLast = won;
+            claimWins += won ? 1 : 0;
+            rescheduleWins += won ? 0 : 1;
+        }
+
+        Assert.True(
+            claimWins > 0 && rescheduleWins > 0,
+            $"Over {round} rounds the claim won {claimWins} and the reschedule won {rescheduleWins}; the race proves nothing unless both sides win at least once.");
+    }
+
     /// <summary>
     /// Certifies that a paused queue yields nothing to claim and that resuming it restores
     /// claimability.
@@ -3538,9 +4069,9 @@ public abstract class ConformanceSuite
     }
 
     /// <summary>
-    /// Certifies that every applied operator action — cancel, pause, resume, set-limit, requeue,
-    /// trigger — appends an audit record carrying its actor, readable by target in chronological
-    /// order, while a rejected action leaves no trace.
+    /// Certifies that every applied operator action (cancel, pause, resume, set-limit, requeue,
+    /// reschedule, trigger) appends an audit record carrying its actor, readable by target in chronological
+    /// order, while a rejected action leaves no trace. Only the reschedule carries a detail.
     /// </summary>
     [Fact]
     public async Task Clause_5_8_EveryOperatorAction_AppendsAnAuditRecord_ReadableByTarget()
@@ -3557,16 +4088,18 @@ public abstract class ConformanceSuite
         Assert.Equal("alice", cancelAudit.Actor);
         Assert.Equal(OperatorAction.Cancel, cancelAudit.Action);
         Assert.Equal(T0, cancelAudit.RecordedAt);
+        Assert.Null(cancelAudit.Detail);
 
         // Pause, resume, then a Concurrency Limit set: all audited under the Queue target, in
         // chronological order — the limit write is audited even though nothing observable changed yet.
         await store.PauseQueueAsync("orders", "bob", T0.AddMinutes(1));
         await store.ResumeQueueAsync("orders", "carol", T0.AddMinutes(2));
         await store.SetConcurrencyLimitAsync("orders", 8, "frank", T0.AddMinutes(3));
+        // Only a reschedule keeps a detail; every other action carries none.
         Assert.Equal(
-            [(OperatorAction.PauseQueue, "bob"), (OperatorAction.ResumeQueue, "carol"),
-             (OperatorAction.SetConcurrencyLimit, "frank")],
-            (await store.ListAuditRecordsAsync("orders")).Select(a => (a.Action, a.Actor)).ToList());
+            [(OperatorAction.PauseQueue, "bob", null), (OperatorAction.ResumeQueue, "carol", null),
+             (OperatorAction.SetConcurrencyLimit, "frank", null)],
+            (await store.ListAuditRecordsAsync("orders")).Select(a => (a.Action, a.Actor, a.Detail)).ToList());
 
         // Requeue audited under the job target.
         var dead = Job();
@@ -3574,14 +4107,24 @@ public abstract class ConformanceSuite
         var claimed = Assert.Single(await ClaimAsync(store, T0));
         await store.ReportOutcomeAsync(claimed.JobId, "w1", claimed.Attempt, new JobOutcome.Failure(null, "x"), T0);
         await store.RequeueAsync(dead.JobId, "dave", T0.AddMinutes(3));
-        Assert.Equal(OperatorAction.Requeue,
-            Assert.Single(await store.ListAuditRecordsAsync(dead.JobId.ToString())).Action);
+        var requeueAudit = Assert.Single(await store.ListAuditRecordsAsync(dead.JobId.ToString()));
+        Assert.Equal(OperatorAction.Requeue, requeueAudit.Action);
+        Assert.Null(requeueAudit.Detail);
+
+        // Reschedule audited under the job target, with the due time before and after the move.
+        var waiting = Job(dueTime: T0.AddHours(1));
+        await store.EnqueueAsync(waiting, now: T0);
+        await store.RescheduleAsync(waiting.JobId, T0.AddHours(2), "grace", T0.AddMinutes(3));
+        var rescheduleAudit = Assert.Single(await store.ListAuditRecordsAsync(waiting.JobId.ToString()));
+        Assert.Equal((OperatorAction.Reschedule, "grace"), (rescheduleAudit.Action, rescheduleAudit.Actor));
+        Assert.Equal(new RescheduleAuditDetail(T0.AddHours(1), T0.AddHours(2)), rescheduleAudit.Detail);
 
         // TriggerScheduleNow audited under the schedule target.
         await store.UpsertScheduleAsync(Schedule("hourly", cursor: T0));
         await store.TriggerScheduleNowAsync("hourly", "erin", T0.AddMinutes(4));
-        Assert.Equal(OperatorAction.TriggerScheduleNow,
-            Assert.Single(await store.ListAuditRecordsAsync("hourly")).Action);
+        var triggerAudit = Assert.Single(await store.ListAuditRecordsAsync("hourly"));
+        Assert.Equal(OperatorAction.TriggerScheduleNow, triggerAudit.Action);
+        Assert.Null(triggerAudit.Detail);
 
         // A rejected action leaves no trace, and an unrelated target sees nothing.
         await store.CancelJobAsync(Guid.NewGuid(), "mallory", T0);

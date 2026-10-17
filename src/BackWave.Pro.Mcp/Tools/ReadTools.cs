@@ -141,9 +141,9 @@ internal sealed class ReadTools(BackWaveMonitor monitor, BackWaveOperator jobOpe
         OpenWorld = false)]
     [Description(
         "The operator audit trail for one target - who did what to it, and when - oldest first. " +
-        "Every operator write action (cancel, requeue, pause/resume queue, trigger schedule, set " +
-        "concurrency limit) contributes exactly one record. Empty when no action ever touched the " +
-        "target.")]
+        "Every operator write action (cancel, requeue, reschedule, pause/resume queue, trigger schedule, " +
+        "set concurrency limit) contributes exactly one record. A reschedule also carries the due time " +
+        "before and after the move. Empty when no action ever touched the target.")]
     public async Task<AuditRecordsResult> ListAuditRecordsAsync(
         [Description("The audit target: a job id, a queue name, or a schedule id.")]
         string target,
@@ -153,7 +153,8 @@ internal sealed class ReadTools(BackWaveMonitor monitor, BackWaveOperator jobOpe
         return new AuditRecordsResult
         {
             AuditRecords = [.. records.Select(r => new AuditRecordRow(
-                r.Actor, r.Action.ToString(), r.Target, r.RecordedAt))],
+                r.Actor, r.Action.ToString(), r.Target, r.RecordedAt,
+                (r.Detail as RescheduleAuditDetail)?.From, (r.Detail as RescheduleAuditDetail)?.To))],
         };
     }
 
@@ -282,13 +283,21 @@ internal sealed record AuditRecordsResult
 /// <param name="Action">Which operator action was performed.</param>
 /// <param name="Target">The job id, queue name, or schedule id acted on.</param>
 /// <param name="RecordedAt">When the action was recorded.</param>
+/// <param name="RescheduledFrom">For a reschedule, the job's due time just before the move; otherwise null.</param>
+/// <param name="RescheduledTo">For a reschedule, the due time the move gave the job; otherwise null.</param>
 internal sealed record AuditRecordRow(
     [property: Description("Who performed the action.")]
     string Actor,
-    [property: Description("Which operator action was performed, e.g. Cancel, Requeue, " +
+    [property: Description("Which operator action was performed, e.g. Cancel, Requeue, Reschedule, " +
         "TriggerScheduleNow, PauseQueue, ResumeQueue, SetConcurrencyLimit.")]
     string Action,
     [property: Description("The job id, queue name, or schedule id the action was performed on.")]
     string Target,
     [property: Description("When the action was recorded.")]
-    DateTimeOffset RecordedAt);
+    DateTimeOffset RecordedAt,
+    [property: Description("For a Reschedule, the job's due time just before the move; null for every " +
+        "other action, and for a reschedule recorded before the store kept it.")]
+    DateTimeOffset? RescheduledFrom,
+    [property: Description("For a Reschedule, the due time the move gave the job; null for every other " +
+        "action, and for a reschedule recorded before the store kept it.")]
+    DateTimeOffset? RescheduledTo);

@@ -61,7 +61,7 @@ public sealed class BackWaveClient(
     /// <param name="callerLineNumber">Compiler-supplied. The line of the enqueue call site, stamped on the send span; do not set it.</param>
     /// <returns>The new job's id, for later tracking or for use as a dependency parent.</returns>
     /// <exception cref="NotSupportedException">A <paramref name="transaction"/> was supplied but the storage adapter does not support transactional enqueue.</exception>
-    /// <exception cref="ArgumentException">The serialized payload exceeds the store's maximum payload size (store a reference, an id or blob key, instead of the data itself), or a tag key or value exceeds the store's tag length bound.</exception>
+    /// <exception cref="ArgumentException">The serialized payload exceeds the store's maximum payload size (store a reference, an id or blob key, instead of the data itself), a tag key or value exceeds the store's tag length bound, or the <paramref name="transaction"/> is not a transaction of the storage adapter's database provider (for the in-memory store, one it did not create).</exception>
     /// <exception cref="InvalidOperationException">The store rejected the enqueue for another reason (for example, a duplicate job id).</exception>
     /// <example>
     /// <code>

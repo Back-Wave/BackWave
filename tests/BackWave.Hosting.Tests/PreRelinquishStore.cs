@@ -53,6 +53,11 @@ public sealed class PreRelinquishStore(IJobStore inner) : IJobStore
         Guid jobId, string actor, DateTimeOffset now, CancellationToken cancellationToken = default)
         => inner.RequeueAsync(jobId, actor, now, cancellationToken);
 
+    public ValueTask<RescheduleResult> RescheduleAsync(
+        Guid jobId, DateTimeOffset dueTime, string actor, DateTimeOffset now,
+        DbTransaction? transaction = null, CancellationToken cancellationToken = default)
+        => inner.RescheduleAsync(jobId, dueTime, actor, now, transaction, cancellationToken);
+
     public ValueTask PauseQueueAsync(
         string queue, string actor, DateTimeOffset now, CancellationToken cancellationToken = default)
         => inner.PauseQueueAsync(queue, actor, now, cancellationToken);

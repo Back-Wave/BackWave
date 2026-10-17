@@ -114,6 +114,7 @@ internal sealed class WorkloadStats(IReadOnlyList<JournalEntry> journal, KeySpac
             ["workflowResults"] = Results(journal.Where(e => e.Op == Ops.Workflow)),
             ["cancelResults"] = Results(journal.Where(e => e.Op == Ops.Cancel)),
             ["requeueResults"] = Results(journal.Where(e => e.Op == Ops.Requeue)),
+            ["rescheduleResults"] = Results(journal.Where(e => e.Op == Ops.Reschedule)),
             ["jobsClaimed"] = claims.Count,
             ["governedQueueClaims"] = claims.Count(e => e.Queue == keys.GovernedQueue),
             ["collisions"] = new Dictionary<string, int>

@@ -68,6 +68,9 @@ public enum InvariantTrigger
     /// <summary>A stored column holds an integer that is not a defined value of the enum it maps to.</summary>
     UndefinedEnumValueStored,
 
+    /// <summary>A stored operator audit detail does not parse as the detail its action keeps.</summary>
+    MalformedAuditDetailStored,
+
     /// <summary>An observer cursor was asked to move strictly backward, which its monotonicity forbids.</summary>
     ObserverCursorRegressed,
 
@@ -91,4 +94,8 @@ public enum InvariantTrigger
     /// after its own parents. The builder rejects a cycle before this point, so reaching it means the
     /// graph was never validated.</summary>
     WorkflowMemberCycle,
+
+    /// <summary>A buffered reschedule's job was not a waiting job when the commit applied it, after that same
+    /// commit had checked it under the same lock.</summary>
+    RescheduleTargetNotWaiting,
 }

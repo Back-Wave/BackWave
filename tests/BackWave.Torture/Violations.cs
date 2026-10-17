@@ -35,6 +35,26 @@ internal static class TortureInvariant
     public const string RawStoreException = "RawStoreException";
 
     /// <summary>
+    /// A claim leased a job whose due time was after the claim's now. A reschedule can move a due time
+    /// later while a claim runs, so a claim that picks a row from one read and locks it in another
+    /// must check the due time again where it locks.
+    /// </summary>
+    public const string ClaimedBeforeDue = "ClaimedBeforeDue";
+
+    /// <summary>
+    /// A reschedule returned Rescheduled while the journal proves the job was Leased for the whole call.
+    /// A Leased job is not waiting, so its due time must not move and the call must return NotReschedulable.
+    /// </summary>
+    public const string ReschedulePlacedInLease = "ReschedulePlacedInLease";
+
+    /// <summary>
+    /// A claim that began after a reschedule returned leased the job before the new due time, and the
+    /// journal proves nothing else moved that due time in between. The store said Rescheduled but the job
+    /// ran on its old due time.
+    /// </summary>
+    public const string ClaimedBeforeRescheduledDue = "ClaimedBeforeRescheduledDue";
+
+    /// <summary>
     /// A production fail-stop trigger fired: an adapter raised <c>InvariantViolationException</c>, which in
     /// production takes the worker group out of service. The finding names the tripped
     /// <c>InvariantTrigger</c>, so the ledger says which invariant broke and not merely that one did.

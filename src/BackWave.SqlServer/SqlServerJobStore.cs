@@ -1727,6 +1727,65 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
     }
 
     /// <inheritdoc/>
+    public async ValueTask<RescheduleResult> RescheduleAsync(
+        Guid jobId, DateTimeOffset dueTime, string actor, DateTimeOffset now,
+        DbTransaction? transaction = null, CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        if (transaction is not null)
+        {
+            // Enlist in the caller's transaction: their rollback means the move never happened.
+            if (transaction is not SqlTransaction { Connection: { } callerConnection } sqlTransaction)
+            {
+                throw new ArgumentException(
+                    "The SQL Server adapter enlists in SqlTransaction instances only.", nameof(transaction));
+            }
+            return await RescheduleCoreAsync(callerConnection, sqlTransaction, jobId, dueTime, actor, now, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var ownTransaction = (SqlTransaction)await connection
+            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        var result = await RescheduleCoreAsync(connection, ownTransaction, jobId, dueTime, actor, now, cancellationToken)
+            .ConfigureAwait(false);
+        await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return result;
+    }
+
+    private async ValueTask<RescheduleResult> RescheduleCoreAsync(
+        SqlConnection connection, SqlTransaction transaction, Guid jobId, DateTimeOffset dueTime,
+        string actor, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        // Only a waiting job (Scheduled 0, AwaitingParent 1) moves; the state guard rejects anything
+        // else without effect (§5.8). A claim's U lock on the row makes this wait, then see Leased.
+        // One row by primary key and then the audit insert: no other job row, no transition. OUTPUT
+        // hands back the due time the move replaces, for the audit detail.
+        await using var update = Cmd(
+            """
+            UPDATE backwave.jobs SET due_time = @due
+            OUTPUT deleted.due_time
+            WHERE job_id = @id AND state IN (0, 1)
+            """,
+            connection, transaction);
+        update.Parameters.AddWithValue("id", jobId);
+        update.Parameters.AddWithValue("due", dueTime);
+        if (await update.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not DateTimeOffset from)
+        {
+            return RescheduleResult.NotReschedulable;
+        }
+
+        // The state does not change, so no Transition Log entry (§5.12); the audit record is the
+        // history. SQL Server has no Wake-Up Hint, so a job moved to now is seen at the next poll.
+        await AppendAuditAsync(
+                connection, transaction, actor, OperatorAction.Reschedule, jobId.ToString(), now,
+                new RescheduleAuditDetail(from, dueTime), cancellationToken)
+            .ConfigureAwait(false);
+        return RescheduleResult.Rescheduled;
+    }
+
+    /// <inheritdoc/>
     public ValueTask PauseQueueAsync(
         string queue, string actor, DateTimeOffset now, CancellationToken cancellationToken = default)
         => SetPausedAsync(queue, paused: true, actor, OperatorAction.PauseQueue, now, cancellationToken);
@@ -1832,7 +1891,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
 
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Cmd(
-            "SELECT actor, action, target, recorded_at FROM backwave.operator_audit WHERE target = @target ORDER BY [sequence]",
+            "SELECT actor, action, target, recorded_at, detail FROM backwave.operator_audit WHERE target = @target ORDER BY [sequence]",
             connection);
         command.Parameters.AddWithValue("target", target);
 
@@ -1840,28 +1899,38 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
+            var action = (OperatorAction)reader.GetInt32(1);
             records.Add(new OperatorAuditRecord(
-                reader.GetString(0), (OperatorAction)reader.GetInt32(1), reader.GetString(2),
-                reader.GetFieldValue<DateTimeOffset>(3)));
+                reader.GetString(0), action, reader.GetString(2), reader.GetFieldValue<DateTimeOffset>(3))
+            {
+                Detail = OperatorAuditDetailCodec.Decode(action, target, reader.IsDBNull(4) ? null : reader.GetString(4)),
+            });
         }
         return records;
     }
 
     // Appends one Operator audit record (§5.8) inside the action's transaction.
-    private async Task AppendAuditAsync(
+    private Task AppendAuditAsync(
         SqlConnection connection, SqlTransaction transaction, string actor, OperatorAction action,
         string target, DateTimeOffset now, CancellationToken cancellationToken)
+        => AppendAuditAsync(connection, transaction, actor, action, target, now, detail: null, cancellationToken);
+
+    private async Task AppendAuditAsync(
+        SqlConnection connection, SqlTransaction transaction, string actor, OperatorAction action,
+        string target, DateTimeOffset now, OperatorAuditDetail? detail, CancellationToken cancellationToken)
     {
         await using var audit = Cmd(
             """
-            INSERT INTO backwave.operator_audit (actor, action, target, recorded_at)
-            VALUES (@actor, @action, @target, @now)
+            INSERT INTO backwave.operator_audit (actor, action, target, recorded_at, detail)
+            VALUES (@actor, @action, @target, @now, @detail)
             """,
             connection, transaction);
         audit.Parameters.AddWithValue("actor", actor);
         audit.Parameters.AddWithValue("action", (int)action);
         audit.Parameters.AddWithValue("target", target);
         audit.Parameters.Add("now", SqlDbType.DateTimeOffset).Value = now;
+        audit.Parameters.Add("detail", SqlDbType.NVarChar, 450).Value =
+            (object?)OperatorAuditDetailCodec.Encode(detail) ?? DBNull.Value;
         await audit.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 

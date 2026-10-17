@@ -21,6 +21,7 @@ internal static class Ops
     public const string RelinquishRequested = "relinquish-requested";
     public const string Cancel = "cancel";
     public const string Requeue = "requeue";
+    public const string Reschedule = "reschedule";
 
     /// <summary>Journaled BEFORE the requeue store call, so a prefix never holds the claim of a reset
     /// attempt without the life that permits it. Answered by exactly one <see cref="Requeue"/> entry.</summary>
@@ -56,6 +57,10 @@ internal sealed record JournalEntry
     public string? Result { get; init; }
     /// <summary>Lease expiry (UTC ticks) as the claim reported it.</summary>
     public long? LeaseExpiry { get; init; }
+    /// <summary>Due time (UTC ticks) as the claim reported it, or the new due time a reschedule asked for.</summary>
+    public long? DueTime { get; init; }
+    /// <summary>The instant (UTC ticks) the store call carried as its now: a claim request's, or a reschedule's.</summary>
+    public long? OpNow { get; init; }
     public bool? CancelRequested { get; init; }
     /// <summary>True when the client simulated execution of this attempt (never true for designated-unroutable wires).</summary>
     public bool? Executed { get; init; }

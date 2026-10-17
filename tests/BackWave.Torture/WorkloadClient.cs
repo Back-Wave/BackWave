@@ -7,7 +7,7 @@ namespace BackWave.Torture;
 /// <summary>
 /// One synthetic client: a seeded-PRNG loop over the store surface with engineered collision
 /// pressure. It plays the roles the production shell would (claimer, reporter, heartbeater, lease
-/// sweeper) *and* the operator (pause/cancel/limit-set), but with adversarial timing. Every store
+/// sweeper) *and* the operator (pause/cancel/reschedule/limit-set), but with adversarial timing. Every store
 /// interaction is journaled; the journal is half the oracle.
 ///
 /// Workload discipline the oracles rely on (violating these here would make the audit unsound):
@@ -49,6 +49,7 @@ internal sealed class WorkloadClient(
                     < 85 => SetLimitAsync(),
                     < 92 => WorkflowAsync(),
                     < 93 => RelinquishLeasesAsync(),
+                    < 96 => RescheduleAsync(),
                     _ => StrayHeartbeatAsync(),
                 };
                 await op;
@@ -131,6 +132,7 @@ internal sealed class WorkloadClient(
                     Client = _client, Op = Ops.Claim, T0 = t0, T1 = t1,
                     JobId = record.JobId, Attempt = record.Attempt, Queue = record.Queue, Wire = record.WireName,
                     LeaseExpiry = record.LeaseExpiry?.UtcTicks, CancelRequested = record.CancelRequested,
+                    DueTime = record.DueTime.UtcTicks, OpNow = request.Now.UtcTicks,
                 });
             }
             return null;
@@ -374,6 +376,27 @@ internal sealed class WorkloadClient(
             {
                 Client = _client, Op = Ops.Requeue, T0 = t0, T1 = Ticks(),
                 JobId = jobId, Result = result.ToString(),
+            };
+        }, jobId);
+    }
+
+    private Task RescheduleAsync()
+    {
+        // Near past or near future only: a due time far ahead would outlive the drain. A move later
+        // races the claims that already read the job as due, which is the window the claim check
+        // in the journal oracle watches. One clock read is the due time's base and the call's now, and
+        // both are journaled for the reschedule checks in the audit.
+        var jobId = PickKnownJobId();
+        var now = Now();
+        var dueTime = now.AddMilliseconds(_rng.Next(-500, 2500));
+        return Call(Ops.Reschedule, async () =>
+        {
+            var t0 = Ticks();
+            var result = await store.RescheduleAsync(jobId, dueTime, _workerId, now);
+            return new JournalEntry
+            {
+                Client = _client, Op = Ops.Reschedule, T0 = t0, T1 = Ticks(),
+                JobId = jobId, Result = result.ToString(), DueTime = dueTime.UtcTicks, OpNow = now.UtcTicks,
             };
         }, jobId);
     }

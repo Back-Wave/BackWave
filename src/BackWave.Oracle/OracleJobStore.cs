@@ -580,7 +580,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             await using (var claim = Cmd(
                 $"""
                 SELECT {JobColumns} FROM backwave.jobs
-                WHERE state = {(int)JobState.Scheduled} AND job_id IN (
+                WHERE state = {(int)JobState.Scheduled} AND due_time <= :now AND job_id IN (
                     SELECT job_id FROM (
                         SELECT job_id FROM backwave.jobs
                         WHERE queue = :queue AND state = 0 AND due_time <= :now
@@ -601,15 +601,25 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     var job = ReadJob(reader);
                     // Oracle has no multi-row RETURNING, so the claim reads the row BEFORE it leases it.
                     // The post-lease state is therefore synthesized in memory and cannot be checked; what
-                    // can be is that the row honored the outer statement's own Scheduled predicate, which
-                    // FOR UPDATE re-evaluates after it takes the lock. The predicate is repeated there and
-                    // not left to the ROWNUM subquery alone, so the check rests on a test the locking
-                    // query level actually makes.
+                    // can be is that the row honored the outer statement's own Scheduled and due
+                    // predicates, which FOR UPDATE re-evaluates after it takes the lock. The predicates
+                    // are repeated there and not left to the ROWNUM subquery alone, so the check rests on
+                    // a test the locking query level actually makes. The due test matters because a
+                    // reschedule can move a Scheduled job's due time after the subquery picked it. No test
+                    // can force that move between the ROWNUM subquery and the lock, so the outer
+                    // due_time <= :now predicate is defense in depth. The reschedule race conformance fact
+                    // and the Torture claim checks cover the invariant end to end.
                     if (job.State != JobState.Scheduled)
                     {
                         throw Invariant.Halt(
                             InvariantTrigger.ClaimedRowNotEligible,
                             $"Claim locked job {job.JobId} in state {job.State}; the statement selects only state Scheduled.");
+                    }
+                    if (job.DueTime > request.Now)
+                    {
+                        throw Invariant.Halt(
+                            InvariantTrigger.ClaimedRowNotEligible,
+                            $"Claim locked job {job.JobId} due {job.DueTime:O}; the statement selects only jobs due at {request.Now:O}.");
                     }
                     queueClaims.Add(job);
                 }
@@ -1882,6 +1892,92 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
     }
 
     /// <inheritdoc/>
+    public async ValueTask<RescheduleResult> RescheduleAsync(
+        Guid jobId, DateTimeOffset dueTime, string actor, DateTimeOffset now,
+        System.Data.Common.DbTransaction? transaction = null, CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        if (transaction is not null)
+        {
+            // Enlist in the caller's transaction: their rollback means the move never happened.
+            if (transaction is not OracleTransaction { Connection: { } callerConnection } oracleTransaction)
+            {
+                throw new ArgumentException(
+                    "The Oracle adapter enlists in OracleTransaction instances only.", nameof(transaction));
+            }
+            return await RescheduleCoreAsync(callerConnection, oracleTransaction, jobId, dueTime, actor, now, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var ownTransaction = await BeginAsync(connection, cancellationToken).ConfigureAwait(false);
+        var result = await RescheduleCoreAsync(connection, ownTransaction, jobId, dueTime, actor, now, cancellationToken)
+            .ConfigureAwait(false);
+        await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return result;
+    }
+
+    private async ValueTask<RescheduleResult> RescheduleCoreAsync(
+        OracleConnection connection, OracleTransaction transaction, Guid jobId, DateTimeOffset dueTime,
+        string actor, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        // Only a waiting job (Scheduled 0, AwaitingParent 1) moves; the state guard rejects anything
+        // else without effect. A claim holding the row makes this wait; Oracle then re-runs the
+        // statement against the committed row, which is Leased, so it moves nothing. RETURNING sees only
+        // the new row below 23ai, so one block locks the row and reads the due time the move replaces,
+        // then moves it: still one round trip.
+        var moved = OutLong("moved");
+        var from = new OracleParameter("from_due", OracleDbType.TimeStampTZ) { Direction = ParameterDirection.Output };
+        var state = OutLong("state");
+        var queue = new OracleParameter("queue", OracleDbType.Varchar2, 450) { Direction = ParameterDirection.Output };
+        await using (var update = Cmd(
+            """
+            BEGIN
+                SELECT due_time INTO :from_due FROM backwave.jobs
+                WHERE job_id = :id AND state IN (0, 1)
+                FOR UPDATE;
+                UPDATE backwave.jobs SET due_time = :due
+                WHERE job_id = :id
+                RETURNING state, queue INTO :state, :queue;
+                :moved := 1;
+            EXCEPTION
+                WHEN NO_DATA_FOUND THEN
+                    :moved := 0;
+            END;
+            """,
+            connection, transaction))
+        {
+            update.Parameters.Add(Tstz("due", dueTime));
+            update.Parameters.Add(Raw("id", jobId));
+            update.Parameters.Add(moved);
+            update.Parameters.Add(from);
+            update.Parameters.Add(state);
+            update.Parameters.Add(queue);
+            await update.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+            if (((OracleDecimal)moved.Value).ToInt32() == 0)
+            {
+                return RescheduleResult.NotReschedulable;
+            }
+        }
+
+        // The state does not change, so no Transition Log entry; the audit record is the history.
+        var replaced = (OracleTimeStampTZ)from.Value;
+        await AppendAuditAsync(
+                connection, transaction, actor, OperatorAction.Reschedule, jobId.ToString(), now,
+                new RescheduleAuditDetail(new DateTimeOffset(replaced.Value, replaced.GetTimeZoneOffset()), dueTime),
+                cancellationToken)
+            .ConfigureAwait(false);
+        if ((JobState)((OracleDecimal)state.Value).ToInt32() == JobState.Scheduled && dueTime <= now)
+        {
+            // Wake-Up Hint (§8): the job is due now, the same as a due enqueue. DBMS_ALERT.SIGNAL is
+            // transactional, so it fires on commit, including the caller's own, or never.
+            await PublishHintAsync(connection, transaction, queue.Value.ToString()!, cancellationToken).ConfigureAwait(false);
+        }
+        return RescheduleResult.Rescheduled;
+    }
+
+    /// <inheritdoc/>
     public ValueTask PauseQueueAsync(
         string queue, string actor, DateTimeOffset now, CancellationToken cancellationToken = default)
         => SetPausedAsync(queue, paused: true, actor, OperatorAction.PauseQueue, now, cancellationToken);
@@ -1984,7 +2080,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
 
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Cmd(
-            "SELECT actor, action, target, recorded_at FROM backwave.operator_audit WHERE target = :target ORDER BY sequence",
+            "SELECT actor, action, target, recorded_at, detail FROM backwave.operator_audit WHERE target = :target ORDER BY sequence",
             connection);
         command.Parameters.Add(Str("target", target));
 
@@ -1992,28 +2088,36 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            records.Add(new OperatorAuditRecord(
-                reader.GetString(0), (OperatorAction)reader.GetInt32(1), reader.GetString(2),
-                ReadTstz(reader, 3)));
+            var action = (OperatorAction)reader.GetInt32(1);
+            records.Add(new OperatorAuditRecord(reader.GetString(0), action, reader.GetString(2), ReadTstz(reader, 3))
+            {
+                Detail = OperatorAuditDetailCodec.Decode(action, target, reader.IsDBNull(4) ? null : reader.GetString(4)),
+            });
         }
         return records;
     }
 
     // Appends one Operator audit record inside the action's transaction.
-    private async Task AppendAuditAsync(
+    private Task AppendAuditAsync(
         OracleConnection connection, OracleTransaction transaction, string actor, OperatorAction action,
         string target, DateTimeOffset now, CancellationToken cancellationToken)
+        => AppendAuditAsync(connection, transaction, actor, action, target, now, detail: null, cancellationToken);
+
+    private async Task AppendAuditAsync(
+        OracleConnection connection, OracleTransaction transaction, string actor, OperatorAction action,
+        string target, DateTimeOffset now, OperatorAuditDetail? detail, CancellationToken cancellationToken)
     {
         await using var audit = Cmd(
             """
-            INSERT INTO backwave.operator_audit (actor, action, target, recorded_at)
-            VALUES (:actor, :action, :target, :now)
+            INSERT INTO backwave.operator_audit (actor, action, target, recorded_at, detail)
+            VALUES (:actor, :action, :target, :now, :detail)
             """,
             connection, transaction);
         audit.Parameters.Add(Str("actor", actor));
         audit.Parameters.Add(Int("action", (int)action));
         audit.Parameters.Add(Str("target", target));
         audit.Parameters.Add(Tstz("now", now));
+        audit.Parameters.Add(StrN("detail", OperatorAuditDetailCodec.Encode(detail)));
         await audit.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 

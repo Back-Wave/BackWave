@@ -1,4 +1,5 @@
 using System.Data;
+using System.Diagnostics;
 using System.Data.Common;
 using System.Text.Json.Serialization;
 using BackWave.Core;
@@ -177,6 +178,196 @@ public class TransactionalEnqueueTests
     }
 
     [Fact]
+    public async Task TransactionalReschedule_FailsTheWholeCommit_WhenAClaimTookTheJobFirst()
+    {
+        // No row lock holds the job between the call and the commit, so the commit checks the state
+        // again. A claim in the gap must fail the commit, and nothing else in the transaction applies.
+        var fixture = CreateFixture();
+        var target = new NewJob(Guid.NewGuid(), "order-receipt", "{}"u8.ToArray(), "default", T0);
+        await fixture.Store.EnqueueAsync(target, now: T0);
+        var sibling = new NewJob(Guid.NewGuid(), "order-receipt", "{}"u8.ToArray(), "default", T0);
+
+        using var transaction = fixture.Store.BeginTransaction();
+        Assert.Equal(EnqueueResult.Ok, await fixture.Store.EnqueueAsync(sibling, now: T0, transaction));
+        Assert.Equal(RescheduleResult.Rescheduled,
+            await fixture.Store.RescheduleAsync(target.JobId, T0.AddDays(1), "alice", T0, transaction));
+
+        Assert.Single(await fixture.Store.ClaimAsync(new ClaimRequest("w1", ["default"], 1, TimeSpan.FromMinutes(1), T0)));
+
+        var exception = Assert.Throws<InvalidOperationException>(() => transaction.Commit());
+        Assert.Contains("Leased", exception.Message);
+        Assert.Equal(T0, (await fixture.Store.GetJobAsync(target.JobId))!.DueTime);
+        Assert.Null(await fixture.Store.GetJobAsync(sibling.JobId));
+        Assert.Empty(await fixture.Store.ListAuditRecordsAsync(target.JobId.ToString()));
+    }
+
+    [Fact]
+    public async Task TransactionalReschedule_FailsTheWholeCommit_WhenAFailedAttemptSetARetryDueTimeFirst()
+    {
+        // A claim, a failed Attempt, and a retry in the gap bring the job back to Scheduled, so the state
+        // alone looks unchanged. On a real database the claim waits for the row lock, so the reschedule
+        // can never overwrite the retry due time. The commit must fail, and nothing in it applies.
+        var fixture = CreateFixture();
+        var target = new NewJob(Guid.NewGuid(), "order-receipt", "{}"u8.ToArray(), "default", T0);
+        await fixture.Store.EnqueueAsync(target, now: T0);
+        var sibling = new NewJob(Guid.NewGuid(), "order-receipt", "{}"u8.ToArray(), "default", T0);
+
+        using var transaction = fixture.Store.BeginTransaction();
+        Assert.Equal(EnqueueResult.Ok, await fixture.Store.EnqueueAsync(sibling, now: T0, transaction));
+        Assert.Equal(RescheduleResult.Rescheduled,
+            await fixture.Store.RescheduleAsync(target.JobId, T0.AddDays(1), "alice", T0, transaction));
+
+        var claimed = Assert.Single(
+            await fixture.Store.ClaimAsync(new ClaimRequest("w1", ["default"], 1, TimeSpan.FromMinutes(1), T0)));
+        var retryAt = T0.AddMinutes(5);
+        Assert.Equal(OutcomeResult.Applied, await fixture.Store.ReportOutcomeAsync(
+            claimed.JobId, "w1", claimed.Attempt, new JobOutcome.Failure(retryAt, "transient"), T0));
+        Assert.Equal(JobState.Scheduled, (await fixture.Store.GetJobAsync(target.JobId))!.State);
+
+        var exception = Assert.Throws<InvalidOperationException>(() => transaction.Commit());
+        Assert.Contains("changed", exception.Message);
+        Assert.Equal(retryAt, (await fixture.Store.GetJobAsync(target.JobId))!.DueTime);
+        Assert.Null(await fixture.Store.GetJobAsync(sibling.JobId));
+        Assert.DoesNotContain(
+            await fixture.Store.ListAuditRecordsAsync(target.JobId.ToString()), a => a.Action == OperatorAction.Reschedule);
+    }
+
+    [Fact]
+    public async Task TransactionalReschedule_FailsTheWholeCommit_WhenTheLatchReleasedTheJobFirst()
+    {
+        // The parent succeeds in the gap and releases the child, which keeps its later due time. On a real
+        // database the release waits for the row lock and clamps the new due time to the release time;
+        // this store cannot replay the release after the reschedule, so the commit must fail instead.
+        var fixture = CreateFixture();
+        var parent = new NewJob(Guid.NewGuid(), "order-receipt", "{}"u8.ToArray(), "default", T0);
+        await fixture.Store.EnqueueAsync(parent, now: T0);
+        var child = new NewJob(Guid.NewGuid(), "order-receipt", "{}"u8.ToArray(), "default", T0.AddHours(2))
+        {
+            Parents = [parent.JobId],
+        };
+        await fixture.Store.EnqueueAsync(child, now: T0);
+
+        using var transaction = fixture.Store.BeginTransaction();
+        Assert.Equal(RescheduleResult.Rescheduled,
+            await fixture.Store.RescheduleAsync(child.JobId, T0, "alice", T0, transaction));
+
+        var claimed = Assert.Single(
+            await fixture.Store.ClaimAsync(new ClaimRequest("w1", ["default"], 1, TimeSpan.FromMinutes(1), T0.AddHours(1))));
+        Assert.Equal(OutcomeResult.Applied, await fixture.Store.ReportOutcomeAsync(
+            claimed.JobId, "w1", claimed.Attempt, new JobOutcome.Success(), T0.AddHours(1)));
+        Assert.Equal(JobState.Scheduled, (await fixture.Store.GetJobAsync(child.JobId))!.State);
+
+        var exception = Assert.Throws<InvalidOperationException>(() => transaction.Commit());
+        Assert.Contains("changed", exception.Message);
+        Assert.Equal(T0.AddHours(2), (await fixture.Store.GetJobAsync(child.JobId))!.DueTime);
+        Assert.DoesNotContain(
+            await fixture.Store.ListAuditRecordsAsync(child.JobId.ToString()), a => a.Action == OperatorAction.Reschedule);
+    }
+
+    [Fact]
+    public async Task TransactionalReschedule_FailsTheWholeCommit_WhenTheJobWasPurgedFirst()
+    {
+        // A cancel and a purge in the gap delete the job. The commit must fail before anything applies,
+        // not part way through.
+        var fixture = CreateFixture();
+        var target = new NewJob(Guid.NewGuid(), "order-receipt", "{}"u8.ToArray(), "default", T0);
+        await fixture.Store.EnqueueAsync(target, now: T0);
+        var sibling = new NewJob(Guid.NewGuid(), "order-receipt", "{}"u8.ToArray(), "default", T0);
+
+        using var transaction = fixture.Store.BeginTransaction();
+        Assert.Equal(EnqueueResult.Ok, await fixture.Store.EnqueueAsync(sibling, now: T0, transaction));
+        Assert.Equal(RescheduleResult.Rescheduled,
+            await fixture.Store.RescheduleAsync(target.JobId, T0.AddDays(1), "alice", T0, transaction));
+
+        Assert.Equal(CancelResult.CancelledImmediately, await fixture.Store.CancelJobAsync(target.JobId, "bob", T0));
+        Assert.Equal(1, await fixture.Store.PurgeTerminalAsync(TerminalStateClass.SucceededOrCancelled, T0, 10));
+        Assert.Null(await fixture.Store.GetJobAsync(target.JobId));
+
+        var exception = Assert.Throws<InvalidOperationException>(() => transaction.Commit());
+        Assert.Contains("no longer exists", exception.Message);
+        Assert.Null(await fixture.Store.GetJobAsync(sibling.JobId));
+        Assert.DoesNotContain(
+            await fixture.Store.ListAuditRecordsAsync(target.JobId.ToString()), a => a.Action == OperatorAction.Reschedule);
+    }
+
+    [Fact]
+    public async Task TransactionalReschedule_OfABufferedChild_IsNotReschedulable_WhenItsParentWasPurged()
+    {
+        // The parent is gone, so the buffered child can never commit. The call must say so, not throw.
+        var fixture = CreateFixture();
+        var parent = new NewJob(Guid.NewGuid(), "order-receipt", "{}"u8.ToArray(), "default", T0);
+        await fixture.Store.EnqueueAsync(parent, now: T0);
+        var child = new NewJob(Guid.NewGuid(), "order-receipt", "{}"u8.ToArray(), "default", T0) { Parents = [parent.JobId] };
+
+        using var transaction = fixture.Store.BeginTransaction();
+        Assert.Equal(EnqueueResult.Ok, await fixture.Store.EnqueueAsync(child, now: T0, transaction));
+        Assert.Equal(CancelResult.CancelledImmediately, await fixture.Store.CancelJobAsync(parent.JobId, "bob", T0));
+        Assert.Equal(1, await fixture.Store.PurgeTerminalAsync(TerminalStateClass.SucceededOrCancelled, T0, 10));
+
+        Assert.Equal(RescheduleResult.NotReschedulable,
+            await fixture.Store.RescheduleAsync(child.JobId, T0.AddDays(1), "alice", T0, transaction));
+    }
+
+    [Fact]
+    public async Task TransactionalReschedule_OfABufferedDeepDiamond_ResolvesEachJobOnce()
+    {
+        // Each layer depends on both jobs of the layer above, so the paths from the bottom job to the roots
+        // double with every layer. The resolution must visit each buffered job once, not once per path.
+        const int Layers = 30;
+        var fixture = CreateFixture();
+        using var transaction = fixture.Store.BeginTransaction();
+        Guid[] above = [];
+        for (var layer = 0; layer < Layers; layer++)
+        {
+            var parents = above;
+            above = [Guid.NewGuid(), Guid.NewGuid()];
+            foreach (var id in above)
+            {
+                var job = new NewJob(id, "order-receipt", "{}"u8.ToArray(), "default", T0) { Parents = parents };
+                Assert.Equal(EnqueueResult.Ok, await fixture.Store.EnqueueAsync(job, now: T0, transaction));
+            }
+        }
+        var bottom = new NewJob(Guid.NewGuid(), "order-receipt", "{}"u8.ToArray(), "default", T0) { Parents = above };
+        Assert.Equal(EnqueueResult.Ok, await fixture.Store.EnqueueAsync(bottom, now: T0, transaction));
+
+        var stopwatch = Stopwatch.StartNew();
+        Assert.Equal(RescheduleResult.Rescheduled,
+            await fixture.Store.RescheduleAsync(bottom.JobId, T0.AddDays(1), "alice", T0, transaction));
+        transaction.Commit();
+        stopwatch.Stop();
+
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(10), $"The reschedule and commit took {stopwatch.Elapsed}.");
+        var committed = (await fixture.Store.GetJobAsync(bottom.JobId))!;
+        Assert.Equal(JobState.AwaitingParent, committed.State);
+        Assert.Equal(T0.AddDays(1), committed.DueTime);
+    }
+
+    [Fact]
+    public async Task TransactionalReschedule_OnACompletedTransaction_Throws()
+    {
+        var fixture = CreateFixture();
+        var job = new NewJob(Guid.NewGuid(), "order-receipt", "{}"u8.ToArray(), "default", T0);
+        await fixture.Store.EnqueueAsync(job, now: T0);
+
+        var committed = fixture.Store.BeginTransaction();
+        committed.Commit();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await fixture.Store.RescheduleAsync(job.JobId, T0.AddDays(1), "alice", T0, committed));
+        Assert.Equal(T0, (await fixture.Store.GetJobAsync(job.JobId))!.DueTime);
+    }
+
+    [Fact]
+    public async Task TransactionalReschedule_WithAForeignTransaction_RejectedWithClearError()
+    {
+        var fixture = CreateFixture();
+        using var transaction = new ForeignTransaction();
+        var exception = await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await fixture.Store.RescheduleAsync(Guid.NewGuid(), T0, "alice", T0, transaction));
+        Assert.Contains("BeginTransaction", exception.Message);
+    }
+
+    [Fact]
     public async Task ForeignTransaction_RejectedWithClearError()
     {
         var fixture = CreateFixture();
@@ -199,7 +390,7 @@ public class TransactionalEnqueueTests
         Assert.Contains("SupportsTransactionalEnqueue", exception.Message);
     }
 
-    private sealed class ForeignTransaction : DbTransaction
+    internal sealed class ForeignTransaction : DbTransaction
     {
         public override IsolationLevel IsolationLevel => IsolationLevel.Unspecified;
         protected override DbConnection? DbConnection => null;
@@ -211,7 +402,7 @@ public class TransactionalEnqueueTests
     /// A stand-in for a future adapter that cannot enlist in a caller's transaction
     /// (spec §6). The client's capability check throws before any member is reached.
     /// </summary>
-    private sealed class NonTransactionalStore : IJobStore
+    internal sealed class NonTransactionalStore : IJobStore
     {
         public bool SupportsTransactionalEnqueue => false;
 

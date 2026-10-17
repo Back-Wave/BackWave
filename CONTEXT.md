@@ -204,8 +204,12 @@ A job's terminal state of deliberate non-execution, with a recorded cause: paren
 _Avoid_: Skipped, aborted, deleted
 
 **Operator Action**:
-A dashboard- or API-initiated Core state transition: requeue (Dead-Lettered or Quarantined), cancel, trigger a Recurring Schedule now, pause/resume a Queue, cancel a whole Workflow, and Restart or Retry a Workflow. Always a defined state-machine transition with recorded identity — never a raw row edit. Editing a job's payload is deliberately not one.
+A dashboard- or API-initiated action with recorded identity: requeue (Dead-Lettered or Quarantined), cancel, reschedule, trigger a Recurring Schedule now, pause/resume a Queue, set a Queue's concurrency limit, cancel a whole Workflow, and Restart or Retry a Workflow. Always a defined action, never a raw row edit. Requeue, cancel, trigger now, and the Workflow actions change job state through the state machine. Reschedule, pause/resume, and set-limit are not job transitions: Reschedule moves only a due time, and the Queue actions change only Queue settings. Editing a job's payload is deliberately not one.
 _Avoid_: Admin override, manual fix
+
+**Reschedule**:
+An Operator Action that moves the due time of a job that waits (Scheduled or AwaitingParent) to a new instant. The job keeps its id, payload, Attempt, and Retry Cause. A running or terminal job cannot be rescheduled. It writes an audit record and no Transition Log entry, because the state does not change. It can join the caller's transaction, the same as Transactional Enqueue.
+_Avoid_: Delay, postpone, move (as names of the action)
 
 **Dashboard Permission**:
 One of a small fixed set of capabilities (View, ViewSensitiveData, Requeue, Cancel, TriggerSchedule, PauseQueue), each delegated to the host app's authorization (policy name or predicate). BackWave never owns users or roles. **ViewSensitiveData** is the one gate over raw content that may carry secrets or PII — job payload bytes, Failure Detail, and Job Output — held separate from View so a reader can be granted the dashboard without being granted that content. It gates operator *viewing* only; the in-process accessor a handler uses to read its ancestors' Job Output is not gated by it.

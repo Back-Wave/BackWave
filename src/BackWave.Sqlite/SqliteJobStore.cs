@@ -1384,6 +1384,96 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
     }
 
     /// <inheritdoc/>
+    public async ValueTask<RescheduleResult> RescheduleAsync(
+        Guid jobId, DateTimeOffset dueTime, string actor, DateTimeOffset now,
+        DbTransaction? transaction = null, CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        if (transaction is not null)
+        {
+            // Enlist in the caller's transaction, as Transactional Enqueue does: the same-file guard
+            // applies, and the Wake-Up Hint stays silent because no commit callback exists (issue 0097).
+            if (transaction is not SqliteTransaction { Connection: { } callerConnection } sqliteTransaction)
+            {
+                throw new ArgumentException(
+                    "The SQLite adapter enlists in SqliteTransaction instances only.", nameof(transaction));
+            }
+            _sameFileGuard.EnsureSameFile(callerConnection);
+            var (result, _) = await RescheduleCoreAsync(
+                callerConnection, sqliteTransaction, jobId, dueTime, actor, now, cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var ownTransaction = (SqliteTransaction)connection.BeginTransaction(deferred: false);
+        var (ownResult, hintQueue) = await RescheduleCoreAsync(
+            connection, ownTransaction, jobId, dueTime, actor, now, cancellationToken).ConfigureAwait(false);
+        await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        // §8: the hint fires only AFTER the adapter's own commit - or never (issue 0097).
+        if (hintQueue is not null)
+        {
+            _hintHub?.Publish(hintQueue);
+        }
+        return ownResult;
+    }
+
+    // Returns the result plus the Queue to hint once the transaction commits: a Scheduled job that is
+    // now due, the same rule as a due enqueue. Null when nothing should be hinted.
+    private async ValueTask<(RescheduleResult Result, string? HintQueue)> RescheduleCoreAsync(
+        SqliteConnection connection, SqliteTransaction transaction, Guid jobId, DateTimeOffset dueTime,
+        string actor, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        // Only a waiting job moves; the state guard rejects anything else without effect (§5.8). The
+        // single writer orders this against a claim. RETURNING sees only the new row, so the due time the
+        // move replaces is read first, in the same transaction under the same write lock: nothing can
+        // change the row between the two statements.
+        DateTimeOffset from;
+        await using (var read = Cmd(
+            $"""
+            SELECT due_time FROM backwave_jobs
+            WHERE job_id = $id AND state IN ({(int)JobState.Scheduled}, {(int)JobState.AwaitingParent})
+            """,
+            connection, transaction))
+        {
+            read.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
+            if (await read.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not long fromTicks)
+            {
+                return (RescheduleResult.NotReschedulable, null);
+            }
+            from = SqliteValueCodec.FromTicks(fromTicks);
+        }
+
+        int state;
+        string queue;
+        await using (var update = Cmd(
+            $"""
+            UPDATE backwave_jobs SET due_time = $due
+            WHERE job_id = $id AND state IN ({(int)JobState.Scheduled}, {(int)JobState.AwaitingParent})
+            RETURNING state, queue
+            """,
+            connection, transaction))
+        {
+            update.Parameters.AddWithValue("$id", SqliteValueCodec.ToText(jobId));
+            update.Parameters.AddWithValue("$due", SqliteValueCodec.ToTicks(dueTime));
+            await using var reader = await update.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return (RescheduleResult.NotReschedulable, null);
+            }
+            (state, queue) = (reader.GetInt32(0), reader.GetString(1));
+        }
+
+        // The state does not change, so no Transition Log entry (§5.12); the audit record is the history.
+        await AppendAuditAsync(
+                connection, transaction, actor, OperatorAction.Reschedule, jobId.ToString(), now,
+                new RescheduleAuditDetail(from, dueTime), cancellationToken)
+            .ConfigureAwait(false);
+        var due = (JobState)state == JobState.Scheduled && dueTime <= now;
+        return (RescheduleResult.Rescheduled, due ? queue : null);
+    }
+
+    /// <inheritdoc/>
     public ValueTask PauseQueueAsync(
         string queue, string actor, DateTimeOffset now, CancellationToken cancellationToken = default)
         => SetPausedAsync(queue, paused: true, actor, OperatorAction.PauseQueue, now, cancellationToken);
@@ -1485,7 +1575,7 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
 
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Cmd(
-            "SELECT actor, action, target, recorded_at FROM backwave_operator_audit WHERE target = $target ORDER BY sequence",
+            "SELECT actor, action, target, recorded_at, detail FROM backwave_operator_audit WHERE target = $target ORDER BY sequence",
             connection);
         command.Parameters.AddWithValue("$target", target);
 
@@ -1493,27 +1583,36 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
+            var action = (OperatorAction)reader.GetInt32(1);
             records.Add(new OperatorAuditRecord(
-                reader.GetString(0), (OperatorAction)reader.GetInt32(1), reader.GetString(2),
-                SqliteValueCodec.FromTicks(reader.GetInt64(3))));
+                reader.GetString(0), action, reader.GetString(2), SqliteValueCodec.FromTicks(reader.GetInt64(3)))
+            {
+                Detail = OperatorAuditDetailCodec.Decode(action, target, reader.IsDBNull(4) ? null : reader.GetString(4)),
+            });
         }
         return records;
     }
 
-    private async Task AppendAuditAsync(
+    private Task AppendAuditAsync(
         SqliteConnection connection, SqliteTransaction transaction, string actor, OperatorAction action,
         string target, DateTimeOffset now, CancellationToken cancellationToken)
+        => AppendAuditAsync(connection, transaction, actor, action, target, now, detail: null, cancellationToken);
+
+    private async Task AppendAuditAsync(
+        SqliteConnection connection, SqliteTransaction transaction, string actor, OperatorAction action,
+        string target, DateTimeOffset now, OperatorAuditDetail? detail, CancellationToken cancellationToken)
     {
         await using var audit = Cmd(
             """
-            INSERT INTO backwave_operator_audit (actor, action, target, recorded_at)
-            VALUES ($actor, $action, $target, $now)
+            INSERT INTO backwave_operator_audit (actor, action, target, recorded_at, detail)
+            VALUES ($actor, $action, $target, $now, $detail)
             """,
             connection, transaction);
         audit.Parameters.AddWithValue("$actor", actor);
         audit.Parameters.AddWithValue("$action", (int)action);
         audit.Parameters.AddWithValue("$target", target);
         audit.Parameters.AddWithValue("$now", SqliteValueCodec.ToTicks(now));
+        audit.Parameters.AddWithValue("$detail", (object?)OperatorAuditDetailCodec.Encode(detail) ?? DBNull.Value);
         await audit.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 

@@ -206,7 +206,7 @@ internal sealed class Auditor(IJobStore store, KeySpace keys, TortureOptions opt
                         end = Math.Min(end, renewal.LeaseExpiry!.Value);
                     }
                 }
-                return (claim.JobId!.Value, Attempt: claim.Attempt!.Value, Queue: claim.Queue, Start: claim.T1, End: end);
+                return (claim.JobId!.Value, Attempt: claim.Attempt!.Value, Queue: claim.Queue, Start: claim.T1, End: end, Claim: claim);
             })
             .Where(i => i.End > i.Start)
             .ToList();
@@ -263,6 +263,143 @@ internal sealed class Auditor(IJobStore store, KeySpace keys, TortureOptions opt
 
         AuditCancelProvenance(violations, journal, jobsById);
         AuditTagDurability(violations, journal, jobsById);
+        AuditReschedules(violations, journal, claims, intervals);
+    }
+
+    // Both reschedule checks are post-drain only: each pairs a reschedule with entries journaled on either
+    // side of it, and mid-run a prefix can lack the in-flight call that would excuse the pair.
+    private static void AuditReschedules(
+        ViolationSink violations,
+        IReadOnlyList<JournalEntry> journal,
+        List<JournalEntry> claims,
+        List<(Guid JobId, int Attempt, string? Queue, long Start, long End, JournalEntry Claim)> intervals)
+    {
+        // A client is sequential and journals in call order, so its neighbours bound a call that faulted:
+        // the call began after the client's previous entry returned, and a request's answer (a result or
+        // a fault) is the client's next entry.
+        var previousReturn = new Dictionary<JournalEntry, long>(ReferenceEqualityComparer.Instance);
+        var requeueWindows = new List<(Guid JobId, long T0, long T1)>();
+        var lastReturn = new Dictionary<string, long>(StringComparer.Ordinal);
+        var openRequeue = new Dictionary<string, JournalEntry>(StringComparer.Ordinal);
+        foreach (var entry in journal)
+        {
+            previousReturn[entry] = lastReturn.GetValueOrDefault(entry.Client, long.MinValue);
+            lastReturn[entry.Client] = entry.T1;
+            if (openRequeue.Remove(entry.Client, out var request))
+            {
+                requeueWindows.Add((request.JobId!.Value, request.T0, entry.T1));
+            }
+            if (entry.Op == Ops.RequeueRequested && entry.JobId is not null)
+            {
+                openRequeue[entry.Client] = entry;
+            }
+        }
+        foreach (var request in openRequeue.Values)
+        {
+            requeueWindows.Add((request.JobId!.Value, request.T0, long.MaxValue));
+        }
+
+        var faults = journal.Where(e => e.Op is Ops.TransientFault or Ops.UnexpectedException or Ops.InvariantViolation).ToList();
+        var faultsByClient = faults.ToLookup(e => e.Client);
+        var faultsByJob = faults.Where(e => e.JobId is not null).ToLookup(e => e.JobId!.Value);
+        var claimsByJob = claims.ToLookup(e => e.JobId!.Value);
+        var reschedules = journal.Where(e => e.Op == Ops.Reschedule && e.JobId is not null).ToList();
+        var reschedulesByJob = reschedules.ToLookup(e => e.JobId!.Value);
+        var rescheduled = reschedules
+            .Where(e => e.Result == nameof(RescheduleResult.Rescheduled) && e.DueTime is not null)
+            .ToList();
+        var rescheduledByJob = rescheduled.ToLookup(e => e.JobId!.Value);
+        var enqueuesByJob = journal
+            .Where(e => e.Op == Ops.Enqueue && e.Result == nameof(EnqueueResult.Ok) && e.JobId is not null)
+            .ToLookup(e => e.JobId!.Value);
+        var heartbeatsLost = journal
+            .Where(e => e.Op == Ops.Heartbeat && e.Result != "Renewed" && e.JobId is not null)
+            .ToLookup(e => (e.Client, e.JobId!.Value));
+        var cancelledAtOnce = journal
+            .Where(e => e.Op == Ops.Cancel && e.Result == nameof(CancelResult.CancelledImmediately) && e.JobId is not null)
+            .ToLookup(e => e.JobId!.Value);
+
+        // ReschedulePlacedInLease. The NoOverlap interval is narrowed further, because here a long interval
+        // convicts: a fault by the holder may be an outcome or a heartbeat that ended or shortened the lease,
+        // so it ends the interval where that call could have begun; a later claim of the job, a heartbeat
+        // of the holder that did not renew, or a cancel that took the job at once, proves the lease was gone.
+        foreach (var interval in intervals)
+        {
+            var claim = interval.Claim;
+            var end = interval.End;
+            foreach (var fault in faultsByClient[claim.Client].Where(f => f.T1 > claim.T1))
+            {
+                end = Math.Min(end, previousReturn[fault]);
+            }
+            foreach (var other in claimsByJob[interval.JobId].Where(c => !ReferenceEquals(c, claim) && c.T1 >= claim.T1))
+            {
+                end = Math.Min(end, other.T0);
+            }
+            foreach (var heartbeat in heartbeatsLost[(claim.Client, interval.JobId)].Where(h => h.T1 > claim.T1))
+            {
+                end = Math.Min(end, heartbeat.T0);
+            }
+            foreach (var cancel in cancelledAtOnce[interval.JobId].Where(c => c.T1 > claim.T1))
+            {
+                end = Math.Min(end, cancel.T0);
+            }
+            foreach (var reschedule in rescheduledByJob[interval.JobId].Where(r => r.T0 > interval.Start && r.T1 < end))
+            {
+                violations.Add(new TortureViolation(
+                    TortureInvariant.ReschedulePlacedInLease,
+                    $"Client {reschedule.Client} rescheduled job {interval.JobId} while client {claim.Client}'s lease " +
+                    $"of attempt {interval.Attempt} was definitely live (" +
+                    $"{new DateTimeOffset(interval.Start, TimeSpan.Zero):O} to {new DateTimeOffset(end, TimeSpan.Zero):O}).",
+                    interval.JobId));
+            }
+        }
+
+        // ClaimedBeforeRescheduledDue. A claim that began after a reschedule returned must see the new due
+        // time unless something moved it in between. A requeue, another reschedule, an accepted enqueue, or
+        // any fault naming the job whose window meets [reschedule start, claim return] excuses the pair. A
+        // lease taken and handed back in between (then a failure, an expiry, or a relinquish sets a new due
+        // time) is ruled out by the attempt counter: with no requeue to reset it, the counter only grows, so
+        // a claim of attempt k leaves no room for another claim when attempt k-1 was already handed out
+        // before the reschedule began. That holds for a claim whose reply was lost too. The parent latch
+        // keeps the later of the due time and its now, so it never makes a job due earlier.
+        // The 1 ms margin covers an adapter that stores a due time less precisely than a tick.
+        static bool Meets(long t0, long t1, long from, long to) => t0 <= to && t1 >= from;
+        foreach (var reschedule in rescheduled)
+        {
+            var jobId = reschedule.JobId!.Value;
+            foreach (var claim in claimsByJob[jobId].Where(c =>
+                c.T0 > reschedule.T1 && c.OpNow < reschedule.DueTime - TimeSpan.TicksPerMillisecond))
+            {
+                var from = reschedule.T0;
+                if (claim.Attempt > 1)
+                {
+                    var previous = claimsByJob[jobId]
+                        .Where(c => c.Attempt == claim.Attempt - 1 && c.T1 < reschedule.T0)
+                        .Select(c => (long?)c.T0)
+                        .Max();
+                    if (previous is null)
+                    {
+                        continue;
+                    }
+                    from = previous.Value;
+                }
+                var to = claim.T1;
+                var moved = requeueWindows.Any(w => w.JobId == jobId && Meets(w.T0, w.T1, from, to))
+                    || reschedulesByJob[jobId].Any(r => !ReferenceEquals(r, reschedule) && Meets(r.T0, r.T1, reschedule.T0, to))
+                    || enqueuesByJob[jobId].Any(e => Meets(e.T0, e.T1, reschedule.T0, to))
+                    || faultsByJob[jobId].Any(f => Meets(previousReturn[f], f.T1, reschedule.T0, to));
+                if (moved)
+                {
+                    continue;
+                }
+                violations.Add(new TortureViolation(
+                    TortureInvariant.ClaimedBeforeRescheduledDue,
+                    $"Client {claim.Client} claimed job {jobId} attempt {claim.Attempt} with a claim now of " +
+                    $"{new DateTimeOffset(claim.OpNow!.Value, TimeSpan.Zero):O} after client {reschedule.Client} " +
+                    $"rescheduled it to {new DateTimeOffset(reschedule.DueTime!.Value, TimeSpan.Zero):O}, and nothing " +
+                    "else moved its due time in between.", jobId));
+            }
+        }
     }
 
     private void AuditCancelProvenance(

@@ -249,6 +249,30 @@ public sealed class ReadToolsTests
     }
 
     [Fact]
+    public async Task ListAuditRecords_AReschedule_CarriesTheDueTimeBeforeAndAfterTheMove()
+    {
+        await using var server = await McpTestServer.StartAsync();
+        var t0 = DateTimeOffset.UtcNow;
+        var job = new NewJob(Guid.NewGuid(), "test-job", "{}"u8.ToArray(), "default", t0.AddHours(1));
+        await server.Store.EnqueueAsync(job, t0);
+        await server.Store.RescheduleAsync(job.JobId, t0.AddHours(2), "alice", t0);
+        await server.Store.CancelJobAsync(job.JobId, "bob", t0);
+
+        var result = await server.Client.CallToolAsync(
+            "list_audit_records", new Dictionary<string, object?> { ["target"] = job.JobId.ToString() });
+
+        Assert.False(result.IsError);
+        var records = result.StructuredContent!.Value.GetProperty("auditRecords").EnumerateArray().ToList();
+        Assert.Equal(2, records.Count);
+        Assert.Equal("Reschedule", records[0].GetProperty("action").GetString());
+        Assert.Equal(t0.AddHours(1), records[0].GetProperty("rescheduledFrom").GetDateTimeOffset());
+        Assert.Equal(t0.AddHours(2), records[0].GetProperty("rescheduledTo").GetDateTimeOffset());
+        Assert.Equal("Cancel", records[1].GetProperty("action").GetString());
+        AssertJson.NullOrAbsent(records[1], "rescheduledFrom");
+        AssertJson.NullOrAbsent(records[1], "rescheduledTo");
+    }
+
+    [Fact]
     public async Task ListAuditRecords_UntouchedTarget_ReturnsAnEmptyList()
     {
         await using var server = await McpTestServer.StartAsync();

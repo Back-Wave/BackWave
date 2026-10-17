@@ -15,11 +15,11 @@ namespace BackWave.Storage;
 public interface IJobStore
 {
     /// <summary>
-    /// The single capability flag: whether <see cref="EnqueueAsync"/> and
-    /// <see cref="EnqueueWorkflowAsync"/> can enlist in a caller-supplied ADO.NET transaction, so a
-    /// job commits or rolls back atomically with the caller's own writes. Implementations that
-    /// return <c>false</c> here MUST reject any non-null transaction passed to those methods loudly,
-    /// never silently ignore it.
+    /// The single capability flag: whether <see cref="EnqueueAsync"/>,
+    /// <see cref="EnqueueWorkflowAsync"/>, and <see cref="RescheduleAsync"/> can enlist in a
+    /// caller-supplied ADO.NET transaction, so a job write commits or rolls back atomically with the
+    /// caller's own writes. Implementations that return <c>false</c> here MUST reject any non-null
+    /// transaction passed to those methods loudly, never silently ignore it.
     /// </summary>
     bool SupportsTransactionalEnqueue { get; }
 
@@ -60,6 +60,7 @@ public interface IJobStore
     /// <see cref="EnqueueResult.WireNameTooLong"/>, <see cref="EnqueueResult.UnknownParent"/>, or
     /// <see cref="EnqueueResult.TooManyParents"/>.
     /// </returns>
+    /// <exception cref="ArgumentException">The <paramref name="transaction"/> is not a transaction of this store's database provider, or, for the in-memory store, was not created by this store.</exception>
     ValueTask<EnqueueResult> EnqueueAsync(
         NewJob job, DateTimeOffset now, DbTransaction? transaction = null,
         CancellationToken cancellationToken = default);
@@ -322,6 +323,50 @@ public interface IJobStore
     /// <returns><see cref="RequeueResult.Requeued"/> when a Dead-Lettered or Quarantined job was returned to Scheduled; <see cref="RequeueResult.NotRequeueable"/> when the job was absent or in a state that cannot be requeued.</returns>
     ValueTask<RequeueResult> RequeueAsync(
         Guid jobId, string actor, DateTimeOffset now, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Operator reschedule of a waiting job: a Scheduled or AwaitingParent job gets
+    /// <paramref name="dueTime"/> as its new due time, and nothing else about it changes - not its
+    /// id, payload, Queue, Attempt, Retry Cause, Tags, or enqueue order. For an AwaitingParent job the
+    /// new due time is the earliest instant it can start once its parents resolve. A Leased, terminal,
+    /// or absent job is rejected without effect. The state does not change, so no Transition Log entry
+    /// is written. Implementations MUST append the operator audit record naming
+    /// <paramref name="actor"/> atomically with the move, with a <see cref="RescheduleAuditDetail"/> whose
+    /// <see cref="RescheduleAuditDetail.From"/> is the job's committed due time just before the move and
+    /// whose <see cref="RescheduleAuditDetail.To"/> is <paramref name="dueTime"/>. They MUST publish the
+    /// same Wake-Up Hint as a due enqueue when a Scheduled job becomes due at or before
+    /// <paramref name="now"/>, and MUST make a claim that races the move never lease the job before its
+    /// committed due time. When
+    /// <paramref name="transaction"/> is supplied the move MUST commit or roll back atomically with the
+    /// caller's own writes; a store whose <see cref="SupportsTransactionalEnqueue"/> is <c>false</c>
+    /// MUST reject a non-null transaction loudly.
+    /// </summary>
+    /// <remarks>
+    /// Keep a caller transaction short. The job row stays locked until the commit. When the job is a
+    /// waiting child, the outcome report of its parent waits for that commit, because the report locks
+    /// the child rows to release the latch. On SQLite, the caller transaction holds the database write
+    /// lock, so every other write waits for the commit. Under REPEATABLE READ, SERIALIZABLE, or SNAPSHOT
+    /// isolation, a caller transaction can get a serialization error from the database instead of
+    /// <see cref="RescheduleResult.NotReschedulable"/>.
+    /// </remarks>
+    /// <param name="jobId">The id of the job to reschedule.</param>
+    /// <param name="dueTime">The job's new due time. An instant at or before <paramref name="now"/> makes the job due at once.</param>
+    /// <param name="actor">Who requested the reschedule; recorded in the audit log.</param>
+    /// <param name="now">The current instant, used for the audit timestamp and the wake-up decision (the store must not read its own clock).</param>
+    /// <param name="transaction">An optional caller-owned transaction to enlist in; null for a standalone reschedule.</param>
+    /// <param name="cancellationToken">Cancels the operation.</param>
+    /// <returns><see cref="RescheduleResult.Rescheduled"/> when a Scheduled or AwaitingParent job got the new due time; <see cref="RescheduleResult.NotReschedulable"/> when the job was absent, running, or terminal.</returns>
+    /// <exception cref="NotSupportedException">The store does not implement reschedule, or a <paramref name="transaction"/> was supplied to a store that does not support transactional writes.</exception>
+    /// <exception cref="ArgumentException">The <paramref name="transaction"/> is not a transaction of this store's database provider, or, for the in-memory store, was not created by this store.</exception>
+    ValueTask<RescheduleResult> RescheduleAsync(
+        Guid jobId,
+        DateTimeOffset dueTime,
+        string actor,
+        DateTimeOffset now,
+        DbTransaction? transaction = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not implement RescheduleAsync. Implement it to support the Reschedule operator action.");
 
     /// <summary>
     /// Pauses a Queue cluster-wide: while paused, the Queue yields nothing to a claim. Jobs already
@@ -1087,6 +1132,16 @@ public enum RequeueResult
     NotRequeueable,
 }
 
+/// <summary>The outcome of an operator reschedule.</summary>
+public enum RescheduleResult
+{
+    /// <summary>A Scheduled or AwaitingParent job got the new due time.</summary>
+    Rescheduled,
+
+    /// <summary>The job was absent, running, or terminal, so its due time cannot move; nothing changed.</summary>
+    NotReschedulable,
+}
+
 /// <summary>The outcome of triggering a recurring schedule immediately.</summary>
 public enum TriggerScheduleResult
 {
@@ -1118,6 +1173,9 @@ public enum OperatorAction
     // Appended last: the audit tables persist the numeric value, so existing members never renumber.
     /// <summary>An operator set or cleared a Queue's concurrency limit.</summary>
     SetConcurrencyLimit,
+
+    /// <summary>An operator moved a waiting job's due time.</summary>
+    Reschedule,
 }
 
 /// <summary>
@@ -1129,7 +1187,20 @@ public enum OperatorAction
 /// <param name="Target">The job id, Queue name, or schedule id the action was performed on.</param>
 /// <param name="RecordedAt">When the action was recorded.</param>
 public sealed record OperatorAuditRecord(
-    string Actor, OperatorAction Action, string Target, DateTimeOffset RecordedAt);
+    string Actor, OperatorAction Action, string Target, DateTimeOffset RecordedAt)
+{
+    /// <summary>
+    /// What the action changed, or <see langword="null"/> when the action keeps no detail. A
+    /// <see cref="OperatorAction.Reschedule"/> carries a <see cref="RescheduleAuditDetail"/> with the due
+    /// time before and after the move; every other action carries <see langword="null"/>. A record written
+    /// before the store kept details also reads <see langword="null"/>.
+    /// </summary>
+    /// <remarks>
+    /// An init property and not a fifth constructor parameter, so the four-value constructor and
+    /// deconstruction of a compiled caller keep working.
+    /// </remarks>
+    public OperatorAuditDetail? Detail { get; init; }
+}
 
 /// <summary>
 /// One entry in a job's transition log: the resulting state a state-changing operation produced, the

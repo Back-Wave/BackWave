@@ -23,6 +23,7 @@ internal sealed class JournalOracle
     private readonly Dictionary<string, TriggerGroup> _haltTriggers = new(StringComparer.Ordinal);
     private readonly List<string> _dirtyTriggers = [];
     private readonly List<JournalEntry> _pendingCrashes = [];
+    private readonly List<JournalEntry> _pendingNotDueClaims = [];
     private readonly Dictionary<Guid, int> _workflowCreates = [];
     private readonly List<Guid> _dirtyWorkflows = [];
     private readonly Dictionary<Guid, JobCounters> _jobs = [];
@@ -84,6 +85,10 @@ internal sealed class JournalOracle
                     break;
 
                 case Ops.Claim when entry.Attempt is { } claimedAttempt:
+                    if (entry.DueTime > entry.OpNow)
+                    {
+                        _pendingNotDueClaims.Add(entry);
+                    }
                     var claimed = job.Attempt(claimedAttempt);
                     claimed.Claims++;
                     claimed.ClaimClients.Add(entry.Client);
@@ -156,6 +161,16 @@ internal sealed class JournalOracle
                 TortureInvariant.ClientCrash, $"Client {crash.Client}: {crash.Detail}"));
         }
         _pendingCrashes.Clear();
+
+        foreach (var claim in _pendingNotDueClaims)
+        {
+            sink.Add(new TortureViolation(
+                TortureInvariant.ClaimedBeforeDue,
+                $"Client {claim.Client} claimed job {claim.JobId} attempt {claim.Attempt} due " +
+                $"{new DateTimeOffset(claim.DueTime!.Value, TimeSpan.Zero):O} with a claim now of " +
+                $"{new DateTimeOffset(claim.OpNow!.Value, TimeSpan.Zero):O}.", claim.JobId));
+        }
+        _pendingNotDueClaims.Clear();
 
         // At most one accepted enqueue per JobId, ever (ids are never purged during a run).
         foreach (var jobId in _dirtyJobs)

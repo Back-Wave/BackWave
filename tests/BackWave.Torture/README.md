@@ -64,7 +64,7 @@ is real wall-clock concurrent load on a live adapter. The cycled driver
 Each client is a seeded-PRNG loop over the store surface: enqueue (with duplicate-JobId pressure
 from a seed-derived collision pool whose window slides with wall time), claim/execute/report
 (single and batched outcomes, added tags, output blobs, occasional lease abandonment), heartbeats
-(including stray ones for fence pressure), `ExpireLeases`, operator cancel/requeue, pause/resume
+(including stray ones for fence pressure), `ExpireLeases`, operator cancel/requeue/reschedule (to a near-past or near-future due time), pause/resume
 and limit-set on config queues (first-config races), and workflow create/append with shared
 WorkflowIds. Collision-pool writes use **barrier alignment** (a shared 250 ms wall-clock boundary)
 so the same key's *first* inserts genuinely race across connections — natural timing essentially
@@ -91,7 +91,16 @@ expiry (renewals can shorten a lease) — OutcomeProvenance (fence supersession)
 DuplicateEnqueueAccepted / DuplicateWorkflowAccepted (at most one `Ok` per shared key),
 EnqueueDurability (accepted ⇒ present; present ⇒ accepted), TagDurability (accepted tag writes
 survive), RawStoreException (a raw provider exception escaping the store surface is itself a
-finding), HaltTriggerFired (an adapter raised the production `InvariantViolationException`, which in
+finding), ClaimedBeforeDue (a claim leased a job whose reported due time is after the claim's
+now - a reschedule that moves a due time later races every claim that already read the job as due),
+ReschedulePlacedInLease (a reschedule returned Rescheduled while a lease of the job was definitely live
+for the whole call; the NoOverlap interval is also cut short by any fault of the holder, a later claim of
+the job, a holder heartbeat that did not renew, and a cancel that took the job at once),
+ClaimedBeforeRescheduledDue (a claim that began after a Rescheduled call returned carried a now more than
+1 ms before the new due time, and the journal rules out every other move of that due time in between: no
+requeue, other reschedule, accepted enqueue, or fault naming the job meets the window, and the claim's
+attempt is the first one after an attempt handed out before the reschedule, so no lease fits in between),
+HaltTriggerFired (an adapter raised the production `InvariantViolationException`, which in
 production takes the worker group out of service; the finding names the tripped `InvariantTrigger`),
 DegradeTriggerFired, ClientCrash.
 
@@ -131,9 +140,10 @@ those checks still run in full in the post-drain audit over the merged journal.
 
 Held back to post-drain (each compares two sources read at different instants, and `WorkloadClient`
 journals *after* the store call returns): DrainLiveness, TerminalStable, NoAwaitingParentOrphan,
-EnqueueDurability, NoOverlap, ConcurrencyLimit. DegradeTriggerFired is held back for a different reason: it
-is swept once over the whole journal at the end, so it cannot be double-reported by two passes over
-overlapping prefixes, and so the drain and the audit are themselves covered.
+EnqueueDurability, NoOverlap, ConcurrencyLimit, ReschedulePlacedInLease, ClaimedBeforeRescheduledDue (a
+prefix can lack the in-flight call that would excuse the pair). DegradeTriggerFired is held back for a
+different reason: it is swept once over the whole journal at the end, so it cannot be double-reported by
+two passes over overlapping prefixes, and so the drain and the audit are themselves covered.
 
 The pass is a net, never a replacement: the post-drain audit still runs in full and remains the
 complete one. On the first mid-run violation the run **fails fast** - the time box is cut short, the

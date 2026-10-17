@@ -17,8 +17,8 @@ public sealed class UpgradeHarnessTests
 {
     // Short workload per prior version keeps the shipped-prior-version sweep battery-friendly while still
     // running a real concurrent workload across the freshly migrated schema. Each prior version in the
-    // sweep (v1..v(current-1)) populates, migrates to current, works and audits: SQL Server carries v1 and
-    // v2, Postgres carries v1. The sabotage fact below proves the oracle turns red on a broken upgrade.
+    // sweep (v1..v(current-1)) populates, migrates to current, works and audits: SQL Server carries v1 to
+    // v3, Postgres carries v1 and v2. The sabotage fact below proves the oracle turns red on a broken upgrade.
     private static readonly TimeSpan BatteryWorkload = TimeSpan.FromSeconds(3);
 
     [Fact]

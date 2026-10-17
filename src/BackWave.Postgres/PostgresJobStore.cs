@@ -1544,6 +1544,86 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     }
 
     /// <inheritdoc/>
+    public async ValueTask<RescheduleResult> RescheduleAsync(
+        Guid jobId, DateTimeOffset dueTime, string actor, DateTimeOffset now,
+        DbTransaction? transaction = null, CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        if (transaction is not null)
+        {
+            // Enlist in the caller's transaction: their rollback means the move never happened.
+            if (transaction is not NpgsqlTransaction { Connection: { } callerConnection } npgsqlTransaction)
+            {
+                throw new ArgumentException(
+                    "The Postgres adapter enlists in NpgsqlTransaction instances only.", nameof(transaction));
+            }
+            return await RescheduleCoreAsync(callerConnection, npgsqlTransaction, jobId, dueTime, actor, now, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var ownTransaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        var result = await RescheduleCoreAsync(connection, ownTransaction, jobId, dueTime, actor, now, cancellationToken)
+            .ConfigureAwait(false);
+        await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return result;
+    }
+
+    private async ValueTask<RescheduleResult> RescheduleCoreAsync(
+        NpgsqlConnection connection, NpgsqlTransaction transaction, Guid jobId, DateTimeOffset dueTime,
+        string actor, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        // Only a waiting job (Scheduled 0, AwaitingParent 1) moves; the state guard rejects anything
+        // else without effect (§5.8). A claim holding the row makes this wait, then see Leased.
+        // RETURNING sees only the new row, so the locked read in the CTE carries the due time the move
+        // replaces. FOR UPDATE re-reads the row after any wait, so it is the committed one. timestamptz
+        // keeps whole microseconds, so the audit takes the new due time from the row, not from the caller.
+        int state;
+        string queue;
+        DateTimeOffset from;
+        DateTimeOffset to;
+        await using (var update = Cmd(
+            """
+            WITH old AS (
+                SELECT job_id, due_time FROM backwave.jobs
+                WHERE job_id = @id AND state IN (0, 1)
+                FOR UPDATE
+            )
+            UPDATE backwave.jobs j SET due_time = @due
+            FROM old
+            WHERE j.job_id = old.job_id
+            RETURNING j.state, j.queue, old.due_time, j.due_time
+            """,
+            connection, transaction))
+        {
+            update.Parameters.AddWithValue("id", jobId);
+            update.Parameters.AddWithValue("due", dueTime.ToUniversalTime());
+            await using var reader = await update.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return RescheduleResult.NotReschedulable;
+            }
+            (state, queue, from, to) = (
+                reader.GetInt32(0), reader.GetString(1),
+                reader.GetFieldValue<DateTimeOffset>(2), reader.GetFieldValue<DateTimeOffset>(3));
+        }
+
+        // The state does not change, so no Transition Log entry (§5.12); the audit record is the history.
+        await AppendAuditAsync(
+                connection, transaction, actor, OperatorAction.Reschedule, jobId.ToString(), now,
+                new RescheduleAuditDetail(from, to), cancellationToken)
+            .ConfigureAwait(false);
+        if ((JobState)state == JobState.Scheduled && dueTime <= now)
+        {
+            // Wake-Up Hint (§8): the job is due now, the same as a due enqueue. NOTIFY is
+            // transactional, so it fires on commit, including the caller's own, or never.
+            await PublishHintAsync(connection, transaction, queue, cancellationToken).ConfigureAwait(false);
+        }
+        return RescheduleResult.Rescheduled;
+    }
+
+    /// <inheritdoc/>
     public ValueTask PauseQueueAsync(
         string queue, string actor, DateTimeOffset now, CancellationToken cancellationToken = default)
         => SetPausedAsync(queue, paused: true, actor, OperatorAction.PauseQueue, now, cancellationToken);
@@ -1647,7 +1727,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Cmd(
-            "SELECT actor, action, target, recorded_at FROM backwave.operator_audit WHERE target = @target ORDER BY sequence",
+            "SELECT actor, action, target, recorded_at, detail FROM backwave.operator_audit WHERE target = @target ORDER BY sequence",
             connection);
         command.Parameters.AddWithValue("target", target);
 
@@ -1655,28 +1735,37 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
+            var action = (OperatorAction)reader.GetInt32(1);
             records.Add(new OperatorAuditRecord(
-                reader.GetString(0), (OperatorAction)reader.GetInt32(1), reader.GetString(2),
-                reader.GetFieldValue<DateTimeOffset>(3)));
+                reader.GetString(0), action, reader.GetString(2), reader.GetFieldValue<DateTimeOffset>(3))
+            {
+                Detail = OperatorAuditDetailCodec.Decode(action, target, reader.IsDBNull(4) ? null : reader.GetString(4)),
+            });
         }
         return records;
     }
 
     // Appends one Operator audit record (spec §5.8) inside the action's transaction.
-    private async Task AppendAuditAsync(
+    private Task AppendAuditAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction, string actor, OperatorAction action,
         string target, DateTimeOffset now, CancellationToken cancellationToken)
+        => AppendAuditAsync(connection, transaction, actor, action, target, now, detail: null, cancellationToken);
+
+    private async Task AppendAuditAsync(
+        NpgsqlConnection connection, NpgsqlTransaction transaction, string actor, OperatorAction action,
+        string target, DateTimeOffset now, OperatorAuditDetail? detail, CancellationToken cancellationToken)
     {
         await using var audit = Cmd(
             """
-            INSERT INTO backwave.operator_audit (actor, action, target, recorded_at)
-            VALUES (@actor, @action, @target, @now)
+            INSERT INTO backwave.operator_audit (actor, action, target, recorded_at, detail)
+            VALUES (@actor, @action, @target, @now, @detail)
             """,
             connection, transaction);
         audit.Parameters.AddWithValue("actor", actor);
         audit.Parameters.AddWithValue("action", (int)action);
         audit.Parameters.AddWithValue("target", target);
         audit.Parameters.AddWithValue("now", now.ToUniversalTime());
+        audit.Parameters.AddWithValue("detail", (object?)OperatorAuditDetailCodec.Encode(detail) ?? DBNull.Value);
         await audit.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 

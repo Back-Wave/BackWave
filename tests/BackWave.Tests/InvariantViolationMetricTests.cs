@@ -150,9 +150,11 @@ public class InvariantViolationMetricTests
             "WorkflowMemberEnqueueRejected", "DanglingGatingEdge",
             "UnexpectedAffectedRowCount", "GuaranteedRowAbsent",
             "ParentJobMissingFromBatch", "UndefinedEnumValueStored",
+            "MalformedAuditDetailStored",
             "ObserverCursorRegressed", "ApplicationLockNotAcquired",
             "QueueConfigLockNotAcquired", "LeasedCountAggregateNull",
             "ObserverReportFenceRejected", "WorkflowMemberCycle",
+            "RescheduleTargetNotWaiting",
         ];
 
         var actual = Enum.GetNames<InvariantTrigger>();

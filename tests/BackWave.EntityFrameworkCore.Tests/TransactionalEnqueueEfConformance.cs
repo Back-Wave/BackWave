@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using BackWave.Jobs;
+using BackWave.Operations;
 using BackWave.Storage;
 using Microsoft.EntityFrameworkCore;
 
@@ -255,6 +256,85 @@ public abstract class TransactionalEnqueueEfConformance : IAsyncLifetime
         await using var check = CreateContext();
         Assert.Empty(check.Orders); // the business write rolled back with the failed enqueue
         Assert.Empty(await _store.ClaimAsync(new ClaimRequest("w1", ["default"], 8, TimeSpan.FromMinutes(1), T0)));
+    }
+
+    // ── §5.8 Reschedule, through the EF unit of work ──────────────────────────
+
+    /// <summary>
+    /// Clause 5.8 (commit): a reschedule in the unit of work commits with the business write. Until
+    /// the commit, the rest of the cluster sees the old due time.
+    /// </summary>
+    [Fact]
+    public async Task Reschedule_Commit_MovesTheDueTimeWithTheBusinessWrite()
+    {
+        var jobId = await _client.EnqueueAsync(new OrderConfirmation(Guid.NewGuid()), dueTime: T0.AddHours(1));
+        var backWaveOperator = new BackWaveOperator(_store);
+
+        await using (var context = CreateContext())
+        await using (var transaction = await context.Database.BeginTransactionAsync())
+        {
+            context.Orders.Add(new Order { Id = Guid.NewGuid(), Customer = "grace" });
+            await context.SaveChangesAsync();
+
+            Assert.Equal(RescheduleResult.Rescheduled,
+                await backWaveOperator.RescheduleAsync(jobId, T0.AddHours(2), "grace", context));
+
+            await transaction.CommitAsync();
+        }
+
+        await using var check = CreateContext();
+        Assert.Single(check.Orders);
+        Assert.Equal(T0.AddHours(2), (await _store.GetJobAsync(jobId))!.DueTime);
+        var audit = Assert.Single(await backWaveOperator.ListAuditRecordsAsync(jobId.ToString()));
+        Assert.Equal(OperatorAction.Reschedule, audit.Action);
+    }
+
+    /// <summary>
+    /// Clause 5.8 (rollback): a rolled-back unit of work leaves the old due time, no audit record, and
+    /// no business write.
+    /// </summary>
+    [Fact]
+    public async Task Reschedule_Rollback_KeepsTheOldDueTime_AndNoBusinessWrite()
+    {
+        var jobId = await _client.EnqueueAsync(new OrderConfirmation(Guid.NewGuid()), dueTime: T0.AddHours(1));
+        var backWaveOperator = new BackWaveOperator(_store);
+
+        await using (var context = CreateContext())
+        await using (var transaction = await context.Database.BeginTransactionAsync())
+        {
+            context.Orders.Add(new Order { Id = Guid.NewGuid(), Customer = "ada" });
+            await context.SaveChangesAsync();
+
+            Assert.Equal(RescheduleResult.Rescheduled,
+                await backWaveOperator.RescheduleAsync(jobId, T0.AddHours(2), "ada", context));
+
+            await transaction.RollbackAsync();
+        }
+
+        await using var check = CreateContext();
+        Assert.Empty(check.Orders);
+        Assert.Equal(T0.AddHours(1), (await _store.GetJobAsync(jobId))!.DueTime);
+        Assert.Empty(await backWaveOperator.ListAuditRecordsAsync(jobId.ToString()));
+    }
+
+    /// <summary>
+    /// Reschedule-outside-transaction: with no ambient transaction the overload throws loudly and names
+    /// the fix rather than silently degrading to a plain, non-atomic move, and moves nothing: the due
+    /// time stays and no audit record is written.
+    /// </summary>
+    [Fact]
+    public async Task Reschedule_WithoutAnOpenTransaction_ThrowsLoudly_AndMovesNothing()
+    {
+        var jobId = await _client.EnqueueAsync(new OrderConfirmation(Guid.NewGuid()), dueTime: T0.AddHours(1));
+        var backWaveOperator = new BackWaveOperator(_store);
+
+        await using var context = CreateContext();
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await backWaveOperator.RescheduleAsync(jobId, T0.AddHours(2), "hopper", context));
+
+        Assert.Contains("BeginTransaction", exception.Message);
+        Assert.Equal(T0.AddHours(1), (await _store.GetJobAsync(jobId))!.DueTime);
+        Assert.Empty(await backWaveOperator.ListAuditRecordsAsync(jobId.ToString()));
     }
 
     // ── The shim's honest escape hatches ──────────────────────────────────────
