@@ -149,14 +149,35 @@ public sealed class OracleTransientFaultTests(Xunit.Abstractions.ITestOutputHelp
 
     // Two migrators that create the same index at the same time can deadlock in the library cache. Oracle
     // rolls back one statement with ORA-04020, and the measured 16-node storm hit it about 1 run in 3. A
-    // real schema fault such as ORA-00942 still stops the migration.
+    // row deadlock (ORA-00060) gets the same retry. A real schema fault such as ORA-00942 still stops the
+    // migration.
     [Theory]
     [InlineData(4020, true)]
+    [InlineData(60, true)]
     [InlineData(12545, true)]
     [InlineData(942, false)]
     [InlineData(1031, false)]
-    public void The_migrator_retries_a_library_cache_deadlock_and_connectivity_faults_only(int number, bool retries)
+    public void The_migrator_retries_deadlocks_and_connectivity_faults_only(int number, bool retries)
         => Assert.Equal(retries, OracleMigrator.IsTransient(number));
+
+    // The store migrates on first use with a 5 s retry budget, and one DDL lock wait can last 30 s, so a
+    // deadlock can reach the pump after the budget. The store must then mark it transient, or the group
+    // halts. The database raises each code here, so the exception is the one ODP.NET gives.
+    [Theory]
+    [InlineData(4020)]
+    [InlineData(60)]
+    public async Task The_store_classifies_a_deadlock_transient(int number)
+    {
+        await using var connection = new OracleConnection(OracleTestDatabase.ConnectionString);
+        await connection.OpenAsync();
+        await using var raise = connection.CreateCommand();
+        raise.CommandText = $"DECLARE e EXCEPTION; PRAGMA EXCEPTION_INIT(e, -{number}); BEGIN RAISE e; END;";
+        var fault = await Assert.ThrowsAsync<OracleException>(() => raise.ExecuteNonQueryAsync());
+
+        var store = new OracleJobStore(new OracleStoreOptions { ConnectionString = OracleTestDatabase.ConnectionString });
+        Assert.Equal(number, fault.Number);
+        Assert.True(store.IsTransientFault(fault), $"ORA-{fault.Number} must classify transient");
+    }
 
     private const string Group = "outage-workers";
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(200);

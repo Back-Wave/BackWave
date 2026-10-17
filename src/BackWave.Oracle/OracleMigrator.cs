@@ -21,18 +21,15 @@ public static class OracleMigrator
     public const int ExpectedSchemaVersion = 2;
 
     // Transient faults a cold-booting fleet can hit that the bounded retry should ride out rather than
-    // surface: the shared listener/handshake-storm and connection-lost connectivity set, and ORA-04020.
-    // Two nodes that create the same object at the same time can deadlock in the library cache. Oracle
-    // rolls back one statement, and the scripts are idempotent, so a new attempt converges.
+    // surface: the shared listener/handshake-storm and connection-lost connectivity set, and a deadlock.
+    // The scripts are idempotent, so a new attempt converges.
     internal static bool IsTransient(int number)
-        => OracleFaultCodes.IsConnectivityFault(number) || number == LibraryCacheDeadlock;
-
-    private const int LibraryCacheDeadlock = 4020;
+        => OracleFaultCodes.IsConnectivityFault(number) || OracleFaultCodes.IsDeadlock(number);
 
     /// <summary>
     /// Runs every schema script in version order, bringing the database up to the version this adapter
     /// requires. Idempotent - safe to run against an already-current database. Transient connection faults
-    /// and library cache deadlocks (ORA-04020) from a fleet cold-boot are retried internally with a bounded
+    /// and deadlocks (ORA-00060, ORA-04020) from a fleet cold-boot are retried internally with a bounded
     /// backoff; a fault that persists past those attempts propagates.
     /// </summary>
     /// <param name="connectionString">The ODP.NET connection string for the target database.</param>

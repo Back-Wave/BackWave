@@ -30,4 +30,9 @@ internal static class OracleFaultCodes
     internal static bool IsConnectivityFault(int code) => code is
         12170 or 12541 or 12514 or 12518 or 12537 or 12570 or 3113 or 3114 or 28 or 1033 or 12154
         or 1089 or 1109 or 12545 or 50201 or 50000 or 50012;
+
+    // True when Oracle rolled back one statement to break a deadlock: 60 on rows, 4020 on the library cache
+    // (two nodes that create the same object at the same time). A new attempt can succeed, so the migrator
+    // retries both and the store tags both transient.
+    internal static bool IsDeadlock(int code) => code is 60 or 4020;
 }

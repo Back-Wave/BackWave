@@ -224,12 +224,12 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
 
     // Classifies a store fault for the backwave.store.faults metric tag, mirroring the host's own
     // transient/terminal split: a bare TimeoutException plus the shared connectivity/timeout set and the
-    // ORA-00060 deadlock victim are the whole transient set. Emit-only - the host still makes the real
-    // retry/fail-stop decision from the rethrown exception.
+    // deadlock victims (ORA-00060, ORA-04020) are the whole transient set. Emit-only - the host still makes
+    // the real retry/fail-stop decision from the rethrown exception.
     private static bool IsTransientStoreFault(Exception exception)
         => exception is TimeoutException
            || (exception is OracleException o
-               && (OracleFaultCodes.IsConnectivityFault(o.Number) || o.Number == 60));
+               && (OracleFaultCodes.IsConnectivityFault(o.Number) || OracleFaultCodes.IsDeadlock(o.Number)));
 
     /// <inheritdoc/>
     public bool IsTransientFault(Exception exception) => IsTransientStoreFault(exception);
