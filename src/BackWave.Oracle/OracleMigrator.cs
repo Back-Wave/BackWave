@@ -20,16 +20,20 @@ public static class OracleMigrator
     /// <summary>The schema version this build of the adapter requires the database to be at.</summary>
     public const int ExpectedSchemaVersion = 2;
 
-    // Transient connection faults a cold-booting fleet can hit that the bounded retry should ride out
-    // rather than surface: the shared listener/handshake-storm and connection-lost connectivity set.
-    private static bool IsTransient(OracleException exception)
-        => OracleFaultCodes.IsConnectivityFault(exception.Number);
+    // Transient faults a cold-booting fleet can hit that the bounded retry should ride out rather than
+    // surface: the shared listener/handshake-storm and connection-lost connectivity set, and ORA-04020.
+    // Two nodes that create the same object at the same time can deadlock in the library cache. Oracle
+    // rolls back one statement, and the scripts are idempotent, so a new attempt converges.
+    internal static bool IsTransient(int number)
+        => OracleFaultCodes.IsConnectivityFault(number) || number == LibraryCacheDeadlock;
+
+    private const int LibraryCacheDeadlock = 4020;
 
     /// <summary>
     /// Runs every schema script in version order, bringing the database up to the version this adapter
     /// requires. Idempotent - safe to run against an already-current database. Transient connection faults
-    /// from a fleet cold-boot are retried internally with a bounded backoff; a fault that persists past
-    /// those attempts propagates.
+    /// and library cache deadlocks (ORA-04020) from a fleet cold-boot are retried internally with a bounded
+    /// backoff; a fault that persists past those attempts propagates.
     /// </summary>
     /// <param name="connectionString">The ODP.NET connection string for the target database.</param>
     /// <param name="cancellationToken">Token to cancel the migration.</param>
@@ -102,7 +106,7 @@ public static class OracleMigrator
                 await ApplyScriptsAsync(connectionString, rewriter, cancellationToken).ConfigureAwait(false);
                 return;
             }
-            catch (OracleException exception) when (IsTransient(exception)
+            catch (OracleException exception) when (IsTransient(exception.Number)
                 && ShouldRetry(attempt, Stopwatch.GetElapsedTime(started), retryBudget))
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(50 * attempt), cancellationToken).ConfigureAwait(false);

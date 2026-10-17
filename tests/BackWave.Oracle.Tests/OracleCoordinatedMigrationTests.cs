@@ -63,9 +63,10 @@ public sealed class OracleCoordinatedMigrationTests : IAsyncLifetime
 
     // The coordinate:false path strips the migrator's own transient-connectivity retry, so a cold-boot
     // listener-handoff fault (ORA-12518, ORA-12570, and the rest of the connectivity set) can surface here -
-    // unrelated to the guarded-DDL convergence this test proves. Ride those out with a bounded retry. Any
-    // non-connectivity error (a real convergence fault such as ORA-00955 or ORA-00001) propagates unchanged
-    // and fails the storm as before.
+    // unrelated to the guarded-DDL convergence this test proves. The same path also surfaces ORA-04020, the
+    // library cache deadlock between two nodes that create the same object, which the coordinated path
+    // retries. Ride those out with a bounded retry. Any other error (a real convergence fault such as
+    // ORA-00955 or ORA-00001) propagates unchanged and fails the storm as before.
     private static async Task MigrateRidingOutConnectivityFaultsAsync(bool coordinate)
     {
         const int maxAttempts = 10;
@@ -77,7 +78,7 @@ public sealed class OracleCoordinatedMigrationTests : IAsyncLifetime
                 return;
             }
             catch (OracleException exception)
-                when (OracleFaultCodes.IsConnectivityFault(exception.Number) && attempt < maxAttempts)
+                when (OracleMigrator.IsTransient(exception.Number) && attempt < maxAttempts)
             {
                 await Task.Delay(250);
             }

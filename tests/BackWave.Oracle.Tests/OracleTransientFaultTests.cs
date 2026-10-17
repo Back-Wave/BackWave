@@ -147,6 +147,17 @@ public sealed class OracleTransientFaultTests(Xunit.Abstractions.ITestOutputHelp
         Assert.Equal(retries, OracleMigrator.ShouldRetry(attempt, TimeSpan.FromSeconds(elapsedSeconds), budget));
     }
 
+    // Two migrators that create the same index at the same time can deadlock in the library cache. Oracle
+    // rolls back one statement with ORA-04020, and the measured 16-node storm hit it about 1 run in 3. A
+    // real schema fault such as ORA-00942 still stops the migration.
+    [Theory]
+    [InlineData(4020, true)]
+    [InlineData(12545, true)]
+    [InlineData(942, false)]
+    [InlineData(1031, false)]
+    public void The_migrator_retries_a_library_cache_deadlock_and_connectivity_faults_only(int number, bool retries)
+        => Assert.Equal(retries, OracleMigrator.IsTransient(number));
+
     private const string Group = "outage-workers";
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(200);
 
