@@ -390,7 +390,7 @@ cmd_sql() {
           sqlite) sqlite3 -header -column -cmd '.timeout 5000' "$SQLITE_DB" "PRAGMA query_only=1; $query" ;;
           postgres) docker exec -e PGOPTIONS='-c default_transaction_read_only=on' "$CONTAINER" \
                         psql -U backwave -d backwave_sample -v ON_ERROR_STOP=1 -c "$query" ;;
-          oracle) printf 'SET MARKUP CSV ON\nWHENEVER SQLERROR EXIT FAILURE\nSET TRANSACTION READ ONLY;\n%s;\nEXIT\n' "${query%;}" \
+          oracle) printf 'SET DEFINE OFF\nSET MARKUP CSV ON\nWHENEVER SQLERROR EXIT FAILURE\nSET TRANSACTION READ ONLY;\n%s;\nEXIT\n' "${query%;}" \
                       | docker exec -i "$CONTAINER" sqlplus -S -L backwave/backwave@localhost/FREEPDB1 ;;
       esac
     } > "$out" 2>&1 || { cat "$out"; die "query failed (saved db/$name.txt)"; }
