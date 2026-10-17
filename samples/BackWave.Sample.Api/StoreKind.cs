@@ -165,7 +165,7 @@ internal abstract class StoreKind
     private sealed class OracleStore : StoreKind
     {
         private const string DefaultConnectionString =
-            "User Id=backwave;Password=backwave;Data Source=localhost:15210/FREEPDB1";
+            "User Id=backwave;Password=backwave;Data Source=localhost:15211/FREEPDB1";
 
         public override string Name => "Oracle";
         public override bool SupportsTransactionalEnqueue => false;

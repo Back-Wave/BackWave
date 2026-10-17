@@ -27,7 +27,7 @@ Then open:
 ## Switching stores
 
 Storage is chosen by the `BackWave:Store` config key: `InMemory` (default), `Sqlite`,
-`SqliteDedicated`, `Postgres`, or `SqlServer`.
+`SqliteDedicated`, `Postgres`, `SqlServer`, or `Oracle`.
 
 | Store             | Infra needed           | Transactional Enqueue (`POST /tx`)         |
 | ----------------- | ---------------------- | ------------------------------------------ |
@@ -36,6 +36,7 @@ Storage is chosen by the `BackWave:Store` config key: `InMemory` (default), `Sql
 | `SqliteDedicated` | none — a local file    | returns **409** (BackWave on its own file) |
 | `Postgres`        | `docker compose up -d` | ✅ commits/rolls back atomically           |
 | `SqlServer`       | `docker compose up -d` | ✅ commits/rolls back atomically           |
+| `Oracle`          | `docker compose up -d` | returns **409** (no business table)        |
 
 The **SQLite Embedded Adapter** needs no server — just a local `.db` file (written under the content
 root). Two deployments demonstrate the spectrum:
@@ -65,10 +66,15 @@ BackWave__Store=Postgres dotnet run
 # SQL Server (amd64 image; slow under Rosetta on Apple Silicon)
 docker compose up -d sqlserver
 BackWave__Store=SqlServer dotnet run
+
+# Oracle (no business table, so POST /tx returns 409)
+docker compose up -d oracle
+BackWave__Store=Oracle dotnet run
 ```
 
 Connection strings default to the compose values and can be overridden via
-`BackWave:Postgres:ConnectionString` / `BackWave:SqlServer:ConnectionString`; the SQLite file paths
+`BackWave:Postgres:ConnectionString` / `BackWave:SqlServer:ConnectionString` /
+`BackWave:Oracle:ConnectionString`; the SQLite file paths
 via `BackWave:Sqlite:DataSource` (and `BackWave:Sqlite:BusinessDataSource` for the dedicated business
 file) — see `appsettings.json`.
 
