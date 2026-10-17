@@ -53,10 +53,10 @@ public static class OracleMigrator
     /// </param>
     /// <param name="coordinate">
     /// When <see langword="true"/> (the default), a cold-booting fleet rides out the transient connection
-    /// faults of a first-boot handshake storm with a bounded retry. The Oracle schema script is idempotent
-    /// and concurrency-safe on its own, so no database lock is taken either way. Setting it to
-    /// <see langword="false"/> runs the script once with no transient retry; it is safe when the deployment
-    /// already serializes migration itself.
+    /// faults of a first-boot handshake storm and the deadlocks (ORA-00060, ORA-04020) of nodes that create
+    /// the same object at once, with a bounded retry. The Oracle schema script is idempotent, so no database
+    /// lock is taken either way. Setting it to <see langword="false"/> runs the script once with no retry;
+    /// it is safe when the deployment already serializes migration itself.
     /// </param>
     /// <param name="cancellationToken">Token to cancel the migration.</param>
     /// <returns>A task that completes once every script has run.</returns>
