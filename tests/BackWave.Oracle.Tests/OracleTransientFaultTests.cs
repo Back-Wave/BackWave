@@ -49,36 +49,57 @@ public sealed class OracleTransientFaultTests(Xunit.Abstractions.ITestOutputHelp
     [MemberData(nameof(Outages))]
     public async Task A_network_outage_degrades_the_worker_group_instead_of_halting_it(string dataSource)
     {
-        var builder = Host.CreateApplicationBuilder();
-        builder.Services.AddBackWave(backwave => backwave
-            .UseStore(Store(dataSource))
-            .UseRegistry(new JobRegistry([]))
-            .AddWorkerGroup(new WorkerGroupOptions
-            {
-                Name = "outage-workers",
-                Policy = new DispatchPolicy.Strict(["default"]),
-                PollInterval = TimeSpan.FromMilliseconds(200),
-                LeaseDuration = TimeSpan.FromSeconds(30),
-            }));
-        using var host = builder.Build();
+        using var host = BuildHost(Store(dataSource));
         var health = host.Services.GetRequiredService<BackWaveHealth>();
 
         await host.StartAsync();
         try
         {
-            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
-            while (DateTime.UtcNow < deadline
-                   && !health.DegradedGroups.ContainsKey("outage-workers")
-                   && !health.HaltedGroups.ContainsKey("outage-workers"))
-            {
-                await Task.Delay(50);
-            }
+            await WaitForDegradedOrHaltedAsync(health);
 
-            Assert.False(health.HaltedGroups.TryGetValue("outage-workers", out var halt),
-                $"the outage fail-stopped the group: {halt?.ExceptionType}: {halt?.Message}");
-            Assert.True(health.DegradedGroups.TryGetValue("outage-workers", out var cause), "the outage must mark the group degraded");
+            AssertNotHalted(health);
+            Assert.True(health.DegradedGroups.TryGetValue(Group, out var cause), "the outage must mark the group degraded");
             output.WriteLine($"degraded: {cause}");
             Assert.True(NamesTransientCode(cause), $"the degraded cause must name a transient code: {cause}");
+
+            // Later polls hit the same outage. Watch three poll intervals: none of them may halt the group.
+            var watchEnd = DateTime.UtcNow + 3 * PollInterval;
+            while (DateTime.UtcNow < watchEnd)
+            {
+                AssertNotHalted(health);
+                await Task.Delay(50);
+            }
+            AssertNotHalted(health);
+        }
+        finally
+        {
+            await host.StopAsync();
+        }
+    }
+
+    // The negative case: a fault that is not an outage must still halt the group. A user that does not
+    // exist raises ORA-01017 on the live listener. The test does not use a wrong password for a real user,
+    // because repeated failed logins can lock that account. This is an integration test: it needs
+    // "docker compose up -d oracle".
+    [Fact]
+    public async Task A_rejected_login_halts_the_worker_group()
+    {
+        var store = new OracleJobStore(new OracleStoreOptions
+        {
+            ConnectionString = "User Id=bw_no_such_user;Password=bw_no_such_user;Connection Timeout=3;"
+                + "Data Source=localhost:15210/FREEPDB1",
+        });
+        using var host = BuildHost(store);
+        var health = host.Services.GetRequiredService<BackWaveHealth>();
+
+        await host.StartAsync();
+        try
+        {
+            await WaitForDegradedOrHaltedAsync(health);
+
+            Assert.True(health.HaltedGroups.TryGetValue(Group, out var halt), "a rejected login must halt the group");
+            output.WriteLine($"halted: {halt.ExceptionType}: {halt.Message}");
+            Assert.Contains("ORA-01017", halt.Message);
         }
         finally
         {
@@ -115,6 +136,44 @@ public sealed class OracleTransientFaultTests(Xunit.Abstractions.ITestOutputHelp
     public void The_migrator_retries_three_attempts_before_the_budget_applies(int attempt, int elapsedSeconds, bool retries)
     {
         Assert.Equal(retries, OracleMigrator.ShouldRetry(attempt, TimeSpan.FromSeconds(elapsedSeconds)));
+    }
+
+    private const string Group = "outage-workers";
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(200);
+
+    private static IHost BuildHost(OracleJobStore store)
+    {
+        var builder = Host.CreateApplicationBuilder();
+        builder.Services.AddBackWave(backwave => backwave
+            .UseStore(store)
+            .UseRegistry(new JobRegistry([]))
+            .AddWorkerGroup(new WorkerGroupOptions
+            {
+                Name = Group,
+                Policy = new DispatchPolicy.Strict(["default"]),
+                PollInterval = PollInterval,
+                LeaseDuration = TimeSpan.FromSeconds(30),
+            }));
+        return builder.Build();
+    }
+
+    private static async Task WaitForDegradedOrHaltedAsync(BackWaveHealth health)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+        while (DateTime.UtcNow < deadline
+               && !health.DegradedGroups.ContainsKey(Group)
+               && !health.HaltedGroups.ContainsKey(Group))
+        {
+            await Task.Delay(50);
+        }
+    }
+
+    // A halt of one pump counts too, so the check reads the partly halted groups as well.
+    private static void AssertNotHalted(BackWaveHealth health)
+    {
+        var halted = health.HaltedGroups.TryGetValue(Group, out var halt)
+            || health.PartiallyHaltedGroups.TryGetValue(Group, out halt);
+        Assert.False(halted, $"the outage fail-stopped the group: {halt?.ExceptionType}: {halt?.Message}");
     }
 
     // True when the cause names an ORA or ODP.NET code that the adapter classifies transient.
