@@ -96,6 +96,21 @@ public sealed class OracleTransientFaultTests
         Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(10), $"the migration took {elapsed.Elapsed.TotalSeconds:F1} s");
     }
 
+    // A slow fault, for example a TNS connect timeout, can use the whole time budget on the first attempt.
+    // A caller that migrates once at startup has no next poll, so the first three attempts always run.
+    [Theory]
+    [InlineData(1, 0, true)]
+    [InlineData(1, 15, true)]
+    [InlineData(2, 30, true)]
+    [InlineData(3, 4, true)]
+    [InlineData(3, 45, false)]
+    [InlineData(7, 4, true)]
+    [InlineData(8, 0, false)]
+    public void The_migrator_retries_three_attempts_before_the_budget_applies(int attempt, int elapsedSeconds, bool retries)
+    {
+        Assert.Equal(retries, OracleMigrator.ShouldRetry(attempt, TimeSpan.FromSeconds(elapsedSeconds)));
+    }
+
     private static string Descriptor(string host, int port) =>
         $"(DESCRIPTION=(CONNECT_TIMEOUT=2)(ADDRESS=(PROTOCOL=TCP)(HOST={host})(PORT={port}))"
         + "(CONNECT_DATA=(SERVICE_NAME=FREEPDB1)))";

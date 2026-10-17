@@ -82,8 +82,6 @@ public static class OracleMigrator
         // startup. The budget bounds the retry by time as well: a host that does not answer costs a full
         // connect timeout on each attempt, and an auto-migrating store runs the migration again on its
         // next poll. On exhaustion the last fault propagates (fail-stop preserved).
-        const int maxAttempts = 8;
-        var budget = TimeSpan.FromSeconds(5);
         var started = Stopwatch.GetTimestamp();
         for (var attempt = 1; ; attempt++)
         {
@@ -92,12 +90,23 @@ public static class OracleMigrator
                 await ApplyScriptsAsync(connectionString, rewriter, cancellationToken).ConfigureAwait(false);
                 return;
             }
-            catch (OracleException exception) when (attempt < maxAttempts && IsTransient(exception)
-                && Stopwatch.GetElapsedTime(started) < budget)
+            catch (OracleException exception) when (IsTransient(exception)
+                && ShouldRetry(attempt, Stopwatch.GetElapsedTime(started)))
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(50 * attempt), cancellationToken).ConfigureAwait(false);
             }
         }
+    }
+
+    // True when a transient fault on this attempt gets another attempt. The first attempts always retry,
+    // because one slow fault can use the whole budget and a caller that migrates once has no next poll.
+    internal static bool ShouldRetry(int attempt, TimeSpan elapsed)
+    {
+        const int maxAttempts = 8;
+        const int minAttempts = 3;
+        const int budgetSeconds = 5;
+        return attempt < maxAttempts
+            && (attempt < minAttempts || elapsed < TimeSpan.FromSeconds(budgetSeconds));
     }
 
     // Runs every embedded schema script in version order. Each script is a single anonymous PL/SQL block
