@@ -107,35 +107,44 @@ public sealed class OracleTransientFaultTests(Xunit.Abstractions.ITestOutputHelp
         }
     }
 
-    // A host that does not answer costs a full connect timeout on every attempt, so the migrator's retry
-    // stops on its time budget instead of waiting out all eight attempts (about 17 s here).
+    // A host that does not answer costs a full connect timeout on every attempt. The store holds its ready
+    // gate while it migrates, so an enqueue waits for the claim's migration and then runs its own. The
+    // retry budget bounds both: without it each call waits out all eight attempts (about 17 s here).
     [Fact]
-    public async Task An_unreachable_host_fails_the_migration_once_the_retry_budget_is_spent()
+    public async Task An_unreachable_host_holds_the_store_ready_gate_only_for_the_retry_budget()
     {
-        var connectionString =
-            $"User Id=backwave;Password=backwave;Connection Timeout=2;Data Source={Descriptor("192.0.2.1", 1521)}";
+        var store = new OracleJobStore(new OracleStoreOptions
+        {
+            ConnectionString = $"User Id=backwave;Password=backwave;Connection Timeout=2;Data Source={Descriptor("192.0.2.1", 1521)}",
+            AutoMigrate = true,
+        });
         var elapsed = Stopwatch.StartNew();
 
-        var fault = await Assert.ThrowsAsync<OracleException>(() => OracleMigrator.MigrateAsync(connectionString));
+        var claim = Assert.ThrowsAsync<OracleException>(async () =>
+            await store.ClaimAsync(new ClaimRequest("w1", ["default"], 10, TimeSpan.FromMinutes(1), DateTimeOffset.UtcNow)));
+        var enqueue = Assert.ThrowsAsync<OracleException>(async () =>
+            await store.EnqueueAsync(new NewJob(Guid.NewGuid(), "gate-test", "{}"u8.ToArray(), "default", DateTimeOffset.UtcNow), DateTimeOffset.UtcNow));
+        var faults = await Task.WhenAll(claim, enqueue);
 
-        output.WriteLine($"ORA-{fault.Number}: {fault.Message}");
-        Assert.True(OracleFaultCodes.IsConnectivityFault(fault.Number), $"ORA-{fault.Number} must be transient");
-        Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(10), $"the migration took {elapsed.Elapsed.TotalSeconds:F1} s");
+        output.WriteLine($"both faulted after {elapsed.Elapsed.TotalSeconds:F1} s: ORA-{faults[0].Number}, ORA-{faults[1].Number}");
+        Assert.All(faults, fault => Assert.True(store.IsTransientFault(fault), $"ORA-{fault.Number} must classify transient"));
+        Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(20), $"the enqueue waited {elapsed.Elapsed.TotalSeconds:F1} s");
     }
 
-    // A slow fault, for example a TNS connect timeout, can use the whole time budget on the first attempt.
-    // A caller that migrates once at startup has no next poll, so the first three attempts always run.
+    // On the store path the pump migrates again on its next poll, so the budget stops the retry. A caller
+    // that migrates once has no next poll, so the public migrator keeps every attempt with no time limit.
     [Theory]
-    [InlineData(1, 0, true)]
-    [InlineData(1, 15, true)]
-    [InlineData(2, 30, true)]
-    [InlineData(3, 4, true)]
-    [InlineData(3, 45, false)]
-    [InlineData(7, 4, true)]
-    [InlineData(8, 0, false)]
-    public void The_migrator_retries_three_attempts_before_the_budget_applies(int attempt, int elapsedSeconds, bool retries)
+    [InlineData(1, 15, null, true)]
+    [InlineData(7, 100, null, true)]
+    [InlineData(8, 0, null, false)]
+    [InlineData(1, 0, 5, true)]
+    [InlineData(2, 6, 5, false)]
+    [InlineData(8, 0, 5, false)]
+    public void The_migrator_bounds_its_retry_by_time_only_when_a_budget_is_given(
+        int attempt, int elapsedSeconds, int? budgetSeconds, bool retries)
     {
-        Assert.Equal(retries, OracleMigrator.ShouldRetry(attempt, TimeSpan.FromSeconds(elapsedSeconds)));
+        var budget = budgetSeconds is { } seconds ? TimeSpan.FromSeconds(seconds) : (TimeSpan?)null;
+        Assert.Equal(retries, OracleMigrator.ShouldRetry(attempt, TimeSpan.FromSeconds(elapsedSeconds), budget));
     }
 
     private const string Group = "outage-workers";

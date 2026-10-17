@@ -187,7 +187,9 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             }
             if (options.AutoMigrate)
             {
-                await OracleMigrator.MigrateAsync(options.ConnectionString, options.SchemaName, options.CoordinateMigration, cancellationToken).ConfigureAwait(false);
+                await OracleMigrator.MigrateCoreAsync(
+                    options.ConnectionString, options.SchemaName, options.CoordinateMigration,
+                    OracleMigrator.StoreRetryBudget, cancellationToken).ConfigureAwait(false);
                 BackWaveLog.MigrationApplied(_logger, "oracle");
             }
             await OracleMigrator.VerifySchemaVersionAsync(options.ConnectionString, options.SchemaName, _logger, cancellationToken).ConfigureAwait(false);
