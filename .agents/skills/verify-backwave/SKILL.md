@@ -32,7 +32,7 @@ Each run owns these resources. All of them use the same run id (`YYYYMMDD-HHMMSS
 | HTTP port | `http://127.0.0.1:<port>` | A free port from the OS. `bwv` never uses the default `5283` from `appsettings.json`. |
 | Scratch directory | `${TMPDIR}/bw-verify-<run>/` | Holds the app copy and the SQLite file `backwave.db`. |
 | Postgres (only with `--store postgres`) | container `backwave-verify-<run>`, label `backwave.verify.run=<run>` | `postgres:17-alpine` on a free loopback port. It never uses the compose containers on `5398` or `14331`. |
-| Oracle (only with `--store oracle`) | container `backwave-verify-<run>`, label `backwave.verify.run=<run>` | `gvenzl/oracle-free:23-slim` on a fixed free loopback port. It never uses the compose container on `15210`. |
+| Oracle (only with `--store oracle`) | container `backwave-verify-<run>`, label `backwave.verify.run=<run>` | `gvenzl/oracle-free:23-slim` on a fixed free loopback port. It never uses the compose container on `15210` or the sample compose container on `15211`. |
 | Browser | `CHROME_DEVTOOLS_AXI_SESSION=bw-verify-<run>` | A private bridge and an isolated headless Chrome profile. `bwv` never uses the `default` session. |
 | Evidence | `.verify-evidence/<run>/` at the worktree root | Gitignored. Cleanup never deletes it. |
 

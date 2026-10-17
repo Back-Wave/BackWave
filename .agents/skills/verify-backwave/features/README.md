@@ -6,7 +6,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 
 - `bwv launch` printed `READY`, and `bwv doctor` passes every check on the run that you drive.
 - The run's Sample.Api starts with no jobs. Each recipe creates its own jobs through the sample's HTTP endpoints with `bwv api`.
-- The run's store is its own SQLite file (the default) its own Postgres container (`--store postgres`), or its own Oracle container (`--store oracle`). The queues are `critical`, `bulk`, `low`, and `limited` (concurrency limit 1).
+- The run's store is its own SQLite file (the default), its own Postgres container (`--store postgres`), or its own Oracle container (`--store oracle`). The queues are `critical`, `bulk`, `low`, and `limited` (concurrency limit 1).
 - The operator actor on the dashboard and on `/ops/*` is `sample-operator`. The startup limit on `limited` has the actor `startup`.
 - Never drive an app, a container, or a browser session that this run did not start.
 
