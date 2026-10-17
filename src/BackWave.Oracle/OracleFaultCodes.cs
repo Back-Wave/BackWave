@@ -14,13 +14,16 @@ namespace BackWave.Oracle;
 //   1089  shutdown in progress           1109  database not open (a restart opens it after the listener)
 //   12154 could not resolve connect id (transient during cold DNS/TNS)
 //   12545 target host does not exist (the host name stops resolving in a network outage)
-// A mistyped host name also raises 12545 (like 12154), so it leaves the group degraded and never halts it.
 // ODP.NET managed raises its own codes when a connect fails:
-//   50201 failed to connect to server (connection refused while the database is down, or a service name
-//         the listener does not know during a restart; a wrong service name also raises it, so that too
-//         leaves the group degraded and never halts it)
+//   50201 failed to connect to server or failed to parse connect string (connection refused while the
+//         database is down, or a service name the listener does not know during a restart)
 //   50000 connection request timed out (the host does not answer)
 //   50012 pooled connection request timed out (the pool has no free connection)
+// A misconfigured Data Source raises some of these codes too, so it leaves the group degraded and never
+// halts it: a mistyped host name (12545), a mistyped EZConnect string or TNS alias (12154), and a wrong
+// service name or a descriptor that ODP.NET cannot parse (50201). A wrong attribute name in the
+// connection string fails the open with an ArgumentException, and a wrong password raises 1017. Neither
+// is in this list, so both halt the group.
 internal static class OracleFaultCodes
 {
     // True when the ORA or ODP.NET code is one of the transient connectivity/timeout faults above.
