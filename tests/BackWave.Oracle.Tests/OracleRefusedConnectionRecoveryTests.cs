@@ -50,9 +50,9 @@ public sealed class OracleRefusedConnectionRecoveryTests(Xunit.Abstractions.ITes
     {
         // Lock the user, so the pool cannot open a new session, then end every session it still has, so
         // the DROP USER does not wait on them.
-        await LockUserAsync();
+        await OutageTestSupport.LockUserAsync(Schema);
         OracleConnection.ClearPool(new OracleConnection(SchemaConnectionString));
-        await DisconnectSessionsAsync();
+        await OutageTestSupport.DisconnectSessionsAsync(Schema);
         await OracleTestDatabase.DropUserAsync(Schema);
         if (_forwarder is not null)
         {
@@ -94,7 +94,7 @@ public sealed class OracleRefusedConnectionRecoveryTests(Xunit.Abstractions.ITes
         {
             // The port is closed, so the first poll's migration gets a refused connect. The group must
             // degrade, not halt: the host degrades a group only on a fault the store calls transient.
-            var cause = await WaitForDegradedAsync(health, "the refused connect to mark the group degraded");
+            var cause = await OutageTestSupport.WaitForDegradedAsync(health, Group, "the refused connect to mark the group degraded");
             output.WriteLine($"degraded while refused: {cause}");
             Assert.Matches(@"ORA-\d+", cause);
 
@@ -115,7 +115,7 @@ public sealed class OracleRefusedConnectionRecoveryTests(Xunit.Abstractions.ITes
             // Recovery: a job enqueued after the database answers is claimed and run by the same group.
             var first = await client.EnqueueAsync(new RefusedJob(1), dueTime: DateTimeOffset.UtcNow);
             await WaitForSucceededAsync(store, health, first);
-            AssertNotHalted(health);
+            OutageTestSupport.AssertNotHalted(health, Group);
 
             // A drop mid-session: the forwarder closes every live connection, so no pooled session is
             // usable. The job is due after the drop, so the group must claim it on a fresh session. The pool
@@ -127,7 +127,7 @@ public sealed class OracleRefusedConnectionRecoveryTests(Xunit.Abstractions.ITes
             Assert.True(dropped > 0, "the group must hold at least one live connection to drop");
             var dropCause = await WaitForSucceededAsync(store, health, second);
             output.WriteLine($"degraded after drop: {dropCause ?? "never"}");
-            AssertNotHalted(health);
+            OutageTestSupport.AssertNotHalted(health, Group);
         }
         finally
         {
@@ -158,115 +158,31 @@ public sealed class OracleRefusedConnectionRecoveryTests(Xunit.Abstractions.ITes
         public static readonly string Service = DataSource[(DataSource.IndexOf('/') + 1)..];
     }
 
-    private static async Task LockUserAsync()
-    {
-        await using var admin = new OracleConnection(OracleTestDatabase.SystemConnectionString);
-        await admin.OpenAsync();
-        await using var lockUser = admin.CreateCommand();
-        lockUser.CommandText = $"ALTER USER {Schema} ACCOUNT LOCK";
-        await lockUser.ExecuteNonQueryAsync();
-    }
-
-    // Ends every session of the private user, a killed one too, and waits until none is left. A killed
-    // session holds its process until its client calls again, and the client is gone at teardown.
-    private static async Task DisconnectSessionsAsync()
-    {
-        await using var admin = new OracleConnection(OracleTestDatabase.SystemConnectionString);
-        await admin.OpenAsync();
-
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
-        while (true)
-        {
-            var sessions = new List<string>();
-            await using (var select = admin.CreateCommand())
-            {
-                select.CommandText = "SELECT sid, serial# FROM v$session WHERE username = :username";
-                select.Parameters.Add(new OracleParameter("username", Schema.ToUpperInvariant()));
-                await using var reader = await select.ExecuteReaderAsync();
-                while (await reader.ReadAsync())
-                {
-                    sessions.Add($"{reader.GetInt32(0)},{reader.GetInt32(1)}");
-                }
-            }
-            if (sessions.Count == 0 || DateTime.UtcNow > deadline)
-            {
-                return;
-            }
-
-            foreach (var session in sessions)
-            {
-                await using var disconnect = admin.CreateCommand();
-                disconnect.CommandText = $"ALTER SYSTEM DISCONNECT SESSION '{session}' IMMEDIATE";
-                try
-                {
-                    await disconnect.ExecuteNonQueryAsync();
-                }
-                catch (OracleException exception) when (exception.Number is 31 or 30)
-                {
-                }
-            }
-            await Task.Delay(200);
-        }
-    }
-
-    // Samples the health state until the group is degraded. The next clean poll clears the mark, so the
-    // sample interval stays well under the poll interval.
-    private static async Task<string> WaitForDegradedAsync(BackWaveHealth health, string description)
-    {
-        var cause = "";
-        await WaitForAsync(() => Task.FromResult(health.DegradedGroups.TryGetValue(Group, out cause!)), health,
-            description, TimeSpan.FromMilliseconds(5));
-        return cause;
-    }
-
     private static async Task WatchNotHaltedAsync(BackWaveHealth health, TimeSpan duration)
     {
         var deadline = DateTime.UtcNow + duration;
         while (DateTime.UtcNow < deadline)
         {
-            AssertNotHalted(health);
+            OutageTestSupport.AssertNotHalted(health, Group);
             await Task.Delay(TimeSpan.FromMilliseconds(20));
         }
-        AssertNotHalted(health);
+        OutageTestSupport.AssertNotHalted(health, Group);
     }
 
     // Returns the first degraded cause seen while waiting, or null when the group never degraded.
     private static async Task<string?> WaitForSucceededAsync(OracleJobStore store, BackWaveHealth health, Guid jobId)
     {
         string? cause = null;
-        await WaitForAsync(async () =>
+        await OutageTestSupport.WaitForAsync(async () =>
         {
             if (cause is null && health.DegradedGroups.TryGetValue(Group, out var degraded))
             {
                 cause = degraded;
             }
             return (await store.GetJobAsync(jobId))?.State == JobState.Succeeded;
-        }, health, $"job {jobId} to reach Succeeded", TimeSpan.FromMilliseconds(5));
+        }, health, Group, $"job {jobId} to reach Succeeded", TimeSpan.FromMilliseconds(5));
         return cause;
     }
-
-    // Polls the condition and fails the test the moment the group halts, so a fail-stop reports its cause
-    // instead of a timeout.
-    private static async Task WaitForAsync(
-        Func<Task<bool>> condition, BackWaveHealth health, string description, TimeSpan? interval = null)
-    {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
-        while (DateTime.UtcNow < deadline)
-        {
-            AssertNotHalted(health);
-            if (await condition())
-            {
-                return;
-            }
-            await Task.Delay(interval ?? TimeSpan.FromMilliseconds(50));
-        }
-        AssertNotHalted(health);
-        Assert.Fail($"Timed out waiting for: {description}");
-    }
-
-    private static void AssertNotHalted(BackWaveHealth health) =>
-        Assert.False(health.HaltedGroups.TryGetValue(Group, out var halt),
-            $"the outage fail-stopped the group: {halt?.ExceptionType}: {halt?.Message}");
 
     // Accepts each client on a loopback port and pumps its bytes both ways to the upstream endpoint.
     private sealed class TcpForwarder : IAsyncDisposable

@@ -57,7 +57,7 @@ public sealed class OracleTransientFaultTests(Xunit.Abstractions.ITestOutputHelp
         {
             await WaitForDegradedOrHaltedAsync(health);
 
-            AssertNotHalted(health);
+            OutageTestSupport.AssertNotHalted(health, Group);
             Assert.True(health.DegradedGroups.TryGetValue(Group, out var cause), "the outage must mark the group degraded");
             output.WriteLine($"degraded: {cause}");
             Assert.True(NamesTransientCode(cause), $"the degraded cause must name a transient code: {cause}");
@@ -66,10 +66,10 @@ public sealed class OracleTransientFaultTests(Xunit.Abstractions.ITestOutputHelp
             var watchEnd = DateTime.UtcNow + 3 * PollInterval;
             while (DateTime.UtcNow < watchEnd)
             {
-                AssertNotHalted(health);
+                OutageTestSupport.AssertNotHalted(health, Group);
                 await Task.Delay(50);
             }
-            AssertNotHalted(health);
+            OutageTestSupport.AssertNotHalted(health, Group);
         }
         finally
         {
@@ -207,14 +207,6 @@ public sealed class OracleTransientFaultTests(Xunit.Abstractions.ITestOutputHelp
         {
             await Task.Delay(50);
         }
-    }
-
-    // A halt of one pump counts too, so the check reads the partly halted groups as well.
-    private static void AssertNotHalted(BackWaveHealth health)
-    {
-        var halted = health.HaltedGroups.TryGetValue(Group, out var halt)
-            || health.PartiallyHaltedGroups.TryGetValue(Group, out halt);
-        Assert.False(halted, $"the outage fail-stopped the group: {halt?.ExceptionType}: {halt?.Message}");
     }
 
     // True when the cause names an ORA or ODP.NET code that the adapter classifies transient.
