@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using BackWave.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -19,16 +20,17 @@ public static class OracleMigrator
     /// <summary>The schema version this build of the adapter requires the database to be at.</summary>
     public const int ExpectedSchemaVersion = 2;
 
-    // Transient connection faults a cold-booting fleet can hit that the bounded retry should ride out
-    // rather than surface: the shared listener/handshake-storm and connection-lost connectivity set.
-    private static bool IsTransient(OracleException exception)
-        => OracleFaultCodes.IsConnectivityFault(exception.Number);
+    // Transient faults a cold-booting fleet can hit that the bounded retry should ride out rather than
+    // surface: the shared listener/handshake-storm and connection-lost connectivity set, and a deadlock.
+    // The scripts are idempotent, so a new attempt converges.
+    internal static bool IsTransient(int number)
+        => OracleFaultCodes.IsConnectivityFault(number) || OracleFaultCodes.IsDeadlock(number);
 
     /// <summary>
     /// Runs every schema script in version order, bringing the database up to the version this adapter
     /// requires. Idempotent - safe to run against an already-current database. Transient connection faults
-    /// from a fleet cold-boot are retried internally with a bounded backoff; a fault that persists past
-    /// those attempts propagates.
+    /// and deadlocks (ORA-00060, ORA-04020) from a fleet cold-boot are retried internally with a bounded
+    /// backoff; a fault that persists past those attempts propagates.
     /// </summary>
     /// <param name="connectionString">The ODP.NET connection string for the target database.</param>
     /// <param name="cancellationToken">Token to cancel the migration.</param>
@@ -51,18 +53,30 @@ public static class OracleMigrator
     /// </param>
     /// <param name="coordinate">
     /// When <see langword="true"/> (the default), a cold-booting fleet rides out the transient connection
-    /// faults of a first-boot handshake storm with a bounded retry. The Oracle schema script is idempotent
-    /// and concurrency-safe on its own, so no database lock is taken either way. Setting it to
-    /// <see langword="false"/> runs the script once with no transient retry; it is safe when the deployment
-    /// already serializes migration itself.
+    /// faults of a first-boot handshake storm and the deadlocks (ORA-00060, ORA-04020) of nodes that create
+    /// the same object at once, with a bounded retry. The Oracle schema script is idempotent, so no database
+    /// lock is taken either way. Setting it to <see langword="false"/> runs the script once with no retry;
+    /// it is safe when the deployment already serializes migration itself.
     /// </param>
     /// <param name="cancellationToken">Token to cancel the migration.</param>
     /// <returns>A task that completes once every script has run.</returns>
     /// <exception cref="ArgumentException"><paramref name="schemaName"/> is not a valid identifier.</exception>
     /// <exception cref="OperationCanceledException">The token was cancelled.</exception>
-    public static async Task MigrateAsync(
+    public static Task MigrateAsync(
         string connectionString, string schemaName, bool coordinate = true,
         CancellationToken cancellationToken = default)
+        => MigrateCoreAsync(connectionString, schemaName, coordinate, retryBudget: null, cancellationToken);
+
+    // The time limit on the transient retry when the store migrates on first use. The store holds its
+    // ready gate for the whole migration, so every other store call waits, and the pump migrates again on
+    // its next poll anyway.
+    internal static readonly TimeSpan StoreRetryBudget = TimeSpan.FromSeconds(5);
+
+    // The migration itself. A null retry budget gives the full bounded attempts with no time limit, for a
+    // caller that migrates once and has no next poll.
+    internal static async Task MigrateCoreAsync(
+        string connectionString, string schemaName, bool coordinate, TimeSpan? retryBudget,
+        CancellationToken cancellationToken)
     {
         var rewriter = new SchemaRewriter(schemaName);
 
@@ -78,8 +92,10 @@ public static class OracleMigrator
         // listener/handshake faults it did nothing to cause. The schema script is idempotent and
         // concurrency-safe by construction (guarded DDL + DDL serialized on each object by Oracle), so
         // re-running it converges; ride out a bounded number of transient faults instead of crashing
-        // startup. On exhaustion the last fault propagates (fail-stop preserved).
-        const int maxAttempts = 8;
+        // startup. A retry budget bounds the retry by time as well, because a host that does not answer
+        // costs a full connect timeout on each attempt. On exhaustion the last fault propagates (fail-stop
+        // preserved).
+        var started = Stopwatch.GetTimestamp();
         for (var attempt = 1; ; attempt++)
         {
             try
@@ -87,11 +103,19 @@ public static class OracleMigrator
                 await ApplyScriptsAsync(connectionString, rewriter, cancellationToken).ConfigureAwait(false);
                 return;
             }
-            catch (OracleException exception) when (attempt < maxAttempts && IsTransient(exception))
+            catch (OracleException exception) when (IsTransient(exception.Number)
+                && ShouldRetry(attempt, Stopwatch.GetElapsedTime(started), retryBudget))
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(50 * attempt), cancellationToken).ConfigureAwait(false);
             }
         }
+    }
+
+    // True when a transient fault on this attempt gets another attempt.
+    internal static bool ShouldRetry(int attempt, TimeSpan elapsed, TimeSpan? retryBudget)
+    {
+        const int maxAttempts = 8;
+        return attempt < maxAttempts && (retryBudget is not { } budget || elapsed < budget);
     }
 
     // Runs every embedded schema script in version order. Each script is a single anonymous PL/SQL block

@@ -49,7 +49,15 @@ public sealed class OracleCoordinatedMigrationTests : IAsyncLifetime
             barrier.SignalAndWait();
             try
             {
-                await MigrateRidingOutConnectivityFaultsAsync(coordinate);
+                // The coordinated path calls the migrator directly, so the storm proves its own retry.
+                if (coordinate)
+                {
+                    await OracleMigrator.MigrateAsync(MigrationConnectionString, Schema);
+                }
+                else
+                {
+                    await MigrateUncoordinatedRidingOutTransientFaultsAsync();
+                }
                 return (Exception?)null;
             }
             catch (Exception exception)
@@ -61,23 +69,23 @@ public sealed class OracleCoordinatedMigrationTests : IAsyncLifetime
         return await Task.WhenAll(tasks);
     }
 
-    // The coordinate:false path strips the migrator's own transient-connectivity retry, so a cold-boot
-    // listener-handoff fault (ORA-12518, ORA-12570, and the rest of the connectivity set) can surface here -
-    // unrelated to the guarded-DDL convergence this test proves. Ride those out with a bounded retry. Any
-    // non-connectivity error (a real convergence fault such as ORA-00955 or ORA-00001) propagates unchanged
-    // and fails the storm as before.
-    private static async Task MigrateRidingOutConnectivityFaultsAsync(bool coordinate)
+    // The coordinate:false path strips the migrator's own transient retry, so a cold-boot listener-handoff
+    // fault (ORA-12518, ORA-12570, and the rest of the connectivity set) or a deadlock between two nodes
+    // that create the same object (ORA-04020) can surface here - unrelated to the guarded-DDL convergence
+    // this test proves. Ride those out with a bounded retry, as the coordinated path does. Any other error
+    // (a real convergence fault such as ORA-00955 or ORA-00001) propagates unchanged and fails the storm.
+    private static async Task MigrateUncoordinatedRidingOutTransientFaultsAsync()
     {
         const int maxAttempts = 10;
         for (var attempt = 1; ; attempt++)
         {
             try
             {
-                await OracleMigrator.MigrateAsync(MigrationConnectionString, Schema, coordinate);
+                await OracleMigrator.MigrateAsync(MigrationConnectionString, Schema, coordinate: false);
                 return;
             }
             catch (OracleException exception)
-                when (OracleFaultCodes.IsConnectivityFault(exception.Number) && attempt < maxAttempts)
+                when (OracleMigrator.IsTransient(exception.Number) && attempt < maxAttempts)
             {
                 await Task.Delay(250);
             }

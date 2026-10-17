@@ -31,6 +31,7 @@
     <ProjectReference Include="..\..\src\BackWave.Pro.Mcp\BackWave.Pro.Mcp.csproj" />
     <ProjectReference Include="..\..\src\BackWave.Postgres\BackWave.Postgres.csproj" />
     <ProjectReference Include="..\..\src\BackWave.SqlServer\BackWave.SqlServer.csproj" />
+    <ProjectReference Include="..\..\src\BackWave.Oracle\BackWave.Oracle.csproj" />
     <ProjectReference Include="..\..\src\BackWave.Sqlite\BackWave.Sqlite.csproj" />
     <ProjectReference Include="..\..\src\BackWave.EntityFrameworkCore\BackWave.EntityFrameworkCore.csproj" />
     <ProjectReference Include="..\..\src\BackWave.SourceGenerators\BackWave.SourceGenerators.csproj"

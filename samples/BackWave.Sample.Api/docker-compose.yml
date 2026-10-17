@@ -30,3 +30,19 @@ services:
       interval: 5s
       timeout: 5s
       retries: 60
+
+  oracle:
+    image: gvenzl/oracle-free:23-slim
+    # Oracle needs far more shared memory than Docker's 64 MB default.
+    shm_size: 2gb
+    environment:
+      ORACLE_PASSWORD: backwave
+      APP_USER: backwave
+      APP_USER_PASSWORD: backwave
+    ports:
+      - "15211:1521"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 5s
+      timeout: 5s
+      retries: 60

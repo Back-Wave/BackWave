@@ -6,12 +6,12 @@
 #   - a scratch dir          ${TMPDIR}/bw-verify-<run>/  (app copy + SQLite file)
 #   - a free port            http://127.0.0.1:<port>
 #   - a browser session      CHROME_DEVTOOLS_AXI_SESSION=bw-verify-<run>
-#   - (postgres only)        container backwave-verify-<run>, label backwave.verify.run=<run>
+#   - (postgres/oracle only) container backwave-verify-<run>, label backwave.verify.run=<run>
 #   - an evidence dir        .verify-evidence/<run>/  (gitignored, survives cleanup)
 # Nothing shared is reused or killed. See ../SKILL.md for the full contract.
 #
 # Usage:
-#   bwv launch [--store sqlite|postgres|inmemory]  new run: build, copy, start, wait for READY
+#   bwv launch [--store sqlite|postgres|oracle|inmemory]  new run: build, copy, start, wait for READY
 #   bwv doctor                         read-only health check of the current run
 #   bwv url [path]                     print the run's base URL (plus an optional path)
 #   bwv api <METHOD> <path> [name] [json-body]   call the Sample API -> <run>/api/<name>.json
@@ -33,6 +33,7 @@ PROJECT="$ROOT/samples/BackWave.Sample.Api/BackWave.Sample.Api.csproj"
 BUILD_OUT="$ROOT/samples/BackWave.Sample.Api/bin/Debug/net10.0"
 DLL="BackWave.Sample.Api.dll"
 PG_IMAGE="postgres:17-alpine"
+ORA_IMAGE="gvenzl/oracle-free:23-slim"
 STATES=(Scheduled AwaitingParent Leased Succeeded Cancelled DeadLettered Quarantined)
 
 log()  { printf "\033[1;34mbwv:\033[0m %s\n" "$*" >&2; }
@@ -141,14 +142,14 @@ cmd_launch() {
     local store=sqlite
     while (( $# )); do
         case "$1" in
-            --store) store="${2:?--store needs sqlite|postgres|inmemory}"; shift 2 ;;
+            --store) store="${2:?--store needs sqlite|postgres|oracle|inmemory}"; shift 2 ;;
             *) die "unknown launch flag '$1'" ;;
         esac
     done
-    [[ "$store" =~ ^(sqlite|postgres|inmemory)$ ]] || die "store must be sqlite, postgres or inmemory"
+    [[ "$store" =~ ^(sqlite|postgres|oracle|inmemory)$ ]] || die "store must be sqlite, postgres, oracle or inmemory"
     command -v dotnet >/dev/null || die "dotnet is not on PATH"
     command -v chrome-devtools-axi >/dev/null || die "chrome-devtools-axi is not on PATH"
-    if [[ "$store" == postgres ]]; then docker info >/dev/null 2>&1 || die "Docker is not running"; fi
+    if [[ "$store" =~ ^(postgres|oracle)$ ]]; then docker info >/dev/null 2>&1 || die "Docker is not running"; fi
 
     RUN="$(date +%Y%m%d-%H%M%S)-$$"
     RUN_DIR="$EVIDENCE_ROOT/$RUN"
@@ -170,6 +171,7 @@ cmd_launch() {
     set_var BROWSER_STARTED 0
     set_var CONTAINER ""
     set_var PG_PORT ""
+    set_var ORA_PORT ""
     set_var SQLITE_DB ""
     log "run $RUN ($store) - evidence at $RUN_DIR"
     mkdir -p "$SCRATCH"
@@ -203,6 +205,26 @@ cmd_launch() {
             store_args=(--BackWave:Store=Postgres
                 "--BackWave:Postgres:ConnectionString=Host=127.0.0.1;Port=$PG_PORT;Username=backwave;Password=backwave;Database=backwave_sample")
             set_var STORE_NAME Postgres ;;
+        oracle)
+            set_var CONTAINER "backwave-verify-$RUN"
+            # A fixed host port, so that the run can stop and start the container (a store outage)
+            # and the app finds the database again on the same port.
+            set_var ORA_PORT "$(free_port)"
+            log "starting $ORA_IMAGE as $CONTAINER on 127.0.0.1:$ORA_PORT (first boot takes 30-90 s)"
+            # Oracle needs far more shared memory than the 64 MB Docker default.
+            docker run -d --name "$CONTAINER" --label "backwave.verify.run=$RUN" --shm-size 2g \
+                -e ORACLE_PASSWORD=backwave -e APP_USER=backwave -e APP_USER_PASSWORD=backwave \
+                -p "127.0.0.1:$ORA_PORT:1521" "$ORA_IMAGE" > /dev/null \
+                || die "docker run failed - run 'bwv cleanup'"
+            local i
+            for i in $(seq 1 180); do
+                docker exec "$CONTAINER" healthcheck.sh >/dev/null 2>&1 && break
+                (( i == 180 )) && die "Oracle was not ready in 180 s - run 'bwv cleanup'"
+                sleep 1
+            done
+            store_args=(--BackWave:Store=Oracle
+                "--BackWave:Oracle:ConnectionString=User Id=backwave;Password=backwave;Data Source=127.0.0.1:$ORA_PORT/FREEPDB1")
+            set_var STORE_NAME Oracle ;;
     esac
 
     log "starting Sample.Api on $(base) (log: $RUN_DIR/app.log)"
@@ -264,9 +286,9 @@ cmd_doctor() {
     case "$STORE" in
         sqlite)
             [[ -f "$SQLITE_DB" ]] && ok "SQLite file $SQLITE_DB" || bad "SQLite file $SQLITE_DB missing" ;;
-        postgres)
+        postgres|oracle)
             if container_is_ours && [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" == true ]]; then
-                ok "container $CONTAINER running on 127.0.0.1:$PG_PORT (label run=$RUN)"
+                ok "container $CONTAINER running on 127.0.0.1:${PG_PORT:-$ORA_PORT} (label run=$RUN)"
             else
                 bad "container $CONTAINER is not running with label backwave.verify.run=$RUN"
             fi ;;
@@ -368,6 +390,8 @@ cmd_sql() {
           sqlite) sqlite3 -header -column -cmd '.timeout 5000' "$SQLITE_DB" "PRAGMA query_only=1; $query" ;;
           postgres) docker exec -e PGOPTIONS='-c default_transaction_read_only=on' "$CONTAINER" \
                         psql -U backwave -d backwave_sample -v ON_ERROR_STOP=1 -c "$query" ;;
+          oracle) printf 'SET DEFINE OFF\nSET MARKUP CSV ON\nWHENEVER SQLERROR EXIT FAILURE\nSET TRANSACTION READ ONLY;\n%s;\nEXIT\n' "${query%;}" \
+                      | docker exec -i "$CONTAINER" sqlplus -S -L backwave/backwave@localhost/FREEPDB1 ;;
       esac
     } > "$out" 2>&1 || { cat "$out"; die "query failed (saved db/$name.txt)"; }
     cat "$out"
