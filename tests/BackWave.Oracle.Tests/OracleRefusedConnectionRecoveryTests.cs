@@ -136,7 +136,10 @@ public sealed class OracleRefusedConnectionRecoveryTests(Xunit.Abstractions.ITes
     }
 
     // Binds a listener on port 0 to get a free loopback port, then stops it, so nothing listens there until
-    // the forwarder starts.
+    // the forwarder starts. Only a port that nothing holds gets a refused connect (ORA-50201): on macOS a
+    // bound socket that does not listen makes the connect wait for its timeout (ORA-50000). Another
+    // process can take the port in the meantime, but then the connect is not refused or the forwarder
+    // cannot bind, so the test fails and never passes by mistake.
     private static int ReserveFreePort()
     {
         var listener = new TcpListener(IPAddress.Loopback, 0);
