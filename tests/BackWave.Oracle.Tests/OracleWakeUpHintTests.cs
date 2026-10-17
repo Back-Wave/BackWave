@@ -33,16 +33,21 @@ public sealed class OracleWakeUpHintTests(Xunit.Abstractions.ITestOutputHelper o
         var recorder = new ConcurrencyRecorder();
 
         // The consumer node: its pump waits on DBMS_ALERT while it polls every 5 s.
+        var registered = await AlertRegistrationsAsync();
         var consumerStore = NewStore(enableWakeUpHints: true);
         using var consumer = BuildHost(consumerStore, recorder, WakeGroup());
         await consumer.StartAsync();
 
-        // Let the pump reach its idle state and the DBMS_ALERT waiter register before the signal fires.
-        await Task.Delay(TimeSpan.FromMilliseconds(750));
+        // A signal before the waiter registers is lost, so wait for the consumer's registration. A fixed
+        // delay was not enough when the whole suite loaded the machine.
+        await WaitForNewRegistrationAsync(registered);
 
-        // The producer node: a separate store (separate connections) enqueues the probe and signals.
-        using var producer = BuildHost(NewStore(enableWakeUpHints: true), new ConcurrencyRecorder(), group: null);
+        // The producer node: a separate store (separate connections) enqueues the probe and signals. Its
+        // first call opens its connections and checks the schema, so that call runs before the stopwatch.
+        var producerStore = NewStore(enableWakeUpHints: true);
+        using var producer = BuildHost(producerStore, new ConcurrencyRecorder(), group: null);
         var producerClient = producer.Services.GetRequiredService<BackWaveClient>();
+        await producerStore.GetJobAsync(Guid.NewGuid());
 
         recorder.ArmProbe();
         var stopwatch = Stopwatch.StartNew();
@@ -253,6 +258,39 @@ public sealed class OracleWakeUpHintTests(Xunit.Abstractions.ITestOutputHelper o
         await using var revoke = sys.CreateCommand();
         revoke.CommandText = $"REVOKE EXECUTE ON SYS.DBMS_ALERT FROM {OracleTestDatabase.AppUser}";
         await revoke.ExecuteNonQueryAsync();
+    }
+
+    // The session ids that hold a registration on the store's alert. Oracle keeps a row for a session that
+    // has ended, so a new registration is a session id that an earlier read did not return.
+    private static async Task<HashSet<string>> AlertRegistrationsAsync()
+    {
+        await using var admin = new OracleConnection(OracleTestDatabase.SystemConnectionString);
+        await admin.OpenAsync();
+        await using var select = admin.CreateCommand();
+        select.CommandText = "SELECT sid FROM sys.dbms_alert_info WHERE name = :name";
+        select.Parameters.Add(new OracleParameter("name",
+            new SchemaRewriter(SchemaRewriter.DefaultSchema).HintAlertName.ToUpperInvariant()));
+        var sessions = new HashSet<string>();
+        await using var reader = await select.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            sessions.Add(reader.GetString(0));
+        }
+        return sessions;
+    }
+
+    private static async Task WaitForNewRegistrationAsync(HashSet<string> before)
+    {
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if ((await AlertRegistrationsAsync()).Except(before).Any())
+            {
+                return;
+            }
+            await Task.Delay(50);
+        }
+        Assert.Fail("Timed out waiting for the consumer to register its DBMS_ALERT waiter");
     }
 
     private static async Task WaitForAsync(Func<bool> condition, TimeSpan timeout, string description)
