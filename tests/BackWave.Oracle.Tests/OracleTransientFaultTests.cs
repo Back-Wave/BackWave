@@ -18,12 +18,13 @@ public sealed class OracleTransientFaultTests
     // Each endpoint reproduces one outage the way ODP.NET reports it to the pump.
     public static TheoryData<string, int> Outages => new()
     {
-        // The host name stops resolving (a DNS or network outage).
-        { Descriptor("bw-no-such-host", 1521), 12545 },
+        // The host name stops resolving (a DNS or network outage). DNS never resolves the .invalid domain.
+        { Descriptor("bw-no-such-host.invalid", 1521), 12545 },
         // The host answers but nothing listens on the port (the database is down).
         { Descriptor("127.0.0.1", 1), 50201 },
-        // The host does not answer at all, so the connect times out.
-        { Descriptor("10.255.255.1", 1521), 50000 },
+        // The host does not answer at all, so the connect times out. 192.0.2.1 is in TEST-NET-1, which no
+        // network routes.
+        { Descriptor("192.0.2.1", 1521), 50000 },
     };
 
     [Theory]
