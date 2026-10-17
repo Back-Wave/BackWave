@@ -4,7 +4,7 @@ using Oracle.ManagedDataAccess.Client;
 namespace BackWave.Oracle.Tests;
 
 /// <summary>
-/// Issue #12: a pump that waits for a pooled connection and does not get one in time must see a transient
+/// A pump that waits for a pooled connection and does not get one in time must see a transient
 /// fault, not a fail-stop. A busy node can drain its pool without any fault in the database. This is an
 /// integration test: it needs "docker compose up -d oracle".
 /// </summary>

@@ -11,7 +11,7 @@ using Oracle.ManagedDataAccess.Client;
 namespace BackWave.Oracle.Tests;
 
 /// <summary>
-/// Issue #12: a network outage between a worker group and its Oracle database must degrade the group, not
+/// A network outage between a worker group and its Oracle database must degrade the group, not
 /// fail-stop it. ODP.NET raises these faults while it opens a connection, so each case points a real store
 /// at an endpoint that cannot answer and needs no database.
 /// </summary>

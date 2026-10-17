@@ -10,7 +10,7 @@ using Oracle.ManagedDataAccess.Client;
 namespace BackWave.Oracle.Tests;
 
 /// <summary>
-/// Issue #12: after an outage a worker group on Oracle must claim and run jobs again without a process
+/// After an outage a worker group on Oracle must claim and run jobs again without a process
 /// restart. The outage is the database killing every session of the group while the pool still holds
 /// them, so the next claim runs on a dead connection. The group runs as a private bw_recover user, so the
 /// kill reaches this test's sessions and no other user's.
