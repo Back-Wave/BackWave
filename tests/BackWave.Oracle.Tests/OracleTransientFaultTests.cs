@@ -1,0 +1,90 @@
+using BackWave.Core;
+using BackWave.Hosting;
+using BackWave.Jobs;
+using BackWave.Storage;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Oracle.ManagedDataAccess.Client;
+
+namespace BackWave.Oracle.Tests;
+
+/// <summary>
+/// Issue #12: a network outage between a worker group and its Oracle database must degrade the group, not
+/// fail-stop it. ODP.NET raises these faults while it opens a connection, so each case points a real store
+/// at an endpoint that cannot answer and needs no database.
+/// </summary>
+public sealed class OracleTransientFaultTests
+{
+    // Each endpoint reproduces one outage the way ODP.NET reports it to the pump.
+    public static TheoryData<string, int> Outages => new()
+    {
+        // The host name stops resolving (a DNS or network outage).
+        { Descriptor("bw-no-such-host", 1521), 12545 },
+        // The host answers but nothing listens on the port (the database is down).
+        { Descriptor("127.0.0.1", 1), 50201 },
+        // The host does not answer at all, so the connect times out.
+        { Descriptor("10.255.255.1", 1521), 50000 },
+    };
+
+    [Theory]
+    [MemberData(nameof(Outages))]
+    public async Task A_network_outage_raises_a_fault_the_adapter_classifies_transient(string dataSource, int expected)
+    {
+        var store = Store(dataSource);
+
+        var fault = await Assert.ThrowsAsync<OracleException>(async () =>
+            await store.ClaimAsync(new ClaimRequest("w1", ["default"], 10, TimeSpan.FromMinutes(1), DateTimeOffset.UtcNow)));
+
+        Assert.Equal(expected, fault.Number);
+        Assert.True(store.IsTransientFault(fault), $"ORA-{fault.Number} must classify transient");
+    }
+
+    [Theory]
+    [MemberData(nameof(Outages))]
+    public async Task A_network_outage_degrades_the_worker_group_instead_of_halting_it(string dataSource, int expected)
+    {
+        var builder = Host.CreateApplicationBuilder();
+        builder.Services.AddBackWave(backwave => backwave
+            .UseStore(Store(dataSource))
+            .UseRegistry(new JobRegistry([]))
+            .AddWorkerGroup(new WorkerGroupOptions
+            {
+                Name = "outage-workers",
+                Policy = new DispatchPolicy.Strict(["default"]),
+                PollInterval = TimeSpan.FromMilliseconds(200),
+                LeaseDuration = TimeSpan.FromSeconds(30),
+            }));
+        using var host = builder.Build();
+        var health = host.Services.GetRequiredService<BackWaveHealth>();
+
+        await host.StartAsync();
+        try
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+            while (DateTime.UtcNow < deadline
+                   && !health.DegradedGroups.ContainsKey("outage-workers")
+                   && !health.HaltedGroups.ContainsKey("outage-workers"))
+            {
+                await Task.Delay(50);
+            }
+
+            Assert.False(health.HaltedGroups.TryGetValue("outage-workers", out var halt),
+                $"the outage fail-stopped the group: {halt?.ExceptionType}: {halt?.Message}");
+            Assert.True(health.DegradedGroups.TryGetValue("outage-workers", out var cause), "the outage must mark the group degraded");
+            Assert.Contains($"ORA-{expected}", cause);
+        }
+        finally
+        {
+            await host.StopAsync();
+        }
+    }
+
+    private static string Descriptor(string host, int port) =>
+        $"(DESCRIPTION=(CONNECT_TIMEOUT=2)(ADDRESS=(PROTOCOL=TCP)(HOST={host})(PORT={port}))"
+        + "(CONNECT_DATA=(SERVICE_NAME=FREEPDB1)))";
+
+    private static OracleJobStore Store(string dataSource) => new(new OracleStoreOptions
+    {
+        ConnectionString = $"User Id=backwave;Password=backwave;Connection Timeout=3;Data Source={dataSource}",
+    });
+}
