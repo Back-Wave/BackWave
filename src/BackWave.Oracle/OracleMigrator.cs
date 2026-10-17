@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using BackWave.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -78,8 +79,12 @@ public static class OracleMigrator
         // listener/handshake faults it did nothing to cause. The schema script is idempotent and
         // concurrency-safe by construction (guarded DDL + DDL serialized on each object by Oracle), so
         // re-running it converges; ride out a bounded number of transient faults instead of crashing
-        // startup. On exhaustion the last fault propagates (fail-stop preserved).
+        // startup. The budget bounds the retry by time as well: a host that does not answer costs a full
+        // connect timeout on each attempt, and an auto-migrating store runs the migration again on its
+        // next poll. On exhaustion the last fault propagates (fail-stop preserved).
         const int maxAttempts = 8;
+        var budget = TimeSpan.FromSeconds(5);
+        var started = Stopwatch.GetTimestamp();
         for (var attempt = 1; ; attempt++)
         {
             try
@@ -87,7 +92,8 @@ public static class OracleMigrator
                 await ApplyScriptsAsync(connectionString, rewriter, cancellationToken).ConfigureAwait(false);
                 return;
             }
-            catch (OracleException exception) when (attempt < maxAttempts && IsTransient(exception))
+            catch (OracleException exception) when (attempt < maxAttempts && IsTransient(exception)
+                && Stopwatch.GetElapsedTime(started) < budget)
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(50 * attempt), cancellationToken).ConfigureAwait(false);
             }

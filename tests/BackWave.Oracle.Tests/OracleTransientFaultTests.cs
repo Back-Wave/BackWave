@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using BackWave.Core;
 using BackWave.Hosting;
 using BackWave.Jobs;
@@ -78,6 +79,21 @@ public sealed class OracleTransientFaultTests
         {
             await host.StopAsync();
         }
+    }
+
+    // A host that does not answer costs a full connect timeout on every attempt, so the migrator's retry
+    // stops on its time budget instead of waiting out all eight attempts (about 17 s here).
+    [Fact]
+    public async Task An_unreachable_host_fails_the_migration_once_the_retry_budget_is_spent()
+    {
+        var connectionString =
+            $"User Id=backwave;Password=backwave;Connection Timeout=2;Data Source={Descriptor("192.0.2.1", 1521)}";
+        var elapsed = Stopwatch.StartNew();
+
+        var fault = await Assert.ThrowsAsync<OracleException>(() => OracleMigrator.MigrateAsync(connectionString));
+
+        Assert.Equal(50000, fault.Number);
+        Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(10), $"the migration took {elapsed.Elapsed.TotalSeconds:F1} s");
     }
 
     private static string Descriptor(string host, int port) =>
