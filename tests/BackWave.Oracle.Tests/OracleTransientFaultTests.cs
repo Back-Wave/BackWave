@@ -77,36 +77,6 @@ public sealed class OracleTransientFaultTests(Xunit.Abstractions.ITestOutputHelp
         }
     }
 
-    // The negative case: a fault that is not an outage must still halt the group. A user that does not
-    // exist raises ORA-01017 on the live listener. The test does not use a wrong password for a real user,
-    // because repeated failed logins can lock that account. This is an integration test: it needs
-    // "docker compose up -d oracle".
-    [Fact]
-    public async Task A_rejected_login_halts_the_worker_group()
-    {
-        var store = new OracleJobStore(new OracleStoreOptions
-        {
-            ConnectionString = "User Id=bw_no_such_user;Password=bw_no_such_user;Connection Timeout=3;"
-                + "Data Source=localhost:15210/FREEPDB1",
-        });
-        using var host = BuildHost(store);
-        var health = host.Services.GetRequiredService<BackWaveHealth>();
-
-        await host.StartAsync();
-        try
-        {
-            await WaitForDegradedOrHaltedAsync(health);
-
-            Assert.True(health.HaltedGroups.TryGetValue(Group, out var halt), "a rejected login must halt the group");
-            output.WriteLine($"halted: {halt.ExceptionType}: {halt.Message}");
-            Assert.Contains("ORA-01017", halt.Message);
-        }
-        finally
-        {
-            await host.StopAsync();
-        }
-    }
-
     // A host that does not answer costs a full connect timeout on every attempt. The store holds its ready
     // gate while it migrates, so an enqueue waits for the claim's migration and then runs its own. The
     // retry budget bounds both: without it each call waits out all eight attempts (about 17 s here).
@@ -179,10 +149,10 @@ public sealed class OracleTransientFaultTests(Xunit.Abstractions.ITestOutputHelp
         Assert.True(store.IsTransientFault(fault), $"ORA-{fault.Number} must classify transient");
     }
 
-    private const string Group = "outage-workers";
+    internal const string Group = "outage-workers";
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(200);
 
-    private static IHost BuildHost(OracleJobStore store)
+    internal static IHost BuildHost(OracleJobStore store)
     {
         var builder = Host.CreateApplicationBuilder();
         builder.Services.AddBackWave(backwave => backwave
