@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.RegularExpressions;
 using BackWave.Core;
 using BackWave.Hosting;
 using BackWave.Jobs;
@@ -14,36 +15,39 @@ namespace BackWave.Oracle.Tests;
 /// fail-stop it. ODP.NET raises these faults while it opens a connection, so each case points a real store
 /// at an endpoint that cannot answer and needs no database.
 /// </summary>
-public sealed class OracleTransientFaultTests
+public sealed class OracleTransientFaultTests(Xunit.Abstractions.ITestOutputHelper output)
 {
-    // Each endpoint reproduces one outage the way ODP.NET reports it to the pump.
-    public static TheoryData<string, int> Outages => new()
+    // Each endpoint reproduces one outage the way ODP.NET reports it to the pump. The code in each comment
+    // is the one measured here. A network can report the same outage with another code, so the tests
+    // assert that the code is transient, not that it is this one.
+    public static TheoryData<string> Outages => new()
     {
         // The host name stops resolving (a DNS or network outage). DNS never resolves the .invalid domain.
-        { Descriptor("bw-no-such-host.invalid", 1521), 12545 },
-        // The host answers but nothing listens on the port (the database is down).
-        { Descriptor("127.0.0.1", 1), 50201 },
+        // ORA-12545.
+        Descriptor("bw-no-such-host.invalid", 1521),
+        // The host answers but nothing listens on the port (the database is down). ORA-50201.
+        Descriptor("127.0.0.1", 1),
         // The host does not answer at all, so the connect times out. 192.0.2.1 is in TEST-NET-1, which no
-        // network routes.
-        { Descriptor("192.0.2.1", 1521), 50000 },
+        // network routes. ORA-50000.
+        Descriptor("192.0.2.1", 1521),
     };
 
     [Theory]
     [MemberData(nameof(Outages))]
-    public async Task A_network_outage_raises_a_fault_the_adapter_classifies_transient(string dataSource, int expected)
+    public async Task A_network_outage_raises_a_fault_the_adapter_classifies_transient(string dataSource)
     {
         var store = Store(dataSource);
 
         var fault = await Assert.ThrowsAsync<OracleException>(async () =>
             await store.ClaimAsync(new ClaimRequest("w1", ["default"], 10, TimeSpan.FromMinutes(1), DateTimeOffset.UtcNow)));
 
-        Assert.Equal(expected, fault.Number);
+        output.WriteLine($"ORA-{fault.Number}: {fault.Message}");
         Assert.True(store.IsTransientFault(fault), $"ORA-{fault.Number} must classify transient");
     }
 
     [Theory]
     [MemberData(nameof(Outages))]
-    public async Task A_network_outage_degrades_the_worker_group_instead_of_halting_it(string dataSource, int expected)
+    public async Task A_network_outage_degrades_the_worker_group_instead_of_halting_it(string dataSource)
     {
         var builder = Host.CreateApplicationBuilder();
         builder.Services.AddBackWave(backwave => backwave
@@ -73,7 +77,8 @@ public sealed class OracleTransientFaultTests
             Assert.False(health.HaltedGroups.TryGetValue("outage-workers", out var halt),
                 $"the outage fail-stopped the group: {halt?.ExceptionType}: {halt?.Message}");
             Assert.True(health.DegradedGroups.TryGetValue("outage-workers", out var cause), "the outage must mark the group degraded");
-            Assert.Contains($"ORA-{expected}", cause);
+            output.WriteLine($"degraded: {cause}");
+            Assert.True(NamesTransientCode(cause), $"the degraded cause must name a transient code: {cause}");
         }
         finally
         {
@@ -92,7 +97,8 @@ public sealed class OracleTransientFaultTests
 
         var fault = await Assert.ThrowsAsync<OracleException>(() => OracleMigrator.MigrateAsync(connectionString));
 
-        Assert.Equal(50000, fault.Number);
+        output.WriteLine($"ORA-{fault.Number}: {fault.Message}");
+        Assert.True(OracleFaultCodes.IsConnectivityFault(fault.Number), $"ORA-{fault.Number} must be transient");
         Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(10), $"the migration took {elapsed.Elapsed.TotalSeconds:F1} s");
     }
 
@@ -109,6 +115,13 @@ public sealed class OracleTransientFaultTests
     public void The_migrator_retries_three_attempts_before_the_budget_applies(int attempt, int elapsedSeconds, bool retries)
     {
         Assert.Equal(retries, OracleMigrator.ShouldRetry(attempt, TimeSpan.FromSeconds(elapsedSeconds)));
+    }
+
+    // True when the cause names an ORA or ODP.NET code that the adapter classifies transient.
+    internal static bool NamesTransientCode(string cause)
+    {
+        var code = Regex.Match(cause, @"ORA-(\d+)");
+        return code.Success && OracleFaultCodes.IsConnectivityFault(int.Parse(code.Groups[1].Value));
     }
 
     private static string Descriptor(string host, int port) =>

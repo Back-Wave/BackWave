@@ -87,7 +87,7 @@ public sealed class OracleOutageRecoveryTests(Xunit.Abstractions.ITestOutputHelp
             // The next poll takes a killed session from the pool. The group must degrade, not halt.
             var cause = await WaitForDegradedAsync(health);
             output.WriteLine($"degraded: {cause}");
-            Assert.Contains("ORA-00028", cause);
+            Assert.True(OracleTransientFaultTests.NamesTransientCode(cause), $"the degraded cause must name a transient code: {cause}");
 
             // Each failed poll drops one dead session from the pool. Wait until none is left, so the
             // enqueue below cannot take one either.
