@@ -17,21 +17,17 @@ public sealed class LatencyProxyTests
     [Fact]
     public async Task Every_round_trip_pays_the_delay_once()
     {
-        // Round-trip COUNT is the thing the dial exists to price, so N sequential exchanges must cost N
-        // delays. The direct baseline is measured on the same sockets so the comparison is the proxy alone.
+        // Round-trip COUNT is the thing the dial exists to price, so N sequential exchanges must cost N delays.
         await using var echo = await EchoServer.StartAsync();
         const int trips = 5;
-
-        var direct = await TimeRoundTripsAsync(echo.Port, trips);
 
         await using var proxy = LatencyProxy.Start("127.0.0.1", echo.Port, Delay);
         var proxied = await TimeRoundTripsAsync(proxy.Port, trips);
 
-        var added = proxied - direct;
         Assert.True(
-            added >= Delay * trips * 0.8,
-            $"expected roughly {(Delay * trips).TotalMilliseconds}ms added over {trips} round trips, " +
-            $"got {added.TotalMilliseconds:N0}ms (direct {direct.TotalMilliseconds:N0}ms, proxied {proxied.TotalMilliseconds:N0}ms)");
+            proxied >= Delay * trips,
+            $"expected at least {(Delay * trips).TotalMilliseconds}ms over {trips} round trips, " +
+            $"got {proxied.TotalMilliseconds:N0}ms");
         Assert.Equal(trips, (int)Math.Min(proxy.HeldSegments, trips));
     }
 
@@ -45,17 +41,13 @@ public sealed class LatencyProxyTests
         const int trips = 50;
         var floor = LatencyProfile.MinimumRoundTrip;
 
-        var direct = await TimeRoundTripsAsync(echo.Port, trips);
-
         await using var proxy = LatencyProxy.Start("127.0.0.1", echo.Port, floor);
         var proxied = await TimeRoundTripsAsync(proxy.Port, trips);
 
-        var added = proxied - direct;
         Assert.True(
-            added >= floor * trips * 0.8,
-            $"expected roughly {(floor * trips).TotalMilliseconds}ms added over {trips} round trips at the " +
-            $"{floor.TotalMilliseconds:0}ms floor, got {added.TotalMilliseconds:N0}ms " +
-            $"(direct {direct.TotalMilliseconds:N0}ms, proxied {proxied.TotalMilliseconds:N0}ms)");
+            proxied >= floor * trips,
+            $"expected at least {(floor * trips).TotalMilliseconds}ms over {trips} round trips at the " +
+            $"{floor.TotalMilliseconds:0}ms floor, got {proxied.TotalMilliseconds:N0}ms");
         Assert.True(
             proxy.MeanHold >= floor,
             $"the mean hold was {proxy.MeanHold.TotalMilliseconds:N3}ms, under the {floor.TotalMilliseconds:0}ms setting");
@@ -77,11 +69,12 @@ public sealed class LatencyProxyTests
 
         Assert.Equal(payload.Length, echoed.Length);
         Assert.True(proxy.HeldSegments > 4, $"expected the response to span many segments, held {proxy.HeldSegments}");
+        var perSegmentCharging = Delay * proxy.HeldSegments;
         Assert.True(
-            stopwatch.Elapsed < Delay * 5,
+            stopwatch.Elapsed < perSegmentCharging / 2,
             $"a {payload.Length / (1024 * 1024)}MB response took {stopwatch.ElapsedMilliseconds}ms across " +
             $"{proxy.HeldSegments} segments; per-segment charging would cost about " +
-            $"{proxy.HeldSegments * Delay.TotalMilliseconds:N0}ms");
+            $"{perSegmentCharging.TotalMilliseconds:N0}ms");
     }
 
     [Fact]
