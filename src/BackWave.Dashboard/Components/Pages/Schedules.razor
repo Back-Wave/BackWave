@@ -42,7 +42,7 @@
                                 <td data-label="Schedule">
                                     <a class="mono" href="@($"{BasePath}/schedules/{Uri.EscapeDataString(schedule.ScheduleId)}")">@schedule.ScheduleId</a>
                                 </td>
-                                <td class="nowrap" data-label="Cron">
+                                <td data-label="Cron">
                                     @if (DashboardGlossary.CronFriendly(schedule.Cron) is { } friendly)
                                     {
                                         <div>@friendly</div>
@@ -58,7 +58,7 @@
                                 <td data-label="Zone">@(schedule.TimeZoneId ?? "UTC")</td>
                                 <td data-label="Catch-Up">@schedule.CatchUp</td>
                                 <td data-label="No-Overlap">@(schedule.NoOverlap ? "yes" : "no")</td>
-                                <td class="mono nowrap" data-label="Next due">@(schedule.NextDue is { } next ? DashboardGlossary.Instant(next) : "—")</td>
+                                <td class="mono" data-label="Next due">@(schedule.NextDue is { } next ? DashboardGlossary.Instant(next) : "—")</td>
                                 <td data-label="Live instance">@(schedule.HasLiveInstance ? "yes" : "no")</td>
                                 <td class="num" data-label="Skipped ticks">@schedule.SkippedTicks.Count</td>
                                 @if (Actions.CanTriggerSchedule)

@@ -45,7 +45,7 @@
                                     </span>
                                 </td>
                                 <td class="num" data-label="Members">@workflow.MemberCount</td>
-                                <td class="mono nowrap" data-label="Created">@DashboardGlossary.Instant(workflow.CreatedAt)</td>
+                                <td class="mono" data-label="Created">@DashboardGlossary.Instant(workflow.CreatedAt)</td>
                                 <td data-label="Restarted from">
                                     @if (workflow.RestartedFrom is { } from)
                                     {

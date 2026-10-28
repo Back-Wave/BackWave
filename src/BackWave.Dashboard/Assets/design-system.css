@@ -777,7 +777,10 @@ html, body { height: 100%; }
 .stat-card { padding: var(--space-4); }
 .dash-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); align-items: stretch; }
 @container content (max-width: 720px) {
-  .stats-row, .dash-grid { grid-template-columns: 1fr; }
+  .stats-row { grid-template-columns: 1fr; }
+}
+@container content (max-width: 920px) {
+  .dash-grid { grid-template-columns: 1fr; }
 }
 .risk-list { display: flex; flex-direction: column; gap: var(--space-4); }
 .risk-row { display: flex; flex-direction: column; gap: var(--space-2); }
@@ -798,6 +801,7 @@ html, body { height: 100%; }
 .ptable td.wrap-anywhere { overflow-wrap: anywhere; min-width: 32ch; }
 .ptable td.wrap-anywhere--narrow { min-width: 20ch; }
 .ptable__cron-raw { color: var(--text-muted); font: var(--type-annotation); margin-top: 2px; }
+.ptable td .ptable__cron-raw { white-space: nowrap; }
 .ptable th {
   font: var(--type-annotation);
   letter-spacing: var(--tracking-label);
@@ -815,13 +819,16 @@ html, body { height: 100%; }
 .avatar-stack { display: inline-flex; }
 .avatar-stack .bw-avatar:not(:first-child) { margin-left: -8px; }
 
-/* ---- Narrow-width card transform (ADR 0044) ----
-   Below ~560px of the content container's width, every data-grid .ptable restyles into a stack
-   of bordered cards: each <tr> is a card, each <td> a `label: value` line whose muted label comes
-   from its data-label attribute. The leftmost cell is the row's primary identity across all five
-   grids, so it is promoted to a header (larger, no label prefix). Property tables opt out with
-   .ptable--plain and keep rendering as a normal table (their narrow treatment is separate). */
-@container content (max-width: 560px) {
+@container content (max-width: 640px) {
+  .ptable-scroll { container: card-mode / inline-size; }
+}
+@container content (max-width: 920px) {
+  .ptable-scroll:has(> .ptable > thead > tr > th:nth-child(7)) { container: card-mode / inline-size; }
+}
+@container content (max-width: 1040px) {
+  .ptable-scroll:has(> .ptable > thead > tr > th:nth-child(10)) { container: card-mode / inline-size; }
+}
+@container card-mode (min-width: 0px) {
   .ptable:not(.ptable--plain) thead { display: none; }
   .ptable:not(.ptable--plain),
   .ptable:not(.ptable--plain) tbody,
@@ -863,8 +870,8 @@ html, body { height: 100%; }
 }
 
 /* ---- Property-table narrow stack (ADR 0044, .ptable--plain) ----
-   The 2-column property lists (th = row label, td = value) opt out of the card transform, but at
-   the same narrow container width they stack the label above its value — a lighter treatment so a
+   The 2-column property lists (th = row label, td = value) opt out of the card transform, but
+   below 560px of container width they stack the label above its value - a lighter treatment so a
    long mono JobId or timestamp is not squeezed side-by-side. No card chrome, no data-label: the
    label is the row's own <th>, not a column header. */
 @container content (max-width: 560px) {

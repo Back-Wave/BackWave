@@ -52,13 +52,13 @@ else
                     <td class="num" data-label="Attempt">@job.Attempt</td>
                     @if (ShowRetryCause)
                     {
-                        <td class="mono nowrap" data-label="Next Attempt">@DashboardGlossary.Instant(job.DueTime)</td>
+                        <td class="mono" data-label="Next Attempt">@DashboardGlossary.Instant(job.DueTime)</td>
                         <td class="nowrap" data-label="Retry Cause">@(job.RetryCause is { } retryCause ? DashboardGlossary.RetryCauseName(retryCause) : "-")</td>
                     }
                     else
                     {
-                        <td class="mono nowrap" data-label="Due Time">@DashboardGlossary.Instant(job.DueTime)</td>
-                        <td class="mono nowrap" data-label="Terminal At">@(job.TerminalAt is { } terminalAt ? DashboardGlossary.Instant(terminalAt) : "—")</td>
+                        <td class="mono" data-label="Due Time">@DashboardGlossary.Instant(job.DueTime)</td>
+                        <td class="mono" data-label="Terminal At">@(job.TerminalAt is { } terminalAt ? DashboardGlossary.Instant(terminalAt) : "—")</td>
                     }
                     @if (TagHref is { } tagHref)
                     {
