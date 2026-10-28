@@ -28,6 +28,11 @@ var builder = WebApplication.CreateBuilder(args);
 // kind carries its own store/DbContext/schema behavior (see StoreKind.cs).
 var store = StoreKind.FromConfiguration(builder.Configuration);
 
+// BackWave:UnclassifiedStoreFaults = Halt (default) | Degrade. Degrade keeps both Worker Groups running
+// through a store fault BackWave cannot classify, such as a database failover.
+var unclassifiedStoreFaults = builder.Configuration.GetValue(
+    "BackWave:UnclassifiedStoreFaults", UnclassifiedStoreFaultAction.Halt);
+
 // ── BackWave wiring — exactly how a consumer wires it up ─────────────────────
 // Process-wide state the jobs share: a singleton injected into the scoped SampleJobs (its
 // cluster-wide concurrency high-water mark must outlive any one Attempt). SampleJobs itself —
@@ -54,6 +59,7 @@ builder.Services.AddBackWave(backwave =>
     backwave.AddWorkerGroup(new WorkerGroupOptions
     {
         Name = "strict-priority",
+        UnclassifiedStoreFaults = unclassifiedStoreFaults,
         Policy = new DispatchPolicy.Strict(["critical", "bulk", "limited"]),
         PollInterval = TimeSpan.FromMilliseconds(250),
         RetryPolicy = new RetryPolicy { MaxAttempts = 5, Backoff = _ => TimeSpan.FromMilliseconds(500) },
@@ -64,6 +70,7 @@ builder.Services.AddBackWave(backwave =>
     backwave.AddWorkerGroup(new WorkerGroupOptions
     {
         Name = "weighted-fair",
+        UnclassifiedStoreFaults = unclassifiedStoreFaults,
         Policy = new DispatchPolicy.Weighted([("high", 6), ("low", 1)]),
         PollInterval = TimeSpan.FromMilliseconds(250),
         RetryPolicy = new RetryPolicy { MaxAttempts = 3, Backoff = _ => TimeSpan.FromMilliseconds(500) },

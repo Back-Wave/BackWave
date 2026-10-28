@@ -15,8 +15,7 @@ internal static partial class HostingLog
     // is the same stable id BackWaveHealth's HaltState carries and the backwave.invariant.trigger metric
     // tag emits, so the halt log and the health report never disagree about why a group stopped.
     [LoggerMessage(EventId = 2001, Level = LogLevel.Critical,
-        Message = "BackWave Worker Group '{worker_group}' fail-stopped on an invariant violation "
-            + "({invariant_trigger}); the group is halted.")]
+        Message = "BackWave Worker Group '{worker_group}' fail-stopped ({invariant_trigger}). The group is halted.")]
     internal static partial void WorkerGroupFailStopped(
         ILogger logger, string worker_group, string invariant_trigger, Exception exception);
 
@@ -26,14 +25,22 @@ internal static partial class HostingLog
 
     // The Degrade counterpart of 2001, at group altitude: a named check tripped, the site took its
     // benign branch, and the group keeps claiming and executing. Warning, not Critical - nothing stopped.
-    // "Degraded" here is the invariant sense and NOT BackWaveHealth's: that one means a transient store
-    // fault, it is reported only from the pump's transient catch, and it is what turns the health probe
+    // "Degraded" here is the invariant sense and NOT BackWaveHealth's: that one means a store fault the
+    // pump retries, it is reported only from the pump's store-fault catches, and it is what turns the health probe
     // amber. This log never touches the probe, so a group that emits 2003 still reads Healthy.
     [LoggerMessage(EventId = 2003, Level = LogLevel.Warning,
         Message = "BackWave Worker Group '{worker_group}' tripped invariant '{invariant_trigger}': {detail}. "
             + "The group keeps running, degraded.")]
     internal static partial void WorkerGroupDegradedByInvariant(
         ILogger logger, string worker_group, string invariant_trigger, string detail);
+
+    // The opt-in counterpart of 2001 for a store fault no classifier recognized as transient. Its own id,
+    // not 1301, so an operator can tell a fault the group chose to ride out from a provider-marked blip:
+    // a stream of 2005 on every poll is what a store defect looks like once it no longer halts the group.
+    [LoggerMessage(EventId = 2005, Level = LogLevel.Warning,
+        Message = "BackWave Worker Group '{worker_group}' hit a store fault not classified as transient. "
+            + "UnclassifiedStoreFaults is Degrade, so the group keeps running, degraded, and retries on the next poll.")]
+    internal static partial void UnclassifiedStoreFaultDegraded(ILogger logger, string worker_group, Exception exception);
 
     [LoggerMessage(EventId = 2002, Level = LogLevel.Error,
         Message = "BackWave Worker Group '{worker_group}' job {job_id} produced a Job Output of {actual_bytes} bytes, "

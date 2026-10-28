@@ -197,9 +197,11 @@ public sealed class BackWaveBuilder
     /// A worker group with the same <see cref="WorkerGroupOptions.Name"/> was already added; the
     /// group's <see cref="WorkerGroupOptions.Pumps"/> count is less than one; its
     /// <see cref="WorkerGroupOptions.MaxPollInterval"/> exceeds int.MaxValue milliseconds (about
-    /// 24.85 days), which the idle-poll pacer cannot wait out; or its
+    /// 24.85 days), which the idle-poll pacer cannot wait out; its
     /// <see cref="WorkerGroupOptions.ShutdownBudget"/> is negative (use
-    /// <see cref="TimeSpan.Zero"/> to skip the shutdown hand-back).
+    /// <see cref="TimeSpan.Zero"/> to skip the shutdown hand-back); or its
+    /// <see cref="WorkerGroupOptions.UnclassifiedStoreFaults"/> is not a defined
+    /// <see cref="UnclassifiedStoreFaultAction"/> value.
     /// </exception>
     /// <example>
     /// <code>
@@ -231,6 +233,11 @@ public sealed class BackWaveBuilder
         {
             throw new InvalidOperationException(
                 $"Worker Group '{options.Name}' has a negative {nameof(WorkerGroupOptions.ShutdownBudget)} ({options.ShutdownBudget}); use TimeSpan.Zero to skip the shutdown hand-back.");
+        }
+        if (!Enum.IsDefined(options.UnclassifiedStoreFaults))
+        {
+            throw new InvalidOperationException(
+                $"Worker Group '{options.Name}' has an undefined {nameof(WorkerGroupOptions.UnclassifiedStoreFaults)} value ({(int)options.UnclassifiedStoreFaults}); use {nameof(UnclassifiedStoreFaultAction.Halt)} or {nameof(UnclassifiedStoreFaultAction.Degrade)}.");
         }
         // Caught at composition rather than on the way down. The hand-back arms its budget with
         // CancellationTokenSource.CancelAfter, which throws past this bound - and it runs while the host

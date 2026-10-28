@@ -65,4 +65,15 @@ public class WorkerGroupRegistrationTests
                 .AddWorkerGroup(Group("workers"))));
         Assert.Contains("twice", ex.Message);
     }
+
+    [Fact]
+    public void AddWorkerGroup_WithUndefinedUnclassifiedStoreFaults_Throws()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            new ServiceCollection().AddBackWave(backwave => backwave
+                .UseStore(new InMemoryJobStore())
+                .UseRegistry(new JobRegistry([]))
+                .AddWorkerGroup(Group("workers") with { UnclassifiedStoreFaults = (UnclassifiedStoreFaultAction)42 })));
+        Assert.Contains(nameof(WorkerGroupOptions.UnclassifiedStoreFaults), ex.Message);
+    }
 }

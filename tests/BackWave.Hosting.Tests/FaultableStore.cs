@@ -17,6 +17,12 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
     private readonly TaskCompletionSource _subscribed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Action<string>? _onHint;
     private int _transientClaimFaults;
+    private int _unclassifiedClaimFaults;
+    private int _unclassifiedHeartbeatFaults;
+    private int _unclassifiedReportFaults;
+    private int _unclassifiedMaintenanceFaults;
+    private int _renewingHeartbeats;
+    private readonly TaskCompletionSource _hangingClaimEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _relinquishCalls;
     private int _misattributeObserverReports;
     private int _reportOutcomesCalls;
@@ -102,6 +108,71 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
     }
 
     /// <summary>
+    /// The next N claims throw an exception no classifier treats as transient, then recover - the provider
+    /// fault a database failover can raise that only <see cref="WorkerGroupOptions.UnclassifiedStoreFaults"/> rides out.
+    /// </summary>
+    public int UnclassifiedClaimFaults
+    {
+        get => Volatile.Read(ref _unclassifiedClaimFaults);
+        set => Volatile.Write(ref _unclassifiedClaimFaults, value);
+    }
+
+    /// <summary>The next N heartbeats carrying at least one job throw an unclassified fault, then recover.</summary>
+    public int UnclassifiedHeartbeatFaults
+    {
+        get => Volatile.Read(ref _unclassifiedHeartbeatFaults);
+        set => Volatile.Write(ref _unclassifiedHeartbeatFaults, value);
+    }
+
+    /// <summary>The next N outcome reports throw an unclassified fault, then recover.</summary>
+    public int UnclassifiedReportFaults
+    {
+        get => Volatile.Read(ref _unclassifiedReportFaults);
+        set => Volatile.Write(ref _unclassifiedReportFaults, value);
+    }
+
+    /// <summary>
+    /// The maintenance store call that <see cref="UnclassifiedMaintenanceFaults"/> targets: one of
+    /// "expire leases", "purge terminal", "list schedules", or "mint due".
+    /// </summary>
+    public string? UnclassifiedMaintenanceOperation { get; set; }
+
+    /// <summary>The next N calls of <see cref="UnclassifiedMaintenanceOperation"/> throw an unclassified fault, then recover.</summary>
+    public int UnclassifiedMaintenanceFaults
+    {
+        get => Volatile.Read(ref _unclassifiedMaintenanceFaults);
+        set => Volatile.Write(ref _unclassifiedMaintenanceFaults, value);
+    }
+
+    /// <summary>How many heartbeats carrying at least one job came back with every Lease renewed.</summary>
+    public int RenewingHeartbeats => Volatile.Read(ref _renewingHeartbeats);
+
+    /// <summary>
+    /// Claims wait inside the store until their token is cancelled, so a host stop meets the
+    /// cancellation from inside a store call - the shape the clean-stop exclusion is written against.
+    /// </summary>
+    public bool ClaimsHangUntilCancelled { get; set; }
+
+    /// <summary>Completes when the first hanging claim is inside the store.</summary>
+    public Task HangingClaimEntered => _hangingClaimEntered.Task;
+
+    private void ThrowIfMaintenanceArmed(string operation)
+    {
+        if (UnclassifiedMaintenanceOperation == operation)
+        {
+            ThrowUnclassifiedWhileArmed(ref _unclassifiedMaintenanceFaults, operation);
+        }
+    }
+
+    private static void ThrowUnclassifiedWhileArmed(ref int remaining, string operation)
+    {
+        if (Volatile.Read(ref remaining) > 0 && Interlocked.Decrement(ref remaining) >= 0)
+        {
+            throw new InvalidOperationException($"forced unclassified store fault ({operation})");
+        }
+    }
+
+    /// <summary>
     /// Wakes the subscribed pump for this Queue, as an adapter's Wake-Up Hint would. A test that must keep
     /// every poll tick out of the window it exercises sets a long poll interval and claims through this.
     /// <para>
@@ -161,15 +232,27 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
         {
             throw new InvalidOperationException($"forced invariant violation (claim on '{poisoned}')");
         }
+        ThrowUnclassifiedWhileArmed(ref _unclassifiedClaimFaults, "claim");
         if (Interlocked.Decrement(ref _transientClaimFaults) >= 0)
         {
             throw new TransientStoreException();
+        }
+        if (ClaimsHangUntilCancelled)
+        {
+            return HangUntilCancelledAsync(cancellationToken);
         }
         if (RewriteClaimedState is null && OverClaimBy is null)
         {
             return inner.ClaimAsync(request, cancellationToken);
         }
         return MalformClaimAsync(request, cancellationToken);
+    }
+
+    private async ValueTask<IReadOnlyList<JobRecord>> HangUntilCancelledAsync(CancellationToken cancellationToken)
+    {
+        _hangingClaimEntered.TrySetResult();
+        await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+        return [];
     }
 
     private async ValueTask<IReadOnlyList<JobRecord>> MalformClaimAsync(
@@ -238,6 +321,7 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
         Interlocked.Increment(ref _reportOutcomesCalls);
         LastOutcomeReportAt = DateTimeOffset.UtcNow;
         ThrowIfFailing();
+        ThrowUnclassifiedWhileArmed(ref _unclassifiedReportFaults, "report outcomes");
         if (BatchOutputCap is { } cap)
         {
             foreach (var row in batch)
@@ -299,11 +383,28 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
         CancellationToken cancellationToken = default)
     {
         ThrowIfFailing();
+        if (jobIds.Count > 0)
+        {
+            ThrowUnclassifiedWhileArmed(ref _unclassifiedHeartbeatFaults, "heartbeat");
+        }
         if (DropHeartbeatResults is null)
         {
-            return inner.HeartbeatAsync(workerId, jobIds, leaseDuration, now, cancellationToken);
+            return CountRenewingHeartbeatAsync(workerId, jobIds, leaseDuration, now, cancellationToken);
         }
         return MalformHeartbeatAsync(workerId, jobIds, leaseDuration, now, cancellationToken);
+    }
+
+    private async ValueTask<IReadOnlyList<HeartbeatResult>> CountRenewingHeartbeatAsync(
+        string workerId, IReadOnlyList<Guid> jobIds, TimeSpan leaseDuration, DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var results = await inner
+            .HeartbeatAsync(workerId, jobIds, leaseDuration, now, cancellationToken).ConfigureAwait(false);
+        if (jobIds.Count > 0 && results.All(r => r.Renewed))
+        {
+            Interlocked.Increment(ref _renewingHeartbeats);
+        }
+        return results;
     }
 
     private async ValueTask<IReadOnlyList<HeartbeatResult>> MalformHeartbeatAsync(
@@ -321,6 +422,7 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
         CancellationToken cancellationToken = default)
     {
         ThrowIfFailing();
+        ThrowIfMaintenanceArmed("expire leases");
         return inner.ExpireLeasesAsync(now, maxJobs, queues, disposition, cancellationToken);
     }
 
@@ -398,11 +500,15 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
     public ValueTask<IReadOnlyList<ScheduleSnapshot>> ListSchedulesAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfFailing();
+        ThrowIfMaintenanceArmed("list schedules");
         return inner.ListSchedulesAsync(cancellationToken);
     }
 
     public ValueTask<int> MintDueAsync(IReadOnlyList<MintDecision> decisions, CancellationToken cancellationToken = default)
-        => inner.MintDueAsync(decisions, cancellationToken);
+    {
+        ThrowIfMaintenanceArmed("mint due");
+        return inner.MintDueAsync(decisions, cancellationToken);
+    }
 
     public ValueTask SetConcurrencyLimitAsync(string queue, int? limit, string actor, DateTimeOffset now, CancellationToken cancellationToken = default)
         => inner.SetConcurrencyLimitAsync(queue, limit, actor, now, cancellationToken);
@@ -451,7 +557,10 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
     public ValueTask<int> PurgeTerminalAsync(
         TerminalStateClass stateClass, DateTimeOffset terminalBefore, int maxJobs,
         CancellationToken cancellationToken = default)
-        => inner.PurgeTerminalAsync(stateClass, terminalBefore, maxJobs, cancellationToken);
+    {
+        ThrowIfMaintenanceArmed("purge terminal");
+        return inner.PurgeTerminalAsync(stateClass, terminalBefore, maxJobs, cancellationToken);
+    }
 
     public ValueTask<ObserverClaim> ClaimObserverDeliveriesAsync(
         ObserverClaimRequest request, CancellationToken cancellationToken = default)

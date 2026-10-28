@@ -168,6 +168,12 @@ public static class BackWaveDiagnostics
     private const string InvariantTriggerKey = "backwave.invariant.trigger";
     private const string InvariantActionKey = "backwave.invariant.action";
 
+    // A gauge, not a counter: the violations counter is a rate at the check site and misses unclassified
+    // halts, while an operator alerts on how many Pumps are down right now.
+    private static readonly UpDownCounter<long> WorkerGroupPumpsHalted = Meter.CreateUpDownCounter<long>(
+        "backwave.worker_group.pumps.halted", "{pump}",
+        "Pumps currently halted by a fail-stop, by Worker Group and trigger.");
+
     private static readonly Counter<long> ObserverDeliveriesAttempted = Meter.CreateCounter<long>(
         "backwave.observer.deliveries.attempted", "{delivery}",
         "Observer callback invocations started at the delivery edge (§5.13, ADR 0017).");
@@ -852,6 +858,12 @@ public static class BackWaveDiagnostics
         => InvariantViolations.Add(1,
             new KeyValuePair<string, object?>(InvariantTriggerKey, trigger.ToString()),
             new KeyValuePair<string, object?>(InvariantActionKey, action.ToString()));
+
+    // trigger is the same value the halt log carries, so the log and the gauge cannot disagree.
+    internal static void RecordPumpHalted(string workerGroup, string trigger)
+        => WorkerGroupPumpsHalted.Add(1,
+            new KeyValuePair<string, object?>(ConsumerGroupKey, workerGroup),
+            new KeyValuePair<string, object?>(InvariantTriggerKey, trigger));
 
     private static KeyValuePair<string, object?>[] ObserverTags(string observerId, string? wireName, string? queue)
         => wireName is null && queue is null

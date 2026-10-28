@@ -142,6 +142,24 @@ public sealed record WorkerGroupOptions
     public TimeSpan ShutdownBudget { get; init; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
+    /// What a pump does when a store call fails with a fault that is not recognized as transient - for
+    /// example a provider error a database failover raises that neither the provider nor the store adapter
+    /// marks as transient. Defaults to <see cref="UnclassifiedStoreFaultAction.Halt"/>: the pump
+    /// fail-stops and stays stopped until the process restarts.
+    /// <para>
+    /// Set it to <see cref="UnclassifiedStoreFaultAction.Degrade"/> to have the pump keep running and retry
+    /// on the next poll instead, as it does for a transient fault. Any exception raised inside a store call
+    /// degrades, an adapter's own argument check included. A named invariant violation, a fault in the
+    /// pump's own code, and any fault that does not come from a store call still fail-stop the pump, and so
+    /// does a Job Output or Job Tag rejection that the pump cannot match to its batch. The
+    /// tradeoff: a store defect that fails every call no longer stops the pump, so it shows only as a
+    /// degraded health state and a Warning log on every poll. See <see cref="UnclassifiedStoreFaultAction.Degrade"/>
+    /// for what lapsed leases and the degraded mark mean while faults continue.
+    /// </para>
+    /// </summary>
+    public UnclassifiedStoreFaultAction UnclassifiedStoreFaults { get; init; } = UnclassifiedStoreFaultAction.Halt;
+
+    /// <summary>
     /// How failed jobs are retried: the backoff schedule and the attempt ceiling after which a job is
     /// dead-lettered. Defaults to the standard retry policy.
     /// </summary>

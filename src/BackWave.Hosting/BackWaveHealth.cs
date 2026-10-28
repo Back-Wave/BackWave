@@ -52,8 +52,9 @@ public sealed class BackWaveHealth
     public IReadOnlyDictionary<string, HaltState> PartiallyHaltedGroups => HaltsByGroup(wholly: false);
 
     /// <summary>
-    /// The groups currently degraded by a transient store fault — at least one of their pumps hit a
-    /// recoverable fault (for example a connection blip) — keyed by worker group name, each mapped to a
+    /// The groups currently degraded by a store fault — at least one of their pumps hit a recoverable
+    /// fault (for example a connection blip), or a fault not classified as transient that
+    /// <see cref="WorkerGroupOptions.UnclassifiedStoreFaults"/> lets the pump retry — keyed by worker group name, each mapped to a
     /// short description of one such fault. These groups are still running and claiming work, retrying
     /// each poll — visible for diagnostics, but not a fail-stop condition.
     /// </summary>

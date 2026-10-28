@@ -399,6 +399,51 @@ public class HostingShellTests
         await app.StopAsync();
     }
 
+    [Fact]
+    public async Task NamedInvariantHalt_AddsOneHaltedPump_TaggedWithTheGroupAndTrigger()
+    {
+        var store = new FaultableStore(new InMemoryJobStore())
+        {
+            ClaimInvariant = InvariantTrigger.ClaimedJobTerminal,
+        };
+        using var halted = new HaltedPumpRecorder("named-halt");
+
+        await using var app = BuildHost(store, Registry(), Group("named-halt", "default"));
+        await app.StartAsync();
+        await WaitForHaltAsync(app, "named-halt");
+
+        var measurement = Assert.Single(halted.Measurements);
+        Assert.Equal((1L, "named-halt", nameof(InvariantTrigger.ClaimedJobTerminal)), measurement);
+
+        await app.StopAsync();
+    }
+
+    [Fact]
+    public async Task UnclassifiedHalt_AddsOneHaltedPump_TaggedUnclassified()
+    {
+        // A non-transient store fault no named check raised: the negative catch-all halts it, and the
+        // gauge still has to count it, under the same trigger value the 2001 log carries.
+        var store = new FaultableStore(new InMemoryJobStore()) { PoisonedQueue = "poison" };
+        using var halted = new HaltedPumpRecorder("unclassified-halt");
+
+        await using var app = BuildHost(store, Registry(), Group("unclassified-halt", "poison"));
+        await app.StartAsync();
+        await WaitForHaltAsync(app, "unclassified-halt");
+
+        var measurement = Assert.Single(halted.Measurements);
+        Assert.Equal((1L, "unclassified-halt", "unclassified"), measurement);
+
+        await app.StopAsync();
+    }
+
+    private static Task WaitForHaltAsync(WebApplication app, string group)
+    {
+        var health = app.Services.GetRequiredService<BackWaveHealth>();
+        return WaitForAsync(
+            () => ValueTask.FromResult(health.HaltedGroups.ContainsKey(group)),
+            $"the '{group}' Worker Group to fail-stop");
+    }
+
     // --- Client clock consistency: DI TimeProvider governs the client (issue 0045) ---
 
     [Fact]
@@ -802,6 +847,41 @@ public sealed class ShiftableTimeProvider : TimeProvider
 
     public override DateTimeOffset GetUtcNow()
         => TimeProvider.System.GetUtcNow() + TimeSpan.FromTicks(Volatile.Read(ref _offsetTicks));
+}
+
+/// <summary>Records every change to the backwave.worker_group.pumps.halted gauge, with its group and trigger tags.</summary>
+internal sealed class HaltedPumpRecorder : IDisposable
+{
+    private readonly MeterListener _listener = new();
+
+    public HaltedPumpRecorder(string group)
+    {
+        _listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == BackWaveDiagnostics.SourceName
+                && instrument.Name == "backwave.worker_group.pumps.halted")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        _listener.SetMeasurementEventCallback<long>((_, value, tags, _) =>
+        {
+            var pairs = tags.ToArray();
+            var measuredGroup = pairs.FirstOrDefault(t => t.Key == "messaging.consumer.group.name").Value as string;
+            if (measuredGroup == group)
+            {
+                Measurements.Add((
+                    value,
+                    measuredGroup,
+                    pairs.FirstOrDefault(t => t.Key == "backwave.invariant.trigger").Value as string));
+            }
+        });
+        _listener.Start();
+    }
+
+    public ConcurrentBag<(long Value, string? Group, string? Trigger)> Measurements { get; } = [];
+
+    public void Dispose() => _listener.Dispose();
 }
 
 /// <summary>Captures every log entry so tests can assert on level, event id, and the carried exception.</summary>

@@ -2,6 +2,7 @@ using System.Net;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using BackWave.Core;
 using BackWave.Diagnostics;
@@ -13,6 +14,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
 
 namespace BackWave.Hosting.Tests;
@@ -377,6 +379,251 @@ public class FailStopTriggerTests
         Assert.DoesNotContain(logs.Entries, e => e.EventId == 1206);  // NOT the shutdown-hiccup warning
     }
 
+    // --- UnclassifiedStoreFaults = Degrade: store faults ride out, everything else still halts ----------
+
+    [Fact]
+    public async Task UnclassifiedClaimFault_UnderDegrade_ReadsDegradedThenHealthy_AndEveryJobCompletes()
+    {
+        var store = new FaultableStore(new InMemoryJobStore()) { UnclassifiedClaimFaults = int.MaxValue };
+        var logs = new CapturingLoggerProvider();
+        using var halted = new HaltedPumpRecorder("workers");
+        var gate = new ExecutionGate();
+        gate.Released.SetResult();
+
+        await using var app = BuildHost(store, logs, Degrading("workers"), gate);
+        await app.StartAsync();
+        var client = app.Services.GetRequiredService<BackWaveClient>();
+        var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
+        var health = app.Services.GetRequiredService<BackWaveHealth>();
+        var check = new BackWaveHealthCheck(health);
+        var jobIds = new List<Guid>();
+        for (var i = 0; i < 3; i++)
+        {
+            jobIds.Add(await client.EnqueueAsync(new ParkedJob($"job-{i}"), dueTime: DateTimeOffset.UtcNow));
+        }
+
+        await WaitForAsync(
+            () => ValueTask.FromResult(health.DegradedGroups.ContainsKey("workers")),
+            "the faulting claims to mark the group degraded");
+        Assert.Equal(HealthStatus.Degraded, (await check.CheckHealthAsync(new HealthCheckContext())).Status);
+        Assert.StartsWith(nameof(InvalidOperationException), health.DegradedGroups["workers"]);
+
+        store.UnclassifiedClaimFaults = 0;
+        await WaitForAsync(
+            async () =>
+            {
+                foreach (var jobId in jobIds)
+                {
+                    if ((await monitor.GetJobAsync(jobId))?.State != JobState.Succeeded)
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            },
+            "every queued job to succeed once the store recovers");
+        await WaitForAsync(
+            () => ValueTask.FromResult(health.DegradedGroups.Count == 0),
+            "a clean cycle to clear the degraded mark");
+        Assert.Equal(HealthStatus.Healthy, (await check.CheckHealthAsync(new HealthCheckContext())).Status);
+
+        Assert.Empty(health.HaltedGroups);
+        Assert.Empty(halted.Measurements);
+        Assert.DoesNotContain(logs.Entries, e => e.Level == LogLevel.Critical);
+        var degraded = logs.Entries.Where(e => e.EventId == 2005).ToList();
+        Assert.NotEmpty(degraded);
+        Assert.All(degraded, e => Assert.Equal(LogLevel.Warning, e.Level));
+        Assert.All(degraded, e => Assert.IsType<InvalidOperationException>(e.Exception));
+        Assert.All(degraded, e => Assert.Contains("workers", e.Message));
+        Assert.DoesNotContain(logs.Entries, e => e.EventId == 1301);
+
+        await app.StopAsync();
+    }
+
+    [Fact]
+    public async Task UnclassifiedHeartbeatAndReportFaults_UnderDegrade_HeartbeatsRenewAgain_AndTheJobStillReachesATerminalState()
+    {
+        var store = new FaultableStore(new InMemoryJobStore())
+        {
+            UnclassifiedHeartbeatFaults = 3,
+            UnclassifiedReportFaults = 1,
+        };
+        var logs = new CapturingLoggerProvider();
+        using var halted = new HaltedPumpRecorder("workers");
+        var gate = new ExecutionGate();
+
+        // A faulted report drops its outcome, as a transient one does: the job reaches its terminal state
+        // through the lapsed Lease and a second Attempt, so keep that path short.
+        var group = Degrading("workers") with
+        {
+            HeartbeatInterval = TimeSpan.FromMilliseconds(25),
+            LeaseDuration = TimeSpan.FromSeconds(1),
+            MaintenanceInterval = TimeSpan.FromMilliseconds(100),
+            RetryPolicy = new RetryPolicy { MaxAttempts = 5, Backoff = _ => TimeSpan.FromMilliseconds(50) },
+        };
+        await using var app = BuildHost(store, logs, group, gate);
+        await app.StartAsync();
+        var jobId = await app.Services.GetRequiredService<BackWaveClient>()
+            .EnqueueAsync(new ParkedJob("parked"), dueTime: DateTimeOffset.UtcNow);
+
+        // A heartbeat carries job ids only while something executes, so park inside the handler.
+        await gate.Entered.Task.WaitAsync(TestTimeout);
+        await WaitForAsync(
+            () => ValueTask.FromResult(store.UnclassifiedHeartbeatFaults <= 0),
+            "the heartbeats to fault and recover");
+        await WaitForAsync(
+            () => ValueTask.FromResult(store.RenewingHeartbeats > 0),
+            "a heartbeat to renew the Lease after the faults stop");
+        gate.Released.SetResult();
+
+        var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
+        await WaitForAsync(
+            async () => (await monitor.GetJobAsync(jobId))?.State == JobState.Succeeded,
+            "the job to succeed once the outcome reports recover");
+        // At least one Attempt more than the first: the faulted report dropped its outcome. A slow runner can
+        // also lapse the Lease during the heartbeat faults, which adds one more.
+        Assert.InRange((await monitor.GetJobAsync(jobId))!.Attempt, 2, 3);
+
+        var health = app.Services.GetRequiredService<BackWaveHealth>();
+        Assert.Empty(health.HaltedGroups);
+        Assert.Empty(halted.Measurements);
+        Assert.DoesNotContain(logs.Entries, e => e.Level == LogLevel.Critical);
+        var degraded = logs.Entries.Where(e => e.EventId == 2005).ToList();
+        Assert.Contains(degraded, e => e.Exception!.Message.Contains("heartbeat"));
+        Assert.Contains(degraded, e => e.Exception!.Message.Contains("report outcomes"));
+
+        await app.StopAsync();
+    }
+
+    [Theory]
+    [InlineData("expire leases")]
+    [InlineData("purge terminal")]
+    [InlineData("list schedules")]
+    [InlineData("mint due")]
+    public async Task UnclassifiedMaintenanceFault_UnderDegrade_KeepsTheGroupRunning(string operation)
+    {
+        var store = new FaultableStore(new InMemoryJobStore())
+        {
+            UnclassifiedMaintenanceOperation = operation,
+            UnclassifiedMaintenanceFaults = 1,
+        };
+        // Mint runs only when a schedule is due, so give it one whose next tick has already passed.
+        await store.UpsertScheduleAsync(new ScheduleRecord
+        {
+            ScheduleId = "due",
+            Cron = Cron.Hourly().Canonical,
+            WireName = "parked",
+            Payload = JsonSerializer.SerializeToUtf8Bytes(new ParkedJob("minted"), FailStopJsonContext.Default.ParkedJob),
+            Queue = "default",
+            Cursor = DateTimeOffset.UtcNow.AddHours(-2),
+        });
+        var logs = new CapturingLoggerProvider();
+        using var halted = new HaltedPumpRecorder("workers");
+        var gate = new ExecutionGate();
+        gate.Released.SetResult();
+
+        await using var app = BuildHost(store, logs, Degrading("workers"), gate);
+        await app.StartAsync();
+        await WaitForAsync(
+            () => ValueTask.FromResult(
+                logs.Entries.Any(e => e.EventId == 2005 && e.Exception!.Message.Contains(operation))),
+            $"the {operation} fault to degrade the group with event 2005");
+
+        var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
+        var jobId = await app.Services.GetRequiredService<BackWaveClient>()
+            .EnqueueAsync(new ParkedJob("after"), dueTime: DateTimeOffset.UtcNow);
+        await WaitForAsync(
+            async () => (await monitor.GetJobAsync(jobId))?.State == JobState.Succeeded,
+            "a job enqueued after the faults to succeed");
+
+        Assert.Empty(app.Services.GetRequiredService<BackWaveHealth>().HaltedGroups);
+        Assert.Empty(halted.Measurements);
+        Assert.DoesNotContain(logs.Entries, e => e.Level == LogLevel.Critical);
+
+        await app.StopAsync();
+    }
+
+    [Fact]
+    public async Task CancellationFromAStoreCallDuringShutdown_UnderDegrade_IsACleanStop()
+    {
+        var store = new FaultableStore(new InMemoryJobStore()) { ClaimsHangUntilCancelled = true };
+        var logs = new CapturingLoggerProvider();
+        using var halted = new HaltedPumpRecorder("workers");
+
+        await using var app = BuildHost(store, logs, Degrading("workers"));
+        await app.StartAsync();
+        await store.HangingClaimEntered.WaitAsync(TestTimeout);
+        await app.StopAsync();
+
+        Assert.Empty(app.Services.GetRequiredService<BackWaveHealth>().HaltedGroups);
+        Assert.Empty(halted.Measurements);
+        Assert.DoesNotContain(logs.Entries, e => e.Level == LogLevel.Critical);
+        Assert.DoesNotContain(logs.Entries, e => e.EventId == 2005);
+    }
+
+    [Fact]
+    public async Task NamedInvariantThrownByTheStore_UnderDegrade_StillFailStops()
+    {
+        var store = new FaultableStore(new InMemoryJobStore()) { ClaimInvariant = InvariantTrigger.ClaimedJobTerminal };
+        var logs = new CapturingLoggerProvider();
+        using var violations = new ViolationRecorder(InvariantTrigger.ClaimedJobTerminal);
+
+        await using var app = BuildHost(store, logs, Degrading("workers"));
+        await app.StartAsync();
+
+        await AssertHaltedAsync(app, logs, violations, InvariantTrigger.ClaimedJobTerminal);
+        Assert.DoesNotContain(logs.Entries, e => e.EventId == 2005);
+        await app.StopAsync();
+    }
+
+    [Fact]
+    public async Task NamedInvariantOnAStoreResult_UnderDegrade_StillFailStops()
+    {
+        var store = new FaultableStore(new InMemoryJobStore()) { RewriteClaimedState = JobState.Succeeded };
+        var logs = new CapturingLoggerProvider();
+        using var violations = new ViolationRecorder(InvariantTrigger.ClaimedJobTerminal);
+
+        await using var app = BuildHost(store, logs, Degrading("workers"));
+        await app.StartAsync();
+        await app.Services.GetRequiredService<BackWaveClient>()
+            .EnqueueAsync(new ParkedJob("terminal"), dueTime: DateTimeOffset.UtcNow);
+
+        await AssertHaltedAsync(app, logs, violations, InvariantTrigger.ClaimedJobTerminal);
+        Assert.DoesNotContain(logs.Entries, e => e.EventId == 2005);
+        await app.StopAsync();
+    }
+
+    [Fact]
+    public async Task FaultRaisedBesideAStoreCallButNotByIt_UnderDegrade_StillFailStops()
+    {
+        // The sweep's own "reclaimed" log runs inside the pump's command executor, right after the store
+        // answered. A fault there is the pump's, not the store's, so Degrade must not ride it out.
+        var store = new FaultableStore(new InMemoryJobStore());
+        var logs = new CapturingLoggerProvider();
+        var gate = new ExecutionGate();
+
+        var group = Degrading("workers") with
+        {
+            LeaseDuration = TimeSpan.FromSeconds(1),
+            MaintenanceInterval = TimeSpan.FromMilliseconds(100),
+        };
+        await using var app = BuildHost(store, logs, group, gate, extraLogs: new ThrowingLoggerProvider(LeasesReclaimedEventId));
+        await app.StartAsync();
+        await app.Services.GetRequiredService<BackWaveClient>()
+            .EnqueueAsync(new ParkedJob("lapsing"), dueTime: DateTimeOffset.UtcNow);
+
+        var health = app.Services.GetRequiredService<BackWaveHealth>();
+        await WaitForAsync(
+            () => ValueTask.FromResult(health.HaltedGroups.ContainsKey("workers")),
+            "the Worker Group to fail-stop on the fault its own log raised");
+        Assert.Null(health.HaltedGroups["workers"].Trigger);
+        Assert.Equal(2001, Assert.Single(logs.Entries, e => e.Level == LogLevel.Critical).EventId);
+        Assert.DoesNotContain(logs.Entries, e => e.EventId == 2005);
+
+        gate.Released.TrySetResult();
+        await app.StopAsync();
+    }
+
     // --- harness ---------------------------------------------------------------------------------
 
     private static ReadOnlyMemory<byte> JobPayload(PullingJob job)
@@ -407,9 +654,14 @@ public class FailStopTriggerTests
         HeartbeatInterval = TimeSpan.FromMinutes(10),  // never fires unless a test asks for it
     };
 
+    private static WorkerGroupOptions Degrading(string name)
+        => Group(name) with { UnclassifiedStoreFaults = UnclassifiedStoreFaultAction.Degrade };
+
+    private const int LeasesReclaimedEventId = 1204;
+
     private static WebApplication BuildHost(
         IJobStore store, ILoggerProvider logs, WorkerGroupOptions group, ExecutionGate? gate = null,
-        TimeProvider? clock = null)
+        TimeProvider? clock = null, ILoggerProvider? extraLogs = null)
     {
         var registry = new JobRegistry(
         [
@@ -422,6 +674,10 @@ public class FailStopTriggerTests
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
         builder.Logging.AddProvider(logs);
+        if (extraLogs is not null)
+        {
+            builder.Logging.AddProvider(extraLogs);
+        }
         builder.Logging.SetMinimumLevel(LogLevel.Debug);  // the benign fence path logs there and nowhere else
         builder.Services.AddSingleton(gate ?? new ExecutionGate());
         if (clock is not null)
@@ -454,5 +710,30 @@ public class FailStopTriggerTests
             await Task.Delay(25);
         }
         Assert.Fail($"Timed out waiting for: {description}");
+    }
+}
+
+/// <summary>A logger that throws when one event is written, to raise a fault from the pump's own code.</summary>
+public sealed class ThrowingLoggerProvider(int eventId) : ILoggerProvider
+{
+    public ILogger CreateLogger(string categoryName) => new ThrowingLogger(eventId);
+
+    public void Dispose() { }
+
+    private sealed class ThrowingLogger(int eventId) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId id, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (id.Id == eventId)
+            {
+                throw new InvalidOperationException($"forced fault writing event {eventId}");
+            }
+        }
     }
 }

@@ -197,7 +197,8 @@ internal sealed class WorkerGroupService(
 
     // <summary>
     // The classification boundary (ADR-0007 amendment): a transient store fault retries, an
-    // invariant violation (and anything unclassifiable) fail-stops. Both adapters surface
+    // invariant violation (and anything unclassifiable) fail-stops, unless UnclassifiedStoreFaults
+    // lets a store-raised fault degrade instead. Both adapters surface
     // provider-transient conditions — connection reset, failover, deadlock victim, command
     // timeout — through <see cref="DbException.IsTransient"/>, so that one flag plus
     // <see cref="TimeoutException"/> is the whole transient set.
@@ -211,6 +212,29 @@ internal sealed class WorkerGroupService(
         // taking a dependency on any provider package (issue 0098, mirrors the IWakeUpHintSource probe).
         _ => store is IStoreFaultClassifier classifier && classifier.IsTransientFault(exception),
     };
+
+    // <summary>
+    // The exception the most recent store call on this pump raised. The pump loop compares the fault it
+    // caught against it by reference, so only a fault the store itself threw can take the
+    // UnclassifiedStoreFaults degrade path - a bug in the Driver or in the pump's own bookkeeping around a
+    // store result still halts. Written and read on the pump loop alone.
+    // </summary>
+    private Exception? _storeFault;
+
+    // <summary>
+    // An exception filter that never matches: it records the fault and lets it unwind untouched, so its
+    // type and stack reach the halt site exactly as they would with no filter at all.
+    // </summary>
+    private bool NoteStoreFault(Exception fault)
+    {
+        _storeFault = fault;
+        return false;
+    }
+
+    private bool DegradesAsUnclassifiedStoreFault(Exception exception, CancellationToken stoppingToken) =>
+        options.UnclassifiedStoreFaults == UnclassifiedStoreFaultAction.Degrade
+        && ReferenceEquals(exception, _storeFault)
+        && !(exception is OperationCanceledException && stoppingToken.IsCancellationRequested);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -234,9 +258,10 @@ internal sealed class WorkerGroupService(
             // A named check adds its trigger id to both. The id is read off the exception on each side,
             // so the log and the health report cannot name different invariants; a halt no check named
             // (the negative catch-all below) reads as unclassified on both.
-            var trigger = (exception as InvariantViolationException)?.Trigger;
-            HostingLog.WorkerGroupFailStopped(
-                logger, options.Name, trigger?.ToString() ?? HostingLog.UnclassifiedTrigger, exception);
+            var trigger = (exception as InvariantViolationException)?.Trigger.ToString()
+                ?? HostingLog.UnclassifiedTrigger;
+            HostingLog.WorkerGroupFailStopped(logger, options.Name, trigger, exception);
+            BackWaveDiagnostics.RecordPumpHalted(options.Name, trigger);
             // Per-pump health, surfaced at group altitude (ADR 0037): this Pump halts under its own
             // worker identity, so a sibling Pump's clean cycle never clears it and the group reads
             // wholly halted only once all options.Pumps Pumps are down.
@@ -386,6 +411,12 @@ internal sealed class WorkerGroupService(
                     BackWaveLog.StoreFaultTransientRetry(logger, options.Name, exception);
                     health.ReportDegraded(options.Name, _workerId, exception);
                 }
+                catch (Exception exception) when (DegradesAsUnclassifiedStoreFault(exception, stoppingToken))
+                {
+                    _storeFault = null;
+                    HostingLog.UnclassifiedStoreFaultDegraded(logger, options.Name, exception);
+                    health.ReportDegraded(options.Name, _workerId, exception);
+                }
             }
         }
         catch (ChannelClosedException closed) when (closed.InnerException is { } carried)
@@ -403,7 +434,7 @@ internal sealed class WorkerGroupService(
             || !stoppingToken.IsCancellationRequested)
         {
             // Everything that is not the clean-stop cancellation is a halt by the time it gets here: the
-            // loop above already swallowed the transient store faults, so what is left reaches the
+            // loop above already swallowed the store faults it retries, so what is left reaches the
             // fail-stop site in ExecuteAsync. Recorded, not handled - the rethrow leaves the exception
             // and its stack exactly as the halt site would have seen them.
             halting = exception;
@@ -767,7 +798,15 @@ internal sealed class WorkerGroupService(
         switch (command)
         {
             case Command.ExpireLeases expire:
-                var reclaimed = await store.ExpireLeasesAsync(now, expire.MaxJobs, expire.Queues, expire.Disposition, stoppingToken).ConfigureAwait(false);
+                int reclaimed;
+                try
+                {
+                    reclaimed = await store.ExpireLeasesAsync(now, expire.MaxJobs, expire.Queues, expire.Disposition, stoppingToken).ConfigureAwait(false);
+                }
+                catch (Exception fault) when (NoteStoreFault(fault))
+                {
+                    throw;
+                }
                 if (reclaimed > 0)
                 {
                     BackWaveLog.LeasesReclaimed(logger, options.Name, reclaimed);
@@ -775,13 +814,29 @@ internal sealed class WorkerGroupService(
                 break;
 
             case Command.PurgeTerminal purge:
-                var purged = await store.PurgeTerminalAsync(
-                    purge.StateClass, purge.TerminalBefore, purge.MaxJobs, stoppingToken).ConfigureAwait(false);
+                int purged;
+                try
+                {
+                    purged = await store.PurgeTerminalAsync(
+                        purge.StateClass, purge.TerminalBefore, purge.MaxJobs, stoppingToken).ConfigureAwait(false);
+                }
+                catch (Exception fault) when (NoteStoreFault(fault))
+                {
+                    throw;
+                }
                 events.TryWrite(new NodeEvent.PurgeCompleted(purge, purged, now));
                 break;
 
             case Command.LoadSchedules:
-                var schedules = await store.ListSchedulesAsync(stoppingToken).ConfigureAwait(false);
+                IReadOnlyList<ScheduleSnapshot> schedules;
+                try
+                {
+                    schedules = await store.ListSchedulesAsync(stoppingToken).ConfigureAwait(false);
+                }
+                catch (Exception fault) when (NoteStoreFault(fault))
+                {
+                    throw;
+                }
                 if (schedules.Count > 0)
                 {
                     events.TryWrite(new NodeEvent.SchedulesLoaded(schedules, now));
@@ -789,7 +844,15 @@ internal sealed class WorkerGroupService(
                 break;
 
             case Command.MintDue mint:
-                var minted = await store.MintDueAsync(mint.Decisions, stoppingToken).ConfigureAwait(false);
+                int minted;
+                try
+                {
+                    minted = await store.MintDueAsync(mint.Decisions, stoppingToken).ConfigureAwait(false);
+                }
+                catch (Exception fault) when (NoteStoreFault(fault))
+                {
+                    throw;
+                }
                 events.TryWrite(new NodeEvent.MintCompleted(minted, now)); // the Driver decides whether to re-poll
                 break;
 
@@ -810,10 +873,18 @@ internal sealed class WorkerGroupService(
                     // the single claim query the runtime issued before this feature existed.
                     // A fault here needs no completion of its own: the batch counts as un-issued, and the
                     // pump loop lands its empty ClaimCompleted as it abandons the cycle.
-                    var result = AdaptivePoll
-                        ? await store.ClaimBatchAsync(request, stoppingToken).ConfigureAwait(false)
-                        : new ClaimResult(
-                            await store.ClaimAsync(request, stoppingToken).ConfigureAwait(false), NextDue: null);
+                    ClaimResult result;
+                    try
+                    {
+                        result = AdaptivePoll
+                            ? await store.ClaimBatchAsync(request, stoppingToken).ConfigureAwait(false)
+                            : new ClaimResult(
+                                await store.ClaimAsync(request, stoppingToken).ConfigureAwait(false), NextDue: null);
+                    }
+                    catch (Exception fault) when (NoteStoreFault(fault))
+                    {
+                        throw;
+                    }
                     var jobs = result.Jobs;
                     BackWaveDiagnostics.RecordClaimed(claimActivity, jobs, now);
                     foreach (var job in jobs)
@@ -979,8 +1050,16 @@ internal sealed class WorkerGroupService(
                 break;
 
             case Command.Heartbeat heartbeat:
-                var results = await store.HeartbeatAsync(
-                    heartbeat.WorkerId, heartbeat.JobIds, heartbeat.LeaseDuration, now, stoppingToken).ConfigureAwait(false);
+                IReadOnlyList<HeartbeatResult> results;
+                try
+                {
+                    results = await store.HeartbeatAsync(
+                        heartbeat.WorkerId, heartbeat.JobIds, heartbeat.LeaseDuration, now, stoppingToken).ConfigureAwait(false);
+                }
+                catch (Exception fault) when (NoteStoreFault(fault))
+                {
+                    throw;
+                }
                 // The Storage Contract is one result per requested job. A short answer would leave a job whose
                 // Lease was silently not renewed looking renewed, so the Driver would keep executing past its
                 // Lease; stop instead.
@@ -1114,6 +1193,13 @@ internal sealed class WorkerGroupService(
                 {
                     FailureDetail = FailureDetail(rejected),
                 };
+            }
+            // A rejection that outlives the bound above, or names a row this batch never sent, is a
+            // contradiction the pump found in the store's answer, so it halts rather than degrades.
+            catch (Exception fault) when (fault is not (JobOutputTooLargeException or JobTagTooLongException)
+                && NoteStoreFault(fault))
+            {
+                throw;
             }
         }
     }
