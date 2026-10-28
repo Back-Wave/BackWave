@@ -6,7 +6,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 
 - `bwv launch` printed `READY`, and `bwv doctor` passes every check on the run that you drive.
 - The run's Sample.Api starts with no jobs. Each recipe creates its own jobs through the sample's HTTP endpoints with `bwv api`.
-- The run's store is its own SQLite file (the default), its own Postgres container (`--store postgres`), or its own Oracle container (`--store oracle`). The queues are `critical`, `bulk`, `low`, and `limited` (concurrency limit 1).
+- The run's store is its own SQLite file (the default), its own Postgres container (`--store postgres`), or its own Oracle container (`--store oracle`). The queues are `critical`, `bulk`, `high`, `low`, and `limited` (concurrency limit 1).
 - The operator actor on the dashboard and on `/ops/*` is `sample-operator`. The startup limit on `limited` has the actor `startup`.
 - Never drive an app, a container, or a browser session that this run did not start.
 
@@ -48,4 +48,4 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Workflows](./workflows.md) covers the Workflows list, the member graph of `order-fulfillment`, member inspection, and a failed workflow.
 - [Tag filter](./tag-filter.md) covers the tag pills on jobs, the Label and key-value filters, the combined filter, and the "Top labels" facet.
 
-Secondary surfaces have no recipe yet: the Sample HTTP API and Swagger as a surface of their own, the MCP server at `/backwave-mcp`, the `BackWave.Demo` host, Recurring Schedules, Observers, and Executing now. Report them as not verified with this skill.
+Secondary surfaces have no recipe yet: the Sample HTTP API and Swagger as a surface of their own, the MCP server at `/backwave-mcp`, the `BackWave.Demo` host, the Pumps page (`/backwave/pumps`, one row per Worker Group Pump per node), Recurring Schedules, Observers, and Executing now. Report them as not verified with this skill.
