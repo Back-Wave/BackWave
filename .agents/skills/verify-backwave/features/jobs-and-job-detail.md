@@ -37,6 +37,6 @@ Preconditions:
 
 - The list shows the first 8 characters of the job id and `…`. Match the link on that prefix.
 - The `Wire Name` combobox lists every registered job type, also types with no jobs yet.
-- Only the Jobs list rows have the `Cancel` and `Requeue` buttons. The job detail page has no action button.
+- The Jobs list rows have the `Cancel` and `Requeue` buttons. The job detail page also shows a `Cancel` button for a job that is not terminal, but it never shows a `Requeue` button.
 - A Scheduled job with a due time in the past runs at once. Use `seconds=600` so that the job stays Scheduled while you click.
 - The Transition Log lists the newest transition first.
