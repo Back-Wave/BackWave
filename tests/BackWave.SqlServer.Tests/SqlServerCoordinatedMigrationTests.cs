@@ -301,6 +301,9 @@ public sealed class SqlServerCoordinatedMigrationTests
         // IsTransient covers transport/connection blips. Both are ambient noise, NOT a DDL race.
         SqlException { Number: 18456 } => StormOutcome.Noise,
         SqlException { IsTransient: true } => StormOutcome.Noise,
+        // 1205 picks a deadlock victim: two uncoordinated migrators locked each other's DDL. That is the
+        // same race seen through locks, but it is not the duplicate-object proof, so keep storming.
+        SqlException { Number: 1205 } => StormOutcome.Noise,
         _ => StormOutcome.Unexpected,
     };
 
