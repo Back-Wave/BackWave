@@ -137,6 +137,29 @@ public sealed class OracleCoordinatedMigrationTests : IAsyncLifetime
         Assert.Equal(OracleMigrator.ExpectedSchemaVersion, await DeployedVersionAsync());
     }
 
+    [Fact]
+    public async Task MigratingAgainAfterACrashBeforeTheV4Stamp_LeavesTheCurrentVersionAndThePumpsTable()
+    {
+        await OracleTestDatabase.ResetUserAsync(Schema);
+        await OracleMigrator.MigrateAsync(MigrationConnectionString, Schema);
+        await using var connection = new OracleConnection(MigrationConnectionString);
+        await connection.OpenAsync();
+        await using (var unstamp = connection.CreateCommand())
+        {
+            unstamp.CommandText = $"UPDATE {Schema}.schema_version SET version = 3";
+            await unstamp.ExecuteNonQueryAsync();
+        }
+
+        await OracleMigrator.MigrateAsync(MigrationConnectionString, Schema);
+        await OracleMigrator.MigrateAsync(MigrationConnectionString, Schema);
+
+        Assert.Equal(1, await SchemaVersionRowCountAsync());
+        Assert.Equal(4, await DeployedVersionAsync());
+        await using var pumps = connection.CreateCommand();
+        pumps.CommandText = $"SELECT count(*) FROM {Schema}.pumps";
+        Assert.Equal(0, Convert.ToInt32(await pumps.ExecuteScalarAsync()));
+    }
+
     // Oracle-true analog of the siblings' negative control. Oracle takes no coordination lock, so the
     // coordinate:false path is not a race waiting to happen - the guarded DDL is concurrency-safe on its
     // own. This proves it: the same first-boot storm with coordinate:false still converges with no error

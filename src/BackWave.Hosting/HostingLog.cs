@@ -86,4 +86,13 @@ internal static partial class HostingLog
         Message = "BackWave Observer '{observer_id}' leaked (timed-out) callback later faulted; the delivery was already "
             + "recorded failed. Swallowed to keep it from surfacing as an unobserved task exception.")]
     internal static partial void ObserverLeakedCallbackFaulted(ILogger logger, string observer_id, Exception exception);
+
+    [LoggerMessage(EventId = 2201, Level = LogLevel.Warning,
+        Message = "BackWave could not write this process's Pump statuses to the store; it retries on the next write. "
+            + "Until a write succeeds, other nodes see these Pumps' rows age and then read them as stale.")]
+    internal static partial void PumpStatusWriteFailed(ILogger logger, Exception exception);
+
+    [LoggerMessage(EventId = 2202, Level = LogLevel.Information,
+        Message = "BackWave wrote this process's Pump statuses to the store again.")]
+    internal static partial void PumpStatusWriteRecovered(ILogger logger);
 }

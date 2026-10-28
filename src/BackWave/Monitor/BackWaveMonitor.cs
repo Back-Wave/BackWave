@@ -378,6 +378,39 @@ public sealed class BackWaveMonitor(
         string observerId, CancellationToken cancellationToken = default)
         => store.ListObserverDeadLettersAsync(observerId, cancellationToken);
 
+    /// <summary>
+    /// The last status every Pump in the cluster wrote, from any node: its state, the fault type behind a
+    /// halt or a degrade, and when it was written. Every BackWave process with a Worker Group writes its
+    /// Pumps' statuses every 30 seconds and once more when it stops cleanly. A row nobody has written for
+    /// an hour is deleted. Judge a row against your own clock with <see cref="PumpStatus.IsStaleAt"/> and
+    /// <see cref="PumpStatus.IsStoppedAt"/>.
+    /// <para>
+    /// A node on a BackWave version that predates Pump statuses writes nothing, so a missing Pump does not
+    /// mean it is down.
+    /// </para>
+    /// </summary>
+    /// <param name="cancellationToken">Cancels the read.</param>
+    /// <returns>The Pump statuses ordered by Worker Group, then worker id; empty when no Pump has written one.</returns>
+    /// <example>
+    /// <code>
+    /// var now = DateTimeOffset.UtcNow;
+    /// foreach (var pump in await monitor.ListPumpStatusesAsync())
+    /// {
+    ///     var verdict = pump.IsStoppedAt(now) ? "Stopped"
+    ///         : pump.IsStaleAt(now) ? $"stale, last {pump.State}"
+    ///         : pump.State.ToString();
+    ///     Console.WriteLine($"{pump.WorkerGroup} {pump.WorkerId} {verdict} {pump.FaultType}");
+    /// }
+    /// </code>
+    /// </example>
+    public async ValueTask<IReadOnlyList<PumpStatus>> ListPumpStatusesAsync(CancellationToken cancellationToken = default)
+    {
+        var statuses = await store.ListPumpStatusesAsync(cancellationToken).ConfigureAwait(false);
+        return [.. statuses
+            .OrderBy(s => s.WorkerGroup, StringComparer.Ordinal)
+            .ThenBy(s => s.WorkerId, StringComparer.Ordinal)];
+    }
+
     // The workflow read surface (ListWorkflowsAsync/GetWorkflowAsync + the WorkflowView projection)
     // is a Pro feature and lives in the BackWave.Pro package as extension methods on this type; the
     // free Monitor exposes no workflow surface. Those extensions read through Store below and project

@@ -38,7 +38,7 @@
                                 <td data-label="Wire Name">@job.WireName</td>
                                 <td class="mono" data-label="Queue">@job.Queue</td>
                                 <td class="num" data-label="Attempt">@job.Attempt</td>
-                                <td class="mono" data-label="Lease owner">@(job.LeaseOwner ?? "—")</td>
+                                <td class="mono wrap-anywhere" data-label="Lease owner">@(job.LeaseOwner ?? "—")</td>
                                 <td class="mono nowrap" data-label="Lease expires">@(job.LeaseExpiry is { } expiry ? DashboardGlossary.Instant(expiry) : "—")</td>
                                 <td class="mono nowrap" data-label="Countdown">@Countdown(job.LeaseExpiry)</td>
                             </tr>

@@ -60,6 +60,8 @@ public sealed class InMemoryJobStore(
     private readonly List<ObserverLogEntry> _observerLog = [];
     private readonly Dictionary<string, ObserverState> _observers = new(StringComparer.Ordinal);
 
+    private readonly Dictionary<string, PumpStatus> _pumpStatuses = new(StringComparer.Ordinal);
+
     /// <inheritdoc/>
     public bool SupportsTransactionalEnqueue => true;
 
@@ -1584,6 +1586,43 @@ public sealed class InMemoryJobStore(
         {
             return ValueTask.FromResult<IReadOnlyList<ObserverDeadLetterRecord>>(
                 _observers.TryGetValue(observerId, out var observer) ? [.. observer.DeadLettered] : []);
+        }
+    }
+
+    /// <inheritdoc/>
+    public ValueTask WritePumpStatusesAsync(
+        IReadOnlyList<PumpStatus> statuses, DateTimeOffset reapBefore, int maxReap,
+        CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+        {
+            foreach (var status in statuses)
+            {
+                if (!_pumpStatuses.TryGetValue(status.WorkerId, out var stored) || status.ReportedAt >= stored.ReportedAt)
+                {
+                    _pumpStatuses[status.WorkerId] = status;
+                }
+            }
+            var reaped = _pumpStatuses.Values
+                .Where(s => s.ReportedAt < reapBefore)
+                .OrderBy(s => s.ReportedAt)
+                .Take(maxReap)
+                .Select(s => s.WorkerId)
+                .ToList();
+            foreach (var workerId in reaped)
+            {
+                _pumpStatuses.Remove(workerId);
+            }
+        }
+        return ValueTask.CompletedTask;
+    }
+
+    /// <inheritdoc/>
+    public ValueTask<IReadOnlyList<PumpStatus>> ListPumpStatusesAsync(CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+        {
+            return ValueTask.FromResult<IReadOnlyList<PumpStatus>>([.. _pumpStatuses.Values]);
         }
     }
 

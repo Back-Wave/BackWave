@@ -58,6 +58,7 @@ public static class OracleTestDatabase
             DELETE FROM backwave.queue_limits;
             DELETE FROM backwave.queue_locks;
             DELETE FROM backwave.operator_audit;
+            DELETE FROM backwave.pumps;
         END;
         """;
 

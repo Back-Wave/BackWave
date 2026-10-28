@@ -436,6 +436,37 @@ public class HostingShellTests
         await app.StopAsync();
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task HaltedPump_LeavesTheGaugeOnce_WhenItsHostStopsOrIsDisposed(bool stopFirst)
+    {
+        // The gauge is process-wide, so a host that halted a Pump and then went away must take that Pump
+        // with it, or every later host in the process reads one Pump more halted than it has.
+        var group = stopFirst ? "stopped-halt" : "disposed-halt";
+        var store = new FaultableStore(new InMemoryJobStore())
+        {
+            ClaimInvariant = InvariantTrigger.ClaimedJobTerminal,
+        };
+        using var halted = new HaltedPumpRecorder(group);
+
+        var app = BuildHost(store, Registry(), Group(group, "default"));
+        await app.StartAsync();
+        await WaitForHaltAsync(app, group);
+        Assert.Equal([1L], halted.Measurements.Select(m => m.Value));
+
+        (long, string?, string?)[] haltedThenLeft =
+            [(-1L, group, nameof(InvariantTrigger.ClaimedJobTerminal)), (1L, group, nameof(InvariantTrigger.ClaimedJobTerminal))];
+        if (stopFirst)
+        {
+            await app.StopAsync();
+            Assert.Equal(haltedThenLeft, halted.Measurements.Order());
+        }
+        await app.DisposeAsync();
+
+        Assert.Equal(haltedThenLeft, halted.Measurements.Order());
+    }
+
     private static Task WaitForHaltAsync(WebApplication app, string group)
     {
         var health = app.Services.GetRequiredService<BackWaveHealth>();

@@ -82,4 +82,13 @@ public enum ConformanceCapabilities
     /// without it the clauses certify only that the refused write changed nothing.
     /// </summary>
     ObserverReportOutcomes = 1 << 9,
+
+    /// <summary>
+    /// The store overrides <see cref="IJobStore.WritePumpStatusesAsync"/> and
+    /// <see cref="IJobStore.ListPumpStatusesAsync"/>. Declaring it proves a written Pump status reads back
+    /// field for field, a second write replaces the first, and the reap deletes only rows written before its
+    /// cutoff, never more than its cap; without it the clauses certify only that the defaults write and
+    /// list nothing.
+    /// </summary>
+    PumpStatuses = 1 << 10,
 }

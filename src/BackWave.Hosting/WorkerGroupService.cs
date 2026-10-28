@@ -160,6 +160,9 @@ internal sealed class WorkerGroupService(
     private readonly CancellationTokenSource _hostStopped = new();
     private CancellationTokenRegistration _hostStopLink;
 
+    // <summary>This Pump's count in the halted-Pumps gauge, held until the host stops or disposes it.</summary>
+    private IDisposable? _haltedPump;
+
     // <summary>
     // What the hand-back may actually spend: the configured ShutdownBudget, clamped so it cannot eat the
     // host's whole stop window. HostOptions.ShutdownTimeout is how long the host waits for its hosted
@@ -181,6 +184,16 @@ internal sealed class WorkerGroupService(
     }
 
     // <summary>
+    // Put this Pump on the health record before the host's StartedAsync hooks run. Not in ExecuteAsync:
+    // from .NET 10 the host runs ExecuteAsync on the thread pool, so it can start after those hooks.
+    // </summary>
+    public override Task StartAsync(CancellationToken cancellationToken)
+    {
+        health.ReportStarted(options.Name, _workerId);
+        return base.StartAsync(cancellationToken);
+    }
+
+    // <summary>
     // Capture the host's stop token on the way past. It is the only handle on the host's actual
     // deadline: the stoppingToken the pump holds is cancelled at the START of the stop and says
     // nothing about when the host gives up waiting. Registered rather than stored, so the pump thread
@@ -188,11 +201,18 @@ internal sealed class WorkerGroupService(
     // An already-cancelled token runs the callback inline here, which is correct - a host that is
     // already out of time gets no hand-back at all.
     // </summary>
-    public override Task StopAsync(CancellationToken cancellationToken)
+    public override async Task StopAsync(CancellationToken cancellationToken)
     {
         _hostStopLink = cancellationToken.Register(
             static state => ((CancellationTokenSource)state!).Cancel(), _hostStopped);
-        return base.StopAsync(cancellationToken);
+        try
+        {
+            await base.StopAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _haltedPump?.Dispose();
+        }
     }
 
     // <summary>
@@ -246,6 +266,7 @@ internal sealed class WorkerGroupService(
         {
             // Normal shutdown: the pump hands its Leases back on the way out, so other nodes
             // inherit the work at once instead of waiting for the Leases to lapse.
+            health.ReportStoppedCleanly(options.Name, _workerId);
         }
         catch (Exception exception)
         {
@@ -261,7 +282,7 @@ internal sealed class WorkerGroupService(
             var trigger = (exception as InvariantViolationException)?.Trigger.ToString()
                 ?? HostingLog.UnclassifiedTrigger;
             HostingLog.WorkerGroupFailStopped(logger, options.Name, trigger, exception);
-            BackWaveDiagnostics.RecordPumpHalted(options.Name, trigger);
+            _haltedPump = BackWaveDiagnostics.RecordPumpHalted(options.Name, trigger);
             // Per-pump health, surfaced at group altitude (ADR 0037): this Pump halts under its own
             // worker identity, so a sibling Pump's clean cycle never clears it and the group reads
             // wholly halted only once all options.Pumps Pumps are down.
@@ -409,13 +430,13 @@ internal sealed class WorkerGroupService(
                     // is the backoff cadence — polling is the sole correctness mechanism, so a
                     // skipped cycle costs latency, nothing else (ADR-0005).
                     BackWaveLog.StoreFaultTransientRetry(logger, options.Name, exception);
-                    health.ReportDegraded(options.Name, _workerId, exception);
+                    health.ReportDegraded(options.Name, _workerId, exception, _clock.GetUtcNow());
                 }
                 catch (Exception exception) when (DegradesAsUnclassifiedStoreFault(exception, stoppingToken))
                 {
                     _storeFault = null;
                     HostingLog.UnclassifiedStoreFaultDegraded(logger, options.Name, exception);
-                    health.ReportDegraded(options.Name, _workerId, exception);
+                    health.ReportDegraded(options.Name, _workerId, exception, _clock.GetUtcNow());
                 }
             }
         }
@@ -1474,6 +1495,7 @@ internal sealed class WorkerGroupService(
         // parked pacer wait, that wait then sees an already-cancelled token, so the resulting
         // ObjectDisposedException is recognized as normal shutdown instead of faulting the pump.
         base.Dispose();
+        _haltedPump?.Dispose();
         _pollWake.Dispose();
         _hostStopLink.Dispose();
         _hostStopped.Dispose();

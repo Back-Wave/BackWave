@@ -23,7 +23,8 @@ public sealed class SqlServerConformanceTests(ITestOutputHelper output) : Confor
         | ConformanceCapabilities.QueueConfigLock
         | ConformanceCapabilities.ConcurrentTagInsert
         | ConformanceCapabilities.ConcurrentEdgeInsert
-        | ConformanceCapabilities.OutOfBandStateWrite;
+        | ConformanceCapabilities.OutOfBandStateWrite
+        | ConformanceCapabilities.PumpStatuses;
 
     protected override async ValueTask<IJobStore> CreateStoreAsync(JobHistoryPolicy historyPolicy)
         => await SqlServerTestDatabase.CreateFreshStoreAsync(historyPolicy);

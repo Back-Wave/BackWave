@@ -90,4 +90,30 @@ public sealed class PostgresAdapterTests
             Assert.Equal(EnqueueResult.Ok, await migrating.EnqueueAsync(Job(), now: T0));
         }
     }
+
+    [Fact]
+    public async Task PumpStatus_WithAnUndefinedStateAndAnUnknownTrigger_ListsAsUnknownWithNoTrigger()
+    {
+        await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
+        var workerId = $"adapter-test:{Guid.NewGuid():N}";
+        await using (var dataSource = NpgsqlDataSource.Create(PostgresTestDatabase.ConnectionString))
+        await using (var insert = dataSource.CreateCommand(
+            """
+            INSERT INTO backwave.pumps
+                (worker_id, worker_group, state, fault_type, invariant_trigger, reported_at, report_interval_ms)
+            VALUES (@id, 'default', 99, NULL, 'TriggerFromANewerVersion', @at, 30000)
+            """))
+        {
+            insert.Parameters.AddWithValue("id", workerId);
+            insert.Parameters.AddWithValue("at", T0);
+            await insert.ExecuteNonQueryAsync();
+        }
+
+        var listed = Assert.Single(await store.ListPumpStatusesAsync(), s => s.WorkerId == workerId);
+
+        Assert.Equal(PumpState.Unknown, listed.State);
+        Assert.Null(listed.Trigger);
+        Assert.Equal(T0, listed.ReportedAt);
+        Assert.Equal(TimeSpan.FromSeconds(30), listed.ReportInterval);
+    }
 }

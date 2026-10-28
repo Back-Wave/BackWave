@@ -41,7 +41,7 @@ public static class PostgresTestDatabase
             await using var truncate = dataSource.CreateCommand(
                 "TRUNCATE backwave.jobs, backwave.job_parents, backwave.job_tags, backwave.schedules, backwave.queue_limits, " +
                 "backwave.operator_audit, backwave.observers, backwave.observer_deliveries, " +
-                "backwave.observer_dead_letters, backwave.workflows, backwave.workflow_edges " +
+                "backwave.observer_dead_letters, backwave.workflows, backwave.workflow_edges, backwave.pumps " +
                 "RESTART IDENTITY CASCADE");
             await truncate.ExecuteNonQueryAsync();
         }

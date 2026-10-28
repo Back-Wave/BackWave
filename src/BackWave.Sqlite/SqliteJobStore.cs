@@ -3345,6 +3345,99 @@ public sealed class SqliteJobStore : IJobStore, IWakeUpHintSource, IStoreFaultCl
         return records;
     }
 
+    // ── §5.14 Pump Statuses ─────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public async ValueTask WritePumpStatusesAsync(
+        IReadOnlyList<PumpStatus> statuses, DateTimeOffset reapBefore, int maxReap,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = (SqliteTransaction)connection.BeginTransaction(deferred: false);
+
+        if (statuses.Count > 0)
+        {
+            var rows = string.Join(", ", Enumerable.Range(0, statuses.Count)
+                .Select(i => $"($w{i}, $g{i}, $s{i}, $f{i}, $t{i}, $r{i}, $i{i})"));
+            await using var upsert = Cmd(
+                $"""
+                INSERT INTO backwave_pumps
+                    (worker_id, worker_group, state, fault_type, invariant_trigger, reported_at, report_interval_ms)
+                VALUES {rows}
+                ON CONFLICT (worker_id) DO UPDATE SET
+                    worker_group = excluded.worker_group, state = excluded.state, fault_type = excluded.fault_type,
+                    invariant_trigger = excluded.invariant_trigger, reported_at = excluded.reported_at,
+                    report_interval_ms = excluded.report_interval_ms
+                WHERE backwave_pumps.reported_at <= excluded.reported_at
+                """,
+                connection, transaction);
+            for (var i = 0; i < statuses.Count; i++)
+            {
+                var status = statuses[i];
+                upsert.Parameters.AddWithValue($"$w{i}", status.WorkerId);
+                upsert.Parameters.AddWithValue($"$g{i}", status.WorkerGroup);
+                upsert.Parameters.AddWithValue($"$s{i}", (int)status.State);
+                upsert.Parameters.AddWithValue($"$f{i}", (object?)status.FaultType ?? DBNull.Value);
+                upsert.Parameters.AddWithValue($"$t{i}", (object?)status.Trigger?.ToString() ?? DBNull.Value);
+                upsert.Parameters.AddWithValue($"$r{i}", SqliteValueCodec.ToTicks(status.ReportedAt));
+                upsert.Parameters.AddWithValue($"$i{i}", (long)status.ReportInterval.TotalMilliseconds);
+            }
+            await upsert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        // SQLite builds without DELETE ... LIMIT by default, so a subquery picks the oldest rows.
+        await using (var reap = Cmd(
+            """
+            DELETE FROM backwave_pumps WHERE worker_id IN (
+                SELECT worker_id FROM backwave_pumps WHERE reported_at < $before ORDER BY reported_at LIMIT $max)
+            """,
+            connection, transaction))
+        {
+            reap.Parameters.AddWithValue("$before", SqliteValueCodec.ToTicks(reapBefore));
+            reap.Parameters.AddWithValue("$max", maxReap);
+            await reap.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async ValueTask<IReadOnlyList<PumpStatus>> ListPumpStatusesAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = Cmd(
+            """
+            SELECT worker_id, worker_group, state, fault_type, invariant_trigger, reported_at, report_interval_ms
+            FROM backwave_pumps
+            """,
+            connection);
+
+        var statuses = new List<PumpStatus>();
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var state = (PumpState)reader.GetInt32(2);
+            statuses.Add(new PumpStatus
+            {
+                WorkerId = reader.GetString(0),
+                WorkerGroup = reader.GetString(1),
+                State = Enum.IsDefined(state) ? state : PumpState.Unknown,
+                FaultType = reader.IsDBNull(3) ? null : reader.GetString(3),
+                Trigger = reader.IsDBNull(4) ? null : ParseTrigger(reader.GetString(4)),
+                ReportedAt = SqliteValueCodec.FromTicks(reader.GetInt64(5)),
+                ReportInterval = TimeSpan.FromMilliseconds(reader.GetInt64(6)),
+            });
+        }
+        return statuses;
+    }
+
+    // By name only: Enum.TryParse would also accept a number, which is not a name this version wrote.
+    private static InvariantTrigger? ParseTrigger(string name)
+        => Enum.IsDefined(typeof(InvariantTrigger), name) ? Enum.Parse<InvariantTrigger>(name) : null;
+
     // ── §8 Wake-Up Hints (in-process hub, issue 0097) ────────────────────────────
 
     /// <inheritdoc/>

@@ -66,6 +66,9 @@ public sealed class SqlServerRoundTripBudgetTests
     private static readonly Budget EnqueueTagged = new(
         "EnqueueAsync of one job carrying three tags", Statements: 5);
 
+    private static readonly Budget WritePumpStatuses = new(
+        "WritePumpStatusesAsync of 8 Pumps, with the reap", Statements: 1);
+
     [Fact]
     public async Task Claim_of_a_full_batch_stays_within_its_round_trip_budget()
     {
@@ -307,6 +310,42 @@ public sealed class SqlServerRoundTripBudgetTests
         }
 
         AssertBudget(EnqueueTagged, measured);
+    }
+
+    [Fact]
+    public async Task WritePumpStatuses_of_a_node_stays_within_its_round_trip_budget()
+    {
+        var store = await SqlServerTestDatabase.CreateFreshStoreAsync();
+        PumpStatus[] Pumps(DateTimeOffset at) =>
+        [
+            .. Enumerable.Range(0, 8).Select(i => new PumpStatus
+            {
+                WorkerId = $"budget-host:group-{i}",
+                WorkerGroup = $"group-{i}",
+                State = PumpState.Running,
+                ReportedAt = at,
+                ReportInterval = TimeSpan.FromSeconds(30),
+            }),
+        ];
+        await store.WritePumpStatusesAsync(Pumps(T0), reapBefore: T0, maxReap: 100); // warms the schema check
+
+        // 1 batch: the upsert of every row, its commit, and the reap, whatever the row count. This call
+        // updates all 8 rows and reaps none; the next proves a reap rides the same batch.
+        Measured measured;
+        using (var scope = SqlServerRoundTrips.Observe())
+        {
+            await store.WritePumpStatusesAsync(Pumps(T0.AddSeconds(30)), reapBefore: T0, maxReap: 100);
+            measured = Measured.From(scope);
+        }
+        AssertBudget(WritePumpStatuses, measured);
+
+        using (var scope = SqlServerRoundTrips.Observe())
+        {
+            await store.WritePumpStatusesAsync([], reapBefore: T0.AddMinutes(1), maxReap: 100);
+            measured = Measured.From(scope);
+        }
+        AssertBudget(WritePumpStatuses, measured);
+        Assert.Empty(await store.ListPumpStatusesAsync());
     }
 
     [Fact]

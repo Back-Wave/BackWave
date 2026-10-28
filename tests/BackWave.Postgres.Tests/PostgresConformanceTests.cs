@@ -23,7 +23,8 @@ public sealed class PostgresConformanceTests(ITestOutputHelper output) : Conform
         | ConformanceCapabilities.QueueConfigLock
         | ConformanceCapabilities.ConcurrentTagInsert
         | ConformanceCapabilities.ConcurrentEdgeInsert
-        | ConformanceCapabilities.OutOfBandStateWrite;
+        | ConformanceCapabilities.OutOfBandStateWrite
+        | ConformanceCapabilities.PumpStatuses;
 
     protected override async ValueTask<IJobStore> CreateStoreAsync(JobHistoryPolicy historyPolicy)
         => await PostgresTestDatabase.CreateFreshStoreAsync(historyPolicy);

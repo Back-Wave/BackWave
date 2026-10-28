@@ -832,6 +832,48 @@ public interface IJobStore
     /// <returns>The observer's dead-lettered deliveries, oldest first; empty for a healthy observer.</returns>
     ValueTask<IReadOnlyList<ObserverDeadLetterRecord>> ListObserverDeadLettersAsync(
         string observerId, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Writes one process's Pump statuses, then deletes at most <paramref name="maxReap"/> rows, written by
+    /// any process, whose <see cref="PumpStatus.ReportedAt"/> is strictly before
+    /// <paramref name="reapBefore"/>. Each status replaces the stored row with its worker id, every field
+    /// stored verbatim, or adds one. A status replaces a stored row only when its
+    /// <see cref="PumpStatus.ReportedAt"/> is at or after the stored row's, compared at the precision the
+    /// store keeps instants, so a write that stalled in flight and lands after a newer one leaves the newer
+    /// row in place. Only the process that minted a worker id writes its row, but that process MAY write
+    /// it twice at once, as when it stops while a loop write is still in flight: concurrent writes for one
+    /// worker id MUST all succeed and leave the row with the newest <see cref="PumpStatus.ReportedAt"/>,
+    /// even when no row exists yet. The write and the delete need no atomicity together: they MAY be
+    /// separate statements, and a crash between them converges on the next call. Observational only: no
+    /// Core decision reads these rows.
+    /// <para>
+    /// The default writes nothing, so a store that does not override it shows no Pumps and loses nothing
+    /// else.
+    /// </para>
+    /// </summary>
+    /// <param name="statuses">This process's Pumps, with distinct worker ids. A <see cref="PumpStatus.FaultType"/> is at most <see cref="PumpStatus.MaxFaultTypeLength"/> characters.</param>
+    /// <param name="reapBefore">Rows last written before this instant are deleted (the store must not read its own clock).</param>
+    /// <param name="maxReap">The most rows this call deletes, bounding the delete every process runs on every write.</param>
+    /// <param name="cancellationToken">Cancels the operation.</param>
+    ValueTask WritePumpStatusesAsync(
+        IReadOnlyList<PumpStatus> statuses,
+        DateTimeOffset reapBefore,
+        int maxReap,
+        CancellationToken cancellationToken = default) => ValueTask.CompletedTask;
+
+    /// <summary>
+    /// Every stored Pump status, from every process, in no particular order. A stored state value this
+    /// version does not define reads as <see cref="PumpState.Unknown"/>, and a trigger name it does not
+    /// define reads as a <see langword="null"/> <see cref="PumpStatus.Trigger"/>, so a row a newer
+    /// BackWave wrote is still listed.
+    /// <para>
+    /// The default returns an empty list.
+    /// </para>
+    /// </summary>
+    /// <param name="cancellationToken">Cancels the read.</param>
+    /// <returns>Every stored Pump status; empty when no process has written one.</returns>
+    ValueTask<IReadOnlyList<PumpStatus>> ListPumpStatusesAsync(CancellationToken cancellationToken = default)
+        => ValueTask.FromResult<IReadOnlyList<PumpStatus>>([]);
 }
 
 /// <summary>The two retention classes for terminal jobs, each purged on its own keep window.</summary>

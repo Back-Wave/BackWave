@@ -78,6 +78,10 @@ internal static class DashboardRequestHandler
                 await ServeLiveAsync(context, ExecutingView(monitor, basePath), options.LiveRefreshInterval).ConfigureAwait(false);
                 break;
 
+            case ["pumps"]:
+                await ServeLiveAsync(context, PumpsView(monitor, basePath), options.LiveRefreshInterval).ConfigureAwait(false);
+                break;
+
             case ["jobs"]:
                 await JobsAsync(context, monitor, basePath, actions).ConfigureAwait(false);
                 break;
@@ -406,6 +410,15 @@ internal static class DashboardRequestHandler
             ["BasePath"] = basePath,
             ["Jobs"] = await monitor.ListJobsAsync(
                 new JobQuery { State = JobState.Leased, MaxResults = PageSize }).ConfigureAwait(false),
+            ["Now"] = DateTimeOffset.UtcNow,
+        });
+
+    private static LiveView PumpsView(BackWaveMonitor monitor, string basePath) => new(
+        typeof(Pumps),
+        async () => new Dictionary<string, object?>
+        {
+            ["BasePath"] = basePath,
+            ["Items"] = await monitor.ListPumpStatusesAsync().ConfigureAwait(false),
             ["Now"] = DateTimeOffset.UtcNow,
         });
 

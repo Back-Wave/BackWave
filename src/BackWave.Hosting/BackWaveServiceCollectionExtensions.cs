@@ -366,6 +366,11 @@ public sealed class BackWaveBuilder
         services.AddSingleton<BackWaveHealthCheck>();
         services.AddSingleton<Microsoft.Extensions.Hosting.IHostedService>(sp =>
             new BackWaveMetricsService(sp.GetRequiredService<IJobStore>()));
+        services.AddSingleton<Microsoft.Extensions.Hosting.IHostedService>(sp => new PumpStatusWriter(
+            sp.GetRequiredService<IJobStore>(),
+            sp.GetRequiredService<BackWaveHealth>(),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<PumpStatusWriter>>(),
+            sp.GetService<TimeProvider>() ?? TimeProvider.System));
 
         // A group runs its Pumps count of independent pump loops (default 1). Each WorkerGroupService is
         // one self-contained Pump — its own Driver, PoolSize pool, and unique worker identity (the Guid

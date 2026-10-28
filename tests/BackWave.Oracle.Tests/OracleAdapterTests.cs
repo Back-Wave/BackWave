@@ -68,6 +68,57 @@ public sealed class OracleAdapterTests
         }
     }
 
+    [Fact]
+    public async Task PumpStatus_WithAStateAndTriggerThisVersionDoesNotDefine_ListsAsUnknownWithNoTrigger()
+    {
+        var store = await OracleTestDatabase.CreateFreshStoreAsync();
+        var workerId = $"adapter-test:{Guid.NewGuid():N}";
+        await using (var connection = new OracleConnection(OracleTestDatabase.ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var insert = connection.CreateCommand();
+            insert.BindByName = true;
+            insert.CommandText =
+                """
+                INSERT INTO backwave.pumps
+                    (worker_id, worker_group, state, fault_type, invariant_trigger, reported_at, report_interval_ms)
+                VALUES (:worker_id, 'default', 99, NULL, 'TriggerFromANewerVersion', :reported_at, 30000)
+                """;
+            insert.Parameters.Add(new OracleParameter("worker_id", OracleDbType.Varchar2) { Value = workerId });
+            insert.Parameters.Add(new OracleParameter("reported_at", OracleDbType.TimeStampTZ) { Value = T0 });
+            await insert.ExecuteNonQueryAsync();
+        }
+
+        var listed = Assert.Single(await store.ListPumpStatusesAsync(), s => s.WorkerId == workerId);
+
+        Assert.Equal(PumpState.Unknown, listed.State);
+        Assert.Null(listed.Trigger);
+        Assert.Equal(T0, listed.ReportedAt);
+    }
+
+    [Fact]
+    public async Task CreateFreshStore_ClearsThePumpStatusesAnEarlierTestWrote()
+    {
+        var earlier = await OracleTestDatabase.CreateFreshStoreAsync();
+        await earlier.WritePumpStatusesAsync(
+            [
+                new PumpStatus
+                {
+                    WorkerId = $"adapter-test:{Guid.NewGuid():N}",
+                    WorkerGroup = "default",
+                    State = PumpState.Running,
+                    ReportedAt = T0,
+                    ReportInterval = TimeSpan.FromSeconds(30),
+                },
+            ],
+            reapBefore: T0 - TimeSpan.FromHours(1),
+            maxReap: 100);
+
+        var fresh = await OracleTestDatabase.CreateFreshStoreAsync();
+
+        Assert.Empty(await fresh.ListPumpStatusesAsync());
+    }
+
     // A heartbeat covers every job the worker is executing, and a worker's pool has no ceiling, so the
     // renewed set can pass the 1,000-expression limit of one IN list on Oracle before 23ai (ORA-01795).
     // The AddIdList guard makes that limit hold on every Oracle version, so this fails before the fix on

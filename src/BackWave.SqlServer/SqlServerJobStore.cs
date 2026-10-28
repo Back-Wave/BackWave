@@ -3759,6 +3759,129 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         return records;
     }
 
+    // ── §5.14 Pump Status ───────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public async ValueTask WritePumpStatusesAsync(
+        IReadOnlyList<PumpStatus> statuses, DateTimeOffset reapBefore, int maxReap,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        var payload = JsonSerializer.Serialize(statuses.Select(status => new PumpStatusRow(
+            status.WorkerId, status.WorkerGroup, (int)status.State, status.FaultType, status.Trigger?.ToString(),
+            status.ReportedAt, (int)status.ReportInterval.TotalMilliseconds)));
+
+        // Two writes for one worker id can race, as when a stopping process writes while its loop write is
+        // in flight. Both can pass NOT EXISTS before either commits, so the loser fails on the primary key
+        // and runs again: the rerun finds the winner's row and takes the UPDATE, which keeps the newer
+        // write. A range lock on the probe would serialize them instead, but it would also lock the gap a
+        // peer inserts its own new key into. The payload leads a loop join, so the UPDATE seeks each of its
+        // own rows: a scan would take a U lock on a peer's row and wait for that peer's commit while the
+        // peer waits for ours.
+        //
+        // The reap reads its candidates off the reported_at index with no locks (RCSI), then deletes them
+        // through the clustered key. A writer locks its row's clustered key and then its reported_at
+        // index key, so a delete that locked the index key first would close a cycle with a writer that
+        // is rewriting a stale row. READPAST skips a row a writer holds: that row is being rewritten,
+        // so it is not dead. The recheck of reported_at keeps a row rewritten since the candidate read.
+        // A SET inside the parameterized batch reverts when the batch ends.
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = Cmd(
+            """
+            SET XACT_ABORT ON;
+            DECLARE @batch TABLE (
+                worker_id nvarchar(450) PRIMARY KEY, worker_group nvarchar(450), state int,
+                fault_type nvarchar(450), invariant_trigger nvarchar(128), reported_at datetimeoffset(7),
+                report_interval_ms int);
+            INSERT INTO @batch
+            SELECT * FROM OPENJSON(@payload)
+                WITH (worker_id nvarchar(450) '$.WorkerId', worker_group nvarchar(450) '$.WorkerGroup',
+                      state int '$.State', fault_type nvarchar(450) '$.FaultType',
+                      invariant_trigger nvarchar(128) '$.Trigger', reported_at datetimeoffset(7) '$.ReportedAt',
+                      report_interval_ms int '$.ReportIntervalMs');
+
+            BEGIN TRANSACTION;
+            UPDATE p
+            SET worker_group = b.worker_group, state = b.state, fault_type = b.fault_type,
+                invariant_trigger = b.invariant_trigger, reported_at = b.reported_at,
+                report_interval_ms = b.report_interval_ms
+            FROM @batch b
+            INNER LOOP JOIN backwave.pumps p ON p.worker_id = b.worker_id
+            WHERE p.reported_at <= b.reported_at;
+            INSERT INTO backwave.pumps
+                (worker_id, worker_group, state, fault_type, invariant_trigger, reported_at, report_interval_ms)
+            SELECT b.worker_id, b.worker_group, b.state, b.fault_type, b.invariant_trigger, b.reported_at,
+                   b.report_interval_ms
+            FROM @batch b
+            WHERE NOT EXISTS (SELECT 1 FROM backwave.pumps p WHERE p.worker_id = b.worker_id);
+            COMMIT TRANSACTION;
+
+            DECLARE @stale TABLE (worker_id nvarchar(450) PRIMARY KEY);
+            INSERT INTO @stale
+            SELECT TOP (@maxReap) worker_id FROM backwave.pumps
+            WHERE reported_at < @reapBefore
+            ORDER BY reported_at;
+            DELETE p
+            FROM @stale s
+            INNER LOOP JOIN backwave.pumps p WITH (READPAST, ROWLOCK) ON p.worker_id = s.worker_id
+            WHERE p.reported_at < @reapBefore;
+            """,
+            connection);
+        command.Parameters.Add("payload", SqlDbType.NVarChar, -1).Value = payload;
+        command.Parameters.Add("reapBefore", SqlDbType.DateTimeOffset).Value = reapBefore;
+        command.Parameters.AddWithValue("maxReap", maxReap);
+        try
+        {
+            await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (SqlException exception) when (exception.Number is 2627 or 2601)
+        {
+            await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <inheritdoc/>
+    public async ValueTask<IReadOnlyList<PumpStatus>> ListPumpStatusesAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = Cmd(
+            """
+            SELECT worker_id, worker_group, state, fault_type, invariant_trigger, reported_at, report_interval_ms
+            FROM backwave.pumps
+            """,
+            connection);
+
+        var statuses = new List<PumpStatus>();
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var state = (PumpState)reader.GetInt32(2);
+            var trigger = reader.IsDBNull(4) ? null : reader.GetString(4);
+            statuses.Add(new PumpStatus
+            {
+                WorkerId = reader.GetString(0),
+                WorkerGroup = reader.GetString(1),
+                State = Enum.IsDefined(state) ? state : PumpState.Unknown,
+                FaultType = reader.IsDBNull(3) ? null : reader.GetString(3),
+                Trigger = trigger is not null && Enum.IsDefined(typeof(InvariantTrigger), trigger)
+                    ? Enum.Parse<InvariantTrigger>(trigger)
+                    : null,
+                ReportedAt = reader.GetFieldValue<DateTimeOffset>(5),
+                ReportInterval = TimeSpan.FromMilliseconds(reader.GetInt32(6)),
+            });
+        }
+        return statuses;
+    }
+
+    // The set-valued status row for the upsert, serialized to JSON and unpacked by OPENJSON.
+    // Property names are the OPENJSON '$.X' paths above; the CLR types map to the WITH column types.
+    private sealed record PumpStatusRow(
+        string WorkerId, string WorkerGroup, int State, string? FaultType, string? Trigger,
+        DateTimeOffset ReportedAt, int ReportIntervalMs);
+
     // ── row mapping ─────────────────────────────────────────────────────────────
 
     private const string JobColumns =

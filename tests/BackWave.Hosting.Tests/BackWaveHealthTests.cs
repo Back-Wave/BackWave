@@ -52,7 +52,7 @@ public sealed class BackWaveHealthTests
         var health = new BackWaveHealth();
 
         // Pump 0 hits a transient store blip and is marked degraded.
-        health.ReportDegraded("emails", "emails:pump-0", new TimeoutException("store blip"));
+        health.ReportDegraded("emails", "emails:pump-0", new TimeoutException("store blip"), DateTimeOffset.UnixEpoch);
         Assert.True(health.DegradedGroups.ContainsKey("emails"));
 
         // Pump 1 completes a clean cycle. Bug #1 fixed: its recovery clears only its own mark, never
@@ -70,8 +70,8 @@ public sealed class BackWaveHealthTests
     {
         var health = new BackWaveHealth();
 
-        health.ReportDegraded("emails", "emails:pump-0", new TimeoutException("store blip"));
-        health.ReportDegraded("emails", "emails:pump-1", new TimeoutException("store blip"));
+        health.ReportDegraded("emails", "emails:pump-0", new TimeoutException("store blip"), DateTimeOffset.UnixEpoch);
+        health.ReportDegraded("emails", "emails:pump-1", new TimeoutException("store blip"), DateTimeOffset.UnixEpoch);
 
         // Pump 0 escalates to a halt: its own degraded mark is superseded, but Pump 1 stays degraded.
         health.ReportHalted("emails", "emails:pump-0", groupPumpCount: 2, Boom());
@@ -90,7 +90,7 @@ public sealed class BackWaveHealthTests
         var health = new BackWaveHealth();
 
         health.ReportHalted("emails", "emails:pump-0", groupPumpCount: 1, Boom());
-        health.ReportDegraded("reports", "reports:pump-0", new TimeoutException("store blip"));
+        health.ReportDegraded("reports", "reports:pump-0", new TimeoutException("store blip"), DateTimeOffset.UnixEpoch);
 
         Assert.True(health.HaltedGroups.ContainsKey("emails"));
         Assert.False(health.HaltedGroups.ContainsKey("reports"));
@@ -156,7 +156,7 @@ public sealed class BackWaveHealthTests
 
         // BREAKING behavioural change: a transient store fault used to report Healthy because the check
         // never read DegradedGroups at all. The group is still claiming, so it is not a fail-stop either.
-        health.ReportDegraded("emails", "emails:pump-0", new TimeoutException("store blip"));
+        health.ReportDegraded("emails", "emails:pump-0", new TimeoutException("store blip"), DateTimeOffset.UnixEpoch);
 
         Assert.Equal(HealthStatus.Degraded, StatusOf(health));
     }
@@ -183,7 +183,7 @@ public sealed class BackWaveHealthTests
         // rotation on. A degraded sibling never escalates it.
         Assert.Equal(HealthStatus.Unhealthy, StatusOf(health));
 
-        health.ReportDegraded("reports", "reports:pump-0", new TimeoutException("store blip"));
+        health.ReportDegraded("reports", "reports:pump-0", new TimeoutException("store blip"), DateTimeOffset.UnixEpoch);
         Assert.Equal(HealthStatus.Unhealthy, StatusOf(health));
     }
 
@@ -195,7 +195,7 @@ public sealed class BackWaveHealthTests
         // A provider's fault message names the host, the database and the login it could not reach.
         // The check's description reaches an unauthenticated probe through a stock response writer.
         health.ReportDegraded("emails", "emails:pump-0", new TimeoutException(
-            "Login failed for user 'bw_app' on server 'prod-sql-01.internal' database 'backwave'."));
+            "Login failed for user 'bw_app' on server 'prod-sql-01.internal' database 'backwave'."), DateTimeOffset.UnixEpoch);
         health.ReportHalted("reports", "reports:pump-0", groupPumpCount: 2, Boom("lease owner 'node-7' is not this worker"));
 
         var description = ResultOf(health).Description!;

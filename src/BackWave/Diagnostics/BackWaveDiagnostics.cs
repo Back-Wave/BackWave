@@ -859,11 +859,28 @@ public static class BackWaveDiagnostics
             new KeyValuePair<string, object?>(InvariantTriggerKey, trigger.ToString()),
             new KeyValuePair<string, object?>(InvariantActionKey, action.ToString()));
 
-    // trigger is the same value the halt log carries, so the log and the gauge cannot disagree.
-    internal static void RecordPumpHalted(string workerGroup, string trigger)
-        => WorkerGroupPumpsHalted.Add(1,
-            new KeyValuePair<string, object?>(ConsumerGroupKey, workerGroup),
-            new KeyValuePair<string, object?>(InvariantTriggerKey, trigger));
+    // trigger is the same value the halt log carries, so the log and the gauge cannot disagree. The gauge
+    // outlives any one host, so the host that owns the Pump disposes the handle when it stops, and a
+    // process that builds another host stops counting this Pump.
+    internal static IDisposable RecordPumpHalted(string workerGroup, string trigger)
+    {
+        KeyValuePair<string, object?>[] tags = [new(ConsumerGroupKey, workerGroup), new(InvariantTriggerKey, trigger)];
+        WorkerGroupPumpsHalted.Add(1, tags);
+        return new HaltedPumpRegistration(tags);
+    }
+
+    private sealed class HaltedPumpRegistration(KeyValuePair<string, object?>[] tags) : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                WorkerGroupPumpsHalted.Add(-1, tags);
+            }
+        }
+    }
 
     private static KeyValuePair<string, object?>[] ObserverTags(string observerId, string? wireName, string? queue)
         => wireName is null && queue is null

@@ -23,7 +23,8 @@ public sealed class OracleConformanceTests(ITestOutputHelper output) : Conforman
         | ConformanceCapabilities.QueueConfigLock
         | ConformanceCapabilities.ConcurrentTagInsert
         | ConformanceCapabilities.ConcurrentEdgeInsert
-        | ConformanceCapabilities.OutOfBandStateWrite;
+        | ConformanceCapabilities.OutOfBandStateWrite
+        | ConformanceCapabilities.PumpStatuses;
 
     protected override async ValueTask<IJobStore> CreateStoreAsync(JobHistoryPolicy historyPolicy)
         => await OracleTestDatabase.CreateFreshStoreAsync(historyPolicy);

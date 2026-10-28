@@ -3492,6 +3492,13 @@ internal sealed class FaultInjectingStore(IJobStore inner, Func<string, bool> sh
 
     public ValueTask<IReadOnlyList<ObserverDeadLetterRecord>> ListObserverDeadLettersAsync(string observerId, CancellationToken cancellationToken = default)
         => inner.ListObserverDeadLettersAsync(observerId, cancellationToken);
+
+    public ValueTask WritePumpStatusesAsync(
+        IReadOnlyList<PumpStatus> statuses, DateTimeOffset reapBefore, int maxReap, CancellationToken cancellationToken = default)
+        => inner.WritePumpStatusesAsync(statuses, reapBefore, maxReap, cancellationToken);
+
+    public ValueTask<IReadOnlyList<PumpStatus>> ListPumpStatusesAsync(CancellationToken cancellationToken = default)
+        => inner.ListPumpStatusesAsync(cancellationToken);
 }
 
 /// <summary>

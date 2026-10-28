@@ -532,6 +532,7 @@ textarea.bw-input { height: auto; padding: var(--space-2) var(--space-3); resize
   padding: 4px 10px;
   background: var(--surface-card);
   color: var(--text-body);
+  white-space: nowrap;
 }
 .bw-badge__dot {
   width: 7px;
@@ -792,6 +793,10 @@ html, body { height: 100%; }
 .ptable-scroll { overflow-x: auto; }
 .ptable { width: 100%; border-collapse: collapse; }
 .ptable td.nowrap, .ptable th.nowrap { white-space: nowrap; }
+/* A worker id ends in a 32-character hex run with no break point; unbroken, it alone pushes a table
+   past its card. The min-width keeps a squeezed table from folding the id into a column of a few characters. */
+.ptable td.wrap-anywhere { overflow-wrap: anywhere; min-width: 32ch; }
+.ptable td.wrap-anywhere--narrow { min-width: 20ch; }
 .ptable__cron-raw { color: var(--text-muted); font: var(--type-annotation); margin-top: 2px; }
 .ptable th {
   font: var(--type-annotation);

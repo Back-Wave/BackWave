@@ -5282,6 +5282,229 @@ public abstract class ConformanceSuite
         Assert.Equal(-1, await store.GetObserverCursorAsync("obs"));
     }
 
+    // ── §5.14 Pump Status ───────────────────────────────────────────────────────
+
+    private static PumpStatus Pump(PumpState state, DateTimeOffset reportedAt, string workerGroup = "conformance") => new()
+    {
+        WorkerId = $"conformance-host:{workerGroup}:{Guid.NewGuid():N}",
+        WorkerGroup = workerGroup,
+        State = state,
+        ReportedAt = reportedAt,
+        ReportInterval = TimeSpan.FromSeconds(30),
+    };
+
+    private static readonly DateTimeOffset NoReap = T0.AddYears(-1);
+
+    private const int ReapUncapped = int.MaxValue;
+
+    private static async Task<List<PumpStatus>> ListOwnPumpStatusesAsync(IJobStore store, params PumpStatus[] pumps)
+        => [.. (await store.ListPumpStatusesAsync()).Where(s => pumps.Any(p => p.WorkerId == s.WorkerId))];
+
+    /// <summary>
+    /// Certifies that a written Pump status reads back field for field: the state, the fault type at its
+    /// full 450-character width, the trigger, the interval, and the instant to the millisecond.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_14_PumpStatuses_RoundTripEveryField()
+    {
+        var store = await CreateStoreAsync();
+        var reportedAt = T0.AddMilliseconds(1234);
+        var halted = Pump(PumpState.Halted, reportedAt) with
+        {
+            FaultType = typeof(InvariantViolationException).FullName,
+            Trigger = InvariantTrigger.ClaimedJobTerminal,
+        };
+        var degraded = Pump(PumpState.Degraded, reportedAt, workerGroup: "conformance-other") with
+        {
+            FaultType = new string('F', 450),
+            ReportInterval = TimeSpan.FromSeconds(45),
+        };
+        await store.WritePumpStatusesAsync([halted, degraded], NoReap, maxReap: 100);
+
+        var listed = await ListOwnPumpStatusesAsync(store, halted, degraded);
+        if (!Provided(ConformanceCapabilities.PumpStatuses, listed.Count > 0, nameof(IJobStore.ListPumpStatusesAsync)))
+        {
+            return;
+        }
+        Assert.Equal(
+            new[] { halted, degraded }.OrderBy(s => s.WorkerId, StringComparer.Ordinal),
+            listed.OrderBy(s => s.WorkerId, StringComparer.Ordinal));
+    }
+
+    /// <summary>
+    /// Certifies that a second write for one worker id replaces the first whole: one row remains, and a
+    /// field the second write leaves null reads back null.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_14_PumpStatuses_ASecondWriteReplacesTheFirst()
+    {
+        var store = await CreateStoreAsync();
+        var first = Pump(PumpState.Degraded, T0) with { FaultType = typeof(TimeoutException).FullName };
+        await store.WritePumpStatusesAsync([first], NoReap, maxReap: 100);
+        if (!Provided(
+            ConformanceCapabilities.PumpStatuses,
+            (await ListOwnPumpStatusesAsync(store, first)).Count > 0,
+            nameof(IJobStore.ListPumpStatusesAsync)))
+        {
+            return;
+        }
+
+        var second = first with { State = PumpState.Stopped, FaultType = null, ReportedAt = T0.AddSeconds(30) };
+        await store.WritePumpStatusesAsync([second], NoReap, maxReap: 100);
+
+        Assert.Equal(second, Assert.Single(await ListOwnPumpStatusesAsync(store, first)));
+    }
+
+    /// <summary>
+    /// Certifies that a write older than the stored row leaves the row as it is, so a write that stalled
+    /// in flight cannot land after its process's Stopped write and read as a crash. A write at the same
+    /// instant replaces the row, and so does a write one tick newer, finer than the store keeps instants.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_14_PumpStatuses_AnOlderWriteDoesNotReplaceANewerRow()
+    {
+        var store = await CreateStoreAsync();
+        var stopped = Pump(PumpState.Stopped, T0.AddSeconds(30));
+        await store.WritePumpStatusesAsync([stopped], NoReap, maxReap: 100);
+        if (!Provided(
+            ConformanceCapabilities.PumpStatuses,
+            (await ListOwnPumpStatusesAsync(store, stopped)).Count > 0,
+            nameof(IJobStore.ListPumpStatusesAsync)))
+        {
+            return;
+        }
+
+        await store.WritePumpStatusesAsync(
+            [stopped with { State = PumpState.Running, ReportedAt = T0 }], NoReap, maxReap: 100);
+        Assert.Equal(stopped, Assert.Single(await ListOwnPumpStatusesAsync(store, stopped)));
+
+        var sameInstant = stopped with { State = PumpState.Halted, FaultType = typeof(TimeoutException).FullName };
+        await store.WritePumpStatusesAsync([sameInstant], NoReap, maxReap: 100);
+        Assert.Equal(sameInstant, Assert.Single(await ListOwnPumpStatusesAsync(store, stopped)));
+
+        await store.WritePumpStatusesAsync(
+            [stopped with { ReportedAt = stopped.ReportedAt.AddTicks(1) }], NoReap, maxReap: 100);
+        var newer = Assert.Single(await ListOwnPumpStatusesAsync(store, stopped));
+        Assert.Equal(PumpState.Stopped, newer.State);
+        Assert.Null(newer.FaultType);
+    }
+
+    /// <summary>
+    /// Certifies that one write judges each row on its own: an older row is rejected, a newer row replaces
+    /// the stored one, and a new worker id is inserted. Instants compare as instants, so a row stamped in
+    /// +05:00 that is older than the stored row loses even though its local time reads later.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_14_PumpStatuses_OneWriteRejectsReplacesAndInsertsRowByRow()
+    {
+        var store = await CreateStoreAsync();
+        var a = Pump(PumpState.Stopped, T0.AddSeconds(30));
+        var b = Pump(PumpState.Running, T0.AddSeconds(30));
+        await store.WritePumpStatusesAsync([a, b], NoReap, maxReap: 100);
+        if (!Provided(
+            ConformanceCapabilities.PumpStatuses,
+            (await ListOwnPumpStatusesAsync(store, a, b)).Count > 0,
+            nameof(IJobStore.ListPumpStatusesAsync)))
+        {
+            return;
+        }
+
+        var olderA = a with { State = PumpState.Running, ReportedAt = T0.AddSeconds(20).ToOffset(TimeSpan.FromHours(5)) };
+        var newerB = b with { State = PumpState.Stopping, ReportedAt = T0.AddSeconds(60) };
+        var c = Pump(PumpState.Running, T0.AddSeconds(60));
+        await store.WritePumpStatusesAsync([olderA, newerB, c], NoReap, maxReap: 100);
+
+        Assert.Equal(
+            new[] { a, newerB, c }.OrderBy(s => s.WorkerId, StringComparer.Ordinal),
+            (await ListOwnPumpStatusesAsync(store, a, b, c)).OrderBy(s => s.WorkerId, StringComparer.Ordinal));
+    }
+
+    /// <summary>
+    /// Certifies that concurrent first writes for one worker id all succeed and leave the newest row: a
+    /// process stopping while its loop write is still in flight writes the same Pump twice at once.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_14_PumpStatuses_ConcurrentFirstWritesForOneWorkerIdAllSucceedAndTheNewestWins()
+    {
+        var store = await CreateStoreAsync();
+        var probe = Pump(PumpState.Running, T0);
+        await store.WritePumpStatusesAsync([probe], NoReap, maxReap: 100);
+        if (!Provided(
+            ConformanceCapabilities.PumpStatuses,
+            (await ListOwnPumpStatusesAsync(store, probe)).Count > 0,
+            nameof(IJobStore.ListPumpStatusesAsync)))
+        {
+            return;
+        }
+
+        const int rounds = 20;
+        const int writers = 8;
+        for (var round = 0; round < rounds; round++)
+        {
+            var pump = Pump(PumpState.Running, T0);
+            var writes = Enumerable.Range(0, writers)
+                .Select(i => pump with { State = PumpState.Stopping, ReportedAt = T0.AddSeconds(i) })
+                .ToList();
+
+            await Task.WhenAll(writes.Select(write =>
+                Task.Run(async () => await store.WritePumpStatusesAsync([write], NoReap, maxReap: 100))));
+
+            Assert.Equal(writes[^1], Assert.Single(await ListOwnPumpStatusesAsync(store, pump)));
+        }
+    }
+
+    /// <summary>
+    /// Certifies that a write deletes the rows any process last wrote strictly before its cutoff and keeps
+    /// the rest: a row written at the cutoff itself survives.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_14_PumpStatuses_ReapDeletesOnlyRowsWrittenBeforeTheCutoff()
+    {
+        var store = await CreateStoreAsync();
+        var dead = Pump(PumpState.Running, T0.AddDays(2));
+        await store.WritePumpStatusesAsync([dead], NoReap, maxReap: 100);
+        if (!Provided(
+            ConformanceCapabilities.PumpStatuses,
+            (await ListOwnPumpStatusesAsync(store, dead)).Count > 0,
+            nameof(IJobStore.ListPumpStatusesAsync)))
+        {
+            return;
+        }
+
+        var live = Pump(PumpState.Running, T0.AddDays(2).AddHours(1));
+        await store.WritePumpStatusesAsync([live], dead.ReportedAt.AddTicks(1), maxReap: ReapUncapped);
+        Assert.Equal([live], await ListOwnPumpStatusesAsync(store, dead, live));
+
+        await store.WritePumpStatusesAsync([live], live.ReportedAt, maxReap: ReapUncapped);
+        Assert.Equal([live], await ListOwnPumpStatusesAsync(store, live));
+    }
+
+    /// <summary>
+    /// Certifies that one write deletes no more than its cap: of two rows past the cutoff, a write capped
+    /// at one row leaves at least one.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_14_PumpStatuses_ReapDeletesAtMostMaxReapRows()
+    {
+        var store = await CreateStoreAsync();
+        var deadA = Pump(PumpState.Running, T0.AddDays(1));
+        var deadB = Pump(PumpState.Running, T0.AddDays(1));
+        await store.WritePumpStatusesAsync([deadA, deadB], NoReap, maxReap: 100);
+        if (!Provided(
+            ConformanceCapabilities.PumpStatuses,
+            (await ListOwnPumpStatusesAsync(store, deadA, deadB)).Count > 0,
+            nameof(IJobStore.ListPumpStatusesAsync)))
+        {
+            return;
+        }
+
+        var live = Pump(PumpState.Running, T0.AddDays(1).AddHours(1));
+        await store.WritePumpStatusesAsync([live], deadA.ReportedAt.AddTicks(1), maxReap: 1);
+
+        Assert.NotEmpty(await ListOwnPumpStatusesAsync(store, deadA, deadB));
+        Assert.Single(await ListOwnPumpStatusesAsync(store, live));
+    }
+
     // ── ADR 0022 Job Tags ────────────────────────────────────────────────────────
 
     /// <summary>

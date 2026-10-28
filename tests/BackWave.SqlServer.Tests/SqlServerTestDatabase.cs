@@ -55,7 +55,8 @@ public static class SqlServerTestDatabase
                 "DELETE FROM backwave.job_tags; DELETE FROM backwave.jobs; DELETE FROM backwave.workflows; " +
                 "DELETE FROM backwave.schedules; DELETE FROM backwave.queue_limits; " +
                 "DELETE FROM backwave.operator_audit; DELETE FROM backwave.observers; " +
-                "DELETE FROM backwave.observer_deliveries; DELETE FROM backwave.observer_dead_letters;",
+                "DELETE FROM backwave.observer_deliveries; DELETE FROM backwave.observer_dead_letters; " +
+                "DELETE FROM backwave.pumps;",
                 connection);
             await wipe.ExecuteNonQueryAsync();
         }

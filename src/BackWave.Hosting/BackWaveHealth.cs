@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using BackWave.Diagnostics;
+using BackWave.Storage;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 
 namespace BackWave.Hosting;
@@ -25,6 +26,8 @@ public sealed class BackWaveHealth
     private readonly ConcurrentDictionary<(string Group, string Pump), HaltState> _halted = new();
     private readonly ConcurrentDictionary<(string Group, string Pump), DegradedState> _degraded = new();
     private readonly ConcurrentDictionary<string, int> _groupPumpCount = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<(string Group, string Pump), bool> _stoppedCleanly = new();
+    private readonly ConcurrentDictionary<(string Group, string Pump), (string FaultType, DateTimeOffset At)> _latestStoreFault = new();
 
     /// <summary>
     /// <see langword="true"/> while no worker group has wholly halted; <see langword="false"/> once
@@ -102,11 +105,62 @@ public sealed class BackWaveHealth
         _degraded.TryRemove((workerGroup, pump), out _); // a halt supersedes this pump's degraded mark
     }
 
-    internal void ReportDegraded(string workerGroup, string pump, Exception exception) =>
+    internal void ReportDegraded(string workerGroup, string pump, Exception exception, DateTimeOffset at)
+    {
         _degraded[(workerGroup, pump)] = new DegradedState(exception.GetType().Name, exception.Message);
+        _latestStoreFault[(workerGroup, pump)] = (exception.GetType().FullName ?? exception.GetType().Name, at);
+    }
 
     internal void ReportRecovered(string workerGroup, string pump) =>
         _degraded.TryRemove((workerGroup, pump), out _); // clears only this pump's mark, never a sibling's
+
+    internal void ReportStarted(string workerGroup, string pump) => _stoppedCleanly[(workerGroup, pump)] = false;
+
+    internal void ReportStoppedCleanly(string workerGroup, string pump) => _stoppedCleanly[(workerGroup, pump)] = true;
+
+    internal IReadOnlyList<PumpStatus> PumpStatuses(
+        DateTimeOffset now, DateTimeOffset reportedAt, TimeSpan reportInterval, HostPhase hostPhase)
+    {
+        var statuses = new List<PumpStatus>(_stoppedCleanly.Count);
+        foreach (var (key, stoppedCleanly) in _stoppedCleanly)
+        {
+            var status = new PumpStatus
+            {
+                WorkerId = key.Pump,
+                WorkerGroup = key.Group,
+                State = PumpState.Running,
+                ReportedAt = reportedAt,
+                ReportInterval = reportInterval,
+            };
+            if (stoppedCleanly)
+            {
+                status = status with { State = PumpState.Stopped };
+            }
+            else if (_halted.TryGetValue(key, out var halt))
+            {
+                status = status with
+                {
+                    State = hostPhase == HostPhase.Stopped ? PumpState.Stopped : PumpState.Halted,
+                    FaultType = Truncated(halt.ExceptionType),
+                    Trigger = halt.Trigger,
+                };
+            }
+            else if (hostPhase != HostPhase.Running)
+            {
+                status = status with { State = PumpState.Stopping };
+            }
+            else if (_latestStoreFault.TryGetValue(key, out var fault)
+                && (_degraded.ContainsKey(key) || fault.At >= now - reportInterval))
+            {
+                status = status with { State = PumpState.Degraded, FaultType = Truncated(fault.FaultType) };
+            }
+            statuses.Add(status);
+        }
+        return statuses;
+    }
+
+    private static string Truncated(string faultType) =>
+        faultType.Length <= PumpStatus.MaxFaultTypeLength ? faultType : faultType[..PumpStatus.MaxFaultTypeLength];
 
     /// <summary>One pump's transient-fault mark, split so the health check can render the type alone.</summary>
     private sealed record DegradedState(string ExceptionType, string Message);

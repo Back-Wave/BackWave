@@ -5,7 +5,7 @@ using Npgsql;
 namespace BackWave.Postgres.Tests;
 
 /// <summary>
-/// The Postgres adapter's round-trip budget: the statements seven hot operations cost today, pinned so a
+/// The Postgres adapter's round-trip budget: the statements hot operations cost today, pinned so a
 /// change has to move them on purpose.
 ///
 /// These numbers are the point. A per-row round trip on this adapter is invisible to every other test in
@@ -69,6 +69,10 @@ public sealed class PostgresRoundTripBudgetTests
     private static readonly Budget EnqueueTagged = new(
         "EnqueueAsync of one job carrying three tags",
         Statements: 6);
+
+    private static readonly Budget WritePumpStatuses = new(
+        "WritePumpStatusesAsync of 8 Pumps that also reaps 8 old rows",
+        Statements: 1);
 
     [Fact]
     public async Task Claim_of_a_full_batch_stays_within_its_round_trip_budget()
@@ -338,6 +342,38 @@ public sealed class PostgresRoundTripBudgetTests
         }
 
         AssertBudget(EnqueueTagged, measured);
+    }
+
+    [Fact]
+    public async Task WritePumpStatuses_of_a_whole_process_stays_within_its_round_trip_budget()
+    {
+        await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
+        static PumpStatus[] Pumps(DateTimeOffset reportedAt) => [.. Enumerable.Range(0, 8).Select(i => new PumpStatus
+        {
+            WorkerId = $"budget-host:group-{i}:{Guid.NewGuid():N}",
+            WorkerGroup = $"group-{i}",
+            State = PumpState.Running,
+            ReportedAt = reportedAt,
+            ReportInterval = TimeSpan.FromSeconds(30),
+        })];
+        var old = Pumps(T0);
+        await store.WritePumpStatusesAsync(old, T0, maxReap: 100);
+
+        // 1 command = 1 statement on this counter: the unnest upsert and the capped reap travel together
+        // in one flush, so the write costs one round trip however many Pumps the process runs and
+        // however many rows it reaps.
+        var fresh = Pumps(T0.AddMinutes(10));
+        Measured measured;
+        using (var scope = PostgresRoundTrips.Observe())
+        {
+            await store.WritePumpStatusesAsync(fresh, T0.AddMinutes(5), maxReap: 100);
+            measured = Measured.From(scope);
+        }
+
+        var listed = await store.ListPumpStatusesAsync();
+        Assert.All(fresh, pump => Assert.Contains(listed, s => s.WorkerId == pump.WorkerId));
+        Assert.All(old, pump => Assert.DoesNotContain(listed, s => s.WorkerId == pump.WorkerId));
+        AssertBudget(WritePumpStatuses, measured);
     }
 
     [Fact]

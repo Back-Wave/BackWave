@@ -3959,6 +3959,125 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         }
         return records;
     }
+
+    /// <inheritdoc/>
+    public async ValueTask WritePumpStatusesAsync(
+        IReadOnlyList<PumpStatus> statuses, DateTimeOffset reapBefore, int maxReap,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+
+        // Two writes for one worker id can race, as when a stopping process writes while its loop write is
+        // in flight, and Oracle's MERGE raises ORA-00001 when two sessions insert one key at once. The
+        // loser runs the MERGE again: the rerun matches the winner's row and keeps the newer write.
+        if (statuses.Count > 0)
+        {
+            await using var upsert = Cmd(
+                """
+                MERGE INTO backwave.pumps p
+                USING (SELECT :worker_id AS worker_id FROM dual) s ON (p.worker_id = s.worker_id)
+                WHEN MATCHED THEN UPDATE SET
+                    p.worker_group = :worker_group,
+                    p.state = :state,
+                    p.fault_type = :fault_type,
+                    p.invariant_trigger = :invariant_trigger,
+                    p.reported_at = :reported_at,
+                    p.report_interval_ms = :report_interval_ms
+                    WHERE p.reported_at <= :reported_at
+                WHEN NOT MATCHED THEN INSERT
+                    (worker_id, worker_group, state, fault_type, invariant_trigger, reported_at, report_interval_ms)
+                VALUES
+                    (:worker_id, :worker_group, :state, :fault_type, :invariant_trigger, :reported_at, :report_interval_ms)
+                """,
+                connection);
+            upsert.ArrayBindCount = statuses.Count;
+            upsert.Parameters.Add(new OracleParameter("worker_id", OracleDbType.Varchar2)
+            {
+                Value = statuses.Select(s => s.WorkerId).ToArray(),
+            });
+            upsert.Parameters.Add(new OracleParameter("worker_group", OracleDbType.Varchar2)
+            {
+                Value = statuses.Select(s => s.WorkerGroup).ToArray(),
+            });
+            upsert.Parameters.Add(new OracleParameter("state", OracleDbType.Int32)
+            {
+                Value = statuses.Select(s => (int)s.State).ToArray(),
+            });
+            upsert.Parameters.Add(new OracleParameter("fault_type", OracleDbType.Varchar2)
+            {
+                Value = statuses.Select(s => s.FaultType).ToArray(),
+            });
+            upsert.Parameters.Add(new OracleParameter("invariant_trigger", OracleDbType.Varchar2)
+            {
+                Value = statuses.Select(s => s.Trigger?.ToString()).ToArray(),
+            });
+            upsert.Parameters.Add(new OracleParameter("reported_at", OracleDbType.TimeStampTZ)
+            {
+                Value = statuses.Select(s => ToTstz(s.ReportedAt)).ToArray(),
+            });
+            upsert.Parameters.Add(new OracleParameter("report_interval_ms", OracleDbType.Int64)
+            {
+                Value = statuses.Select(s => (long)s.ReportInterval.TotalMilliseconds).ToArray(),
+            });
+            try
+            {
+                await upsert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OracleException exception) when (IsDuplicate(exception))
+            {
+                await upsert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        await using var reap = Cmd(
+            """
+            DELETE FROM backwave.pumps WHERE ROWID IN (
+                SELECT ROWID FROM backwave.pumps WHERE reported_at < :reap_before
+                ORDER BY reported_at FETCH FIRST :max_reap ROWS ONLY)
+            """,
+            connection);
+        reap.Parameters.Add(Tstz("reap_before", reapBefore));
+        reap.Parameters.Add(Int("max_reap", maxReap));
+        await reap.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async ValueTask<IReadOnlyList<PumpStatus>> ListPumpStatusesAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = Cmd(
+            """
+            SELECT worker_id, worker_group, state, fault_type, invariant_trigger, reported_at, report_interval_ms
+            FROM backwave.pumps
+            """,
+            connection);
+
+        var statuses = new List<PumpStatus>();
+        await using var reader = (OracleDataReader)await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var state = (PumpState)reader.GetInt32(2);
+            statuses.Add(new PumpStatus
+            {
+                WorkerId = reader.GetString(0),
+                WorkerGroup = reader.GetString(1),
+                State = Enum.IsDefined(state) ? state : PumpState.Unknown,
+                FaultType = reader.IsDBNull(3) ? null : reader.GetString(3),
+                Trigger = reader.IsDBNull(4) ? null : ReadKnownTriggerOrNull(reader.GetString(4)),
+                ReportedAt = ReadTstz(reader, 5),
+                ReportInterval = TimeSpan.FromMilliseconds(reader.GetInt64(6)),
+            });
+        }
+        return statuses;
+    }
+
+    private static InvariantTrigger? ReadKnownTriggerOrNull(string name)
+        => Enum.IsDefined(typeof(InvariantTrigger), name) ? Enum.Parse<InvariantTrigger>(name) : null;
+
     // ── row mapping ───────────────────────────────────────────────────────────────
 
     // The jobs columns in reader order. job_mode and sequence are plain identifiers here (SqlServer needs

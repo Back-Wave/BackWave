@@ -34,7 +34,8 @@ public sealed class SqliteConformanceTests(ITestOutputHelper output) : Conforman
         | ConformanceCapabilities.ObserverReportOutcomes
         | ConformanceCapabilities.AtomicBatchOutcomes
         | ConformanceCapabilities.FaultInjection
-        | ConformanceCapabilities.OutOfBandStateWrite;
+        | ConformanceCapabilities.OutOfBandStateWrite
+        | ConformanceCapabilities.PumpStatuses;
 
     /// <summary>Migrate the file once up front, so a §5.1 caller transaction never races first-use migration.</summary>
     public async Task InitializeAsync()

@@ -5,7 +5,7 @@ using Microsoft.Data.Sqlite;
 namespace BackWave.Sqlite.Tests;
 
 /// <summary>
-/// The SQLite adapter's statement budget: the number of statements eight hot operations execute today,
+/// The SQLite adapter's statement budget: the number of statements nine hot operations execute today,
 /// pinned so a change has to move them on purpose.
 ///
 /// Read the number for what it is. SQLite runs in-process, so a statement here is a prepare plus a step
@@ -78,6 +78,9 @@ public sealed class SqliteStatementBudgetTests
 
     private static readonly Budget EnqueueTagged = new(
         "EnqueueAsync of one job carrying three tags", Statements: 6);
+
+    private static readonly Budget WritePumpStatuses = new(
+        "WritePumpStatusesAsync of 8 statuses over 8 reapable rows", Statements: 2);
 
     [Fact]
     public async Task Claim_of_a_full_batch_stays_within_its_statement_budget()
@@ -397,6 +400,39 @@ public sealed class SqliteStatementBudgetTests
         }
 
         AssertBudget(EnqueueTagged, measured);
+    }
+
+    [Fact]
+    public async Task WritePumpStatuses_costs_two_statements_however_many_pumps_it_writes()
+    {
+        const int pumps = 8;
+        await using var temp = TempSqliteStore.Create();
+        var store = temp.Store;
+        PumpStatus Status(string workerId, DateTimeOffset at) => new()
+        {
+            WorkerId = workerId,
+            WorkerGroup = "budget",
+            State = PumpState.Running,
+            ReportedAt = at,
+            ReportInterval = TimeSpan.FromSeconds(30),
+        };
+        await store.WritePumpStatusesAsync(
+            [.. Enumerable.Range(0, pumps).Select(i => Status($"old-{i}", T0))], T0, maxReap: pumps);
+
+        // 1 multi-row upsert + 1 bounded reap = 2 statements, independent of the number of Pumps.
+        var now = T0 + TimeSpan.FromHours(2);
+        int measured;
+        using (var scope = SqliteStatementCounts.Observe())
+        {
+            await store.WritePumpStatusesAsync(
+                [.. Enumerable.Range(0, pumps).Select(i => Status($"new-{i}", now))], now - TimeSpan.FromHours(1), maxReap: pumps);
+            measured = scope.Statements;
+        }
+
+        var listed = await store.ListPumpStatusesAsync();
+        Assert.Equal(pumps, listed.Count);
+        Assert.All(listed, status => Assert.StartsWith("new-", status.WorkerId, StringComparison.Ordinal));
+        AssertBudget(WritePumpStatuses, measured);
     }
 
     [Fact]

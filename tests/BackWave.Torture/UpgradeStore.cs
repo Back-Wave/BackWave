@@ -239,6 +239,7 @@ internal sealed class SqlServerUpgradeStore : IUpgradeStore
         IF OBJECT_ID('backwave.schedules', 'U') IS NOT NULL DROP TABLE backwave.schedules;
         IF OBJECT_ID('backwave.queue_limits', 'U') IS NOT NULL DROP TABLE backwave.queue_limits;
         IF OBJECT_ID('backwave.operator_audit', 'U') IS NOT NULL DROP TABLE backwave.operator_audit;
+        IF OBJECT_ID('backwave.pumps', 'U') IS NOT NULL DROP TABLE backwave.pumps;
         IF OBJECT_ID('backwave.schema_version', 'U') IS NOT NULL DROP TABLE backwave.schema_version;
         IF EXISTS (SELECT 1 FROM sys.sequences s JOIN sys.schemas c ON s.schema_id = c.schema_id
                    WHERE c.name = 'backwave' AND s.name = 'observer_log_position')

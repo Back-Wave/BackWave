@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Data.Common;
 using BackWave.Core;
 using BackWave.Diagnostics;
@@ -27,6 +28,36 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
     private int _misattributeObserverReports;
     private int _reportOutcomesCalls;
     private int _rowsSettledBeforeRejection;
+
+    private readonly ConcurrentQueue<IReadOnlyList<PumpStatus>> _pumpStatusWrites = new();
+    private int _landedPumpStatusWrites;
+
+    /// <summary>Every Pump Status write that reached this store, failed ones included, in arrival order.</summary>
+    public IReadOnlyList<IReadOnlyList<PumpStatus>> PumpStatusWrites => [.. _pumpStatusWrites];
+
+    /// <summary>How many Pump Status writes the inner store has applied.</summary>
+    public int LandedPumpStatusWrites => Volatile.Read(ref _landedPumpStatusWrites);
+
+    /// <summary>Pump Status writes throw, and touch nothing else.</summary>
+    public bool FailPumpStatusWrites { get; set; }
+
+    /// <summary>
+    /// Pump Status writes wait until their token is cancelled and then throw a fault that is not an
+    /// <see cref="OperationCanceledException"/>, the way SqlClient reports a command cancelled mid-execute.
+    /// </summary>
+    public bool PumpStatusWritesFaultOnCancellation { get; set; }
+
+    public enum HungWriteEnding { TimesOut, LandsLate }
+
+    public HungWriteEnding? HangNextPumpStatusWrite { get; set; }
+
+    private readonly TaskCompletionSource _hungPumpStatusWriteReleased = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private readonly TaskCompletionSource _hungPumpStatusWriteLanded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public void ReleaseHungPumpStatusWrite() => _hungPumpStatusWriteReleased.TrySetResult();
+
+    public Task HungPumpStatusWriteLanded => _hungPumpStatusWriteLanded.Task;
 
     /// <summary>Claims from this Queue throw — the targeted fail-stop trigger.</summary>
     public string? PoisonedQueue { get; set; }
@@ -594,4 +625,37 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
     public ValueTask<IReadOnlyList<ObserverDeadLetterRecord>> ListObserverDeadLettersAsync(
         string observerId, CancellationToken cancellationToken = default)
         => inner.ListObserverDeadLettersAsync(observerId, cancellationToken);
+
+    public async ValueTask WritePumpStatusesAsync(
+        IReadOnlyList<PumpStatus> statuses, DateTimeOffset reapBefore, int maxReap, CancellationToken cancellationToken = default)
+    {
+        _pumpStatusWrites.Enqueue(statuses);
+        if (FailPumpStatusWrites)
+        {
+            throw new InvalidOperationException("forced Pump Status write fault");
+        }
+        if (HangNextPumpStatusWrite is { } ending)
+        {
+            HangNextPumpStatusWrite = null;
+            await _hungPumpStatusWriteReleased.Task.ConfigureAwait(false);
+            if (ending == HungWriteEnding.TimesOut)
+            {
+                throw new TimeoutException("forced connect timeout");
+            }
+            await inner.WritePumpStatusesAsync(statuses, reapBefore, maxReap, CancellationToken.None).ConfigureAwait(false);
+            Interlocked.Increment(ref _landedPumpStatusWrites);
+            _hungPumpStatusWriteLanded.TrySetResult();
+            return;
+        }
+        if (PumpStatusWritesFaultOnCancellation)
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            throw new InvalidOperationException("Operation cancelled by user.");
+        }
+        await inner.WritePumpStatusesAsync(statuses, reapBefore, maxReap, cancellationToken).ConfigureAwait(false);
+        Interlocked.Increment(ref _landedPumpStatusWrites);
+    }
+
+    public ValueTask<IReadOnlyList<PumpStatus>> ListPumpStatusesAsync(CancellationToken cancellationToken = default)
+        => inner.ListPumpStatusesAsync(cancellationToken);
 }

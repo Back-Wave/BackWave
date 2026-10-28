@@ -3506,6 +3506,110 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         return records;
     }
 
+    // ── §5.14 Pump Status ───────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public async ValueTask WritePumpStatusesAsync(
+        IReadOnlyList<PumpStatus> statuses, DateTimeOffset reapBefore, int maxReap,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        var ids = new string[statuses.Count];
+        var groups = new string[statuses.Count];
+        var states = new int[statuses.Count];
+        var faultTypes = new string?[statuses.Count];
+        var triggers = new string?[statuses.Count];
+        var reportedAts = new DateTimeOffset[statuses.Count];
+        var intervals = new int[statuses.Count];
+        for (var i = 0; i < statuses.Count; i++)
+        {
+            ids[i] = statuses[i].WorkerId;
+            groups[i] = statuses[i].WorkerGroup;
+            states[i] = (int)statuses[i].State;
+            faultTypes[i] = statuses[i].FaultType;
+            triggers[i] = statuses[i].Trigger?.ToString();
+            reportedAts[i] = statuses[i].ReportedAt.ToUniversalTime();
+            intervals[i] = (int)statuses[i].ReportInterval.TotalMilliseconds;
+        }
+
+        // timestamptz keeps whole microseconds and Npgsql truncates the rest, so a cutoff between two
+        // microseconds would spare a row written in the microsecond below it. Every stored instant is
+        // whole, so rounding the cutoff up keeps "strictly before" exact.
+        var reapCutoff = reapBefore.ToUniversalTime();
+        reapCutoff = reapCutoff.AddTicks(
+            (TimeSpan.TicksPerMicrosecond - reapCutoff.Ticks % TimeSpan.TicksPerMicrosecond) % TimeSpan.TicksPerMicrosecond);
+
+        // One command, so the upsert and the reap share one round trip. SKIP LOCKED leaves a row another
+        // process is refreshing right now to that process instead of waiting on it.
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = Cmd(
+            """
+            INSERT INTO backwave.pumps
+                (worker_id, worker_group, state, fault_type, invariant_trigger, reported_at, report_interval_ms)
+            SELECT * FROM unnest(@ids::text[], @groups::text[], @states::int[], @faultTypes::text[],
+                                 @triggers::text[], @reportedAts::timestamptz[], @intervals::int[])
+            ON CONFLICT (worker_id) DO UPDATE
+            SET worker_group = EXCLUDED.worker_group, state = EXCLUDED.state, fault_type = EXCLUDED.fault_type,
+                invariant_trigger = EXCLUDED.invariant_trigger, reported_at = EXCLUDED.reported_at,
+                report_interval_ms = EXCLUDED.report_interval_ms
+            WHERE backwave.pumps.reported_at <= EXCLUDED.reported_at;
+            DELETE FROM backwave.pumps
+            WHERE worker_id IN (
+                SELECT worker_id FROM backwave.pumps
+                WHERE reported_at < @reapBefore
+                ORDER BY reported_at
+                LIMIT @maxReap
+                FOR UPDATE SKIP LOCKED)
+            """,
+            connection);
+        command.Parameters.AddWithValue("ids", ids);
+        command.Parameters.AddWithValue("groups", groups);
+        command.Parameters.AddWithValue("states", states);
+        command.Parameters.AddWithValue("faultTypes", faultTypes);
+        command.Parameters.AddWithValue("triggers", triggers);
+        command.Parameters.AddWithValue("reportedAts", reportedAts);
+        command.Parameters.AddWithValue("intervals", intervals);
+        command.Parameters.AddWithValue("reapBefore", reapCutoff);
+        command.Parameters.AddWithValue("maxReap", maxReap);
+        await command.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async ValueTask<IReadOnlyList<PumpStatus>> ListPumpStatusesAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = Cmd(
+            """
+            SELECT worker_id, worker_group, state, fault_type, invariant_trigger, reported_at, report_interval_ms
+            FROM backwave.pumps
+            """,
+            connection);
+
+        var statuses = new List<PumpStatus>();
+        await using var reader = await command.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var storedState = reader.GetInt32(2);
+            var storedTrigger = reader.IsDBNull(4) ? null : reader.GetString(4);
+            statuses.Add(new PumpStatus
+            {
+                WorkerId = reader.GetString(0),
+                WorkerGroup = reader.GetString(1),
+                State = Enum.IsDefined((PumpState)storedState) ? (PumpState)storedState : PumpState.Unknown,
+                FaultType = reader.IsDBNull(3) ? null : reader.GetString(3),
+                Trigger = storedTrigger is not null && Enum.IsDefined(typeof(InvariantTrigger), storedTrigger)
+                    ? Enum.Parse<InvariantTrigger>(storedTrigger)
+                    : null,
+                ReportedAt = reader.GetFieldValue<DateTimeOffset>(5),
+                ReportInterval = TimeSpan.FromMilliseconds(reader.GetInt32(6)),
+            });
+        }
+        return statuses;
+    }
+
     // ── §8 Wake-Up Hints ────────────────────────────────────────────────────────
 
     /// <inheritdoc/>

@@ -1,0 +1,118 @@
+@using System.Net
+@* Pumps: the last status each Pump's own process wrote, one row per Worker Group per process,
+   read from the store via the Monitor API, so it covers every node. Stale and Stopped are this
+   page's verdict against the render instant, not states a process writes. The Fault cell names
+   the exception type or the broken invariant, never the exception message. *@
+<DashboardLayout BasePath="@BasePath" Title="Pumps" Active="pumps" ContentOnly="@ContentOnly" Live="@Live">
+    <div class="screen" data-screen-label="Pumps">
+        <header class="screen__head">
+            <div>
+                <h1 style="font:var(--type-display);letter-spacing:var(--tracking-tight);">Pumps</h1>
+            </div>
+        </header>
+
+        <div class="bw-card">
+            @if (Items.Count == 0)
+            {
+                <p class="ptable__empty">
+                    No Pump has reported. Each node writes the status of its Worker Group Pumps every 30 seconds.
+                    Nodes that run an older BackWave version write no status, so their Pumps do not appear here.
+                </p>
+            }
+            else
+            {
+                <div class="ptable-scroll">
+                <table class="ptable">
+                    <thead>
+                        <tr>
+                            <th>Pump</th>
+                            <th>State</th>
+                            <th>Fault</th>
+                            <th>Last report</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var pump in Items)
+                        {
+                            var (tone, label) = Badge(pump);
+                            <tr>
+                                <td class="mono wrap-anywhere wrap-anywhere--narrow" data-label="Pump">
+                                    <div>@pump.WorkerGroup</div>
+                                    <div style="color:var(--text-secondary);">@pump.WorkerId</div>
+                                </td>
+                                <td data-label="State">
+                                    <span class="bw-badge bw-badge--@tone"><span class="bw-badge__dot"></span>@label</span>
+                                    @if (pump.IsStaleAt(Now))
+                                    {
+                                        <div style="color:var(--text-secondary);">last @pump.State</div>
+                                    }
+                                </td>
+                                <td class="mono wrap-anywhere wrap-anywhere--narrow" data-label="Fault">@BreakAfterDots(Fault(pump))</td>
+                                <td class="mono" data-label="Last report">
+                                    <div>@DashboardGlossary.Instant(pump.ReportedAt)</div>
+                                    <div style="color:var(--text-secondary);">@Age(pump.ReportedAt)</div>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                </div>
+            }
+        </div>
+    </div>
+</DashboardLayout>
+
+@code {
+    [Parameter, EditorRequired] public string BasePath { get; set; } = "";
+
+    /// <summary>The status rows the Pumps' processes last wrote, one per Pump.</summary>
+    [Parameter, EditorRequired] public IReadOnlyList<PumpStatus> Items { get; set; } = [];
+
+    /// <summary>The render instant the Stale and Stopped verdicts and the age are measured against (passed in so the view stays pure).</summary>
+    [Parameter, EditorRequired] public DateTimeOffset Now { get; set; }
+
+    /// <summary>Render only the live region (SSE fragment) rather than the full document.</summary>
+    [Parameter] public bool ContentOnly { get; set; }
+
+    /// <summary>Wrap in the #bw-live region and inline the SSE client.</summary>
+    [Parameter] public bool Live { get; set; }
+
+    private (string Tone, string Label) Badge(PumpStatus pump)
+    {
+        if (pump.IsStoppedAt(Now))
+        {
+            return ("navy", "Stopped");
+        }
+        if (pump.IsStaleAt(Now))
+        {
+            return ("red", "Stale");
+        }
+        return pump.State switch
+        {
+            PumpState.Running => ("green", "Running"),
+            PumpState.Degraded => ("amber", "Degraded"),
+            PumpState.Stopping => ("amber", "Stopping"),
+            PumpState.Halted => ("red", "Halted"),
+            _ => ("navy", pump.State.ToString()),
+        };
+    }
+
+    private static string Fault(PumpStatus pump) => (pump.FaultType, pump.Trigger) switch
+    {
+        (null, null) => "-",
+        ({ } type, null) => type,
+        (null, { } trigger) => trigger.ToString(),
+        ({ } type, { } trigger) => $"{type} ({trigger})",
+    };
+
+    private static MarkupString BreakAfterDots(string text) =>
+        new(string.Join(".<wbr>", text.Split('.').Select(WebUtility.HtmlEncode)));
+
+    private string Age(DateTimeOffset reportedAt)
+    {
+        var age = Now - reportedAt;
+        return age <= TimeSpan.Zero
+            ? "just now"
+            : $"{(int)age.TotalMinutes}m {age.Seconds:D2}s ago";
+    }
+}

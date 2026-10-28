@@ -161,6 +161,33 @@ public sealed class SqlServerAdapterTests
     }
 
     [Fact]
+    public async Task APumpStatusANewerVersionWrote_IsListedWithAnUnknownStateAndNoTrigger()
+    {
+        var store = await SqlServerTestDatabase.CreateFreshStoreAsync();
+        await using var connection = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await connection.OpenAsync();
+        await using (var insert = new SqlCommand(
+            """
+            INSERT INTO backwave.pumps
+                (worker_id, worker_group, state, fault_type, invariant_trigger, reported_at, report_interval_ms)
+            VALUES (N'newer-host:g:1', N'g', 99, NULL, N'TriggerFromTheFuture', @at, 30000)
+            """,
+            connection))
+        {
+            insert.Parameters.AddWithValue("at", T0);
+            await insert.ExecuteNonQueryAsync();
+        }
+
+        var status = Assert.Single(await store.ListPumpStatusesAsync());
+
+        Assert.Equal("newer-host:g:1", status.WorkerId);
+        Assert.Equal(PumpState.Unknown, status.State);
+        Assert.Null(status.Trigger);
+        Assert.Equal(T0, status.ReportedAt);
+        Assert.Equal(TimeSpan.FromSeconds(30), status.ReportInterval);
+    }
+
+    [Fact]
     public async Task AutoMigrate_IsOptIn_AndExecutesTheCanonicalScripts()
     {
         _ = await SqlServerTestDatabase.CreateFreshStoreAsync(); // ensure the database exists

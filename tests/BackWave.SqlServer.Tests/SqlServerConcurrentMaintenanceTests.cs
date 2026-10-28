@@ -496,6 +496,53 @@ public sealed class SqlServerConcurrentMaintenanceTests
             "SELECT count(*) FROM backwave.job_transitions WHERE job_id = @id AND state = 2", firstJob))!);
     }
 
+    // Each round dates every row from the round before past the cutoff, so each reap goes after the rows
+    // of a peer that is rewriting them at the same instant: the writer holds its rows in worker id order,
+    // the reap walks them in reported_at order. The write has no deadlock retry, so a loss reaches the
+    // caller.
+    [Fact]
+    public async Task Concurrent_pump_status_writes_and_reaps_never_deadlock()
+    {
+        const int Rounds = 200, PumpsPerWriter = 8, Reapers = 2;
+        var store = await SqlServerTestDatabase.CreateFreshStoreAsync();
+        string[] writers = ["node-a", "node-b"];
+        var escaped = 0;
+
+        for (var round = 0; round < Rounds; round++)
+        {
+            var now = T0 + TimeSpan.FromMinutes(round);
+            var writes = writers.Select(node => Task.Run(() => WriteOrLose(
+                [.. Enumerable.Range(0, PumpsPerWriter).Select(p => new PumpStatus
+                {
+                    WorkerId = $"{node}:group-{p}",
+                    WorkerGroup = $"group-{p}",
+                    State = PumpState.Running,
+                    ReportedAt = now,
+                    ReportInterval = TimeSpan.FromSeconds(30),
+                })])));
+            var reaps = Enumerable.Range(0, Reapers).Select(_ => Task.Run(() => WriteOrLose([])));
+            escaped += (await Task.WhenAll(writes.Concat(reaps))).Sum();
+
+            async Task<int> WriteOrLose(PumpStatus[] statuses)
+            {
+                try
+                {
+                    await store.WritePumpStatusesAsync(statuses, reapBefore: now, maxReap: 100);
+                    return 0;
+                }
+                catch (SqlException e) when (e.Number == 1205)
+                {
+                    return 1;
+                }
+            }
+        }
+
+        Assert.Equal(0, escaped);
+        var listed = await store.ListPumpStatusesAsync();
+        Assert.Equal(writers.Length * PumpsPerWriter, listed.Count);
+        Assert.All(listed, status => Assert.Equal(T0 + TimeSpan.FromMinutes(Rounds - 1), status.ReportedAt));
+    }
+
     // ── harness ─────────────────────────────────────────────────────────────────
 
     // One statement on the rival session. The Task comes back so a caller can issue a statement WITHOUT

@@ -43,7 +43,8 @@ public sealed class SqlServerCustomSchemaTests
                 $"DELETE FROM {Schema}.job_tags; DELETE FROM {Schema}.jobs; DELETE FROM {Schema}.workflows; " +
                 $"DELETE FROM {Schema}.schedules; DELETE FROM {Schema}.queue_limits; " +
                 $"DELETE FROM {Schema}.operator_audit; DELETE FROM {Schema}.observers; " +
-                $"DELETE FROM {Schema}.observer_deliveries; DELETE FROM {Schema}.observer_dead_letters;",
+                $"DELETE FROM {Schema}.observer_deliveries; DELETE FROM {Schema}.observer_dead_letters; " +
+                $"DELETE FROM {Schema}.pumps;",
                 connection);
             await wipe.ExecuteNonQueryAsync();
         }
@@ -121,6 +122,29 @@ public sealed class SqlServerCustomSchemaTests
         {
             Assert.Equal(1, (int)(await rows.ExecuteScalarAsync())!);
         }
+    }
+
+    [Fact]
+    public async Task PumpStatuses_UnderCustomSchema_AreWrittenReapedAndListed()
+    {
+        var store = await FreshCustomSchemaStoreAsync();
+        PumpStatus Pump(string workerId, DateTimeOffset at) => new()
+        {
+            WorkerId = workerId,
+            WorkerGroup = "g",
+            State = PumpState.Running,
+            ReportedAt = at,
+            ReportInterval = TimeSpan.FromSeconds(30),
+        };
+        await store.WritePumpStatusesAsync([Pump("old", T0)], reapBefore: T0, maxReap: 100);
+        await store.WritePumpStatusesAsync([Pump("new", T0.AddHours(1))], reapBefore: T0.AddMinutes(1), maxReap: 100);
+
+        Assert.Equal("new", Assert.Single(await store.ListPumpStatusesAsync()).WorkerId);
+
+        await using var connection = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await connection.OpenAsync();
+        await using var rows = new SqlCommand($"SELECT count(*) FROM {Schema}.pumps", connection);
+        Assert.Equal(1, (int)(await rows.ExecuteScalarAsync())!);
     }
 
     [Theory]

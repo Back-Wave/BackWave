@@ -49,10 +49,10 @@ public sealed class SchemaGateTests
     public void Sqlite_ShipsOneIncrementalStepPerVersion_InVersionOrder()
     {
         // SQLite's real vN-1 -> vN steps since its schema was consolidated into v1: 0002 adds the
-        // transition-position high-water mark, 0003 adds the retry cause and 0004 adds the audit
-        // detail. The script count is the version the adapter requires and the last step stamps that
-        // same version, so the two cannot drift apart unnoticed; the gate above polices each step's DDL
-        // like any other adapter's.
+        // transition-position high-water mark, 0003 adds the retry cause, 0004 adds the audit detail
+        // and 0005 adds the Pump status table. The script count is the version the adapter requires
+        // and the last step stamps that same version, so the two cannot drift apart unnoticed; the gate
+        // above polices each step's DDL like any other adapter's.
         var scripts = SchemaScripts.Load(typeof(SqliteMigrator).Assembly);
         Assert.Equal(SqliteMigrator.ExpectedSchemaVersion, scripts.Count);
 
@@ -65,12 +65,17 @@ public sealed class SchemaGateTests
         Assert.EndsWith("0003_retry_cause.sql", retryCause.ResourceName, StringComparison.Ordinal);
         Assert.Contains("ADD COLUMN retry_cause INTEGER NULL", retryCause.Sql, StringComparison.Ordinal);
 
-        var auditDetail = scripts[^1];
+        var auditDetail = scripts[3];
         Assert.EndsWith("0004_audit_detail.sql", auditDetail.ResourceName, StringComparison.Ordinal);
         Assert.Contains("ADD COLUMN detail TEXT NULL", auditDetail.Sql, StringComparison.Ordinal);
+        Assert.Contains("UPDATE backwave_schema_version SET version = 4;", auditDetail.Sql, StringComparison.Ordinal);
+
+        var pumpStatus = scripts[^1];
+        Assert.EndsWith("0005_pump_status.sql", pumpStatus.ResourceName, StringComparison.Ordinal);
+        Assert.Contains("CREATE TABLE IF NOT EXISTS backwave_pumps", pumpStatus.Sql, StringComparison.Ordinal);
         Assert.Contains(
             $"UPDATE backwave_schema_version SET version = {SqliteMigrator.ExpectedSchemaVersion};",
-            auditDetail.Sql, StringComparison.Ordinal);
+            pumpStatus.Sql, StringComparison.Ordinal);
     }
 
     // ---- Sabotage self-tests: prove the gate turns RED on a synthetic non-additive migration. ----

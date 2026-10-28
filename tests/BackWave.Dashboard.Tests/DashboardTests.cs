@@ -373,6 +373,7 @@ public class DashboardTests
                      [
                          ("/backwave/jobs", "Jobs", "jobs", false),
                          ($"/backwave/jobs/{job.JobId}", "Job", "jobs", false),
+                         ("/backwave/pumps", "Pumps", "pumps", true),
                          ("/backwave/failures", "Failures", "failures", true),
                          ("/backwave/schedules", "Recurring Schedules", "schedules", true),
                          ("/backwave/schedules/nightly-sync", "Schedule", "schedules", false),
@@ -1323,6 +1324,180 @@ public class DashboardTests
         }
     }
 
+    private static readonly TimeSpan PumpReportInterval = TimeSpan.FromSeconds(30);
+
+    private static PumpStatus Pump(
+        string workerId, PumpState state, DateTimeOffset reportedAt, string workerGroup = "default",
+        string? faultType = null, InvariantTrigger? trigger = null) => new()
+    {
+        WorkerId = workerId,
+        WorkerGroup = workerGroup,
+        State = state,
+        FaultType = faultType,
+        Trigger = trigger,
+        ReportedAt = reportedAt,
+        ReportInterval = PumpReportInterval,
+    };
+
+    private static ValueTask WritePumpsAsync(InMemoryJobStore store, params PumpStatus[] pumps) =>
+        store.WritePumpStatusesAsync(pumps, reapBefore: DateTimeOffset.MinValue, maxReap: 100);
+
+    private static string PumpRow(string html, string workerId)
+    {
+        var row = Regex.Match(html, $"<tr>(?:(?!</tr>).)*>{Regex.Escape(workerId)}<(?:(?!</tr>).)*</tr>", RegexOptions.Singleline);
+        Assert.True(row.Success, $"no row for Pump {workerId}");
+        return row.Value;
+    }
+
+    private static void AssertBadge(string row, string tone, string label) =>
+        Assert.Contains($"<span class=\"bw-badge bw-badge--{tone}\"><span class=\"bw-badge__dot\"></span>{label}</span>", row);
+
+    [Fact]
+    public async Task Pumps_NoPumpHasReported_RendersTheEmptyState()
+    {
+        var (app, _, http) = await StartAsync();
+        await using (app)
+        {
+            var response = await http.GetAsync("/backwave/pumps");
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var html = await response.Content.ReadAsStringAsync();
+            Assert.Contains("data-screen-label=\"Pumps\"", html);
+            Assert.Contains("bw-sidenav__item--active", html);
+            Assert.Contains("No Pump has reported.", html);
+            Assert.Contains("Nodes that run an older BackWave version write no status", html);
+            Assert.DoesNotContain("<table class=\"ptable\">", html);
+        }
+    }
+
+    [Fact]
+    public async Task Pumps_ShowsOneRowPerPump_WithItsGroupFaultAndLastReport()
+    {
+        var (app, store, http) = await StartAsync();
+        await using (app)
+        {
+            var reportedAt = DateTimeOffset.UtcNow;
+            await WritePumpsAsync(store,
+                Pump("node-a:billing:1", PumpState.Halted, reportedAt, "billing",
+                    "BackWave.InvariantViolationException", InvariantTrigger.ClaimedJobTerminal),
+                Pump("node-a:default:1", PumpState.Degraded, reportedAt, faultType: "System.TimeoutException"),
+                Pump("node-b:default:1", PumpState.Running, reportedAt));
+
+            var html = await http.GetStringAsync("/backwave/pumps");
+
+            var halted = PumpRow(html, "node-a:billing:1");
+            Assert.Matches(@"data-label=""Pump"">\s*<div>billing</div>\s*<div[^>]*>node-a:billing:1</div>", halted);
+            Assert.Contains("data-label=\"Fault\">BackWave.<wbr>InvariantViolationException (ClaimedJobTerminal)</td>", halted);
+            Assert.Contains(DashboardGlossary.Instant(reportedAt), halted);
+            Assert.Contains("System.<wbr>TimeoutException", PumpRow(html, "node-a:default:1"));
+            Assert.Contains("data-label=\"Fault\">-</td>", PumpRow(html, "node-b:default:1"));
+
+            var billing = html.IndexOf("node-a:billing:1", StringComparison.Ordinal);
+            var defaultA = html.IndexOf("node-a:default:1", StringComparison.Ordinal);
+            var defaultB = html.IndexOf("node-b:default:1", StringComparison.Ordinal);
+            Assert.True(billing < defaultA && defaultA < defaultB, "rows are ordered by Worker Group, then worker id");
+        }
+    }
+
+    [Fact]
+    public async Task Pumps_AFaultTypeWithMarkup_RendersEncodedWithItsBreakPoints()
+    {
+        var (app, store, http) = await StartAsync();
+        await using (app)
+        {
+            await WritePumpsAsync(store,
+                Pump("node-a:default:1", PumpState.Halted, DateTimeOffset.UtcNow, faultType: "Evil.<script>alert(1)</script>&x"));
+
+            var html = await http.GetStringAsync("/backwave/pumps");
+
+            Assert.Contains(
+                "data-label=\"Fault\">Evil.<wbr>&lt;script&gt;alert(1)&lt;/script&gt;&amp;x</td>",
+                PumpRow(html, "node-a:default:1"));
+            Assert.DoesNotContain("<script>alert(1)", html);
+        }
+    }
+
+    [Theory]
+    [InlineData(PumpState.Running, "green", "Running")]
+    [InlineData(PumpState.Degraded, "amber", "Degraded")]
+    [InlineData(PumpState.Stopping, "amber", "Stopping")]
+    [InlineData(PumpState.Halted, "red", "Halted")]
+    [InlineData(PumpState.Stopped, "navy", "Stopped")]
+    [InlineData(PumpState.Unknown, "navy", "Unknown")]
+    public async Task Pumps_AFreshRow_ShowsItsWrittenState(PumpState state, string tone, string label)
+    {
+        var (app, store, http) = await StartAsync();
+        await using (app)
+        {
+            await WritePumpsAsync(store, Pump("node-a:default:1", state, DateTimeOffset.UtcNow));
+
+            var html = await http.GetStringAsync("/backwave/pumps");
+
+            AssertBadge(PumpRow(html, "node-a:default:1"), tone, label);
+        }
+    }
+
+    [Theory]
+    [InlineData(PumpState.Running, "red", "Stale", "last Running")]
+    [InlineData(PumpState.Degraded, "red", "Stale", "last Degraded")]
+    [InlineData(PumpState.Halted, "red", "Stale", "last Halted")]
+    [InlineData(PumpState.Unknown, "red", "Stale", "last Unknown")]
+    [InlineData(PumpState.Stopping, "navy", "Stopped", null)]
+    [InlineData(PumpState.Stopped, "navy", "Stopped", null)]
+    public async Task Pumps_AQuietRow_ReadsAsStale_UnlessItWasStopping(PumpState state, string tone, string label, string? lastState)
+    {
+        var (app, store, http) = await StartAsync();
+        await using (app)
+        {
+            await WritePumpsAsync(store, Pump("node-a:default:1", state, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(10)));
+
+            var html = await http.GetStringAsync("/backwave/pumps");
+
+            var row = PumpRow(html, "node-a:default:1");
+            AssertBadge(row, tone, label);
+            if (lastState is null)
+            {
+                Assert.DoesNotContain(">last ", row);
+            }
+            else
+            {
+                Assert.Contains($">{lastState}</div>", row);
+            }
+            Assert.Matches(@">10m \d{2}s ago<", row);
+        }
+    }
+
+    [Fact]
+    public async Task Pumps_AHaltedPumpThatStoppedWithItsProcess_ReadsStoppedWithItsFault()
+    {
+        var (app, store, http) = await StartAsync();
+        await using (app)
+        {
+            await WritePumpsAsync(store, Pump("node-a:default:1", PumpState.Stopped, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(10),
+                faultType: "BackWave.InvariantViolationException", trigger: InvariantTrigger.ClaimedJobTerminal));
+
+            var html = await http.GetStringAsync("/backwave/pumps");
+
+            var row = PumpRow(html, "node-a:default:1");
+            AssertBadge(row, "navy", "Stopped");
+            Assert.Contains("data-label=\"Fault\">BackWave.<wbr>InvariantViolationException (ClaimedJobTerminal)</td>", row);
+        }
+    }
+
+    [Fact]
+    public async Task Pumps_NavEntry_SitsRightAfterExecutingNow()
+    {
+        var (app, _, http) = await StartAsync();
+        await using (app)
+        {
+            var html = await http.GetStringAsync("/backwave/");
+            var executing = html.IndexOf("href=\"/backwave/executing\"", StringComparison.Ordinal);
+            var pumps = html.IndexOf("href=\"/backwave/pumps\"", StringComparison.Ordinal);
+            var jobs = html.IndexOf("href=\"/backwave/jobs\"", StringComparison.Ordinal);
+            Assert.True(executing >= 0 && pumps >= 0 && jobs >= 0);
+            Assert.True(executing < pumps && pumps < jobs, "the Pumps nav entry sits between Executing now and Jobs");
+        }
+    }
+
     [Fact]
     public async Task Queues_ShowPausedDistinctly_AndInUseAgainstTheConcurrencyLimit()
     {
@@ -2191,6 +2366,20 @@ public class DashboardTests
             await store.ClaimAsync(new ClaimRequest("worker-7", ["billing"], 32, Lease, T0));
 
             var html = await http.GetStringAsync("/backwave/executing");
+            AssertEveryDataGridCellIsLabeled(html);
+        }
+    }
+
+    [Fact]
+    public async Task PumpsTable_EveryDataCell_CarriesANonEmptyDataLabel()
+    {
+        var (app, store, http) = await StartAsync();
+        await using (app)
+        {
+            await WritePumpsAsync(store,
+                Pump("node-a:default:1", PumpState.Degraded, DateTimeOffset.UtcNow, faultType: "System.TimeoutException"));
+
+            var html = await http.GetStringAsync("/backwave/pumps");
             AssertEveryDataGridCellIsLabeled(html);
         }
     }

@@ -75,6 +75,10 @@ public sealed class OracleRoundTripBudgetTests
         "EnqueueAsync of one job carrying three tags",
         Statements: 3, LobReads: 0, FetchWindowBytes: 0);
 
+    private static readonly Budget WritePumpStatuses = new(
+        "WritePumpStatusesAsync of 8 statuses",
+        Statements: 2, LobReads: 0, FetchWindowBytes: 0);
+
     // The window a statement selecting the full jobs column set declares: 32 rows (one claim batch) of
     // 140,469 bytes, which is the driver's own size for that row - both LOB columns at the 65,536
     // payload prefetch, plus about 9 KB of scalars. Claim and job list select the same columns, so they
@@ -322,6 +326,31 @@ public sealed class OracleRoundTripBudgetTests
         }
 
         AssertBudget(EnqueueTagged, measured);
+    }
+
+    [Fact]
+    public async Task WritePumpStatuses_costs_one_statement_for_every_status_together()
+    {
+        var store = await OracleTestDatabase.CreateFreshStoreAsync();
+        await store.EnqueueAsync(Job(), T0); // warms the one-time schema check, off the measured path
+        var statuses = Enumerable.Range(0, 8).Select(i => new PumpStatus
+        {
+            WorkerId = $"budget-host:group-{i}:{Guid.NewGuid():N}",
+            WorkerGroup = $"group-{i}",
+            State = PumpState.Running,
+            ReportedAt = T0,
+            ReportInterval = TimeSpan.FromSeconds(30),
+        }).ToList();
+
+        // 1 array-bound MERGE + 1 capped reap DELETE = 2, independent of how many Pumps the process runs.
+        Measured measured;
+        using (var scope = OracleRoundTrips.Observe())
+        {
+            await store.WritePumpStatusesAsync(statuses, T0.AddYears(-1), maxReap: 100);
+            measured = Measured.From(scope);
+        }
+
+        AssertBudget(WritePumpStatuses, measured);
     }
 
     [Fact]
