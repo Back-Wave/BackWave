@@ -306,7 +306,7 @@ public sealed partial class BackWaveGenerator
         return false;
     }
 
-    // IReadOnlySet<T> is missing on purpose: STJ writes it but throws when it reads it back.
+    // IReadOnlySet<T> is missing on purpose: STJ before 11 writes it but throws when it reads it back.
     private static readonly HashSet<string> StjCollectionInterfaces = new(StringComparer.Ordinal)
     {
         "System.Collections.Generic.IEnumerable<T>",
@@ -393,9 +393,14 @@ public sealed partial class BackWaveGenerator
     /// <summary>
     /// True when the attribute's AttributeUsage lets it go on a class or struct, read from the nearest
     /// AttributeUsage in its base chain.
+    /// [JsonIgnore] is never valid on the type: on a type it sets a policy for the properties of the type.
     /// </summary>
     private static bool IsValidOnType(INamedTypeSymbol attributeClass)
     {
+        if (attributeClass.ToDisplayString() == "System.Text.Json.Serialization.JsonIgnoreAttribute")
+        {
+            return false;
+        }
         const int classOrStruct = (int)(AttributeTargets.Class | AttributeTargets.Struct);
         for (var current = attributeClass; current is not null; current = current.BaseType)
         {
