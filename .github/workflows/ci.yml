@@ -20,12 +20,15 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-dotnet@v5
         with:
-          # net10 builds every shipped TFM (net8/net9 via reference packs); the net8 and net9
-          # runtimes are here so the multi-targeted test projects can also execute on those.
+          # net11 builds every shipped TFM (net8/net9/net10 via reference packs); the older runtimes
+          # are here so the multi-targeted test projects can also execute on those. net11 is an RC
+          # until GA, so the preview quality is required to install it.
           dotnet-version: |
             8.0.x
             9.0.x
             10.0.x
+            11.0.x
+          dotnet-quality: preview
       - name: Cache NuGet packages
         uses: actions/cache@v4
         with:
@@ -67,6 +70,8 @@ jobs:
             8.0.x
             9.0.x
             10.0.x
+            11.0.x
+          dotnet-quality: preview
       - name: Cache NuGet packages
         uses: actions/cache@v4
         with:
@@ -102,7 +107,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang zlib1g-dev
-          for tfm in net8.0 net9.0 net10.0; do
+          for tfm in net8.0 net9.0 net10.0 net11.0; do
             dotnet publish tests/BackWave.AotConsumer -c Release -f "$tfm" -o "aot-out/$tfm"
             "aot-out/$tfm/BackWave.AotConsumer"
           done

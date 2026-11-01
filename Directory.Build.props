@@ -5,10 +5,11 @@
          this by setting TargetFrameworks to $(ShipTfms) and clearing TargetFramework — see below. -->
     <TargetFramework>net10.0</TargetFramework>
     <!-- The frameworks every shipped package targets. net10 is current; net8 (LTS) and net9 broaden
-         reach to apps not yet on net10. Kept here as the single source of truth so a future bump edits
-         one line. TimeProvider and Enumerable.Order() are native on all three; only System.Threading.Lock
-         (net9+) needs a guard on net8. -->
-    <ShipTfms>net8.0;net9.0;net10.0</ShipTfms>
+         reach to apps not yet on net10. net11 is in preview: until .NET 11 reaches GA it builds against
+         the net10 Microsoft.Extensions, EF Core, and Pkcs packages. Kept here as the single source of
+         truth so a future bump edits one line. TimeProvider and Enumerable.Order() are native on every
+         target; only System.Threading.Lock (net9+) needs a guard on net8. -->
+    <ShipTfms>net8.0;net9.0;net10.0;net11.0</ShipTfms>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>

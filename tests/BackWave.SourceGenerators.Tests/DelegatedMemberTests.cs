@@ -1472,7 +1472,7 @@ public class DelegatedMemberTests
     /// <summary>
     /// System.Text.Json writes an interface or abstract member with the properties of the declared type only, and
     /// throws when it reads one back. Such a member is BW0004 at build time, wherever it sits in the member type.
-    /// IReadOnlySet is the one collection interface that STJ writes but cannot read back, as
+    /// IReadOnlySet is the one collection interface that STJ writes but cannot read back before STJ 11, as
     /// <see cref="StjReadsAStackBackInReverse_AndCannotReadAReadOnlySetOrABag"/> shows.
     /// </summary>
     [Theory]
@@ -1597,7 +1597,11 @@ public class DelegatedMemberTests
 
         Assert.Equal("2,1|1,2", probe.Call("RoundTripImmutableStack"));
         Assert.Equal("2,1|1,2", probe.Call("RoundTripStack"));
+#if NET11_0_OR_GREATER
+        Assert.Equal("read", probe.Call("ReadSet"));
+#else
         Assert.Equal("NotSupportedException", probe.Call("ReadSet"));
+#endif
         Assert.Equal("NotSupportedException", probe.Call("ReadBag"));
         Assert.Equal("NotSupportedException", probe.Call("ReadSegment"));
     }
