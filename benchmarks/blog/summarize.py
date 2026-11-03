@@ -1,0 +1,80 @@
+"""Summarizes a run-blog.sh results directory into Markdown tables, one per workload.
+
+Each cell is the median across rounds of each round's single measured run, with the min and max across
+rounds. A paced cell that delivered less than 98% of its offered rate is marked as not carried, because
+its latency then measures a backlog and not the system at that load.
+"""
+
+import json
+import statistics
+import sys
+from pathlib import Path
+
+PACED_FLOOR = 0.98
+SYSTEMS = {
+    "postgres": "BackWave",
+    "hangfire-postgres": "Hangfire",
+    "quartz-postgres": "Quartz.NET",
+    "tickerq-postgres": "TickerQ",
+    "jobmaster-postgres": "JobMaster",
+}
+WORKLOADS = ["drain-noop", "drain-10ms", "max-sustained", "paced-50", "paced-500"]
+
+
+def load_cells(root: Path) -> dict[tuple[str, str], list[dict]]:
+    cells: dict[tuple[str, str], list[dict]] = {}
+    for path in sorted(root.glob("round-*/*/*.json")):
+        result = json.loads(path.read_text())
+        result["_idle"] = float(path.with_suffix(".idle-before").read_text())
+        cells.setdefault((path.parent.name, path.stem), []).append(result)
+    return cells
+
+
+def spread(values: list[float], fmt: str) -> str:
+    median = statistics.median(values)
+    if len(values) == 1:
+        return format(median, fmt)
+    return f"{format(median, fmt)} [{format(min(values), fmt)}-{format(max(values), fmt)}]"
+
+
+def row(target: str, runs: list[dict]) -> str:
+    throughput = [r["ThroughputJobsPerSecond"]["Median"] for r in runs]
+    workload = runs[0]["Workload"]
+    offered = workload["SustainedRatePerSecond"]
+    paced = workload["Arrival"] == "Sustained" and offered < 50000
+    carried = [t >= PACED_FLOOR * offered for t in throughput] if paced else []
+    status = ""
+    if paced and not all(carried):
+        status = f" (not carried in {carried.count(False)} of {len(carried)} rounds)"
+    return (
+        f"| {SYSTEMS.get(target, target)}{status} | {spread(throughput, ',.0f')} "
+        f"| {spread([r['EndToEndP50Ms']['Median'] for r in runs], ',.1f')} "
+        f"| {spread([r['EndToEndP99Ms']['Median'] for r in runs], ',.1f')} "
+        f"| {spread([r['EnqueueP50Ms']['Median'] for r in runs], ',.2f')} "
+        f"| {max(r['Resources']['PeakConnections'] for r in runs)} "
+        f"| {spread([r['Resources']['CpuPercent'] for r in runs], ',.1f')} "
+        f"| {workload['JobCount']:,} | {len(runs)} | {min(r['_idle'] for r in runs):.0f} |"
+    )
+
+
+def main() -> None:
+    root = Path(sys.argv[1])
+    cells = load_cells(root)
+    first = next(iter(cells.values()))[0]["Manifest"]
+    print(f"Local mode, indicative only. {first['Os']}, {first['ProcessArchitecture']}, "
+          f"{first['ProcessorCount']} cores, {first['DotnetVersion']}, PostgreSQL {first['DbVersion']}.\n")
+    for workload in WORKLOADS:
+        targets = [t for t in SYSTEMS if (workload, t) in cells]
+        if not targets:
+            continue
+        print(f"## {workload}\n")
+        print("| System | Throughput (jobs/s) | e2e p50 (ms) | e2e p99 (ms) | enqueue p50 (ms) "
+              "| Peak DB conns | CPU % | Jobs | Rounds | Min idle % before |")
+        print("|---|---|---|---|---|---|---|---|---|---|")
+        for target in targets:
+            print(row(target, cells[(workload, target)]))
+        print()
+
+
+if __name__ == "__main__":
+    main()
