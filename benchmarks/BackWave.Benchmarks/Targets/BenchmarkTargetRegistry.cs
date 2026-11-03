@@ -58,9 +58,14 @@ public static class BenchmarkTargetRegistry
             JobMasterPostgresTarget.ConnectionStringEnvVar,
             DatabaseDriver.Postgres,
             static () => new JobMasterPostgresTarget()),
+        "tickerq-postgres" or "tickerq-pg" => new BenchmarkTargetDescriptor(
+            "tickerq-postgres",
+            TickerQPostgresTarget.ConnectionStringEnvVar,
+            DatabaseDriver.Postgres,
+            static () => new TickerQPostgresTarget()),
         _ => throw new ArgumentException(
             $"Unknown target '{target}'. Expected 'postgres', 'sqlserver', 'oracle', " +
-            "'hangfire-postgres', 'hangfire-sqlserver', or 'jobmaster-postgres'."),
+            "'hangfire-postgres', 'hangfire-sqlserver', 'jobmaster-postgres', or 'tickerq-postgres'."),
     };
 
     /// <summary>Resolves a <c>--target</c> name to its target, or throws for a name nothing serves.</summary>

@@ -48,6 +48,8 @@
          to ours so JobMasterPostgresTarget can spawn it as a fresh child process per run. -->
     <ProjectReference Include="..\BackWave.Benchmarks.JobMasterHost\BackWave.Benchmarks.JobMasterHost.csproj"
                       ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\BackWave.Benchmarks.TickerQHost\BackWave.Benchmarks.TickerQHost.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
   <Target Name="StageJobMasterHost" AfterTargets="Build">
@@ -60,6 +62,19 @@
     </ItemGroup>
     <Copy SourceFiles="@(JobMasterHostFiles)"
           DestinationFiles="@(JobMasterHostFiles->'$(OutDir)jobmaster-host\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="StageTickerQHost" AfterTargets="Build">
+    <MSBuild Projects="..\BackWave.Benchmarks.TickerQHost\BackWave.Benchmarks.TickerQHost.csproj"
+             Targets="GetTargetPath" Properties="Configuration=$(Configuration)">
+      <Output TaskParameter="TargetOutputs" PropertyName="TickerQHostTargetPath" />
+    </MSBuild>
+    <ItemGroup>
+      <TickerQHostFiles Include="$([System.IO.Path]::GetDirectoryName($(TickerQHostTargetPath)))\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(TickerQHostFiles)"
+          DestinationFiles="@(TickerQHostFiles->'$(OutDir)tickerq-host\%(RecursiveDir)%(Filename)%(Extension)')"
           SkipUnchangedFiles="true" />
   </Target>
 

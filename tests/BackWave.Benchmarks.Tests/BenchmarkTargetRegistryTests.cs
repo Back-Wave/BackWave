@@ -24,6 +24,8 @@ public sealed class BenchmarkTargetRegistryTests
         { "hangfire-mssql", typeof(HangfireSqlServerTarget) },
         { "jobmaster-postgres", typeof(JobMasterPostgresTarget) },
         { "jobmaster-pg", typeof(JobMasterPostgresTarget) },
+        { "tickerq-postgres", typeof(TickerQPostgresTarget) },
+        { "tickerq-pg", typeof(TickerQPostgresTarget) },
     };
 
     [Theory]

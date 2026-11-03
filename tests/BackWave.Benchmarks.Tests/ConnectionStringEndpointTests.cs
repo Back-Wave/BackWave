@@ -85,6 +85,7 @@ public sealed class ConnectionStringEndpointTests
             "hangfire-postgres", "hangfire-pg",
             "hangfire-sqlserver", "hangfire-mssql",
             "jobmaster-postgres", "jobmaster-pg",
+            "tickerq-postgres", "tickerq-pg",
         ];
 
         foreach (var name in names)
