@@ -26,6 +26,8 @@ public sealed class BenchmarkTargetRegistryTests
         { "jobmaster-pg", typeof(JobMasterPostgresTarget) },
         { "tickerq-postgres", typeof(TickerQPostgresTarget) },
         { "tickerq-pg", typeof(TickerQPostgresTarget) },
+        { "quartz-postgres", typeof(QuartzPostgresTarget) },
+        { "quartz-pg", typeof(QuartzPostgresTarget) },
     };
 
     [Theory]
