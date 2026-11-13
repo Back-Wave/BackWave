@@ -502,3 +502,6 @@ StrykerOutput/
 
 # Verification skill evidence (verify-backwave)
 .verify-evidence/
+
+# Amp orb portal registrations (machine-specific)
+.amp/portals/*

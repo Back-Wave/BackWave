@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Runs each time an orb starts or wakes. Keep it fast: no installs here (see .agents/setup).
+set -euo pipefail
+
+# Docker is socket-activated (enabled by .agents/setup); make sure the socket is listening so the
+# first docker command starts the daemon. Database containers stay on demand:
+#   docker compose up -d --wait postgres sqlserver oracle
+sudo systemctl start docker.socket

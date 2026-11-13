@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Prepares an Amp orb for BackWave: .NET SDK and runtimes, Docker for the database-backed tests,
+# native AOT prerequisites, the verify-backwave skill's tools, and restored NuGet packages.
+# Runs on a fresh orb and again on a stale snapshot, so every step must be idempotent and cheap
+# when its work is already done. See https://ampcode.com/docs/orbs.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+step() {
+  local name="$1"; shift
+  local start=$SECONDS
+  echo "==> $name"
+  "$@"
+  echo "<== $name ($((SECONDS - start))s)"
+}
+
+# ---------------------------------------------------------------- system packages
+# clang + zlib1g-dev: native AOT publish (tests/BackWave.AotConsumer, as in ci.yml).
+# sqlite3: 'bwv sql' against the verify-backwave SQLite store.
+# docker-compose-plugin: 'docker compose' for docker-compose.yml (the base image has only the engine).
+install_apt_packages() {
+  local wanted=(clang zlib1g-dev sqlite3 docker-compose-plugin) missing=()
+  for pkg in "${wanted[@]}"; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed' || missing+=("$pkg")
+  done
+  if ((${#missing[@]})); then
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}"
+  else
+    echo "all present: ${wanted[*]}"
+  fi
+}
+
+# ---------------------------------------------------------------- .NET
+# Installed into /usr/share/dotnet, the location the dotnet host and app executables search by
+# default on Linux, so every shell and supervised service finds it without DOTNET_ROOT or PATH edits.
+# Mirrors ci.yml: SDK 11 (preview quality until GA) builds every shipped TFM; the 8/9/10 runtimes let
+# the multi-targeted test projects execute on each of them.
+dotnet_dir=/usr/share/dotnet
+install_dotnet() {
+  if [[ ! -w "$dotnet_dir" ]]; then
+    sudo install -d -o "$(id -u)" -g "$(id -g)" "$dotnet_dir"
+  fi
+  local installer
+  installer="$(mktemp)"
+  curl -fsSL --retry 3 https://dot.net/v1/dotnet-install.sh -o "$installer"
+  local common=(--install-dir "$dotnet_dir" --no-path)
+  bash "$installer" "${common[@]}" --channel 11.0 --quality preview
+  for channel in 8.0 9.0 10.0; do
+    bash "$installer" "${common[@]}" --channel "$channel" --runtime dotnet
+    bash "$installer" "${common[@]}" --channel "$channel" --runtime aspnetcore
+  done
+  rm -f "$installer"
+  sudo ln -sfn "$dotnet_dir/dotnet" /usr/local/bin/dotnet
+  dotnet --list-sdks
+  dotnet --list-runtimes
+}
+
+# ---------------------------------------------------------------- Docker
+# Docker is installed in the base image but disabled, and the socket belongs to a group this user
+# is not in. Socket-activate the daemon with the user's group so 'docker' works in every shell
+# without sudo or a new login; dockerd then starts on the first docker command.
+setup_docker() {
+  local dropin=/etc/systemd/system/docker.socket.d/amp-orb-user.conf
+  local want
+  want="$(printf '[Socket]\nSocketGroup=%s\n' "$(id -gn)")"
+  if [[ "$(cat "$dropin" 2>/dev/null)" != "$want" ]]; then
+    sudo install -d /etc/systemd/system/docker.socket.d
+    printf '%s\n' "$want" | sudo tee "$dropin" >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl stop docker.service docker.socket 2>/dev/null || true
+  fi
+  sudo systemctl enable --now docker.socket
+  docker info --format 'docker {{.ServerVersion}} storage={{.Driver}}'
+}
+
+# Pre-pull the images used by docker-compose.yml (DB-backed tests) and by 'bwv launch --store',
+# so tests never wait on a multi-gigabyte download. Pulls of present images are skipped.
+pull_images() {
+  local images
+  images="$(docker compose config --images)"
+  for image in $(sort -u <<<"$images"); do
+    if docker image inspect "$image" >/dev/null 2>&1; then
+      echo "present: $image"
+    else
+      docker pull -q "$image"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------- verify-backwave skill browser driver
+# chrome-devtools-axi runs 'npx chrome-devtools-mcp@latest', which launches Chrome from the stable
+# channel path. The orb ships Chrome for Testing under ~/.agent-browser instead, so link the newest
+# copy there and warm the npx cache so the first 'bwv browser' call does not download it.
+install_chrome_devtools_axi() {
+  if command -v chrome-devtools-axi >/dev/null; then
+    echo "present: $(command -v chrome-devtools-axi)"
+  else
+    sudo npm install -g --no-fund --no-audit chrome-devtools-axi
+  fi
+  local chrome
+  chrome="$(find "$HOME/.agent-browser/browsers" -mindepth 2 -maxdepth 2 -name chrome -type f -perm -u+x 2>/dev/null | sort -V | tail -n 1)"
+  local stable=/opt/google/chrome/chrome
+  if [[ -n "$chrome" && ( -L "$stable" || ! -e "$stable" ) && "$(readlink "$stable")" != "$chrome" ]]; then
+    sudo install -d /opt/google/chrome
+    sudo ln -sfn "$chrome" "$stable"
+  fi
+  echo "chrome: $(readlink -f "$stable" 2>/dev/null || echo missing)"
+  npx -y chrome-devtools-mcp@latest --version
+}
+
+# ---------------------------------------------------------------- NuGet packages and local tools
+restore_dotnet() {
+  export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
+  dotnet tool restore
+  dotnet restore BackWave.slnx
+}
+
+step "apt packages" install_apt_packages
+step ".NET SDK and runtimes" install_dotnet
+step "Docker" setup_docker
+step "Docker images" pull_images
+step "chrome-devtools-axi" install_chrome_devtools_axi
+step "dotnet restore" restore_dotnet
