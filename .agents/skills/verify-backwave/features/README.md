@@ -43,9 +43,10 @@ Keep implementation details out of the map. Name only user paths, stable handles
 ## Features
 
 - [Jobs and job detail](./jobs-and-job-detail.md) covers the Jobs list and its filters, the job detail page (payload, Transition Log, Failure Detail), and Cancel of a scheduled job.
-- [Failures and Requeue](./failures-and-requeue.md) covers the Dead-Lettered and Quarantined tabs, Requeue from the Failures page and from the Jobs list, and the audit row.
+- [Failures and Requeue](./failures-and-requeue.md) covers the Dead-Lettered, Quarantined, and Retrying tabs, Requeue from the Failures page and from the Jobs list, and the audit row.
 - [Queue pause and resume](./queue-pause-resume.md) covers Pause and Resume on the Queues page, the Overview "Paused Queues" count, the stalled claims, and the audit rows.
 - [Workflows](./workflows.md) covers the Workflows list, the member graph of `order-fulfillment`, member inspection, and a failed workflow.
 - [Tag filter](./tag-filter.md) covers the tag pills on jobs, the Label and key-value filters, the combined filter, and the "Top labels" facet.
+- [Pumps](./pumps.md) covers the Pumps page: each Pump's state, fault, and last report time, and the two worker groups the sample runs.
 
 Secondary surfaces have no recipe yet: the Sample HTTP API and Swagger as a surface of their own, the MCP server at `/backwave-mcp`, the `BackWave.Demo` host, Recurring Schedules, Observers, and Executing now. Report them as not verified with this skill.

@@ -37,6 +37,7 @@ Preconditions:
 
 - The list shows the first 8 characters of the job id and `…`. Match the link on that prefix.
 - The `Wire Name` combobox lists every registered job type, also types with no jobs yet.
-- Only the Jobs list rows have the `Cancel` and `Requeue` buttons. The job detail page has no action button.
+- The `State` combobox has a `Retrying` option. It lists jobs between attempts (`Scheduled` with an attempt more than 0). The list then shows `Next Attempt` and `Retry Cause` in place of `Due Time` and `Terminal At`.
+- The Jobs list rows have the `Cancel` and `Requeue` buttons. The job detail page shows a `Cancel` button for a non-terminal job (`Scheduled`, `Leased`, or `AwaitingParent`), but no `Requeue` button. A terminal job has no action button.
 - A Scheduled job with a due time in the past runs at once. Use `seconds=600` so that the job stays Scheduled while you click.
 - The Transition Log lists the newest transition first.
