@@ -18,9 +18,11 @@
          GHSA-2m69-gcr7-jv3q (NU1903) on its bundled SQLite. Microsoft.Data.Sqlite still
          references SQLitePCLRaw.bundle_e_sqlite3 2.1.x transitively (true through at least
          10.0.9), so this direct pin to 3.x is required to clear the audit error.
-         REMOVE this line once Microsoft.Data.Sqlite bumps its bundle to 3.x internally and
-         a vulnerable-package audit stays clean without it. -->
-    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.3" />
+         The pin must also ship SQLite 3.51.3 or later, which fixes the WAL-reset corruption bug
+         (https://sqlite.org/wal.html, section 11). Bundle 3.0.5 ships 3.53.4; 3.0.3 shipped 3.50.4.
+         REMOVE this line once Microsoft.Data.Sqlite bumps its bundle to one that ships 3.51.3 or
+         later internally and a vulnerable-package audit stays clean without it. -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.5" />
   </ItemGroup>
 
   <ItemGroup>
