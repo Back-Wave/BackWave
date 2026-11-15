@@ -1,18 +1,19 @@
 # Failures and Requeue
 
-A job that fails every attempt goes to Dead-Lettered, and a job that the store refuses to run goes to Quarantined. The Failures page lists both, in two tabs. An operator chooses `Requeue` to give a failed job a new attempt. BackWave writes an audit row for the action, and the job runs again.
+A job that fails every attempt goes to Dead-Lettered. A job that the store refuses to run goes to Quarantined. A job that failed one attempt but has attempts left goes back to Scheduled and shows as Retrying. The Failures page lists these in three tabs: Dead-Lettered, Quarantined, and Retrying. An operator chooses `Requeue` to give a failed job a new attempt. BackWave writes an audit row for the action, and the job runs again.
 
 ## Sub-features
 
 - `failures-dead-lettered` lists the Dead-Lettered jobs with their count on the `Dead-Lettered` tab.
 - `failures-quarantined` lists the Quarantined jobs on the `Quarantined` tab.
+- `failures-retrying` lists the Retrying jobs on the `Retrying` tab. A Retrying job is live, so its row has no `Requeue` button.
 - `failures-requeue` requeues one job from its row, and opens the job detail page.
 - `failures-requeue-from-jobs` requeues the same kind of job from its row on the Jobs list.
 - `failures-overview` shows the failed jobs in the Overview "Needs attention" table and the `DEAD-LETTERED` count.
 
 ## How to get to it (user POV)
 
-- Choose `Failures` in the sidebar. `Quarantined` is the second tab, at `/backwave/failures?tab=quarantine`.
+- Choose `Failures` in the sidebar. `Quarantined` is the second tab, at `/backwave/failures?tab=quarantine`. `Retrying` is the third tab, at `/backwave/failures?tab=retrying`.
 - Choose `ALL FAILURES →` on the Overview "Needs attention" table.
 - Choose `Jobs`, then filter `State` to `Dead-Lettered`. Each row has a `Requeue` button.
 
@@ -28,6 +29,8 @@ Preconditions:
 - **Requeue.** Choose `Requeue` in the job's row. Run `bwv browser snapshot | grep -A12 'link "<first 8 chars>'` to find the button uid, then `bwv browser click @<uid>`. The browser lands on `/backwave/jobs/<id>`.
 - **See the new attempts.** Wait for the job to fail again. Run `bwv wait-job <jobId> DeadLettered`, then `bwv browser open /backwave/jobs/<jobId>` and `bwv shot failures-after`. The Transition Log shows `14 RECORDED`, newest first. The first 7 rows end at `Dead-Lettered` attempt 3. Then the requeue adds `Scheduled` attempt 0 and 3 new attempts.
 - **Requeue from Jobs.** Create a second failure and requeue it from the Jobs list. Run `bwv api POST '/jobs/flaky?label=two' flaky-2`, `bwv wait-job <jobId> DeadLettered`, and `bwv browser open '/backwave/jobs?state=Dead-Lettered'`. Click the `Requeue` button in that row. The browser lands on the job detail page.
+- **Populate the Quarantined tab.** Enqueue an unregistered Wire Name. Run `bwv api POST /jobs/quarantine quar`, then `bwv wait-job <jobId> Quarantined`. Open the tab with `bwv browser open '/backwave/failures?tab=quarantine'`, then `bwv shot quarantined`. The `Quarantined` tab count is `1`, and the row shows `ghost-job` and `Quarantined`.
+- **Open the Retrying tab.** Run `bwv browser open '/backwave/failures?tab=retrying'`, then `bwv shot retrying`. The tab shows the jobs that went back to Scheduled between attempts. A `flaky` job stays in this tab for less than a second per retry, so the tab reads `No Retrying jobs.` on most runs.
 - **Proof.** Read the audit and the job. Run `bwv sql failures-audit "select actor, action, target from backwave_operator_audit"` (`backwave.operator_audit` on Postgres). There is one row for each click, with actor `sample-operator`, action 1 (Requeue), and the job id. Run `bwv api GET /monitor/jobs/<jobId> failures-job`. The job is back in state 5 (Dead-Lettered), because the handler always fails.
 
 ## Gotchas
@@ -36,6 +39,6 @@ Preconditions:
 - The `Requeue` redirect goes to the job detail page, not back to the Failures page.
 - Run `wait-job` only after the click landed on the job page. Before the requeue, the job is already `DeadLettered`, so `wait-job` returns at once.
 - A requeue sets the attempt back to 0. Each attempt gets its own `Failure Detail` row in the Transition Log.
-- The sample has no endpoint that makes a Quarantined job on purpose. The `Quarantined` tab stays at 0 unless you seed with `bwv api POST /demo/seed seed`.
+- `POST /jobs/quarantine` enqueues an unregistered Wire Name straight through the store. No handler can route it, so the pump moves it to Quarantined. `bwv api POST /demo/seed seed` also makes Quarantined jobs.
 - `POST /ops/jobs/<id>/requeue` does the same action through the API. It is not a dashboard proof.
 - The `Dead-Lettered` tab count updates only when the page loads again.

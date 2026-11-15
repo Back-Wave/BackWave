@@ -28,7 +28,7 @@ Preconditions:
 - **Enqueue a job.** Enqueue a greeting. Run `bwv api POST '/jobs/enqueue?name=Ada' greet`, then `bwv wait-job <jobId> Succeeded`. The response has `jobId` and `"queue": "critical"`, and the job reaches `Succeeded` in about 1 s.
 - **Open the list.** Choose `Jobs`. Run `bwv browser open /backwave/jobs`. The snapshot has `heading "Jobs"`, the comboboxes `State`, `Queue`, `Wire Name`, `Rows`, the textbox `Job ID`, and a row with `link "<first 8 chars>…"` and `greet`.
 - **Filter the list.** Filter by queue and state. Run `bwv browser open '/backwave/jobs?state=Succeeded&queue=critical'`. The `State` combobox shows `Succeeded`, the `Queue` combobox shows `critical`, and only matching rows show.
-- **Open job detail.** Choose the job id link. Run `bwv browser click @<uid of the job link>`, then `bwv shot job-detail`. The page has `heading "Job <id>"`, `WIRE NAME greet`, `QUEUE critical`, `STATE Succeeded`, `ATTEMPT 1`, a `Payload` card with `"Name": "Ada"`, and `Transition Log` with `3 RECORDED` rows: `Scheduled`, `Leased`, `Succeeded`.
+- **Open job detail.** Choose the job id link. Run `bwv browser click @<uid of the job link>`, then `bwv shot job-detail`. The page has `heading "Job <id>"`, `WIRE NAME greet`, `QUEUE critical`, `STATE Succeeded`, `ATTEMPT 1`, a `Payload` card with `"Name": "Ada"`, and `Transition Log` with `3 RECORDED` rows, newest first: `Succeeded`, `Leased`, `Scheduled`.
 - **See a failure.** Enqueue a job that always fails. Run `bwv api POST '/jobs/flaky?label=x' flaky`, `bwv wait-job <jobId> DeadLettered`, then `bwv browser open /backwave/jobs/<jobId>`. The page shows `STATE Dead-Lettered`, `ATTEMPT 3`, `TERMINAL CAUSE flaky 'x' always fails (attempt 3)`, and a `Failure Detail` section with `System.InvalidOperationException`.
 - **Cancel a scheduled job.** Enqueue a job due in 10 minutes. Run `bwv api POST '/jobs/delayed?name=Later&seconds=600' later`, then `bwv browser open '/backwave/jobs?state=Scheduled'`. Find the `Cancel` button in that job's row and run `bwv browser click @<uid>`. The browser lands on `/backwave/jobs/<id>` with `STATE Cancelled`.
 - **Proof.** Read the store. Run `bwv sql jobs "select job_id, state, attempt from backwave_jobs"` (`backwave.jobs` on Postgres), and `bwv sql cancel-audit "select actor, action, target from backwave_operator_audit"`. The states are 3 (Succeeded), 5 (Dead-Lettered), and 4 (Cancelled). The audit table has one row with actor `sample-operator`, action 0 (Cancel), and the job id as target.
@@ -37,6 +37,6 @@ Preconditions:
 
 - The list shows the first 8 characters of the job id and `…`. Match the link on that prefix.
 - The `Wire Name` combobox lists every registered job type, also types with no jobs yet.
-- Only the Jobs list rows have the `Cancel` and `Requeue` buttons. The job detail page has no action button.
+- The Jobs list rows have the `Cancel` and `Requeue` buttons. The job detail page also shows a `Cancel` button in its header, but only for a job that is still cancellable and not terminal (for example a Scheduled job). The detail page has no `Requeue` button.
 - A Scheduled job with a due time in the past runs at once. Use `seconds=600` so that the job stays Scheduled while you click.
 - The Transition Log lists the newest transition first.

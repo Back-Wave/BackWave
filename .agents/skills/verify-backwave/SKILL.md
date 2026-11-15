@@ -115,7 +115,7 @@ Rules for handles:
 - To list the form actions of a page without a click, run `bwv browser eval "() => [...document.querySelectorAll('form')].map(f => f.getAttribute('action'))"`. The actions name the target: `/backwave/queues/critical/pause`, `/backwave/jobs/<id>/requeue`, and `/backwave/jobs/<id>/cancel`.
 - Navigation links and filter links are plain URLs. You can `open` their URL directly, for example `/backwave/jobs?tk=tenant&tv=acme`. This is the same request as a click on the link.
 
-Dashboard pages: `/backwave` (Overview), `/backwave/executing`, `/backwave/jobs`, `/backwave/jobs/<id>`, `/backwave/queues`, `/backwave/failures` (`?tab=quarantine`), `/backwave/workflows`, `/backwave/workflows/<id>`, `/backwave/observers`, and `/backwave/schedules`.
+Dashboard pages: `/backwave` (Overview), `/backwave/executing`, `/backwave/pumps`, `/backwave/jobs`, `/backwave/jobs/<id>`, `/backwave/queues`, `/backwave/failures` (`?tab=quarantine`, `?tab=retrying`), `/backwave/workflows`, `/backwave/workflows/<id>`, `/backwave/observers`, and `/backwave/schedules`.
 
 To wait for a job to reach a state, run `bwv wait-job <jobId> <State> [timeout-s]`. The states are `Scheduled`, `AwaitingParent`, `Leased`, `Succeeded`, `Cancelled`, `DeadLettered`, and `Quarantined`.
 
