@@ -38,7 +38,7 @@ Preconditions:
 
 - Every row has a button with the same name. Find the button after the queue's own link, or read the form actions (`/backwave/queues/<queue>/pause`) with `bwv browser eval`.
 - Pause and Resume redirect to the Overview, not back to the Queues page.
-- The Overview "Queue depths" table and the Queues page list only the queues that hold jobs. The exception is `limited`, which has a limit from startup. The sample also has `bulk` and `low`.
+- The Overview "Queue depths" table lists only the queues that hold jobs. The Queues page lists those too, and always lists `limited` as well, which has a limit from startup. The sample also has `bulk` and `low`.
 - `bwv shot` takes a snapshot, so it makes the uid from the earlier snapshot stale. A click on that uid fails with `STALE_REF` and the page stays on Queues. Take the snapshot and click at once.
 - A paused `critical` queue also stalls workflow members on `critical`, for example `validate-order`. Resume the queue before you drive the Workflows recipe on the same run.
 - `limited` has the cap `1` and an audit row from the actor `startup` (action 5). Filter the audit query by actor or target if the run has that row.
