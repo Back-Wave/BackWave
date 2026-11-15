@@ -9,7 +9,7 @@
 # the deployment recycles hourly (see fly.toml / the demo-recycle workflow) and re-seeds on boot.
 
 # The .NET 11 SDK builds the net11.0 target of the referenced src/* projects. The demo itself runs on net10.
-FROM mcr.microsoft.com/dotnet/sdk:11.0-preview AS build
+FROM mcr.microsoft.com/dotnet/sdk:11.0 AS build
 WORKDIR /src
 
 # Copy the whole repo (source + .git for MinVer + Directory.Build.*), then restore and publish just

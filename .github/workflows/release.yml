@@ -29,7 +29,6 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 11.0.x
-          dotnet-quality: preview
 
       - name: Restore
         run: dotnet restore
