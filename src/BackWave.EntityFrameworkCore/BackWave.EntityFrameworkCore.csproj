@@ -28,8 +28,11 @@
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
     <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.0" />
   </ItemGroup>
+  <!-- net11 floors at 10.0.0, not 11.0.0: the Npgsql and Oracle EF Core providers cap Relational below
+       11.0.0 until they ship an 11.x, and an 11.0.0 floor would make them fail to restore. The package
+       only reads Database.CurrentTransaction, so an EF Core 11 app resolves upward and runs unchanged. -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net11.0'">
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="11.0.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.0" />
   </ItemGroup>
 
   <PropertyGroup>
