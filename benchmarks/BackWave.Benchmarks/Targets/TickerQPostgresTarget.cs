@@ -89,7 +89,7 @@ public sealed class TickerQPostgresTarget : IBenchmarkTarget
                 $"The TickerQ host is missing at '{HostPath}'. Build benchmarks/BackWave.Benchmarks (it stages the host).");
         }
 
-        await EnsureDatabaseAsync(cancellationToken).ConfigureAwait(false);
+        PostgresDatabase.EnsureExists(_connectionString);
         _dataSource = NpgsqlDataSource.Create(_connectionString);
         await using var command = _dataSource.CreateCommand("SHOW server_version");
         var version = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
@@ -290,23 +290,6 @@ public sealed class TickerQPostgresTarget : IBenchmarkTarget
     }
 
     private NpgsqlDataSource DataSource => _dataSource ?? throw new InvalidOperationException("SetupAsync has not run.");
-
-    private async Task EnsureDatabaseAsync(CancellationToken cancellationToken)
-    {
-        var builder = new NpgsqlConnectionStringBuilder(_connectionString);
-        var database = builder.Database ?? throw new InvalidOperationException("The TickerQ DSN names no database.");
-        builder.Database = "postgres";
-        await using var admin = NpgsqlDataSource.Create(builder.ConnectionString);
-        await using var exists = admin.CreateCommand("SELECT 1 FROM pg_database WHERE datname = $1");
-        exists.Parameters.AddWithValue(database);
-        if (await exists.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null)
-        {
-            return;
-        }
-
-        await using var create = admin.CreateCommand($"CREATE DATABASE \"{database}\"");
-        await create.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-    }
 
     private async Task DropTickerQSchemaAsync(CancellationToken cancellationToken)
     {

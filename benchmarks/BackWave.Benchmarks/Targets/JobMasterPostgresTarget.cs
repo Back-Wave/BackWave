@@ -91,6 +91,7 @@ public sealed class JobMasterPostgresTarget : IBenchmarkTarget
                 $"The JobMaster host is missing at '{HostPath}'. Build benchmarks/BackWave.Benchmarks (it stages the host).");
         }
 
+        PostgresDatabase.EnsureExists(_connectionString);
         _dataSource = NpgsqlDataSource.Create(_connectionString);
         await using var command = _dataSource.CreateCommand("SHOW server_version");
         var version = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);

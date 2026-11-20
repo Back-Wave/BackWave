@@ -151,6 +151,7 @@ public sealed class QuartzPostgresTarget : IBenchmarkTarget
     /// <inheritdoc/>
     public async Task<string> SetupAsync(CancellationToken cancellationToken)
     {
+        PostgresDatabase.EnsureExists(_connectionString);
         _dataSource = NpgsqlDataSource.Create(_connectionString);
 
         // The store provisions its schema when a scheduler starts, so start one with nothing to fire.

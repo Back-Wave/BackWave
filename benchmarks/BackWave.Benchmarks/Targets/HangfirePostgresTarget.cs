@@ -45,6 +45,7 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
     /// <inheritdoc/>
     protected override JobStorage CreateStorage()
     {
+        PostgresDatabase.EnsureExists(_connectionString);
         var options = new PostgreSqlStorageOptions
         {
             SchemaName = SchemaName,
