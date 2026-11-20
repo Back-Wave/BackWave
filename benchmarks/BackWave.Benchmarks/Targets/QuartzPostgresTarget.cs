@@ -79,7 +79,7 @@ public sealed class QuartzPostgresTarget : IBenchmarkTarget
     /// <summary>Environment variable holding the Quartz Postgres connection string (DSN).</summary>
     public const string ConnectionStringEnvVar = "BACKWAVE_QUARTZ_POSTGRES_DSN";
 
-    private const string QuartzVersion = "4.7.0";
+    private const string QuartzVersion = "4.7.3";
     private const string SchedulerName = "backwave-bench";
 
     private const string DefaultConnectionString =

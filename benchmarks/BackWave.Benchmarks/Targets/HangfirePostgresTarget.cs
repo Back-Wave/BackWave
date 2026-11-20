@@ -18,7 +18,7 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
     public const string ConnectionStringEnvVar = "BACKWAVE_HANGFIRE_POSTGRES_DSN";
 
     private const string SchemaName = "hangfire";
-    private const string HangfireVersion = "1.8.23";
+    private const string HangfireVersion = "1.8.25";
     private const string AdapterVersion = "1.21.1";
 
     private const string DefaultConnectionString =
