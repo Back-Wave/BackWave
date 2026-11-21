@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using BackWave.Benchmarks;
+using BackWave.Benchmarks.Diagnostics;
 using BackWave.Benchmarks.Environment;
 using BackWave.Benchmarks.Latency;
 using BackWave.Benchmarks.ScaleOut;
@@ -46,6 +47,8 @@ if (Array.IndexOf(args, "--scale-out") >= 0)
 }
 
 var options = BenchmarkOptions.Parse(args);
+
+using var dbTrace = DbTrace.StartFromEnvironment();
 
 // Official mode refuses up front on a non-native-x86-64 host (e.g. Apple Silicon / Rosetta) rather than
 // running to a silently-unpublishable number (ADR 0027 §8). Local mode is never gated. The refusal is a
