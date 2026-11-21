@@ -41,6 +41,8 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
         _probe = NpgsqlDataSource.Create(connectionString);
     }
 
+    private static bool LongPolling => System.Environment.GetEnvironmentVariable("BACKWAVE_BENCH_HANGFIRE_LONG_POLLING") == "1";
+
     /// <inheritdoc/>
     public override string Name => "Hangfire/Postgres";
 
@@ -61,6 +63,7 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
             QueuePollInterval = TimeSpan.FromMilliseconds(200),
             UseSlidingInvisibilityTimeout = true,
             UseNativeDatabaseTransactions = true,
+            EnableLongPolling = LongPolling,
         };
         return new PostgreSqlStorage(new NpgsqlConnectionFactory(_connectionString, options), options);
     }
@@ -69,6 +72,7 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
     protected override IReadOnlyDictionary<string, string> StorageDials() => new Dictionary<string, string>
     {
         ["queue-poll-interval"] = "200ms (community adapter, aggressive)",
+        ["long-polling"] = LongPolling ? "on (LISTEN/NOTIFY wakes idle fetchers)" : "off (adapter default)",
         ["fetch-mode"] = "sliding invisibility timeout, native DB transactions (tuned-to-best)",
         ["schema"] = SchemaName,
         ["hangfire-version"] = HangfireVersion,
