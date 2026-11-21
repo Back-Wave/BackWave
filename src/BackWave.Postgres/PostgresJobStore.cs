@@ -295,14 +295,25 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             : pendingParents.Count > 0 ? JobState.AwaitingParent
             : JobState.Scheduled;
 
-        await using var insert = Cmd(
+        const string insertJob =
             """
             INSERT INTO backwave.jobs
                 (job_id, wire_name, payload, trace_context, queue, state, due_time, parents_remaining, mode,
                  terminal_at, terminal_cause, workflow_id)
             VALUES (@id, @wire, @payload, @trace::text, @queue, @state, @due, @remaining, @mode, @terminalAt, @terminalCause, @workflowId)
             ON CONFLICT (job_id) DO NOTHING
-            """,
+            """;
+        // The transition row exists only for a job row this statement inserted, so a Duplicate writes nothing.
+        var recordsHistory = _historyPolicy != JobHistoryPolicy.Off;
+        await using var insert = Cmd(
+            recordsHistory
+                ? $"""
+                  WITH inserted AS ({insertJob} RETURNING job_id)
+                  INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
+                  SELECT job_id, 0, @now, @state, 0, NULL FROM inserted
+                  RETURNING ordinal
+                  """
+                : insertJob,
             connection, transaction);
         insert.Parameters.AddWithValue("id", job.JobId);
         insert.Parameters.AddWithValue("wire", job.WireName);
@@ -320,9 +331,22 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // Workflow membership (ADR 0023): the immutable scalar, stamped once here at enqueue; null for
         // an ordinary job. The Core never reads it — it lives entirely above the determinism boundary.
         insert.Parameters.AddWithValue("workflowId", (object?)workflowId ?? DBNull.Value);
-        if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) == 0)
+        if (!recordsHistory)
         {
-            return (EnqueueResult.Duplicate, null);
+            if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) == 0)
+            {
+                return (EnqueueResult.Duplicate, null);
+            }
+        }
+        else
+        {
+            insert.Parameters.AddWithValue("now", now.ToUniversalTime());
+            if (await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not long ordinal)
+            {
+                return (EnqueueResult.Duplicate, null);
+            }
+            await PruneTransitionsAsync(connection, transaction, job.JobId, ordinal, cancellationToken)
+                .ConfigureAwait(false);
         }
 
         // Crash between the job row and its parent edges: rollback must leave neither (issue 0034).
@@ -341,12 +365,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // Job Tags (ADR 0022): the enqueue-time set, in this same transaction so they are visible
         // exactly when the job is — and rolled back with it under Transactional Enqueue.
         await InsertTagsAsync(connection, transaction, job.JobId, job.Tags, cancellationToken).ConfigureAwait(false);
-
-        // Transition Log (§5.12): the actual resulting state — Scheduled, AwaitingParent, or
-        // Cancelled (an already-terminal parent resolved against an on-success child) — at Attempt 0,
-        // in this same transaction (atomic with the job row, even under Transactional Enqueue).
-        await RecordTransitionAsync(connection, transaction, job.JobId, state, attempt: 0, now, cancellationToken)
-            .ConfigureAwait(false);
 
         return (EnqueueResult.Ok, state == JobState.Scheduled && job.DueTime <= now ? job.Queue : null);
     }
@@ -1820,7 +1838,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             failureDetail = null; // record the transition, but never the detail it would have carried
         }
 
-        // RETURNING the assigned ordinal lets the prune be skipped entirely (below) when the entry
+        // RETURNING the assigned ordinal lets PruneTransitionsAsync skip the DELETE when the entry
         // just written has not reached the cap - the common 2-transition job pays no DELETE round-trip.
         long ordinal;
         await using (var insert = Cmd(
@@ -1841,12 +1859,14 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             ordinal = (long)(await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
         }
 
-        // Per-job-life cap (§7): skip the prune entirely unless the entry just written reached the
-        // cap - a job nowhere near MaxTransitionsPerJob never pays the DELETE. Under the cap the
-        // delete could only be a no-op: its bound is MAX(ordinal) - cap, which is negative while the
-        // newest ordinal is below the cap, and no ordinal is negative. When the entry did reach it,
-        // the bounded DELETE keeps only the newest MaxTransitionsPerJob entries, dropping oldest.
-        if (ordinal < _options.Bounds.MaxTransitionsPerJob)
+        await PruneTransitionsAsync(connection, transaction, jobId, ordinal, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task PruneTransitionsAsync(
+        NpgsqlConnection connection, NpgsqlTransaction transaction, Guid jobId, long newestOrdinal,
+        CancellationToken cancellationToken)
+    {
+        if (newestOrdinal < _options.Bounds.MaxTransitionsPerJob)
         {
             return;
         }

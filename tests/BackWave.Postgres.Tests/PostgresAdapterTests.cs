@@ -12,6 +12,20 @@ public sealed class PostgresAdapterTests
     private static NewJob Job() => new(Guid.NewGuid(), "adapter-test", "{}"u8.ToArray(), "default", T0);
 
     [Fact]
+    public async Task DuplicateEnqueue_LeavesTheOriginalTransitionLogUntouched()
+    {
+        await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
+        var job = Job();
+        Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(job, now: T0));
+
+        var duplicate = job with { DueTime = T0.AddDays(1) };
+        Assert.Equal(EnqueueResult.Duplicate, await store.EnqueueAsync(duplicate, now: T0.AddHours(1)));
+
+        var only = Assert.Single(await store.GetJobHistoryAsync(job.JobId));
+        Assert.Equal(new JobTransition(0, T0, JobState.Scheduled, 0, null), only);
+    }
+
+    [Fact]
     public async Task SchemaVersionMismatch_FailsLoudly_BeforeAnyOperation()
     {
         await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
