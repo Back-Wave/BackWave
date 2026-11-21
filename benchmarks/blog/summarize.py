@@ -5,9 +5,9 @@ rounds. A round that failed, whose work audit failed, or that ran with a diagnos
 out of the figures and counted next to the system name.
 
 A paced round is carried when the producers delivered at least 98% of the offered rate and the system
-completed jobs at that rate too. The completion rate leaves out one median end-to-end latency at the end
-of the window, because a system that keeps up still needs that long to finish the last job. A backlog
-makes the latency grow, so it shows up as a completion rate below the floor.
+completed jobs at that rate too, over the whole window from the first enqueue to the last completion. A
+system that keeps up finishes its last job a few milliseconds after the last enqueue, so the floor leaves
+room for that. A backlog stretches the window, so it shows up as a completion rate below the floor.
 """
 
 import json
@@ -57,9 +57,7 @@ def slots(run: dict) -> int:
 
 def carried(run: dict, offered: float) -> bool:
     floor = PACED_FLOOR * offered
-    jobs = run["Workload"]["JobCount"]
-    window = jobs / run["ThroughputJobsPerSecond"]["Median"]
-    completing = jobs / max(window - run["EndToEndP50Ms"]["Median"] / 1000, 1e-9)
+    completing = run["ThroughputJobsPerSecond"]["Median"]
     arrivals = [a["ArrivalJobsPerSecond"] or 0 for a in run.get("WorkAudits", [])]
     return all(a >= floor for a in arrivals) and completing >= floor
 
