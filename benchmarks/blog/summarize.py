@@ -1,9 +1,13 @@
 """Summarizes a run-blog.sh results directory into Markdown tables, one per workload.
 
 Each cell is the median across rounds of each round's single measured run, with the min and max across
-rounds. A round whose work audit failed, or that ran with a diagnostic knob engaged, is left out of the
-figures and counted next to the system name. A paced cell that delivered less than 98% of its offered rate
-is marked as not carried, because its latency then measures a backlog and not the system at that load.
+rounds. A round that failed, whose work audit failed, or that ran with a diagnostic knob engaged is left
+out of the figures and counted next to the system name.
+
+A paced round is carried when the producers delivered at least 98% of the offered rate and the system
+completed jobs at that rate too. The completion rate leaves out one median end-to-end latency at the end
+of the window, because a system that keeps up still needs that long to finish the last job. A backlog
+makes the latency grow, so it shows up as a completion rate below the floor.
 """
 
 import json
@@ -29,6 +33,8 @@ def load_cells(root: Path) -> dict[tuple[str, str], list[dict]]:
         result = json.loads(path.read_text())
         result["_idle"] = float(path.with_suffix(".idle-before").read_text())
         cells.setdefault((path.parent.name, path.stem), []).append(result)
+    for path in sorted(root.glob("round-*/*/*.failed")):
+        cells.setdefault((path.parent.name, path.stem), []).append({"_failed": True})
     return cells
 
 
@@ -40,7 +46,22 @@ def spread(values: list[float], fmt: str) -> str:
 
 
 def clean(run: dict) -> bool:
-    return not run.get("Diagnostic") and all(not a["Problems"] for a in run.get("WorkAudits", []))
+    return (not run.get("_failed") and not run.get("Diagnostic")
+            and all(not a["Problems"] for a in run.get("WorkAudits", [])))
+
+
+def slots(run: dict) -> int:
+    dials = run["TuningDials"]
+    return int(dials["worker-pool-size"]) * int(dials.get("worker-groups", 1))
+
+
+def carried(run: dict, offered: float) -> bool:
+    floor = PACED_FLOOR * offered
+    jobs = run["Workload"]["JobCount"]
+    window = jobs / run["ThroughputJobsPerSecond"]["Median"]
+    completing = jobs / max(window - run["EndToEndP50Ms"]["Median"] / 1000, 1e-9)
+    arrivals = [a["ArrivalJobsPerSecond"] or 0 for a in run.get("WorkAudits", [])]
+    return all(a >= floor for a in arrivals) and completing >= floor
 
 
 def row(target: str, all_runs: list[dict]) -> str:
@@ -48,24 +69,23 @@ def row(target: str, all_runs: list[dict]) -> str:
     name = SYSTEMS.get(target, target)
     excluded = len(all_runs) - len(runs)
     if excluded:
-        name += f" ({excluded} of {len(all_runs)} rounds left out: failed audit or diagnostic)"
+        name += f" ({excluded} of {len(all_runs)} rounds left out: failed, failed audit, or diagnostic)"
     if not runs:
-        return f"| {name} | " + " | ".join(["-"] * 9) + f" | {audit(all_runs)} |"
-    throughput = [r["ThroughputJobsPerSecond"]["Median"] for r in runs]
+        return f"| {name} | " + " | ".join(["-"] * 10) + f" | {audit(all_runs)} |"
     workload = runs[0]["Workload"]
     offered = workload["SustainedRatePerSecond"]
-    paced = workload["Arrival"] == "Sustained" and offered < 50000
-    carried = [t >= PACED_FLOOR * offered for t in throughput] if paced else []
-    status = ""
-    if paced and not all(carried):
-        status = f" (not carried in {carried.count(False)} of {len(carried)} rounds)"
+    if workload["Arrival"] == "Sustained" and offered < 50000:
+        missed = [r for r in runs if not carried(r, offered)]
+        if missed:
+            name += f" (not carried in {len(missed)} of {len(runs)} rounds)"
     return (
-        f"| {name}{status} | {spread(throughput, ',.0f')} "
+        f"| {name} | {spread([r['ThroughputJobsPerSecond']['Median'] for r in runs], ',.0f')} "
         f"| {spread([r['EndToEndP50Ms']['Median'] for r in runs], ',.1f')} "
         f"| {spread([r['EndToEndP99Ms']['Median'] for r in runs], ',.1f')} "
         f"| {spread([r['EnqueueP50Ms']['Median'] for r in runs], ',.2f')} "
         f"| {max(r['Resources']['PeakConnections'] for r in runs)} "
         f"| {spread([r['Resources']['CpuPercent'] for r in runs], ',.1f')} "
+        f"| {'/'.join(str(s) for s in sorted({slots(r) for r in runs}))} "
         f"| {workload['JobCount']:,} | {len(runs)} | {min(r['_idle'] for r in runs):.0f} "
         f"| {audit(all_runs)} |"
     )
@@ -73,28 +93,34 @@ def row(target: str, all_runs: list[dict]) -> str:
 
 def audit(runs: list[dict]) -> str:
     audits = [a for r in runs for a in r.get("WorkAudits", [])]
-    if not audits:
-        return "n/a"
+    crashed = sum(1 for r in runs if r.get("_failed"))
     failed = [a for a in audits if a["Problems"]]
-    return "PASS" if not failed else f"FAIL {len(failed)}/{len(audits)}: {failed[0]['Problems'][0]}"
+    if not audits and not crashed:
+        return "n/a"
+    if not failed and not crashed:
+        return "PASS"
+    parts = []
+    if failed:
+        parts.append(f"FAIL {len(failed)}/{len(audits)}: {failed[0]['Problems'][0]}")
+    if crashed:
+        parts.append(f"{crashed} round(s) failed, see the .log")
+    return "; ".join(parts)
 
 
 def main() -> None:
     root = Path(sys.argv[1])
     cells = load_cells(root)
-    first = next(iter(cells.values()))[0]["Manifest"]
+    first = next(r for runs in cells.values() for r in runs if not r.get("_failed"))["Manifest"]
     print(f"Local mode, indicative only. {first['Os']}, {first['ProcessArchitecture']}, "
-          f"{first['ProcessorCount']} cores, {first['DotnetVersion']}, PostgreSQL {first['DbVersion']}.")
-    slots = sorted({r["TuningDials"].get("worker-pool-size") for (_, t), rs in cells.items() if t != "postgres-4g" for r in rs})
-    print(f"Run slots per system: {', '.join(s for s in slots if s)}.\n")
+          f"{first['ProcessorCount']} cores, {first['DotnetVersion']}, PostgreSQL {first['DbVersion']}.\n")
     for workload in WORKLOADS:
         targets = [t for t in SYSTEMS if (workload, t) in cells]
         if not targets:
             continue
         print(f"## {workload}\n")
         print("| System | Throughput (jobs/s) | e2e p50 (ms) | e2e p99 (ms) | enqueue p50 (ms) "
-              "| Peak DB conns | CPU % | Jobs | Rounds | Min idle % before | Work audit |")
-        print("|---|---|---|---|---|---|---|---|---|---|---|")
+              "| Peak DB conns | CPU % | Slots | Jobs | Rounds | Min idle % before | Work audit |")
+        print("|---|---|---|---|---|---|---|---|---|---|---|---|")
         for target in targets:
             print(row(target, cells[(workload, target)]))
         print()

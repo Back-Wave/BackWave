@@ -17,7 +17,11 @@
 # Before each cell the script waits until the machine is at least IDLE_MIN percent idle over a 3 s sample, and
 # records that figure next to the result.
 #
-# Tunables (env): ROUNDS (5), JOBS (20000), JOBMASTER_JOBS (5000), IDLE_MIN (85), OUT_DIR, TARGETS, WORKLOADS.
+# A cell that fails leaves a .failed marker, which summarize.py counts. A rerun skips cells that have a result
+# or a marker; RETRY_FAILED=1 runs the marked cells again. Each start appends to run-manifest.txt.
+#
+# Tunables (env): ROUNDS (5), JOBS (20000), JOBMASTER_JOBS (5000), IDLE_MIN (85), RETRY_FAILED (0), OUT_DIR,
+# TARGETS, WORKLOADS.
 
 set -uo pipefail
 
@@ -27,10 +31,12 @@ JOBMASTER_JOBS="${JOBMASTER_JOBS:-5000}"
 IDLE_MIN="${IDLE_MIN:-85}"
 TARGETS="${TARGETS:-postgres postgres-4g hangfire-postgres quartz-postgres tickerq-postgres jobmaster-postgres}"
 WORKLOADS="${WORKLOADS:-drain-noop drain-10ms max-sustained paced-50 paced-500}"
+RETRY_FAILED="${RETRY_FAILED:-0}"
 OUT_DIR="${OUT_DIR:-benchmarks/results/blog-$(date +%Y%m%d-%H%M)}"
 
-# Every competitor runs as many slots as BackWave's default pool, four per core and at least 8. The
-# four-group BackWave cell splits that same total, so all systems match on any host.
+# Every competitor runs as many slots as BackWave's default pool, four per core and at least 8, and the
+# four-group BackWave cell splits that same total. JobMaster rounds its slots up to a multiple of 5. The
+# summary prints each system's slot count.
 SLOTS=$(( $(sysctl -n hw.ncpu) * 4 )); (( SLOTS < 8 )) && SLOTS=8
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT="$SCRIPT_DIR/../BackWave.Benchmarks"
@@ -70,11 +76,12 @@ workload_args() {
 }
 
 {
-  echo "commit $(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+  echo "start $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "commit $(git -C "$SCRIPT_DIR" rev-parse HEAD), $(git -C "$SCRIPT_DIR" status --porcelain | wc -l | tr -d ' ') uncommitted changes"
   echo "host $(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.ncpu) cores, $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB"
   echo "rounds $ROUNDS jobs $JOBS jobmaster_jobs $JOBMASTER_JOBS idle_min $IDLE_MIN slots $SLOTS"
   docker ps --format '{{.Names}} {{.Image}}'
-} > "$OUT_DIR/run-manifest.txt"
+} >> "$OUT_DIR/run-manifest.txt"
 
 read -r -a target_list <<< "$TARGETS"
 count=${#target_list[@]}
@@ -90,6 +97,7 @@ for round in $(seq 1 "$ROUNDS"); do
       cell="$OUT_DIR/round-$round/$workload/$target"
       mkdir -p "$(dirname "$cell")"
       if [[ -f "$cell.json" ]]; then continue; fi
+      if [[ -f "$cell.failed" && "$RETRY_FAILED" != 1 ]]; then continue; fi
 
       idle="$(wait_for_idle)"
       echo ">>> round $round $workload $target (idle ${idle}%)"
@@ -99,6 +107,9 @@ for round in $(seq 1 "$ROUNDS"); do
           $(workload_args "$workload" "$jobs") --out "$cell.json" > "$cell.log" 2>&1; then
         echo "    FAILED, see $cell.log"
         rm -f "$cell.json"
+        touch "$cell.failed"
+      else
+        rm -f "$cell.failed"
       fi
     done
   done

@@ -29,6 +29,9 @@ TickerQ and JobMaster run in their own host processes, `BackWave.Benchmarks.Tick
 the harness also builds both hosts and copies them next to it. The harness talks to each host over stdin and
 stdout.
 
+Each run starts a fresh host process, so the JIT and the EF Core query caches of TickerQ and JobMaster are
+cold in every measured run. Warmup runs do not warm them.
+
 TickerQ stays on 10.4.0. Version 10.5.0 and later refuse to run jobs without a license certificate.
 
 ## Run one cell
@@ -42,8 +45,9 @@ dotnet run -c Release --project benchmarks/BackWave.Benchmarks -- \
 The usage comment at the top of [BackWave.Benchmarks/Program.cs](BackWave.Benchmarks/Program.cs) lists
 every option.
 
-Every system gets the same number of run slots: BackWave's default pool of four per core, at least 8. That
-is 40 on a 10-core host. End-to-end latency starts at the enqueue call, for every system. It stops at the
+Every system gets BackWave's default pool of run slots: four per core, at least 8. That is 40 on a
+10-core host. JobMaster rounds its slots up to a multiple of 5, so it gets more on some hosts, for example
+50 against 48 on 12 cores. End-to-end latency starts at the enqueue call, for every system. It stops at the
 completion instant the system records: the handler's return for TickerQ and Quartz.NET, the success state
 for Hangfire and JobMaster, and the batched outcome write for BackWave, which comes later than the handler's
 return. After each run, a work audit checks three things:
@@ -66,10 +70,14 @@ docker compose up -d --wait postgres
 OUT_DIR=benchmarks/results/my-run ROUNDS=5 bash benchmarks/blog/run-blog.sh
 ```
 
-The script skips cells that already have a result, so you can stop it and start it again. At the end,
+The script skips cells that already have a result, so you can stop it and start it again. A cell that fails
+leaves a `.failed` marker next to its log, and a restart skips it too. Set `RETRY_FAILED=1` to run the
+marked cells again. At the end,
 [blog/summarize.py](blog/summarize.py) writes `summary.md` into `OUT_DIR`, with the median and range of each
-cell across rounds. It leaves out a round whose audit failed or that ran with a diagnostic variable engaged,
-and says so next to the system name. `benchmarks/results/` is in `.gitignore`.
+cell across rounds. It leaves out a round that failed, whose audit failed, or that ran with a
+diagnostic variable engaged, and says so next to the system name. A paced round counts as carried when the
+producers delivered 98% of the offered rate and the system completed jobs at 98% of it too, not counting one
+median end-to-end latency at the end of the window. `benchmarks/results/` is in `.gitignore`.
 
 ## Tuning and diagnostic variables
 
@@ -92,4 +100,6 @@ recorded in the result's `DiagnosticKnobs` and makes the result unpublishable.
 | `BACKWAVE_TICKERQ_FALLBACK_MS` | `10` | TickerQ fallback scan period |
 | `BACKWAVE_TICKERQ_MIN_POLL_MS` | `0` | TickerQ minimum scheduler wait |
 | `BACKWAVE_JOBMASTER_BUCKETS` | `1` | JobMaster bucket count |
+| `BACKWAVE_JOBMASTER_PARALLELISM_FACTOR` | slot count / 5, rounded up | JobMaster run slots per bucket, divided by 5 |
+| `BACKWAVE_JOBMASTER_BUCKET_BUFFER` | `1000` | Jobs JobMaster takes into memory per bucket on each 3 s tick |
 | `BACKWAVE_BENCH_DB_TRACE` | off | A file path. Writes one CSV row for each Npgsql and BackWave Postgres span. Diagnostic, because it slows every call |
