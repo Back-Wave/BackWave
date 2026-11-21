@@ -1,0 +1,89 @@
+# Benchmark harness
+
+`BackWave.Benchmarks` is a console app that runs a job stream through a real scheduler against a real
+database and writes one JSON result. It measures throughput, enqueue latency, end-to-end latency, peak
+database connections, and CPU. It is not a test, and `dotnet test` never runs it.
+
+Local runs on a laptop are indicative only. A publishable number comes only from `--mode official` on the
+pinned native x86-64 instance in [cloud/aws-official-run.md](cloud/aws-official-run.md).
+
+## Targets
+
+Every Postgres target uses its own database on the `postgres` service of the repository's
+`docker-compose.yml` (port 5499). The harness creates the database when it is missing. Set the environment
+variable to use another server.
+
+| `--target` | System | DSN variable | Default database |
+|---|---|---|---|
+| `postgres` | BackWave | `BACKWAVE_POSTGRES_DSN` | `backwave_test` |
+| `sqlserver` | BackWave | `BACKWAVE_SQLSERVER_DSN` | |
+| `oracle` | BackWave | `BACKWAVE_ORACLE_DSN` | |
+| `hangfire-postgres` | Hangfire 1.8.25, Hangfire.PostgreSql 1.21.1 | `BACKWAVE_HANGFIRE_POSTGRES_DSN` | `hangfire_test` |
+| `hangfire-sqlserver` | Hangfire 1.8.25 | `BACKWAVE_HANGFIRE_SQLSERVER_DSN` | |
+| `quartz-postgres` | Quartz.NET 4.7.3, ADO.NET job store, clustered | `BACKWAVE_QUARTZ_POSTGRES_DSN` | `quartz_test` |
+| `tickerq-postgres` | TickerQ 10.4.0 | `BACKWAVE_TICKERQ_POSTGRES_DSN` | `tickerq_test` |
+| `jobmaster-postgres` | JobMaster 0.0.11-alpha | `BACKWAVE_JOBMASTER_POSTGRES_DSN` | `jobmaster_test` |
+
+TickerQ and JobMaster run in their own host processes, `BackWave.Benchmarks.TickerQHost` and
+`BackWave.Benchmarks.JobMasterHost`, so that their package graphs stay apart from the harness. A build of
+the harness also builds both hosts and copies them next to it. The harness talks to each host over stdin and
+stdout.
+
+TickerQ stays on 10.4.0. Version 10.5.0 and later refuse to run jobs without a license certificate.
+
+## Run one cell
+
+```sh
+docker compose up -d --wait postgres
+dotnet run -c Release --project benchmarks/BackWave.Benchmarks -- \
+	--target quartz-postgres --mode local --arrival drain --delay-ms 0 --jobs 20000
+```
+
+The usage comment at the top of [BackWave.Benchmarks/Program.cs](BackWave.Benchmarks/Program.cs) lists
+every option.
+
+Every system gets the same 40 run slots. End-to-end latency starts at the enqueue call and stops when the
+handler completes, for every system. After each run, a work audit checks three things:
+
+- The number of succeeded jobs equals the number of enqueued jobs.
+- Each handler ran exactly once.
+- The first and the last completion are inside the timed window.
+
+A failed audit does not stop the run. The harness prints the failure and records it in the result JSON.
+
+## Run the five-way battery
+
+[blog/run-blog.sh](blog/run-blog.sh) runs the local five-way comparison: BackWave in two shapes, Hangfire,
+Quartz.NET, TickerQ, and JobMaster, all on one Postgres server. The script header describes the workloads
+and the fairness controls. The script uses `top` and `sysctl` from macOS.
+
+```sh
+docker compose up -d --wait postgres
+OUT_DIR=benchmarks/results/my-run ROUNDS=5 bash benchmarks/blog/run-blog.sh
+```
+
+The script skips cells that already have a result, so you can stop it and start it again. At the end,
+[blog/summarize.py](blog/summarize.py) writes `summary.md` into `OUT_DIR`, with the median and range of each
+cell across rounds. `benchmarks/results/` is in `.gitignore`.
+
+## Tuning and diagnostic variables
+
+Every variable is optional. The default is the setting that the battery uses.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `BACKWAVE_BENCH_HANGFIRE_POLL_MS` | `200` | Hangfire `QueuePollInterval` |
+| `BACKWAVE_BENCH_HANGFIRE_LONG_POLLING` | off | `1` turns on Hangfire.PostgreSql long polling |
+| `BACKWAVE_QUARTZ_CLUSTERED` | `true` | Quartz clustered job store |
+| `BACKWAVE_QUARTZ_MAX_BATCH_SIZE` | slot count | Quartz `MaxBatchSize` |
+| `BACKWAVE_QUARTZ_IDLE_WAIT_MS` | `1000` | Quartz `IdleWaitTime` |
+| `BACKWAVE_QUARTZ_FIRE_AHEAD_MS` | `0` | Quartz batch trigger acquisition fire-ahead window |
+| `BACKWAVE_QUARTZ_ACQUIRE_WITHIN_LOCK` | `false` | Quartz `AcquireTriggersWithinLock` |
+| `BACKWAVE_QUARTZ_LOCK_ON_INSERT` | `false` | Quartz `LockOnInsert` |
+| `BACKWAVE_QUARTZ_LOCK_FREE_FIRING` | `true` | Quartz lock-free firing rounds |
+| `BACKWAVE_QUARTZ_ENQUEUE_SHAPE` | `one-off` | `job-per-enqueue` stores one job and one trigger per enqueue |
+| `BACKWAVE_TICKERQ_MAX_CONCURRENCY` | slot count | TickerQ concurrency per function |
+| `BACKWAVE_TICKERQ_FALLBACK_MS` | `10` | TickerQ fallback scan period |
+| `BACKWAVE_TICKERQ_MIN_POLL_MS` | `0` | TickerQ minimum scheduler wait |
+| `BACKWAVE_JOBMASTER_BUCKETS` | `1` | JobMaster bucket count |
+| `BACKWAVE_BENCH_DB_TRACE` | off | A file path. Writes one CSV row for each Npgsql and BackWave Postgres span. It slows every call, so never report a traced run |
