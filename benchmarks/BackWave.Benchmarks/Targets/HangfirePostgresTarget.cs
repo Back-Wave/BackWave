@@ -26,6 +26,8 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
 
     private readonly string _connectionString;
 
+    private readonly NpgsqlDataSource _probe;
+
     /// <summary>Creates the target using the DSN from the environment, or the local docker-compose default.</summary>
     public HangfirePostgresTarget()
         : this(System.Environment.GetEnvironmentVariable(ConnectionStringEnvVar) ?? DefaultConnectionString)
@@ -34,7 +36,10 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
 
     /// <summary>Creates the target against an explicit connection string.</summary>
     public HangfirePostgresTarget(string connectionString)
-        => _connectionString = connectionString;
+    {
+        _connectionString = connectionString;
+        _probe = NpgsqlDataSource.Create(connectionString);
+    }
 
     /// <inheritdoc/>
     public override string Name => "Hangfire/Postgres";
@@ -85,8 +90,7 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
     {
         // Defined identically to the BackWave Postgres probe (this process's backends, minus the probe's own),
         // so peak DB connections is a fair cross-system metric.
-        await using var dataSource = NpgsqlDataSource.Create(_connectionString);
-        await using var command = dataSource.CreateCommand(
+        await using var command = _probe.CreateCommand(
             "SELECT count(*) FROM pg_stat_activity " +
             "WHERE datname = current_database() AND pid <> pg_backend_pid()");
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
@@ -103,4 +107,8 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
             $"{SchemaName}.aggregatedcounter, {SchemaName}.lock RESTART IDENTITY CASCADE");
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    /// <inheritdoc/>
+    public override async Task TeardownAsync(CancellationToken cancellationToken)
+        => await _probe.DisposeAsync().ConfigureAwait(false);
 }
