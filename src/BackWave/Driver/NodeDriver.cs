@@ -194,12 +194,22 @@ internal sealed class NodeDriver(NodeOptions options)
                 }
                 return reactions;
 
-            case NodeEvent.OutcomeReported outcome:
+            case NodeEvent.OutcomeBatchReported reported:
+            {
+                var answered = new List<Command>();
                 // An applied terminal outcome may have released a Dependency due right now:
                 // re-poll so it is claimed promptly, not on the next timer tick. This decision
                 // lives here, not in either pump, so production and the deterministic harness
                 // drain everything due at this instant identically.
-                return outcome.Result == OutcomeResult.Applied ? [new Command.RequestPoll(outcome.Now)] : [];
+                foreach (var row in reported.Results)
+                {
+                    if (row.Result == OutcomeResult.Applied)
+                    {
+                        answered.Add(new Command.RequestPoll(reported.Now));
+                    }
+                }
+                return answered;
+            }
 
             case NodeEvent.MintCompleted mint:
                 // Minted-due-now instances run this cycle: re-poll when the mint produced work.

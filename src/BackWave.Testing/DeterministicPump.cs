@@ -264,10 +264,7 @@ internal sealed class DeterministicPump(
                         Output = rowHasOutput ? rowOutput : (ReadOnlyMemory<byte>?)null,
                     });
                 }
-                foreach (var rowResult in await store.ReportOutcomesAsync(reports, now))
-                {
-                    events.Enqueue(new NodeEvent.OutcomeReported(rowResult.JobId, rowResult.Result, now));
-                }
+                events.Enqueue(new NodeEvent.OutcomeBatchReported(await store.ReportOutcomesAsync(reports, now), now));
                 break;
 
             case Command.Heartbeat heartbeat:

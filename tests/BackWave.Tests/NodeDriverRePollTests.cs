@@ -22,14 +22,29 @@ public class NodeDriverRePollTests
     [Fact]
     public void AnAppliedOutcome_EmitsARePoll_AtTheOutcomeInstant()
     {
-        var commands = Driver().Step(new NodeEvent.OutcomeReported(Guid.NewGuid(), OutcomeResult.Applied, T0));
+        var commands = Driver().Step(new NodeEvent.OutcomeBatchReported(
+            [new OutcomeReportResult(Guid.NewGuid(), OutcomeResult.Applied)], T0));
         var repoll = Assert.IsType<Command.RequestPoll>(Assert.Single(commands));
         Assert.Equal(T0, repoll.Now);
     }
 
     [Fact]
     public void AStaleOutcome_EmitsNoRePoll()
-        => Assert.Empty(Driver().Step(new NodeEvent.OutcomeReported(Guid.NewGuid(), OutcomeResult.StaleLease, T0)));
+        => Assert.Empty(Driver().Step(new NodeEvent.OutcomeBatchReported(
+            [new OutcomeReportResult(Guid.NewGuid(), OutcomeResult.StaleLease)], T0)));
+
+    [Fact]
+    public void ABatchAnswer_EmitsOneRePollPerAppliedRow()
+    {
+        var commands = Driver().Step(new NodeEvent.OutcomeBatchReported(
+            [
+                new OutcomeReportResult(Guid.NewGuid(), OutcomeResult.Applied),
+                new OutcomeReportResult(Guid.NewGuid(), OutcomeResult.StaleLease),
+                new OutcomeReportResult(Guid.NewGuid(), OutcomeResult.Applied),
+            ], T0));
+        Assert.Equal(2, commands.Count);
+        Assert.All(commands, command => Assert.IsType<Command.RequestPoll>(command));
+    }
 
     [Fact]
     public void AProductiveMint_EmitsARePoll_ABarrenMintDoesNot()

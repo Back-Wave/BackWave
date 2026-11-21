@@ -466,7 +466,7 @@ internal sealed class WorkerGroupService(
             // The pump loop has exited, so this group claims nothing more: give back what it holds. This
             // runs BEFORE the writer is completed, because the hand-back reads the events the stopping
             // executions are still writing and flushes the Driver's buffered outcomes through the
-            // ordinary command path, which writes their OutcomeReported events back to this very
+            // ordinary command path, which writes their OutcomeBatchReported events back to this very
             // channel - a completed writer would refuse every one of them.
             try
             {
@@ -1066,8 +1066,8 @@ internal sealed class WorkerGroupService(
                             BackWaveLog.OutcomeFencedOut(logger, rowResult.JobId, reports[i].Attempt);
                         }
                     }
-                    events.TryWrite(new NodeEvent.OutcomeReported(rowResult.JobId, rowResult.Result, now));
                 }
+                events.TryWrite(new NodeEvent.OutcomeBatchReported(batchResults, now));
                 break;
 
             case Command.Heartbeat heartbeat:

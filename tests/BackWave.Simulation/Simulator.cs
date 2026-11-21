@@ -1812,7 +1812,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 // complete the event channel before the hand-back, so a re-poll queued behind a shutdown
                 // flush is never read. Only the clean stop can reach here (it is the one caller that drives
                 // a node it has just marked down), so this is a no-op for every other cascade - without it,
-                // a stopping node's flush would answer its own OutcomeReported by claiming fresh work.
+                // a stopping node's flush would answer its own OutcomeBatchReported by claiming fresh work.
                 if (_nodes[rp.Node].Down)
                 {
                     continue;
@@ -2079,8 +2079,9 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     /// command, and the harness reports it as one store call - <c>ReportOutcomesAsync</c>, the batched
     /// API the host calls - so the store's own batch shape is what runs. Per row: a pre-state read and the
     /// per-(workerId, attempt) fence verdict BEFORE the batch lands, then after it the Outcome-Provenance
-    /// assertion, the slot-release detection and Drive(OutcomeReported) over the row's returned result. The
-    /// batch consults the per-node faulty store once on the same "ReportOutcome" axis a single report uses;
+    /// assertion and the slot-release detection over the row's returned result, then one
+    /// Drive(OutcomeBatchReported) with every row's result. The batch consults the per-node faulty store
+    /// once on the same "ReportOutcome" axis a single report uses;
     /// a fault aborts the whole batch, and those leases lapse and reclaim (At-Least-Once, the buffer-loss
     /// window modeled for free). The batch is applied synchronously - no new SimEvent, so the determinism
     /// boundary is unchanged.
@@ -2120,11 +2121,12 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             ObserveOutcome(nodeIndex, row.JobId, row.WorkerId, row.Attempt, row.Outcome,
                 pres[i], fenceShouldApply[i], results[i].Result);
         }
+        Drive(nodeIndex, new NodeEvent.OutcomeBatchReported(results, NodeNow(nodeIndex)));
     }
 
     /// <summary>
     /// Applies one outcome row through the per-node faulty store's singular report and runs the per-row
-    /// oracles, then drives the resulting OutcomeReported back into the Driver. Only the
+    /// oracles, then drives its one-row OutcomeBatchReported back into the Driver. Only the
     /// SabotageInlineUnroutableReport self-test reports this way; every buffered outcome goes through
     /// <see cref="RunOutcomeBatch"/> and the batched store API.
     /// </summary>
@@ -2134,6 +2136,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         var (pre, fenceShouldApply) = FenceVerdict(jobId, workerId, attempt, reportNow);
         var result = Get(_nodeFaulty[nodeIndex].ReportOutcomeAsync(jobId, workerId, attempt, outcome, reportNow));
         ObserveOutcome(nodeIndex, jobId, workerId, attempt, outcome, pre, fenceShouldApply, result);
+        Drive(nodeIndex, new NodeEvent.OutcomeBatchReported([new OutcomeReportResult(jobId, result)], NodeNow(nodeIndex)));
     }
 
     /// <summary>
@@ -2154,7 +2157,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
 
     /// <summary>
     /// Runs the per-row oracles over one reported outcome's result against the pre-state verdict from
-    /// <see cref="FenceVerdict"/>, then drives the OutcomeReported back into the Driver.
+    /// <see cref="FenceVerdict"/>.
     /// </summary>
     private void ObserveOutcome(
         int nodeIndex, Guid jobId, string workerId, int attempt, JobOutcome outcome,
@@ -2195,7 +2198,6 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         {
             _cooperativeCancels++;
         }
-        Drive(nodeIndex, new NodeEvent.OutcomeReported(jobId, result, NodeNow(nodeIndex)));
     }
 
     /// <summary>Drives one node event, absorbing a transient store fault as a retry-next-tick no-op.</summary>
@@ -2449,7 +2451,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         {
             return;
         }
-        // Down BEFORE the hand-back, not after. The flush drives OutcomeReported back into the Driver, which
+        // Down BEFORE the hand-back, not after. The flush drives OutcomeBatchReported back into the Driver, which
         // answers an applied row with a re-poll; production never obeys that one, because the pump completes
         // its event channel before HandBackAsync. Marking the node down first is what makes the sim's re-poll
         // drain drop it, so a stopping node cannot claim fresh work on its way out the door.

@@ -46,8 +46,8 @@ internal abstract record NodeEvent
     /// <summary>The store answered a heartbeat.</summary>
     public sealed record HeartbeatCompleted(IReadOnlyList<HeartbeatResult> Results, DateTimeOffset Now) : NodeEvent;
 
-    /// <summary>The store acknowledged (or rejected as stale) a reported outcome.</summary>
-    public sealed record OutcomeReported(Guid JobId, OutcomeResult Result, DateTimeOffset Now) : NodeEvent;
+    /// <summary>The store acknowledged (or rejected as stale) each row of a reported outcome batch.</summary>
+    public sealed record OutcomeBatchReported(IReadOnlyList<OutcomeReportResult> Results, DateTimeOffset Now) : NodeEvent;
 
     /// <summary>The store applied the Core's mint decisions; carries how many instances it minted.</summary>
     public sealed record MintCompleted(int Minted, DateTimeOffset Now) : NodeEvent;
