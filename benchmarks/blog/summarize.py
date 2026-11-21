@@ -13,6 +13,7 @@ from pathlib import Path
 PACED_FLOOR = 0.98
 SYSTEMS = {
     "postgres": "BackWave",
+    "postgres-4g": "BackWave (4 groups x 10)",
     "hangfire-postgres": "Hangfire",
     "quartz-postgres": "Quartz.NET",
     "tickerq-postgres": "TickerQ",

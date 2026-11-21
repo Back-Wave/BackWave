@@ -25,7 +25,7 @@ ROUNDS="${ROUNDS:-5}"
 JOBS="${JOBS:-20000}"
 JOBMASTER_JOBS="${JOBMASTER_JOBS:-5000}"
 IDLE_MIN="${IDLE_MIN:-85}"
-TARGETS="${TARGETS:-postgres hangfire-postgres quartz-postgres tickerq-postgres jobmaster-postgres}"
+TARGETS="${TARGETS:-postgres postgres-4g hangfire-postgres quartz-postgres tickerq-postgres jobmaster-postgres}"
 WORKLOADS="${WORKLOADS:-drain-noop drain-10ms max-sustained paced-50 paced-500}"
 OUT_DIR="${OUT_DIR:-benchmarks/results/blog-$(date +%Y%m%d-%H%M)}"
 
@@ -44,6 +44,14 @@ wait_for_idle() {
     sleep 30
   done
   echo "$idle"
+}
+
+# postgres-4g is BackWave with its 40 slots split over four Worker Groups of 10.
+target_args() {
+  case "$1" in
+    postgres-4g) echo "--target postgres --worker-groups 4 --pool-size 10" ;;
+    *)           echo "--target $1" ;;
+  esac
 }
 
 workload_args() {
@@ -84,7 +92,7 @@ for round in $(seq 1 "$ROUNDS"); do
       echo ">>> round $round $workload $target (idle ${idle}%)"
       echo "$idle" > "$cell.idle-before"
       if ! dotnet run -c Release --no-build --project "$PROJECT" -- \
-          --target "$target" --mode local --warmup 1 --runs 1 \
+          $(target_args "$target") --mode local --warmup 1 --runs 1 \
           $(workload_args "$workload" "$jobs") --out "$cell.json" > "$cell.log" 2>&1; then
         echo "    FAILED, see $cell.log"
         rm -f "$cell.json"
