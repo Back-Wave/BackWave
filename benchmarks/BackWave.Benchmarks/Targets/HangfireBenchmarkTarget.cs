@@ -25,9 +25,6 @@ public abstract class HangfireBenchmarkTarget : IBenchmarkTarget
     private BackgroundJobServer? _server;
 
     private readonly List<TimeSpan> _enqueueLatencies = [];
-    // Job id → the instant the harness committed its enqueue, so end-to-end latency can pair the store's
-    // own SucceededAt against a single co-located clock — the same enqueue→terminal span BackWave derives
-    // from its store timestamps (ADR 0027 §4). Concurrent because the parallel producers write it at once.
     private readonly ConcurrentDictionary<string, DateTimeOffset> _enqueuedAt = new();
     private readonly TimeSpan _drainPollInterval = TimeSpan.FromMilliseconds(10);
     private readonly TimeSpan _connectionSampleInterval = TimeSpan.FromMilliseconds(20);
@@ -251,8 +248,9 @@ public abstract class HangfireBenchmarkTarget : IBenchmarkTarget
             {
                 var payload = job.Payload;
                 var delayMs = job.DelayMs;
+                var calledAt = DateTimeOffset.UtcNow;
                 var id = client.Enqueue(() => HangfireBenchmarkJob.ExecuteAsync(payload, delayMs));
-                _enqueuedAt[id] = DateTimeOffset.UtcNow;
+                _enqueuedAt[id] = calledAt;
                 return ValueTask.CompletedTask;
             },
             cancellationToken).ConfigureAwait(false);

@@ -331,8 +331,9 @@ public sealed class QuartzPostgresTarget : IBenchmarkTarget
             async (job, token) =>
             {
                 var input = new QuartzBenchInput(job.Payload, job.DelayMs);
+                var calledAt = DateTimeOffset.UtcNow;
                 var trigger = await ScheduleAsync(scheduler, input, token).ConfigureAwait(false);
-                _enqueuedAt[trigger] = DateTimeOffset.UtcNow;
+                _enqueuedAt[trigger] = calledAt;
             },
             cancellationToken).ConfigureAwait(false);
         _enqueueLatencies.AddRange(latencies);

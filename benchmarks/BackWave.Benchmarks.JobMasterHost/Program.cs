@@ -166,8 +166,9 @@ async ValueTask EnqueueAsync(BenchJob job, CancellationToken cancellationToken)
     var data = WriteableMessageData.New()
         .SetStringValue(JobMasterBenchmarkJob.PayloadKey, job.Payload)
         .SetIntValue(JobMasterBenchmarkJob.DelayKey, job.DelayMs);
+    var calledAt = DateTimeOffset.UtcNow;
     var context = await JobMasterScheduler.Instance.OnceNowAsync<JobMasterBenchmarkJob>(data).ConfigureAwait(false);
-    enqueuedAt[context.Id] = DateTimeOffset.UtcNow;
+    enqueuedAt[context.Id] = calledAt;
 }
 
 async Task WaitForCountAsync(string sql, int target)

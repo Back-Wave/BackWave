@@ -164,8 +164,6 @@ async Task<TickerQHostResponse> ExecuteAsync(WorkloadSpec spec)
         : new TickerQHostResponse(false, $"{unsuccessful} tickers ended unsuccessful: {await StatusBreakdownAsync().ConfigureAwait(false)}");
 }
 
-// End-to-end latency = TickerQ's own ExecutedAt stamp (taken when the handler returns) minus the instant the
-// ticker's INSERT committed, recorded by EnqueueCommitStamp.
 async Task<TickerQHostResponse> SamplesAsync()
 {
     var endToEnd = new List<long>(enqueuedAt.Count);
@@ -205,6 +203,7 @@ async ValueTask EnqueueAsync(ITimeTickerManager<TimeTickerEntity> manager, Bench
         Request = TickerHelper.CreateTickerRequest(job),
         Retries = 0,
     };
+    EnqueueCommitStamp.CallStart.Value = DateTimeOffset.UtcNow;
     var result = await manager.AddAsync(ticker, cancellationToken).ConfigureAwait(false);
     if (!result.IsSucceeded)
     {

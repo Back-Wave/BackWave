@@ -68,7 +68,7 @@ public sealed class TickerQPostgresTarget : IBenchmarkTarget
         ["serialization"] = "System.Text.Json reflection, request bytes stored on the ticker row (as shipped)",
         ["process-model"] = "producer-only instance (DisableBackgroundServices) persists the drain backlog; processing host in the same fresh child process per run",
         ["schema"] = "dropped before each run and recreated by EnsureCreated, so it always matches the TickerQ version under test",
-        ["latency-source"] = "TickerQ's own ExecutedAt (taken when the handler returns) minus the instant the ticker INSERT committed (EF Core SaveChanges interceptor)",
+        ["latency-source"] = "TickerQ's own ExecutedAt (taken when the handler returns) minus the instant the enqueue call started (paired with the ticker id by an EF Core SaveChanges interceptor), as BackWave measures from its due-now DueTime",
         ["tickerq-version"] = $"{TickerQVersion} (newest MIT/Apache release; 10.5.x and 11.5.x need a license certificate to execute jobs, and 11.5.x targets net11.0 only)",
         ["npgsql"] = $"{ChildNpgsqlVersion} in the child process (BackWave and Hangfire run on Npgsql 9.0.3)",
     };
