@@ -43,6 +43,9 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
 
     private static bool LongPolling => System.Environment.GetEnvironmentVariable("BACKWAVE_BENCH_HANGFIRE_LONG_POLLING") == "1";
 
+    private static int QueuePollMs =>
+        int.TryParse(System.Environment.GetEnvironmentVariable("BACKWAVE_BENCH_HANGFIRE_POLL_MS"), out var ms) ? ms : 200;
+
     /// <inheritdoc/>
     public override string Name => "Hangfire/Postgres";
 
@@ -60,7 +63,7 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
             // Tuned-to-best for the community adapter: an aggressive poll interval (the PG adapter has no
             // zero-poll fetch like SQL Server's sliding invisibility), sliding invisibility timeout, and
             // native DB transactions. Surfaced in StorageDials.
-            QueuePollInterval = TimeSpan.FromMilliseconds(200),
+            QueuePollInterval = TimeSpan.FromMilliseconds(QueuePollMs),
             UseSlidingInvisibilityTimeout = true,
             UseNativeDatabaseTransactions = true,
             EnableLongPolling = LongPolling,
@@ -71,7 +74,7 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
     /// <inheritdoc/>
     protected override IReadOnlyDictionary<string, string> StorageDials() => new Dictionary<string, string>
     {
-        ["queue-poll-interval"] = "200ms (community adapter, aggressive)",
+        ["queue-poll-interval"] = $"{QueuePollMs}ms (community adapter, aggressive)",
         ["long-polling"] = LongPolling ? "on (LISTEN/NOTIFY wakes idle fetchers)" : "off (adapter default)",
         ["fetch-mode"] = "sliding invisibility timeout, native DB transactions (tuned-to-best)",
         ["schema"] = SchemaName,
