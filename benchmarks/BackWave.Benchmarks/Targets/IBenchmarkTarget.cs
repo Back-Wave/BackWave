@@ -59,6 +59,12 @@ public interface IBenchmarkTarget : IAsyncDisposable
     /// </summary>
     IReadOnlyDictionary<string, string> TuningDials { get; }
 
+    /// <summary>
+    /// The environment variables engaged for this run that change what the target does in a way no real
+    /// deployment would. Any entry makes the result a diagnostic that is never publishable.
+    /// </summary>
+    IReadOnlyList<string> DiagnosticKnobs => [];
+
     /// <summary>One-time setup: connect, migrate schema, build the host. Returns the engine version string.</summary>
     Task<string> SetupAsync(CancellationToken cancellationToken);
 

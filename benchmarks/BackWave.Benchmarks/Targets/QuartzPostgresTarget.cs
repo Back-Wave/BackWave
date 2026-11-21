@@ -150,6 +150,9 @@ public sealed class QuartzPostgresTarget : IBenchmarkTarget
     };
 
     /// <inheritdoc/>
+    public IReadOnlyList<string> DiagnosticKnobs => _tuning.Clustered ? [] : [QuartzTuning.ClusteredEnvVar];
+
+    /// <inheritdoc/>
     public async Task<string> SetupAsync(CancellationToken cancellationToken)
     {
         PostgresDatabase.EnsureExists(_connectionString);

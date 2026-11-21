@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using BackWave.Benchmarks.Diagnostics;
 using BackWave.Benchmarks.Environment;
 using BackWave.Benchmarks.Latency;
 using BackWave.Benchmarks.Metrics;
@@ -75,6 +76,7 @@ public sealed class RunOrchestrator
             EnqueueP99Ms = MetricsAggregator.Distribute(Project(metrics, m => m.EnqueueP99.TotalMilliseconds)),
             Resources = AggregateResources(measured.Select(o => o.Resources).ToArray()),
             WorkAudits = audits,
+            DiagnosticKnobs = DbTrace.IsEngaged ? [.. _target.DiagnosticKnobs, DbTrace.EnvVar] : _target.DiagnosticKnobs,
         };
     }
 

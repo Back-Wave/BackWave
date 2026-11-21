@@ -133,6 +133,7 @@ public sealed class LatencyProfileTests
             EnqueueP99Ms = new Distribution(1, 2, 3),
             Resources = ResourceMetrics.None,
             WorkAudits = [],
+            DiagnosticKnobs = [],
         };
     }
 }

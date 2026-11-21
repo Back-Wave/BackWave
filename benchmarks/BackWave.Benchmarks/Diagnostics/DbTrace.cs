@@ -33,14 +33,18 @@ internal sealed class DbTrace : IDisposable
         ActivitySource.AddActivityListener(_listener);
     }
 
+    /// <summary>Whether <see cref="EnvVar"/> is set, so this process records spans.</summary>
+    public static bool IsEngaged => !string.IsNullOrWhiteSpace(System.Environment.GetEnvironmentVariable(EnvVar));
+
     /// <summary>Starts recording when <see cref="EnvVar"/> is set; returns null otherwise.</summary>
     public static DbTrace? StartFromEnvironment()
     {
-        var path = System.Environment.GetEnvironmentVariable(EnvVar);
-        if (string.IsNullOrWhiteSpace(path))
+        if (!IsEngaged)
         {
             return null;
         }
+
+        var path = System.Environment.GetEnvironmentVariable(EnvVar)!;
 
         Console.Error.WriteLine($"DB TRACE ENGAGED ({path}): a DIAGNOSTIC run, never reported.");
         return new DbTrace(path);
