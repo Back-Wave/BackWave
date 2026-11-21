@@ -33,6 +33,9 @@ public abstract class BackWaveTarget : IBenchmarkTarget
     private readonly TimeSpan _drainPollInterval = TimeSpan.FromMilliseconds(10);
     private readonly TimeSpan _connectionSampleInterval = TimeSpan.FromMilliseconds(20);
     private ResourceMetrics _lastResources = ResourceMetrics.None;
+    private TimeSpan? _producerElapsed;
+    private DateTimeOffset? _firstCompletion;
+    private DateTimeOffset? _lastCompletion;
 
     /// <inheritdoc/>
     public abstract string Name { get; }
@@ -109,6 +112,10 @@ public abstract class BackWaveTarget : IBenchmarkTarget
     {
         _enqueueLatencies.Clear();
         _lastResources = ResourceMetrics.None;
+        _producerElapsed = null;
+        _firstCompletion = null;
+        _lastCompletion = null;
+        BenchExecutions.Reset();
         return ResetStoreAsync(cancellationToken);
     }
 
@@ -213,7 +220,8 @@ public abstract class BackWaveTarget : IBenchmarkTarget
     public async Task<TargetSamples> CollectSamplesAsync(CancellationToken cancellationToken)
     {
         var endToEnd = await CollectEndToEndLatenciesAsync(cancellationToken).ConfigureAwait(false);
-        return new TargetSamples(_enqueueLatencies.ToArray(), endToEnd, _lastResources);
+        return new TargetSamples(_enqueueLatencies.ToArray(), endToEnd, _lastResources,
+            new WorkEvidence(BenchExecutions.Count, _firstCompletion, _lastCompletion, _producerElapsed));
     }
 
     /// <inheritdoc/>
@@ -252,6 +260,7 @@ public abstract class BackWaveTarget : IBenchmarkTarget
             async (job, ct) => await client.EnqueueAsync(job, DateTimeOffset.UtcNow, cancellationToken: ct).ConfigureAwait(false),
             cancellationToken).ConfigureAwait(false);
         _enqueueLatencies.AddRange(latencies);
+        _producerElapsed = ParallelProducer.LastElapsed;
     }
 
     private async Task<int> SampleConnectionsAsync(CancellationToken cancellationToken)
@@ -313,9 +322,11 @@ public abstract class BackWaveTarget : IBenchmarkTarget
 
             foreach (var job in page)
             {
-                if (job.TerminalAt is { } terminal)
+                if (job.State == JobState.Succeeded && job.TerminalAt is { } terminal)
                 {
                     latencies.Add(terminal - job.DueTime);
+                    _firstCompletion = _firstCompletion is { } first && first <= terminal ? first : terminal;
+                    _lastCompletion = _lastCompletion is { } last && last >= terminal ? last : terminal;
                 }
             }
 

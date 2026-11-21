@@ -26,6 +26,16 @@ public sealed class TuningDialsTests
     }
 
     [Fact]
+    public void TickerQ_max_concurrency_is_matched_to_backwave_pool_size_and_retries_are_off()
+    {
+        var backwave = new PostgresBenchmarkTarget(PgDsn).TuningDials["worker-pool-size"];
+        var tickerQ = new TickerQPostgresTarget(PgDsn).TuningDials;
+
+        Assert.Equal(backwave, tickerQ["worker-pool-size"]);
+        Assert.Contains("Retries=0", tickerQ["retry-policy"]);
+    }
+
+    [Fact]
     public void JobMaster_worker_count_is_the_smallest_multiple_of_five_at_or_above_backwave_pool_size()
     {
         // JobMaster sizes run slots as 5 x parallelism factor per bucket, so it cannot record a pool that

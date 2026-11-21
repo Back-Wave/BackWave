@@ -18,7 +18,7 @@ public sealed class HangfireSqlServerTarget : HangfireBenchmarkTarget
     public const string ConnectionStringEnvVar = "BACKWAVE_HANGFIRE_SQLSERVER_DSN";
 
     private const string SchemaName = "HangFire";
-    private const string HangfireVersion = "1.8.23";
+    private const string HangfireVersion = "1.8.25";
 
     private const string DefaultConnectionString =
         "Server=localhost,14330;User Id=sa;Password=BackWave!Passw0rd;TrustServerCertificate=true;Database=hangfire_test";

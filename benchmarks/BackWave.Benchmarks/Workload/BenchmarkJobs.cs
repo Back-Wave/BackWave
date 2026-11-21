@@ -21,6 +21,7 @@ public sealed class BenchmarkJobs
         // payload is carried only to exercise the ~100-200B serialization path; it is intentionally unused.
         _ = payload;
         _ = context;
+        BenchExecutions.Record();
         return delayMs > 0 ? Task.Delay(delayMs, cancellationToken) : Task.CompletedTask;
     }
 }

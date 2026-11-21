@@ -18,13 +18,15 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
     public const string ConnectionStringEnvVar = "BACKWAVE_HANGFIRE_POSTGRES_DSN";
 
     private const string SchemaName = "hangfire";
-    private const string HangfireVersion = "1.8.23";
+    private const string HangfireVersion = "1.8.25";
     private const string AdapterVersion = "1.21.1";
 
     private const string DefaultConnectionString =
         "Host=localhost;Port=5499;Username=backwave;Password=backwave;Database=hangfire_test";
 
     private readonly string _connectionString;
+
+    private readonly NpgsqlDataSource _probe;
 
     /// <summary>Creates the target using the DSN from the environment, or the local docker-compose default.</summary>
     public HangfirePostgresTarget()
@@ -34,7 +36,15 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
 
     /// <summary>Creates the target against an explicit connection string.</summary>
     public HangfirePostgresTarget(string connectionString)
-        => _connectionString = connectionString;
+    {
+        _connectionString = connectionString;
+        _probe = NpgsqlDataSource.Create(connectionString);
+    }
+
+    private static bool LongPolling => System.Environment.GetEnvironmentVariable("BACKWAVE_BENCH_HANGFIRE_LONG_POLLING") == "1";
+
+    private static int QueuePollMs =>
+        int.TryParse(System.Environment.GetEnvironmentVariable("BACKWAVE_BENCH_HANGFIRE_POLL_MS"), out var ms) ? ms : 200;
 
     /// <inheritdoc/>
     public override string Name => "Hangfire/Postgres";
@@ -45,6 +55,7 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
     /// <inheritdoc/>
     protected override JobStorage CreateStorage()
     {
+        PostgresDatabase.EnsureExists(_connectionString);
         var options = new PostgreSqlStorageOptions
         {
             SchemaName = SchemaName,
@@ -52,9 +63,10 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
             // Tuned-to-best for the community adapter: an aggressive poll interval (the PG adapter has no
             // zero-poll fetch like SQL Server's sliding invisibility), sliding invisibility timeout, and
             // native DB transactions. Surfaced in StorageDials.
-            QueuePollInterval = TimeSpan.FromMilliseconds(200),
+            QueuePollInterval = TimeSpan.FromMilliseconds(QueuePollMs),
             UseSlidingInvisibilityTimeout = true,
             UseNativeDatabaseTransactions = true,
+            EnableLongPolling = LongPolling,
         };
         return new PostgreSqlStorage(new NpgsqlConnectionFactory(_connectionString, options), options);
     }
@@ -62,7 +74,8 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
     /// <inheritdoc/>
     protected override IReadOnlyDictionary<string, string> StorageDials() => new Dictionary<string, string>
     {
-        ["queue-poll-interval"] = "200ms (community adapter, aggressive)",
+        ["queue-poll-interval"] = QueuePollMs == 200 ? "200ms (community adapter, aggressive)" : $"{QueuePollMs}ms (override)",
+        ["long-polling"] = LongPolling ? "on (LISTEN/NOTIFY wakes idle fetchers)" : "off (adapter default)",
         ["fetch-mode"] = "sliding invisibility timeout, native DB transactions (tuned-to-best)",
         ["schema"] = SchemaName,
         ["hangfire-version"] = HangfireVersion,
@@ -84,8 +97,7 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
     {
         // Defined identically to the BackWave Postgres probe (this process's backends, minus the probe's own),
         // so peak DB connections is a fair cross-system metric.
-        await using var dataSource = NpgsqlDataSource.Create(_connectionString);
-        await using var command = dataSource.CreateCommand(
+        await using var command = _probe.CreateCommand(
             "SELECT count(*) FROM pg_stat_activity " +
             "WHERE datname = current_database() AND pid <> pg_backend_pid()");
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
@@ -102,4 +114,8 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
             $"{SchemaName}.aggregatedcounter, {SchemaName}.lock RESTART IDENTITY CASCADE");
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    /// <inheritdoc/>
+    public override async Task TeardownAsync(CancellationToken cancellationToken)
+        => await _probe.DisposeAsync().ConfigureAwait(false);
 }

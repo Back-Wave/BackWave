@@ -54,12 +54,13 @@ fi
 log "Starting Postgres + SQL Server"
 $DOCKER compose up -d --wait
 
-# 4. Seed the databases the official battery needs. Compose auto-creates only PG backwave_test, so add
-#    PG hangfire_test and both SQL Server databases. Idempotent — safe to re-run.
+# 4. Seed the databases the official battery needs.
 log "Seeding databases"
-$DOCKER compose exec -T postgres psql -U backwave -d backwave_test -tAc \
-  "SELECT 1 FROM pg_database WHERE datname='hangfire_test'" | grep -q 1 \
-  || $DOCKER compose exec -T postgres psql -U backwave -d backwave_test -c "CREATE DATABASE hangfire_test"
+for db in hangfire_test jobmaster_test quartz_test tickerq_test; do
+  $DOCKER compose exec -T postgres psql -U backwave -d backwave_test -tAc \
+    "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -q 1 \
+    || $DOCKER compose exec -T postgres psql -U backwave -d backwave_test -c "CREATE DATABASE $db"
+done
 $DOCKER compose exec -T sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'BackWave!Passw0rd' -C -b -Q \
   "IF DB_ID('backwave_test') IS NULL CREATE DATABASE backwave_test; IF DB_ID('hangfire_test') IS NULL CREATE DATABASE hangfire_test;"
 
@@ -67,6 +68,9 @@ $DOCKER compose exec -T sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U 
 #    whole run is reproducible from this script alone (and so a stray local override can't sneak in).
 export BACKWAVE_POSTGRES_DSN="Host=localhost;Port=5499;Username=backwave;Password=backwave;Database=backwave_test"
 export BACKWAVE_HANGFIRE_POSTGRES_DSN="Host=localhost;Port=5499;Username=backwave;Password=backwave;Database=hangfire_test"
+export BACKWAVE_JOBMASTER_POSTGRES_DSN="Host=localhost;Port=5499;Username=backwave;Password=backwave;Database=jobmaster_test"
+export BACKWAVE_QUARTZ_POSTGRES_DSN="Host=localhost;Port=5499;Username=backwave;Password=backwave;Database=quartz_test"
+export BACKWAVE_TICKERQ_POSTGRES_DSN="Host=localhost;Port=5499;Username=backwave;Password=backwave;Database=tickerq_test"
 export BACKWAVE_SQLSERVER_DSN="Server=localhost,14330;User Id=sa;Password=BackWave!Passw0rd;TrustServerCertificate=true;Database=backwave_test"
 export BACKWAVE_HANGFIRE_SQLSERVER_DSN="Server=localhost,14330;User Id=sa;Password=BackWave!Passw0rd;TrustServerCertificate=true;Database=hangfire_test"
 

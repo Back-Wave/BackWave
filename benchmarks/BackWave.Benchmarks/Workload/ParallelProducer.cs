@@ -13,6 +13,12 @@ namespace BackWave.Benchmarks.Workload;
 internal static class ParallelProducer
 {
     /// <summary>
+    /// How long the last <see cref="RunAsync"/> took from its first enqueue to its last, so a sustained run
+    /// can report the arrival rate it actually delivered next to the throughput it drained.
+    /// </summary>
+    public static TimeSpan LastElapsed { get; private set; }
+
+    /// <summary>
     /// Enqueues the spec's whole job stream across <see cref="WorkloadSpec.ProducerCount"/> producers, each
     /// pacing at an equal share of <paramref name="paceRatePerSecond"/>, and returns every per-call latency.
     /// </summary>
@@ -34,11 +40,14 @@ internal static class ParallelProducer
         var ranges = Partition(jobs.Length, producerCount);
         // Each producer paces at its share of the target rate, so the producers together hit the total rate.
         var ratePerProducer = paceRatePerSecond > 0 ? paceRatePerSecond / producerCount : 0d;
+        var phase = Stopwatch.StartNew();
 
         if (producerCount == 1)
         {
-            return await ProduceAsync(jobs, ranges[0].Offset, ranges[0].Count, ratePerProducer, enqueueAsync, cancellationToken)
+            var single = await ProduceAsync(jobs, ranges[0].Offset, ranges[0].Count, ratePerProducer, enqueueAsync, cancellationToken)
                 .ConfigureAwait(false);
+            LastElapsed = phase.Elapsed;
+            return single;
         }
 
         var tasks = ranges
@@ -47,6 +56,7 @@ internal static class ParallelProducer
                 cancellationToken))
             .ToArray();
         var perProducer = await Task.WhenAll(tasks).ConfigureAwait(false);
+        LastElapsed = phase.Elapsed;
 
         var all = new List<TimeSpan>(jobs.Length);
         foreach (var latencies in perProducer)

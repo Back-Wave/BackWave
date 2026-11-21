@@ -11,10 +11,27 @@ namespace BackWave.Benchmarks.Targets;
 /// <param name="EnqueueLatencies">Per-job enqueue call→committed durations observed this run.</param>
 /// <param name="EndToEndLatencies">Per-job enqueue→terminal durations observed this run.</param>
 /// <param name="Resources">The resource-cost metrics captured around this run's timed window.</param>
+/// <param name="Work">What the target can prove about the work itself; see <see cref="WorkEvidence"/>.</param>
 public readonly record struct TargetSamples(
     IReadOnlyList<TimeSpan> EnqueueLatencies,
     IReadOnlyList<TimeSpan> EndToEndLatencies,
-    ResourceMetrics Resources);
+    ResourceMetrics Resources,
+    WorkEvidence Work = default);
+
+/// <summary>
+/// The target's evidence that the work happened: how many handler executions it counted, the first and last
+/// completion instants on the host clock, and how long the enqueue side took. The orchestrator checks it
+/// against the job count and the timed window. A null field is one the target cannot observe.
+/// </summary>
+/// <param name="Executions">Handler executions counted this run; equal to the job count when each job ran exactly once.</param>
+/// <param name="FirstCompletion">The earliest completion instant among the end-to-end samples.</param>
+/// <param name="LastCompletion">The latest completion instant among the end-to-end samples.</param>
+/// <param name="ProducerElapsed">First enqueue to last enqueue of this run's producers.</param>
+public readonly record struct WorkEvidence(
+    int? Executions,
+    DateTimeOffset? FirstCompletion,
+    DateTimeOffset? LastCompletion,
+    TimeSpan? ProducerElapsed);
 
 /// <summary>
 /// The fairness seam (ADR 0027 §5). Each system under test — BackWave on each adapter, and later Hangfire
@@ -41,6 +58,12 @@ public interface IBenchmarkTarget : IAsyncDisposable
     /// (claim strategy, serialization — these are the product, won fairly, not hidden). Keyed dial → value.
     /// </summary>
     IReadOnlyDictionary<string, string> TuningDials { get; }
+
+    /// <summary>
+    /// The environment variables engaged for this run that change what the target does in a way no real
+    /// deployment would. Any entry makes the result a diagnostic that is never publishable.
+    /// </summary>
+    IReadOnlyList<string> DiagnosticKnobs => [];
 
     /// <summary>One-time setup: connect, migrate schema, build the host. Returns the engine version string.</summary>
     Task<string> SetupAsync(CancellationToken cancellationToken);

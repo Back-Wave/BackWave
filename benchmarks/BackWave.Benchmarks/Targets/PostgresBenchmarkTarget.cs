@@ -51,7 +51,10 @@ public sealed class PostgresBenchmarkTarget : BackWaveTarget
 
     /// <inheritdoc/>
     protected override Task MigrateAsync(CancellationToken cancellationToken)
-        => PostgresMigrator.MigrateAsync(_dataSource, cancellationToken);
+    {
+        PostgresDatabase.EnsureExists(_connectionString);
+        return PostgresMigrator.MigrateAsync(_dataSource, cancellationToken);
+    }
 
     /// <inheritdoc/>
     protected override IJobStore CreateStore()

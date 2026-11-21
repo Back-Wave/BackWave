@@ -26,12 +26,15 @@
     <!-- The Hangfire competitor (bench-0140): its own server + storage behind the IBenchmarkTarget seam,
          so the measurement code around it is provably identical to BackWave's. SQL Server is first-party
          (the flagship comparison); Hangfire.PostgreSql is the community adapter (footnoted in the doc). -->
-    <PackageReference Include="Hangfire.Core" Version="1.8.23" />
-    <PackageReference Include="Hangfire.SqlServer" Version="1.8.23" />
+    <PackageReference Include="Hangfire.Core" Version="1.8.25" />
+    <PackageReference Include="Hangfire.SqlServer" Version="1.8.25" />
     <PackageReference Include="Hangfire.PostgreSql" Version="1.21.1" />
     <!-- Hangfire serializes with Newtonsoft.Json (reflection-JSON, the competitor's path); its transitive
          pin (11.0.1) carries a known advisory that NU1903-as-error rejects, so float it to a patched line. -->
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <!-- The Quartz.NET competitor: the ADO.NET job store loads Npgsql by name, so it runs in-process on the
+         harness's own Npgsql 9.0.3. -->
+    <PackageReference Include="Quartz" Version="4.7.3" />
   </ItemGroup>
 
   <ItemGroup>
@@ -48,6 +51,8 @@
          to ours so JobMasterPostgresTarget can spawn it as a fresh child process per run. -->
     <ProjectReference Include="..\BackWave.Benchmarks.JobMasterHost\BackWave.Benchmarks.JobMasterHost.csproj"
                       ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\BackWave.Benchmarks.TickerQHost\BackWave.Benchmarks.TickerQHost.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
   <Target Name="StageJobMasterHost" AfterTargets="Build">
@@ -60,6 +65,19 @@
     </ItemGroup>
     <Copy SourceFiles="@(JobMasterHostFiles)"
           DestinationFiles="@(JobMasterHostFiles->'$(OutDir)jobmaster-host\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="StageTickerQHost" AfterTargets="Build">
+    <MSBuild Projects="..\BackWave.Benchmarks.TickerQHost\BackWave.Benchmarks.TickerQHost.csproj"
+             Targets="GetTargetPath" Properties="Configuration=$(Configuration)">
+      <Output TaskParameter="TargetOutputs" PropertyName="TickerQHostTargetPath" />
+    </MSBuild>
+    <ItemGroup>
+      <TickerQHostFiles Include="$([System.IO.Path]::GetDirectoryName($(TickerQHostTargetPath)))\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(TickerQHostFiles)"
+          DestinationFiles="@(TickerQHostFiles->'$(OutDir)tickerq-host\%(RecursiveDir)%(Filename)%(Extension)')"
           SkipUnchangedFiles="true" />
   </Target>
 
