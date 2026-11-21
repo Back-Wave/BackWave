@@ -1589,6 +1589,81 @@ public class SimulatorTests
         Assert.Equal(InvariantId.PerNodeCap, exception.InvariantId);
     }
 
+    [Theory]
+    [InlineData(2861UL)]
+    [InlineData(2862UL)]
+    [InlineData(2863UL)]
+    public void StoreCallsInFlight_OverlapPollsAndCompletions_AndEveryOracleHolds(ulong seed)
+    {
+        var options = new SimulationOptions
+        {
+            Seed = seed,
+            WorkloadDuration = TimeSpan.FromMinutes(10),
+            MaxStoreLaneLatency = TimeSpan.FromSeconds(3),
+        };
+        var result = new Simulator(options).Run();
+
+        Assert.True(result.CompletionsDuringOutcomeWrite > 0, $"seed {seed}: no execution finished during a write");
+        Assert.True(result.PollsDuringClaim > 0, $"seed {seed}: no poll landed during a claim");
+        Assert.Equal(200, result.Succeeded + result.DeadLettered + result.Cancelled);
+        Assert.Equal(result.FinalJobs, new Simulator(options).Run().FinalJobs);
+    }
+
+    [Theory]
+    [InlineData(2864UL)]
+    [InlineData(2865UL)]
+    [InlineData(2866UL)]
+    public void StoreCallsInFlight_KeepThePoolBound_UnderChaos(ulong seed)
+    {
+        var chaos = new Simulator(new SimulationOptions
+        {
+            Seed = seed,
+            PoolSize = 2,
+            WorkloadDuration = TimeSpan.FromMinutes(10),
+            MaxStoreLaneLatency = TimeSpan.FromSeconds(3),
+        }).Run();
+        Assert.True(chaos.CompletionsDuringOutcomeWrite > 0, $"seed {seed}: no execution finished during a write");
+        Assert.True(chaos.PollsDuringClaim > 0, $"seed {seed}: no poll landed during a claim");
+        Assert.Equal(200, chaos.Succeeded + chaos.DeadLettered + chaos.Cancelled);
+
+        var isolated = new Simulator(new SimulationOptions
+        {
+            Seed = seed,
+            PoolSize = 2,
+            IsolationCount = 30,
+            WorkloadDuration = TimeSpan.FromMinutes(10),
+            MaxStoreLaneLatency = TimeSpan.FromSeconds(3),
+        }).Run();
+        Assert.True(isolated.Isolations > 0, $"seed {seed}: isolation injected nothing");
+        Assert.Equal(200, isolated.Succeeded + isolated.DeadLettered + isolated.Cancelled);
+    }
+
+    [Theory]
+    [InlineData(1UL)]
+    [InlineData(2UL)]
+    [InlineData(3UL)]
+    public void CleanStop_LandsTheStoreCallsInFlight_BeforeItRelinquishes(ulong seed)
+    {
+        var result = new Simulator(new SimulationOptions
+        {
+            Seed = seed,
+            StopCount = 40,
+            WorkloadDuration = TimeSpan.FromMinutes(10),
+            CrashProbabilityPerPoll = 0,
+            HeartbeatLossProbability = 0,
+            StoreFaultProbability = 0,
+            MaxStoreLaneLatency = TimeSpan.FromSeconds(3),
+        }).Run();
+
+        Assert.True(result.OutcomeWritesLandedOnStop > 0, $"seed {seed}: no clean stop caught a write in flight");
+        Assert.True(result.ClaimsLandedOnStop > 0, $"seed {seed}: no clean stop caught a claim in flight");
+        Assert.True(result.LeasesRelinquished > 0, $"seed {seed}: no clean stop ever reached the store");
+        Assert.Equal(0, result.OutcomeBufferDropped);
+        Assert.Equal(0, result.StaleOutcomes);
+        Assert.Equal(0, result.LeasesExpired);
+        Assert.Equal(200, result.Succeeded + result.DeadLettered + result.Cancelled + result.Quarantined);
+    }
+
     /// <summary>
     /// Per-Queue Concurrency Limits over the multi-Queue topology (issue 0074): several Queues each carry their
     /// own cap, enforced simultaneously, while the anchor node juggles all of them — the regime that makes

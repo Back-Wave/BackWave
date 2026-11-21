@@ -31,6 +31,7 @@ public sealed class SwarmEnvelopeTests
         Assert.Equal(a.OperatorActionCount, b.OperatorActionCount);
         Assert.Equal(a.TopologyQueues, b.TopologyQueues);
         Assert.Equal(a.PoolSize, b.PoolSize);
+        Assert.Equal(a.MaxStoreLaneLatency, b.MaxStoreLaneLatency);
         Assert.Equal(a.ConcurrencyLimits.Count, b.ConcurrencyLimits.Count);
         foreach (var (queue, cap) in a.ConcurrencyLimits)
         {

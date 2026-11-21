@@ -32,6 +32,8 @@ internal static class SwarmEnvelope
     public const int LimitMin = 1, LimitMax = 3;
     public const int PoolMin = 1, PoolMax = 4;
 
+    public static readonly TimeSpan StoreLaneLatencyMax = TimeSpan.FromSeconds(5);
+
     public static readonly TimeSpan WorkloadDuration = TimeSpan.FromHours(1);
     public static readonly TimeSpan DrainAllowance = TimeSpan.FromHours(6);
     public static readonly TimeSpan DefaultMaxExecution = TimeSpan.FromSeconds(90); // GC-pause regime (> Lease)
@@ -128,6 +130,9 @@ internal static class SwarmEnvelope
             UnroutableProbability = unroutable,
             IsolationCount = isolation,
             StopCount = stops,
+            MaxStoreLaneLatency = scenario.MaxStoreLaneLatency <= TimeSpan.Zero
+                ? TimeSpan.Zero
+                : TimeSpan.FromTicks(Math.Min(scenario.MaxStoreLaneLatency.Ticks, StoreLaneLatencyMax.Ticks)),
             OperatorActionCount = operatorActions,
             JobCount = jobCount,
             TopologyQueues = topologyQueues,

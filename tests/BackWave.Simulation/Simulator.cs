@@ -39,6 +39,8 @@ internal sealed record SimulationOptions
     /// </summary>
     public TimeSpan MaxPollInterval { get; init; }
 
+    public TimeSpan MaxStoreLaneLatency { get; init; }
+
     public TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(20);
     public TimeSpan LeaseDuration { get; init; } = TimeSpan.FromSeconds(60);
     public int MaxAttempts { get; init; } = 3;
@@ -546,6 +548,14 @@ internal sealed record SimulationResult(
     /// <summary>Outcome batches that clean stops flushed from a non-empty buffer before relinquishing.</summary>
     public int OutcomeBufferFlushed { get; init; }
 
+    public int CompletionsDuringOutcomeWrite { get; init; }
+
+    public int OutcomeWritesLandedOnStop { get; init; }
+
+    public int PollsDuringClaim { get; init; }
+
+    public int ClaimsLandedOnStop { get; init; }
+
     /// <summary>
     /// Leases swept by ExpireLeases over the run — the migration mechanism. In an isolation regime with
     /// crashes and heartbeat loss off, every expiry is a Lease lapsed under an isolated holder and re-homed
@@ -612,12 +622,16 @@ internal sealed record SimulationResult(
 /// </summary>
 internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan = null)
 {
-    private enum EventKind { Enqueue, Poll, Heartbeat, ExecutionComplete, Restart, Hint, OperatorAction, IsolationStart, IsolationHeal, Stop }
+    private enum EventKind { Enqueue, Poll, Heartbeat, ExecutionComplete, Restart, Hint, OperatorAction, IsolationStart, IsolationHeal, Stop, OutcomeWriteLanded, ClaimLanded }
 
     private sealed record SimEvent(EventKind Kind, int Node, int Epoch, JobRecord? Job, bool Fails)
     {
         /// <summary>The episode an <see cref="EventKind.IsolationStart"/> carries; null for every other kind.</summary>
         public IsolationEpisode? Episode { get; init; }
+
+        public Command.ReportOutcomeBatch? Batch { get; init; }
+
+        public Command.ClaimBatch? Claim { get; init; }
     }
 
     private sealed class SimNode
@@ -663,6 +677,8 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         // The host drops such a job from its in-flight set the moment the handler returns, so the
         // double-execution oracle does not count these as running. Cleared with Executing.
         public HashSet<(Guid JobId, int Attempt)> AwaitingReport { get; } = [];
+        public SimEvent? OutcomeWrite { get; set; }
+        public SimEvent? Claim { get; set; }
     }
 
     private readonly DeterministicRandom _rng = new(options.Seed);
@@ -767,6 +783,12 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     // ExecutionUnroutable instead of executing, so it reaches Quarantined and never enters _everExecuted.
     private readonly DeterministicRandom _routeRng = new(options.Seed ^ 0x554E524F55544142UL); // "UNROUTAB": its own stream
     private readonly HashSet<Guid> _unroutable = [];
+    private readonly DeterministicRandom _outcomeWriteRng = new(options.Seed ^ 0x4F55545752495445UL); // "OUTWRITE"
+    private readonly DeterministicRandom _claimRng = new(options.Seed ^ 0x434C41494D4C414EUL); // "CLAIMLAN"
+    private int _completionsDuringOutcomeWrite;
+    private int _outcomeWritesLandedOnStop;
+    private int _pollsDuringClaim;
+    private int _claimsLandedOnStop;
     // Outcome-Provenance Oracle (issue 0068): a captured violation message, asserted in CheckInvariants
     // so the oracle "runs in the oracle" — the store applied an outcome whose reporter did not hold the
     // live Lease for that Attempt. Null on every legitimate run.
@@ -1248,6 +1270,10 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             PermanentLosses = _permanentLosses,
             OutcomeBufferDropped = _outcomeBufferDropped,
             OutcomeBufferFlushed = _outcomeBufferFlushed,
+            CompletionsDuringOutcomeWrite = _completionsDuringOutcomeWrite,
+            OutcomeWritesLandedOnStop = _outcomeWritesLandedOnStop,
+            PollsDuringClaim = _pollsDuringClaim,
+            ClaimsLandedOnStop = _claimsLandedOnStop,
             LeasesExpired = _leasesExpired,
             LeasesRelinquished = _leasesRelinquished,
             AckLosses = _ackLosses,
@@ -1494,6 +1520,10 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     Schedule(_now + options.PollInterval, simEvent);
                     break;
                 }
+                if (execNode.OutcomeWrite is not null)
+                {
+                    _completionsDuringOutcomeWrite++;
+                }
                 // Ack-loss isolation (issue 0070): once per (job, attempt), the outcome write commits but
                 // the ack is lost. Arm the per-node store to apply-then-throw, then re-arm this completion:
                 // the node believes the report failed and re-reports on its next tick. The committed write
@@ -1542,6 +1572,44 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 {
                     Stop(simEvent.Node);
                 }
+                break;
+
+            case EventKind.OutcomeWriteLanded:
+                var writer = _nodes[simEvent.Node];
+                if (!ReferenceEquals(writer.OutcomeWrite, simEvent))
+                {
+                    break;
+                }
+                writer.OutcomeWrite = null;
+                IReadOnlyList<OutcomeReportResult> written;
+                try
+                {
+                    written = WriteOutcomeBatch(simEvent.Node, simEvent.Batch!);
+                }
+                catch (SimTransientFault)
+                {
+                    written = [];
+                }
+                TryDrive(simEvent.Node, new NodeEvent.OutcomeBatchReported(written, NodeNow(simEvent.Node)));
+                break;
+
+            case EventKind.ClaimLanded:
+                var claimer = _nodes[simEvent.Node];
+                if (!ReferenceEquals(claimer.Claim, simEvent))
+                {
+                    break;
+                }
+                claimer.Claim = null;
+                IReadOnlyList<JobRecord> landed;
+                try
+                {
+                    landed = StoreClaim(simEvent.Node, simEvent.Claim!);
+                }
+                catch (SimTransientFault)
+                {
+                    landed = [];
+                }
+                TryDrive(simEvent.Node, new NodeEvent.ClaimCompleted(landed, NodeNow(simEvent.Node)));
                 break;
 
             case EventKind.Restart:
@@ -1834,6 +1902,10 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     private void DriveInner(int nodeIndex, NodeEvent nodeEvent)
     {
         var node = _nodes[nodeIndex];
+        if (nodeEvent is NodeEvent.PollDue && node.Claim is not null)
+        {
+            _pollsDuringClaim++;
+        }
         // An Unroutable ExecuteJob's terminal report is DEFERRED to after the whole command batch
         // (issue 0136), mirroring the production Shell: the pump enqueues the ExecutionUnroutable as a
         // feedback event and only runs its ReportOutcome once every ExecuteJob in the batch has been
@@ -1890,36 +1962,23 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     break;
 
                 case Command.ClaimBatch claim:
-                    var claimNow = NodeNow(nodeIndex);
-                    var request = new ClaimRequest(claim.WorkerId, claim.Queues, claim.MaxJobs, claim.LeaseDuration, claimNow);
+                    if (options.MaxStoreLaneLatency > TimeSpan.Zero && !node.Down)
+                    {
+                        if (node.Claim is not null)
+                        {
+                            throw new InvalidOperationException(
+                                $"[seed {options.Seed}] node {nodeIndex} started a claim while another was in flight");
+                        }
+                        node.Claim = new SimEvent(EventKind.ClaimLanded, nodeIndex, node.Epoch, null, false)
+                        {
+                            Claim = claim,
+                        };
+                        Schedule(_now + _claimRng.NextTimeSpan(options.MaxStoreLaneLatency), node.Claim);
+                        break;
+                    }
                     // A fault here needs no completion of its own: the batch counts as un-issued, and the
                     // catch below lands its empty ClaimCompleted as it abandons the batch.
-                    IReadOnlyList<JobRecord> jobs;
-                    if (AdaptivePoll)
-                    {
-                        // Take the store's next-due hint and fold it into this node's backoff, exactly as the
-                        // host pump does. Off by default (ClaimAsync path below), so a run stays byte-identical.
-                        var result = Get(_nodeFaulty[nodeIndex].ClaimBatchAsync(request));
-                        jobs = result.Jobs;
-                        UpdatePollBackoff(nodeIndex, jobs.Count > 0, result.NextDue, claimNow);
-                    }
-                    else
-                    {
-                        jobs = Get(_nodeFaulty[nodeIndex].ClaimAsync(request));
-                    }
-                    // SabotageDoubleClaim: once, hand this claim one extra row a peer is still executing under
-                    // a Lease live on the peer's clock, as a claim that ignored Lease expiry would. The store
-                    // row keeps the peer as owner; only the per-node views show two live executors.
-                    if (options.SabotageDoubleClaim && !_doubleClaimSabotaged && jobs.Count < claim.MaxJobs
-                        && FindLiveHeldByPeer(nodeIndex) is { } stolen)
-                    {
-                        _doubleClaimSabotaged = true;
-                        jobs = [.. jobs, stolen with { LeaseOwner = claim.WorkerId }];
-                    }
-                    // Always report the claim's completion, an empty result included: the Driver reserved this
-                    // batch's slots at issue and frees them here, so an empty claim must still land or the
-                    // reservation would strand and wedge the pool.
-                    Drive(nodeIndex, new NodeEvent.ClaimCompleted(jobs, NodeNow(nodeIndex)));
+                    Drive(nodeIndex, new NodeEvent.ClaimCompleted(StoreClaim(nodeIndex, claim), NodeNow(nodeIndex)));
                     break;
 
                 case Command.ExecuteJob execute:
@@ -1972,6 +2031,20 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     break;
 
                 case Command.ReportOutcomeBatch batch:
+                    if (options.MaxStoreLaneLatency > TimeSpan.Zero && !node.Down)
+                    {
+                        if (node.OutcomeWrite is not null)
+                        {
+                            throw new InvalidOperationException(
+                                $"[seed {options.Seed}] node {nodeIndex} started an outcome write while another was in flight");
+                        }
+                        node.OutcomeWrite = new SimEvent(EventKind.OutcomeWriteLanded, nodeIndex, node.Epoch, null, false)
+                        {
+                            Batch = batch,
+                        };
+                        Schedule(_now + _outcomeWriteRng.NextTimeSpan(options.MaxStoreLaneLatency), node.OutcomeWrite);
+                        break;
+                    }
                     RunOutcomeBatch(nodeIndex, batch);
                     break;
 
@@ -2097,6 +2170,38 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     /// Single-row batches stay fenced, so this is strictly the batched-path twin of SabotageOutcomeFence.
     /// </summary>
     private void RunOutcomeBatch(int nodeIndex, Command.ReportOutcomeBatch batch)
+        => Drive(nodeIndex, new NodeEvent.OutcomeBatchReported(WriteOutcomeBatch(nodeIndex, batch), NodeNow(nodeIndex)));
+
+    private IReadOnlyList<JobRecord> StoreClaim(int nodeIndex, Command.ClaimBatch claim)
+    {
+        var claimNow = NodeNow(nodeIndex);
+        var request = new ClaimRequest(claim.WorkerId, claim.Queues, claim.MaxJobs, claim.LeaseDuration, claimNow);
+        IReadOnlyList<JobRecord> jobs;
+        if (AdaptivePoll)
+        {
+            // Take the store's next-due hint and fold it into this node's backoff, exactly as the
+            // host pump does. Off by default (ClaimAsync path below), so a run stays byte-identical.
+            var result = Get(_nodeFaulty[nodeIndex].ClaimBatchAsync(request));
+            jobs = result.Jobs;
+            UpdatePollBackoff(nodeIndex, jobs.Count > 0, result.NextDue, claimNow);
+        }
+        else
+        {
+            jobs = Get(_nodeFaulty[nodeIndex].ClaimAsync(request));
+        }
+        // SabotageDoubleClaim: once, hand this claim one extra row a peer is still executing under
+        // a Lease live on the peer's clock, as a claim that ignored Lease expiry would. The store
+        // row keeps the peer as owner; only the per-node views show two live executors.
+        if (options.SabotageDoubleClaim && !_doubleClaimSabotaged && jobs.Count < claim.MaxJobs
+            && FindLiveHeldByPeer(nodeIndex) is { } stolen)
+        {
+            _doubleClaimSabotaged = true;
+            jobs = [.. jobs, stolen with { LeaseOwner = claim.WorkerId }];
+        }
+        return jobs;
+    }
+
+    private IReadOnlyList<OutcomeReportResult> WriteOutcomeBatch(int nodeIndex, Command.ReportOutcomeBatch batch)
     {
         var dropBatchFence = options.SabotageBatchFence && batch.Outcomes.Count > 1;
         var reportNow = NodeNow(nodeIndex);
@@ -2120,7 +2225,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             ObserveOutcome(nodeIndex, row.JobId, row.WorkerId, row.Attempt, row.Outcome,
                 pres[i], fenceShouldApply[i], results[i].Result);
         }
-        Drive(nodeIndex, new NodeEvent.OutcomeBatchReported(results, NodeNow(nodeIndex)));
+        return results;
     }
 
     /// <summary>
@@ -2405,12 +2510,14 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         // At-Least-Once). Tally it for the coverage Situation before the buffer is gone. This is the DISCARD
         // path and stays one: a crashed process gets no hand-back, which is the whole difference between it
         // and the clean stop in Stop.
-        if (node.Driver.BufferedOutcomeCount > 0)
+        if (node.Driver.BufferedOutcomeCount > 0 || node.OutcomeWrite is not null)
         {
             _outcomeBufferDropped++;
         }
         node.Crashed = true;
         node.Epoch++;
+        node.OutcomeWrite = null;
+        node.Claim = null;
         node.Executing.Clear();
         node.AwaitingReport.Clear();
         _crashes++;
@@ -2458,6 +2565,32 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         node.Epoch++;
         node.Executing.Clear();
         node.AwaitingReport.Clear();
+
+        if (node.Claim is { Claim: { } claimInFlight })
+        {
+            node.Claim = null;
+            try
+            {
+                StoreClaim(nodeIndex, claimInFlight);
+                _claimsLandedOnStop++;
+            }
+            catch (SimTransientFault)
+            {
+            }
+        }
+        if (node.OutcomeWrite is { Batch: { } inFlight })
+        {
+            node.OutcomeWrite = null;
+            try
+            {
+                WriteOutcomeBatch(nodeIndex, inFlight);
+                _outcomeWritesLandedOnStop++;
+            }
+            catch (SimTransientFault)
+            {
+                _outcomeBufferDropped++;
+            }
+        }
 
         // 1. The buffered outcomes, through the ordinary command path (RunOutcomeBatch), so the fence, the
         //    Outcome-Provenance oracle and the slot-release detector all see them exactly as they see a
@@ -3004,10 +3137,13 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         }
         for (var n = 0; n < _nodes.Length; n++)
         {
+            var node = _nodes[n];
+            var writing = node.OutcomeWrite?.Batch!.Outcomes.Count(row => !node.Executing.ContainsKey(row.JobId)) ?? 0;
             Invariant(
                 InvariantId.PerNodeCap,
-                _nodes[n].Executing.Count <= options.PoolSize,
-                $"per-node cap {options.PoolSize} exceeded: node-{n} has {_nodes[n].Executing.Count} in-flight executions");
+                node.Executing.Count + writing <= options.PoolSize,
+                $"per-node cap {options.PoolSize} exceeded: node-{n} has {node.Executing.Count} in-flight executions"
+                + (writing > 0 ? $" and {writing} outcomes being written" : ""));
             // BackpressureIdle coverage (issue 0124): the node's finite pool is full, so its next claim is
             // blocked purely by backpressure (the Driver subtracts in-flight from each claim batch). Tallied
             // off the in-flight count the invariant already read — no rng, no hot-path instrumentation.

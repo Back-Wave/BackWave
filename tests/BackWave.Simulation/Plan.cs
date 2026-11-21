@@ -45,6 +45,7 @@ internal sealed record Scenario
     public int OperatorActionCount { get; init; }
     public int IsolationCount { get; init; }
     public int StopCount { get; init; }
+    public TimeSpan MaxStoreLaneLatency { get; init; }
     public double PermanentLossProbability { get; init; }
     public double AckLossProbability { get; init; }
     public double UnroutableProbability { get; init; }
@@ -113,6 +114,7 @@ internal sealed record Scenario
         OperatorActionCount = o.OperatorActionCount,
         IsolationCount = o.IsolationCount,
         StopCount = o.StopCount,
+        MaxStoreLaneLatency = o.MaxStoreLaneLatency,
         PermanentLossProbability = o.PermanentLossProbability,
         AckLossProbability = o.AckLossProbability,
         UnroutableProbability = o.UnroutableProbability,
@@ -169,6 +171,7 @@ internal sealed record Scenario
         OperatorActionCount = OperatorActionCount,
         IsolationCount = IsolationCount,
         StopCount = StopCount,
+        MaxStoreLaneLatency = MaxStoreLaneLatency,
         PermanentLossProbability = PermanentLossProbability,
         AckLossProbability = AckLossProbability,
         UnroutableProbability = UnroutableProbability,

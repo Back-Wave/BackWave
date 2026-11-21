@@ -212,6 +212,12 @@ internal static class SwarmConfig
         var stopDraw = rng.Next(SwarmEnvelope.StopMax + 1); // 0..3 clean stops
         var stops = topologyQueues == 0 && !poolBounded ? stopDraw : 0;
 
+        var laneCoin = rng.NextDouble();
+        var laneSpan = rng.NextDouble();
+        var laneLatency = laneCoin < AxisActiveProbability
+            ? TimeSpan.FromMilliseconds(Math.Max(1, laneSpan * SwarmEnvelope.StoreLaneLatencyMax.TotalMilliseconds))
+            : TimeSpan.Zero;
+
         return new SimulationOptions
         {
             Seed = seed,
@@ -229,6 +235,7 @@ internal static class SwarmConfig
             UnroutableProbability = unroutable,
             IsolationCount = isolation,
             StopCount = stops,
+            MaxStoreLaneLatency = laneLatency,
             // Healing-only: never a permanent loss, so Migration-Liveness always converges inside the drain.
             PermanentLossProbability = 0.0,
             OperatorActionCount = operatorActions,
@@ -327,6 +334,8 @@ internal static class SwarmConfig
             // Restart-Reclaim bound is already disarmed by RadioactiveMode, so the stops here exercise the
             // hand-back under maxed faults without arming a bound this regime cannot hold.
             StopCount = 1 + rng.Next(SwarmEnvelope.StopMax),
+
+            MaxStoreLaneLatency = TimeSpan.FromMilliseconds(Band(rng, 1, SwarmEnvelope.StoreLaneLatencyMax.TotalMilliseconds)),
         };
     }
 
