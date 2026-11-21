@@ -196,7 +196,6 @@ public sealed class BackWaveBuilder
     /// <exception cref="InvalidOperationException">
     /// A worker group with the same <see cref="WorkerGroupOptions.Name"/> was already added; the
     /// group's <see cref="WorkerGroupOptions.Pumps"/> count is less than one; its
-    /// <see cref="WorkerGroupOptions.MaxOutcomeBatch"/> is set below one; its
     /// <see cref="WorkerGroupOptions.MaxPollInterval"/> exceeds int.MaxValue milliseconds (about
     /// 24.85 days), which the idle-poll pacer cannot wait out; its
     /// <see cref="WorkerGroupOptions.ShutdownBudget"/> is negative (use
@@ -224,11 +223,6 @@ public sealed class BackWaveBuilder
         {
             throw new InvalidOperationException(
                 $"Worker Group '{options.Name}' must run at least one Pump (Pumps = {options.Pumps}).");
-        }
-        if (options.MaxOutcomeBatch < 1)
-        {
-            throw new InvalidOperationException(
-                $"Worker Group '{options.Name}' has a {nameof(WorkerGroupOptions.MaxOutcomeBatch)} below one ({options.MaxOutcomeBatch}); use 1 to write each outcome on its own, or leave it null to batch a claim's worth.");
         }
         if (options.MaxPollInterval > TimeSpan.Zero && options.MaxPollInterval.TotalMilliseconds > int.MaxValue)
         {

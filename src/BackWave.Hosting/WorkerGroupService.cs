@@ -328,7 +328,8 @@ internal sealed class WorkerGroupService(
             WorkerId = _workerId,
             Policy = options.Policy,
             MaxClaimBatch = options.MaxClaimBatch,
-            MaxOutcomeBatch = options.MaxOutcomeBatch ?? options.MaxClaimBatch, // coalesce a claim batch's worth of outcomes
+            // A value below 1 has always meant one outcome per write, and the Driver's batches need at least one row.
+            MaxOutcomeBatch = Math.Max(1, options.MaxOutcomeBatch ?? options.MaxClaimBatch), // coalesce a claim batch's worth of outcomes
             PoolSize = options.PoolSize, // the Driver subtracts in-flight work from claims
             LeaseDuration = options.LeaseDuration,
             RetryPolicy = options.RetryPolicy,
@@ -500,16 +501,23 @@ internal sealed class WorkerGroupService(
                 // the tickers to fill until host shutdown, and the Wake-Up Hint subscription would leak on
                 // exactly the path - a halt - that most needs the process left tidy.
                 //
-                // A halting pump writes nothing more to the store, and no lane call outlives the pump.
-                _claim.Cancel();
-                _outcomeWrite.Cancel();
-
                 // Pump gone: close the channel so the tickers' writes no-op instead of
                 // filling an unread buffer until host shutdown.
                 events.Writer.TryComplete();
                 if (hints is not null)
                 {
                     await hints.DisposeAsync().ConfigureAwait(false);
+                }
+
+                // A halting pump cancels its lane calls still in flight, so a store that honors the cancel
+                // writes nothing more. Last, because a store's cancellation callback can throw.
+                try
+                {
+                    _claim.Cancel();
+                }
+                finally
+                {
+                    _outcomeWrite.Cancel();
                 }
             }
         }
@@ -691,7 +699,7 @@ internal sealed class WorkerGroupService(
         await ExecuteAsync(command, events, budget).ConfigureAwait(false);
         if (command is Command.ReportOutcomeBatch)
         {
-            await _outcomeWrite.Running.ConfigureAwait(false);
+            await _outcomeWrite.Running.WaitAsync(budget).ConfigureAwait(false);
             TakeAnswer(_outcomeWrite);
         }
     }

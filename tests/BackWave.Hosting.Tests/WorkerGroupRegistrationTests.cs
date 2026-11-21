@@ -54,19 +54,6 @@ public class WorkerGroupRegistrationTests
         Assert.Contains("Pump", ex.Message);
     }
 
-    [Theory]
-    [InlineData(0)]
-    [InlineData(-1)]
-    public void AddWorkerGroup_WithMaxOutcomeBatchBelowOne_Throws(int maxOutcomeBatch)
-    {
-        var ex = Assert.Throws<InvalidOperationException>(() =>
-            new ServiceCollection().AddBackWave(backwave => backwave
-                .UseStore(new InMemoryJobStore())
-                .UseRegistry(new JobRegistry([]))
-                .AddWorkerGroup(Group("workers") with { MaxOutcomeBatch = maxOutcomeBatch })));
-        Assert.Contains(nameof(WorkerGroupOptions.MaxOutcomeBatch), ex.Message);
-    }
-
     [Fact]
     public void AddWorkerGroup_WithDuplicateName_Throws()
     {

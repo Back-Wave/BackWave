@@ -69,7 +69,8 @@ public class OutcomeWriteOverlapTests
     ]);
 
     private static WebApplication BuildHost(
-        IJobStore store, PingBoard board, int poolSize, ILoggerProvider? logs = null, TimeSpan? shutdownBudget = null)
+        IJobStore store, PingBoard board, int poolSize, ILoggerProvider? logs = null, TimeSpan? shutdownBudget = null,
+        int? maxOutcomeBatch = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
@@ -90,6 +91,7 @@ public class OutcomeWriteOverlapTests
                 PoolSize = poolSize,
                 LeaseDuration = TimeSpan.FromMinutes(5),
                 ShutdownBudget = shutdownBudget ?? TimeSpan.FromSeconds(5),
+                MaxOutcomeBatch = maxOutcomeBatch,
             }));
         return builder.Build();
     }
@@ -124,6 +126,32 @@ public class OutcomeWriteOverlapTests
         store.ReleaseOutcomeWrites();
         await WaitForStateAsync(monitor, first, JobState.Succeeded);
         await WaitForStateAsync(monitor, second, JobState.Succeeded);
+        await app.StopAsync();
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public async Task AMaxOutcomeBatchBelowOne_WritesEachOutcomeOnItsOwn(int maxOutcomeBatch)
+    {
+        var store = new FaultableStore(new InMemoryJobStore());
+        await using var app = BuildHost(store, new PingBoard(), poolSize: 2, maxOutcomeBatch: maxOutcomeBatch);
+        await app.StartAsync();
+        var client = app.Services.GetRequiredService<BackWaveClient>();
+        var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
+
+        Guid[] jobs =
+        [
+            await client.EnqueueAsync(new PingJob("first"), dueTime: DateTimeOffset.UtcNow),
+            await client.EnqueueAsync(new PingJob("second"), dueTime: DateTimeOffset.UtcNow),
+            await client.EnqueueAsync(new PingJob("third"), dueTime: DateTimeOffset.UtcNow),
+        ];
+
+        foreach (var job in jobs)
+        {
+            await WaitForStateAsync(monitor, job, JobState.Succeeded);
+        }
+        Assert.Equal(jobs.Length, store.ReportOutcomesCalls);
         await app.StopAsync();
     }
 
