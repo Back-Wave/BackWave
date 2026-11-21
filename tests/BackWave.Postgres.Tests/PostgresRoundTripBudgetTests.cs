@@ -64,11 +64,11 @@ public sealed class PostgresRoundTripBudgetTests
 
     private static readonly Budget Enqueue = new(
         "EnqueueAsync of one untagged job",
-        Statements: 3);
+        Statements: 2);
 
     private static readonly Budget EnqueueTagged = new(
         "EnqueueAsync of one job carrying three tags",
-        Statements: 6);
+        Statements: 5);
 
     private static readonly Budget WritePumpStatuses = new(
         "WritePumpStatusesAsync of 8 Pumps that also reaps 8 old rows",
@@ -287,19 +287,19 @@ public sealed class PostgresRoundTripBudgetTests
         await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
         await store.EnqueueAsync(Job(), T0); // warms the one-time schema check, off the measured path
 
-        // 1 job insert + 1 transition insert + 1 pg_notify wake-up hint = 3 statements. Enqueue is a
-        // per-CALL path, not a per-row one, so there is no batch here for a set-based statement to
-        // collapse - which is why the batching work in this file's other budgets left this number alone.
+        // 1 job insert + 1 transition insert = 2 statements. Enqueue is a per-CALL path, not a per-row
+        // one, so there is no batch here for a set-based statement to collapse - which is why the
+        // batching work in this file's other budgets left this number alone.
         //
         // This is the budget that guards the skipped prune. The transition insert RETURNs the ordinal
         // it just assigned, and the recorder issues its bounded DELETE only when that ordinal reached
         // MaxTransitionsPerJob. A brand-new job's first transition is ordinal 0, so the DELETE is
         // skipped - it could only ever have been a no-op, since its bound is MAX(ordinal) - cap, which
         // is negative while the newest ordinal is under the cap. Take the skip back out and every
-        // transition on every job in the system pays a wasted round trip, and this test fails with 4
-        // against 3 while nothing else in the suite changes.
+        // transition on every job in the system pays a wasted round trip, and this test fails with 3
+        // against 2 while nothing else in the suite changes.
         //
-        // Three is also NOT the number the wire charges. This counter deliberately excludes acquiring a
+        // Two is also NOT the number the wire charges. This counter deliberately excludes acquiring a
         // pooled connection, BEGIN and COMMIT (see the class remarks), and enqueue pays all of them on
         // every call because it opens and commits its own transaction per job. That fixed per-call cost
         // is why enqueue barely moves when the claim and outcome paths get faster, and only a bulk
@@ -320,14 +320,14 @@ public sealed class PostgresRoundTripBudgetTests
         await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
         await store.EnqueueAsync(Job(), T0);
 
-        // The untagged budget above plus ONE STATEMENT PER TAG: 3 + 3 = 6. InsertTagsAsync walks the
+        // The untagged budget above plus ONE STATEMENT PER TAG: 2 + 3 = 5. InsertTagsAsync walks the
         // set and binds one INSERT ... ON CONFLICT DO NOTHING per tag, so a job carrying n tags costs
         // n statements on top of its enqueue.
         //
         // That is a per-row cost with an obvious set-based form - unnest(@keys::text[], @values::text[])
         // would fold the whole set into one INSERT, the way the transition batch already folds - and
-        // when someone writes it this number should fall to 4. Recording 6 rather than a rounder number
-        // is what makes the size of that win visible; recording an aspirational 4 would just make this
+        // when someone writes it this number should fall to 3. Recording 5 rather than a rounder number
+        // is what makes the size of that win visible; recording an aspirational 3 would just make this
         // test fail on a green tree.
         var tagged = Job() with
         {

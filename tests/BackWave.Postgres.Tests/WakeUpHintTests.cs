@@ -64,7 +64,7 @@ public class WakeUpHintTests
     }
 
     /// <summary>The pump subscribes asynchronously; wait until the LISTEN backend is live.</summary>
-    private static async Task WaitForListenerAsync()
+    internal static async Task WaitForListenerAsync()
     {
         var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(15);
         await using var dataSource = NpgsqlDataSource.Create(PostgresTestDatabase.ConnectionString);
