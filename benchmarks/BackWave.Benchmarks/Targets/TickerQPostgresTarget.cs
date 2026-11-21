@@ -66,7 +66,7 @@ public sealed class TickerQPostgresTarget : IBenchmarkTarget
         ["sustained-path"] = "run-now tickers are inserted, acquired, and handed to the local worker pool inside AddAsync, so producers wait on dispatch (architectural)",
         ["per-job-round-trips"] = "claim UPDATE, request SELECT, completion UPDATE, each its own autocommit statement (architectural)",
         ["serialization"] = "System.Text.Json reflection, request bytes stored on the ticker row (as shipped)",
-        ["process-model"] = "producer-only instance (DisableBackgroundServices) persists the drain backlog; processing host in the same fresh child process per run",
+        ["process-model"] = "producer-only instance (DisableBackgroundServices) persists the drain backlog; processing host in the same fresh child process per run, so JIT and EF Core query caches are cold in every measured run and warmup runs do not warm them",
         ["schema"] = "dropped before each run and recreated by EnsureCreated, so it always matches the TickerQ version under test",
         ["latency-source"] = "TickerQ's own ExecutedAt (taken when the handler returns) minus the instant the enqueue call started (paired with the ticker id by an EF Core SaveChanges interceptor), as BackWave measures from its due-now DueTime",
         ["tickerq-version"] = $"{TickerQVersion} (newest MIT/Apache release; 10.5.x and 11.5.x need a license certificate to execute jobs, and 11.5.x targets net11.0 only)",
