@@ -98,6 +98,7 @@ public sealed class QuartzPostgresTarget : IBenchmarkTarget
     private IScheduler? _scheduler;
     private int _sequence;
     private ResourceMetrics _lastResources = ResourceMetrics.None;
+    private TimeSpan? _producerElapsed;
 
     /// <summary>Creates the target using the DSN from the environment, or the local docker-compose default.</summary>
     public QuartzPostgresTarget()
@@ -173,6 +174,7 @@ public sealed class QuartzPostgresTarget : IBenchmarkTarget
         _enqueuedAt.Clear();
         _completions.Clear();
         _lastResources = ResourceMetrics.None;
+        _producerElapsed = null;
 
         await using (var command = DataSource.CreateCommand(
             "DO $$ BEGIN EXECUTE (SELECT 'TRUNCATE ' || string_agg(quote_ident(tablename), ', ') " +
@@ -264,7 +266,9 @@ public sealed class QuartzPostgresTarget : IBenchmarkTarget
             endToEnd.Add(completed[trigger] - enqueuedAt);
         }
 
-        return Task.FromResult(new TargetSamples(_enqueueLatencies.ToArray(), endToEnd, _lastResources));
+        var instants = completed.Values;
+        return Task.FromResult(new TargetSamples(_enqueueLatencies.ToArray(), endToEnd, _lastResources,
+            new WorkEvidence(_completions.Executions, instants.Min(), instants.Max(), _producerElapsed)));
     }
 
     /// <inheritdoc/>
@@ -332,6 +336,7 @@ public sealed class QuartzPostgresTarget : IBenchmarkTarget
             },
             cancellationToken).ConfigureAwait(false);
         _enqueueLatencies.AddRange(latencies);
+        _producerElapsed = ParallelProducer.LastElapsed;
     }
 
     private async ValueTask<string> ScheduleAsync(IScheduler scheduler, QuartzBenchInput input, CancellationToken cancellationToken)

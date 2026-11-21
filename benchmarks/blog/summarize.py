@@ -53,8 +53,17 @@ def row(target: str, runs: list[dict]) -> str:
         f"| {spread([r['EnqueueP50Ms']['Median'] for r in runs], ',.2f')} "
         f"| {max(r['Resources']['PeakConnections'] for r in runs)} "
         f"| {spread([r['Resources']['CpuPercent'] for r in runs], ',.1f')} "
-        f"| {workload['JobCount']:,} | {len(runs)} | {min(r['_idle'] for r in runs):.0f} |"
+        f"| {workload['JobCount']:,} | {len(runs)} | {min(r['_idle'] for r in runs):.0f} "
+        f"| {audit(runs)} |"
     )
+
+
+def audit(runs: list[dict]) -> str:
+    audits = [a for r in runs for a in r.get("WorkAudits", [])]
+    if not audits:
+        return "n/a"
+    failed = [a for a in audits if a["Problems"]]
+    return "PASS" if not failed else f"FAIL {len(failed)}/{len(audits)}: {failed[0]['Problems'][0]}"
 
 
 def main() -> None:
@@ -69,8 +78,8 @@ def main() -> None:
             continue
         print(f"## {workload}\n")
         print("| System | Throughput (jobs/s) | e2e p50 (ms) | e2e p99 (ms) | enqueue p50 (ms) "
-              "| Peak DB conns | CPU % | Jobs | Rounds | Min idle % before |")
-        print("|---|---|---|---|---|---|---|---|---|---|")
+              "| Peak DB conns | CPU % | Jobs | Rounds | Min idle % before | Work audit |")
+        print("|---|---|---|---|---|---|---|---|---|---|---|")
         for target in targets:
             print(row(target, cells[(workload, target)]))
         print()

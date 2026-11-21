@@ -23,6 +23,7 @@ public static class HangfireBenchmarkJob
     public static Task ExecuteAsync(string payload, int delayMs)
     {
         _ = payload;
+        BenchExecutions.Record();
         return delayMs > 0 ? Task.Delay(delayMs) : Task.CompletedTask;
     }
 }

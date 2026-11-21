@@ -32,6 +32,9 @@ public abstract class HangfireBenchmarkTarget : IBenchmarkTarget
     private readonly TimeSpan _drainPollInterval = TimeSpan.FromMilliseconds(10);
     private readonly TimeSpan _connectionSampleInterval = TimeSpan.FromMilliseconds(20);
     private ResourceMetrics _lastResources = ResourceMetrics.None;
+    private TimeSpan? _producerElapsed;
+    private DateTimeOffset? _firstCompletion;
+    private DateTimeOffset? _lastCompletion;
 
     /// <summary>
     /// Worker count, taken verbatim from BackWave's pump pool size so the two systems are provably matched on
@@ -124,6 +127,10 @@ public abstract class HangfireBenchmarkTarget : IBenchmarkTarget
         _enqueueLatencies.Clear();
         _enqueuedAt.Clear();
         _lastResources = ResourceMetrics.None;
+        _producerElapsed = null;
+        _firstCompletion = null;
+        _lastCompletion = null;
+        BenchExecutions.Reset();
         return ResetStoreAsync(cancellationToken);
     }
 
@@ -208,7 +215,8 @@ public abstract class HangfireBenchmarkTarget : IBenchmarkTarget
     public async Task<TargetSamples> CollectSamplesAsync(CancellationToken cancellationToken)
     {
         var endToEnd = await Task.Run(CollectEndToEndLatencies, cancellationToken).ConfigureAwait(false);
-        return new TargetSamples(_enqueueLatencies.ToArray(), endToEnd, _lastResources);
+        return new TargetSamples(_enqueueLatencies.ToArray(), endToEnd, _lastResources,
+            new WorkEvidence(BenchExecutions.Count, _firstCompletion, _lastCompletion, _producerElapsed));
     }
 
     /// <inheritdoc/>
@@ -249,6 +257,7 @@ public abstract class HangfireBenchmarkTarget : IBenchmarkTarget
             },
             cancellationToken).ConfigureAwait(false);
         _enqueueLatencies.AddRange(latencies);
+        _producerElapsed = ParallelProducer.LastElapsed;
     }
 
     private async Task WaitForDrainAsync(CancellationToken cancellationToken)
@@ -289,6 +298,9 @@ public abstract class HangfireBenchmarkTarget : IBenchmarkTarget
                     // so stamp it UTC explicitly to pair against the UTC enqueue instant on one clock.
                     var succeededUtc = DateTime.SpecifyKind(succeeded, DateTimeKind.Utc);
                     latencies.Add(succeededUtc - enqueuedAt.UtcDateTime);
+                    var completion = new DateTimeOffset(succeededUtc);
+                    _firstCompletion = _firstCompletion is { } first && first <= completion ? first : completion;
+                    _lastCompletion = _lastCompletion is { } last && last >= completion ? last : completion;
                 }
             }
         }

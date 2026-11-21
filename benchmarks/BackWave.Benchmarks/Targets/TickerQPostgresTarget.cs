@@ -148,7 +148,12 @@ public sealed class TickerQPostgresTarget : IBenchmarkTarget
         var response = await SendAsync(TickerQHostProtocol.Samples, null, cancellationToken).ConfigureAwait(false);
         var enqueue = (response.EnqueueTicks ?? []).Select(TimeSpan.FromTicks).ToArray();
         var endToEnd = (response.EndToEndTicks ?? []).Select(TimeSpan.FromTicks).ToArray();
-        return new TargetSamples(enqueue, endToEnd, _lastResources);
+        var work = new WorkEvidence(
+            response.Executions,
+            response.FirstCompletionUtcTicks is { } first ? new DateTimeOffset(first, TimeSpan.Zero) : null,
+            response.LastCompletionUtcTicks is { } last ? new DateTimeOffset(last, TimeSpan.Zero) : null,
+            response.ProducerTicks is { } producer ? TimeSpan.FromTicks(producer) : null);
+        return new TargetSamples(enqueue, endToEnd, _lastResources, work);
     }
 
     /// <inheritdoc/>

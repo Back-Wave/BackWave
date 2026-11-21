@@ -57,6 +57,7 @@ public sealed class RunOrchestrator
 
         var measured = MetricsAggregator.DiscardWarmup(perRun, warmupRuns);
         var metrics = measured.Select(o => o.Metrics).ToArray();
+        var audits = measured.Select(o => o.Audit).ToArray();
 
         return new BenchmarkResult
         {
@@ -73,6 +74,7 @@ public sealed class RunOrchestrator
             EnqueueP50Ms = MetricsAggregator.Distribute(Project(metrics, m => m.EnqueueP50.TotalMilliseconds)),
             EnqueueP99Ms = MetricsAggregator.Distribute(Project(metrics, m => m.EnqueueP99.TotalMilliseconds)),
             Resources = AggregateResources(measured.Select(o => o.Resources).ToArray()),
+            WorkAudits = audits,
         };
     }
 
@@ -82,16 +84,20 @@ public sealed class RunOrchestrator
         await _target.PreloadAsync(spec, cancellationToken).ConfigureAwait(false);
         await _target.WarmAsync(spec, cancellationToken).ConfigureAwait(false);
 
+        var windowOpen = DateTimeOffset.UtcNow;
         var stopwatch = Stopwatch.StartNew();
         await _target.ExecuteAsync(spec, cancellationToken).ConfigureAwait(false);
         stopwatch.Stop();
+        var windowClose = DateTimeOffset.UtcNow;
 
         await _target.CooldownAsync(cancellationToken).ConfigureAwait(false);
 
         var samples = await _target.CollectSamplesAsync(cancellationToken).ConfigureAwait(false);
         var metrics = MetricsAggregator.Aggregate(new RunSamples(
             spec.JobCount, stopwatch.Elapsed, samples.EndToEndLatencies, samples.EnqueueLatencies));
-        return new RunOutcome(metrics, samples.Resources);
+        var audit = WorkAudit.Check(spec, samples, windowOpen, windowClose);
+        Console.Error.WriteLine(audit.Describe());
+        return new RunOutcome(metrics, samples.Resources, audit);
     }
 
     private static IReadOnlyList<double> Project(IReadOnlyList<RunMetrics> runs, Func<RunMetrics, double> select)
@@ -122,5 +128,5 @@ public sealed class RunOrchestrator
     }
 
     /// <summary>One run's aggregated latency/throughput metrics plus the resource costs measured alongside it.</summary>
-    private readonly record struct RunOutcome(RunMetrics Metrics, ResourceMetrics Resources);
+    private readonly record struct RunOutcome(RunMetrics Metrics, ResourceMetrics Resources, WorkAudit Audit);
 }

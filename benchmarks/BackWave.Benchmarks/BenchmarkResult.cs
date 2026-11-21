@@ -59,6 +59,9 @@ public sealed record BenchmarkResult
     /// </summary>
     public required ResourceMetrics Resources { get; init; }
 
+    /// <summary>One work audit per measured run: whether every job ran exactly once, inside the timed window.</summary>
+    public required IReadOnlyList<WorkAudit> WorkAudits { get; init; }
+
     /// <summary>Whether this number may be published (mirrors <see cref="EnvironmentManifest.Publishable"/>).</summary>
     public bool Publishable => Manifest.Publishable;
 

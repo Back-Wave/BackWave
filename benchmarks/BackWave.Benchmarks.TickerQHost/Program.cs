@@ -67,6 +67,7 @@ await using var dataSource = NpgsqlDataSource.Create(dsn);
 var producerManager = producer.GetRequiredService<ITimeTickerManager<TimeTickerEntity>>();
 var processingManager = host.Services.GetRequiredService<ITimeTickerManager<TimeTickerEntity>>();
 var enqueueLatencies = new List<TimeSpan>();
+TimeSpan? producerElapsed = null;
 var stdout = Console.Out;
 Respond(new TickerQHostResponse(true));
 
@@ -135,6 +136,7 @@ async Task<TickerQHostResponse> PreloadAsync(WorkloadSpec spec)
         spec, paceRatePerSecond: 0, (job, ct) => EnqueueAsync(producerManager, job, ct), CancellationToken.None)
         .ConfigureAwait(false);
     enqueueLatencies.AddRange(latencies);
+    producerElapsed = ParallelProducer.LastElapsed;
     return new TickerQHostResponse(true);
 }
 
@@ -152,6 +154,7 @@ async Task<TickerQHostResponse> ExecuteAsync(WorkloadSpec spec)
             spec, spec.SustainedRatePerSecond, (job, ct) => EnqueueAsync(processingManager, job, ct), CancellationToken.None)
             .ConfigureAwait(false);
         enqueueLatencies.AddRange(latencies);
+        producerElapsed = ParallelProducer.LastElapsed;
     }
 
     await WaitForFinalAsync(spec.JobCount).ConfigureAwait(false);
@@ -166,6 +169,8 @@ async Task<TickerQHostResponse> ExecuteAsync(WorkloadSpec spec)
 async Task<TickerQHostResponse> SamplesAsync()
 {
     var endToEnd = new List<long>(enqueuedAt.Count);
+    long? firstCompletion = null;
+    long? lastCompletion = null;
     await using var command = dataSource.CreateCommand(
         """SELECT "Id", "ExecutedAt" FROM ticker."TimeTickers" WHERE "Status" IN (3, 4) AND "ExecutedAt" IS NOT NULL""");
     await using var reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
@@ -176,6 +181,8 @@ async Task<TickerQHostResponse> SamplesAsync()
         if (enqueuedAt.TryGetValue(id, out var startedAt))
         {
             endToEnd.Add((executedAt - startedAt.UtcDateTime).Ticks);
+            firstCompletion = Math.Min(firstCompletion ?? long.MaxValue, executedAt.Ticks);
+            lastCompletion = Math.Max(lastCompletion ?? long.MinValue, executedAt.Ticks);
         }
     }
 
@@ -184,7 +191,9 @@ async Task<TickerQHostResponse> SamplesAsync()
         return new TickerQHostResponse(false, $"{endToEnd.Count} end-to-end samples for {enqueuedAt.Count} committed tickers.");
     }
 
-    return new TickerQHostResponse(true, EnqueueTicks: enqueueLatencies.Select(t => t.Ticks).ToArray(), EndToEndTicks: endToEnd.ToArray());
+    return new TickerQHostResponse(true, EnqueueTicks: enqueueLatencies.Select(t => t.Ticks).ToArray(), EndToEndTicks: endToEnd.ToArray(),
+        Executions: TickerQBenchmarkJob.Executions, FirstCompletionUtcTicks: firstCompletion, LastCompletionUtcTicks: lastCompletion,
+        ProducerTicks: producerElapsed?.Ticks);
 }
 
 async ValueTask EnqueueAsync(ITimeTickerManager<TimeTickerEntity> manager, BenchJob job, CancellationToken cancellationToken)
