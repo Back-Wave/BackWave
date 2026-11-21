@@ -543,7 +543,7 @@ internal sealed record SimulationResult(
     /// </summary>
     public int OutcomeBufferDropped { get; init; }
 
-    /// <summary>Clean stops whose hand-back flushed a non-empty outcome buffer before relinquishing.</summary>
+    /// <summary>Outcome batches that clean stops flushed from a non-empty buffer before relinquishing.</summary>
     public int OutcomeBufferFlushed { get; init; }
 
     /// <summary>
@@ -2024,16 +2024,15 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         }
         catch (SimTransientFault)
         {
-            // A fault abandons the rest of this batch's commands, but the Driver already reserved the pool
-            // slots of every ClaimBatch it planned - it frees them only when that batch's ClaimCompleted
-            // lands. Land an empty completion for each claim this batch never ran, so an abandoned batch
-            // cannot strand a reservation and wedge the pool shut. commands[issued] is the command that
-            // faulted, and everything after it never ran. Mirrors the production pump.
             for (var index = issued; index < commands.Count; index++)
             {
                 if (commands[index] is Command.ClaimBatch)
                 {
                     Drive(nodeIndex, new NodeEvent.ClaimCompleted([], NodeNow(nodeIndex)));
+                }
+                else if (commands[index] is Command.ReportOutcomeBatch)
+                {
+                    Drive(nodeIndex, new NodeEvent.OutcomeBatchReported([], NodeNow(nodeIndex)));
                 }
             }
             throw;
@@ -2464,7 +2463,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         //    Outcome-Provenance oracle and the slot-release detector all see them exactly as they see a
         //    poll-tick flush. Reporting first is what saves the work: these rows are terminal, and a Lease
         //    handed back before them would fence every one of them out.
-        if (node.Driver.DrainBufferedOutcomes() is { } pending)
+        while (node.Driver.DrainBufferedOutcomes() is { } pending)
         {
             try
             {
@@ -2476,6 +2475,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 // The rows behind the faulted one are gone with the Driver - the buffer-loss window, reached
                 // by a clean stop this time rather than a crash. Same tally, same At-Least-Once reclaim.
                 _outcomeBufferDropped++;
+                break;
             }
         }
 

@@ -26,7 +26,19 @@ public sealed class InvoiceLog
     public List<(string OrderId, int Attempt)> Sent { get; } = [];
 }
 
+public sealed record WriteReceipt(string Text);
+
+public sealed class WriteReceiptHandler : IJobHandler<WriteReceipt>
+{
+    public Task HandleAsync(WriteReceipt job, JobContext context, CancellationToken cancellationToken)
+    {
+        context.SetOutput(job, HarnessJsonContext.Default.WriteReceipt);
+        return Task.CompletedTask;
+    }
+}
+
 [JsonSerializable(typeof(SendInvoice))]
+[JsonSerializable(typeof(WriteReceipt))]
 internal sealed partial class HarnessJsonContext : JsonSerializerContext;
 
 public class BackWaveHarnessTests
@@ -43,6 +55,33 @@ public class BackWaveHarnessTests
                 "send-invoice", HarnessJsonContext.Default.SendInvoice),
         ]);
         return (new BackWaveHarness(registry, services), services.GetRequiredService<InvoiceLog>());
+    }
+
+    [Fact]
+    public async Task AnOutcomeWriteTheStoreRejects_DoesNotStopLaterOutcomesFromBeingWritten()
+    {
+        var services = new ServiceCollection()
+            .AddSingleton<InvoiceLog>()
+            .AddTransient<IJobHandler<SendInvoice>, SendInvoiceHandler>()
+            .AddTransient<IJobHandler<WriteReceipt>, WriteReceiptHandler>()
+            .BuildServiceProvider();
+        var registry = new JobRegistry(
+        [
+            JobRegistration.Create<SendInvoice, SendInvoiceHandler>(
+                "send-invoice", HarnessJsonContext.Default.SendInvoice),
+            JobRegistration.Create<WriteReceipt, WriteReceiptHandler>(
+                "write-receipt", HarnessJsonContext.Default.WriteReceipt),
+        ]);
+        var harness = new BackWaveHarness(
+            registry, services, new BackWaveHarnessOptions { Bounds = new StoreBounds { MaxOutputBytes = 16 } });
+
+        await harness.EnqueueAsync(new WriteReceipt(new string('x', 64)));
+        await Assert.ThrowsAsync<JobOutputTooLargeException>(harness.RunDueAsync);
+
+        var next = await harness.EnqueueAsync(new SendInvoice("order-1"));
+        await harness.RunDueAsync();
+
+        Assert.Equal(JobState.Succeeded, (await harness.Monitor.GetJobAsync(next))!.State);
     }
 
     [Fact]

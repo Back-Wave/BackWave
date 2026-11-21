@@ -38,6 +38,10 @@ internal sealed class DeterministicPump(
 
     private readonly List<InFlight> _inFlight = [];
 
+    // The events still to step. A field, not a drive's local, so the empty completions a throwing store
+    // call leaves behind are stepped by the next drive, as the production pump's channel keeps them.
+    private readonly Queue<NodeEvent> _events = new();
+
     // The pending settlement of each in-flight Attempt's process telemetry, keyed by (JobId, Attempt):
     // its held-open process span (possibly null) plus the Wire Name and Queue the settling report needs
     // to tag the dead-letter counter, so the settling outcome can land a retry-scheduled / dead-lettered
@@ -69,16 +73,24 @@ internal sealed class DeterministicPump(
 
     private async Task DriveAsync(NodeEvent first, DateTimeOffset now)
     {
-        var events = new Queue<NodeEvent>();
-        events.Enqueue(first);
+        _events.Enqueue(first);
 
         while (true)
         {
-            while (events.TryDequeue(out var nodeEvent))
+            while (_events.TryDequeue(out var nodeEvent))
             {
-                foreach (var command in driver.Step(nodeEvent))
+                var commands = driver.Step(nodeEvent);
+                for (var issued = 0; issued < commands.Count; issued++)
                 {
-                    await ExecuteAsync(command, events, now);
+                    try
+                    {
+                        await ExecuteAsync(commands[issued], _events, now);
+                    }
+                    catch
+                    {
+                        ReleaseUnansweredBatches(commands, issued, now);
+                        throw;
+                    }
                 }
             }
 
@@ -123,11 +135,29 @@ internal sealed class DeterministicPump(
                 // The execution edge already classified this Attempt (RunHandlerAsync) and the telemetry
                 // it emitted rode that same verdict, so the outcome event and the metrics can never
                 // disagree about what a cancellation meant.
-                events.Enqueue(verdict.Failure is { } exception
+                _events.Enqueue(verdict.Failure is { } exception
                     ? StashFailureAndReport(flight.Job, exception, now)
                     : verdict.IsCancelled
                         ? new NodeEvent.ExecutionCancelled(flight.Job, "operator-cancel", now)
                         : new NodeEvent.ExecutionSucceeded(flight.Job, now));
+            }
+        }
+    }
+
+    // The Driver frees its claim or its outcome write only when that batch's completion lands, and a store
+    // call that throws lands none. Land an empty one for the batch that threw and for each batch behind it
+    // that never ran, so one failed call cannot stop the node from claiming or writing again.
+    private void ReleaseUnansweredBatches(IReadOnlyList<Command> commands, int from, DateTimeOffset now)
+    {
+        for (var index = from; index < commands.Count; index++)
+        {
+            if (commands[index] is Command.ClaimBatch)
+            {
+                _events.Enqueue(new NodeEvent.ClaimCompleted([], now));
+            }
+            else if (commands[index] is Command.ReportOutcomeBatch)
+            {
+                _events.Enqueue(new NodeEvent.OutcomeBatchReported([], now));
             }
         }
     }
@@ -188,9 +218,9 @@ internal sealed class DeterministicPump(
                         // A claim is the start of an Attempt: its Lease is now held (Trace).
                         BackWaveLog.LeaseAcquired(_log, job.JobId, job.WireName, job.Attempt, job.Queue);
                     }
-                    // Always report the claim's completion, an empty result included: the Driver reserved this
-                    // batch's slots at issue and frees them here, so an empty claim must still land or the
-                    // reservation would strand and wedge the pool.
+                    // Always report the claim's completion, an empty result included: the Driver keeps one
+                    // claim out at a time and frees it here, so an empty claim must still land or the node
+                    // would never claim again.
                     events.Enqueue(new NodeEvent.ClaimCompleted(jobs, now));
                 }
                 break;
