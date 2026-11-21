@@ -1,8 +1,9 @@
 """Summarizes a run-blog.sh results directory into Markdown tables, one per workload.
 
 Each cell is the median across rounds of each round's single measured run, with the min and max across
-rounds. A paced cell that delivered less than 98% of its offered rate is marked as not carried, because
-its latency then measures a backlog and not the system at that load.
+rounds. A round whose work audit failed, or that ran with a diagnostic knob engaged, is left out of the
+figures and counted next to the system name. A paced cell that delivered less than 98% of its offered rate
+is marked as not carried, because its latency then measures a backlog and not the system at that load.
 """
 
 import json
@@ -13,7 +14,7 @@ from pathlib import Path
 PACED_FLOOR = 0.98
 SYSTEMS = {
     "postgres": "BackWave",
-    "postgres-4g": "BackWave (4 groups x 10)",
+    "postgres-4g": "BackWave (4 groups)",
     "hangfire-postgres": "Hangfire",
     "quartz-postgres": "Quartz.NET",
     "tickerq-postgres": "TickerQ",
@@ -38,7 +39,18 @@ def spread(values: list[float], fmt: str) -> str:
     return f"{format(median, fmt)} [{format(min(values), fmt)}-{format(max(values), fmt)}]"
 
 
-def row(target: str, runs: list[dict]) -> str:
+def clean(run: dict) -> bool:
+    return not run.get("Diagnostic") and all(not a["Problems"] for a in run.get("WorkAudits", []))
+
+
+def row(target: str, all_runs: list[dict]) -> str:
+    runs = [r for r in all_runs if clean(r)]
+    name = SYSTEMS.get(target, target)
+    excluded = len(all_runs) - len(runs)
+    if excluded:
+        name += f" ({excluded} of {len(all_runs)} rounds left out: failed audit or diagnostic)"
+    if not runs:
+        return f"| {name} | " + " | ".join(["-"] * 9) + f" | {audit(all_runs)} |"
     throughput = [r["ThroughputJobsPerSecond"]["Median"] for r in runs]
     workload = runs[0]["Workload"]
     offered = workload["SustainedRatePerSecond"]
@@ -48,14 +60,14 @@ def row(target: str, runs: list[dict]) -> str:
     if paced and not all(carried):
         status = f" (not carried in {carried.count(False)} of {len(carried)} rounds)"
     return (
-        f"| {SYSTEMS.get(target, target)}{status} | {spread(throughput, ',.0f')} "
+        f"| {name}{status} | {spread(throughput, ',.0f')} "
         f"| {spread([r['EndToEndP50Ms']['Median'] for r in runs], ',.1f')} "
         f"| {spread([r['EndToEndP99Ms']['Median'] for r in runs], ',.1f')} "
         f"| {spread([r['EnqueueP50Ms']['Median'] for r in runs], ',.2f')} "
         f"| {max(r['Resources']['PeakConnections'] for r in runs)} "
         f"| {spread([r['Resources']['CpuPercent'] for r in runs], ',.1f')} "
         f"| {workload['JobCount']:,} | {len(runs)} | {min(r['_idle'] for r in runs):.0f} "
-        f"| {audit(runs)} |"
+        f"| {audit(all_runs)} |"
     )
 
 
@@ -72,7 +84,9 @@ def main() -> None:
     cells = load_cells(root)
     first = next(iter(cells.values()))[0]["Manifest"]
     print(f"Local mode, indicative only. {first['Os']}, {first['ProcessArchitecture']}, "
-          f"{first['ProcessorCount']} cores, {first['DotnetVersion']}, PostgreSQL {first['DbVersion']}.\n")
+          f"{first['ProcessorCount']} cores, {first['DotnetVersion']}, PostgreSQL {first['DbVersion']}.")
+    slots = sorted({r["TuningDials"].get("worker-pool-size") for (_, t), rs in cells.items() if t != "postgres-4g" for r in rs})
+    print(f"Run slots per system: {', '.join(s for s in slots if s)}.\n")
     for workload in WORKLOADS:
         targets = [t for t in SYSTEMS if (workload, t) in cells]
         if not targets:

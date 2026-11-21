@@ -56,7 +56,7 @@ $DOCKER compose up -d --wait
 
 # 4. Seed the databases the official battery needs.
 log "Seeding databases"
-for db in hangfire_test jobmaster_test quartz_test; do
+for db in hangfire_test jobmaster_test quartz_test tickerq_test; do
   $DOCKER compose exec -T postgres psql -U backwave -d backwave_test -tAc \
     "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -q 1 \
     || $DOCKER compose exec -T postgres psql -U backwave -d backwave_test -c "CREATE DATABASE $db"
@@ -70,6 +70,7 @@ export BACKWAVE_POSTGRES_DSN="Host=localhost;Port=5499;Username=backwave;Passwor
 export BACKWAVE_HANGFIRE_POSTGRES_DSN="Host=localhost;Port=5499;Username=backwave;Password=backwave;Database=hangfire_test"
 export BACKWAVE_JOBMASTER_POSTGRES_DSN="Host=localhost;Port=5499;Username=backwave;Password=backwave;Database=jobmaster_test"
 export BACKWAVE_QUARTZ_POSTGRES_DSN="Host=localhost;Port=5499;Username=backwave;Password=backwave;Database=quartz_test"
+export BACKWAVE_TICKERQ_POSTGRES_DSN="Host=localhost;Port=5499;Username=backwave;Password=backwave;Database=tickerq_test"
 export BACKWAVE_SQLSERVER_DSN="Server=localhost,14330;User Id=sa;Password=BackWave!Passw0rd;TrustServerCertificate=true;Database=backwave_test"
 export BACKWAVE_HANGFIRE_SQLSERVER_DSN="Server=localhost,14330;User Id=sa;Password=BackWave!Passw0rd;TrustServerCertificate=true;Database=hangfire_test"
 

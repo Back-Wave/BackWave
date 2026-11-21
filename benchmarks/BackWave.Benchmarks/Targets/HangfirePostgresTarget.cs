@@ -74,7 +74,7 @@ public sealed class HangfirePostgresTarget : HangfireBenchmarkTarget
     /// <inheritdoc/>
     protected override IReadOnlyDictionary<string, string> StorageDials() => new Dictionary<string, string>
     {
-        ["queue-poll-interval"] = $"{QueuePollMs}ms (community adapter, aggressive)",
+        ["queue-poll-interval"] = QueuePollMs == 200 ? "200ms (community adapter, aggressive)" : $"{QueuePollMs}ms (override)",
         ["long-polling"] = LongPolling ? "on (LISTEN/NOTIFY wakes idle fetchers)" : "off (adapter default)",
         ["fetch-mode"] = "sliding invisibility timeout, native DB transactions (tuned-to-best)",
         ["schema"] = SchemaName,

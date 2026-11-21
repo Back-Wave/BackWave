@@ -42,14 +42,18 @@ dotnet run -c Release --project benchmarks/BackWave.Benchmarks -- \
 The usage comment at the top of [BackWave.Benchmarks/Program.cs](BackWave.Benchmarks/Program.cs) lists
 every option.
 
-Every system gets the same 40 run slots. End-to-end latency starts at the enqueue call and stops when the
-handler completes, for every system. After each run, a work audit checks three things:
+Every system gets the same number of run slots: BackWave's default pool of four per core, at least 8. That
+is 40 on a 10-core host. End-to-end latency starts at the enqueue call, for every system. It stops at the
+completion instant the system records: the handler's return for TickerQ and Quartz.NET, the success state
+for Hangfire and JobMaster, and the batched outcome write for BackWave, which comes later than the handler's
+return. After each run, a work audit checks three things:
 
 - The number of succeeded jobs equals the number of enqueued jobs.
 - Each handler ran exactly once.
 - The first and the last completion are inside the timed window.
 
-A failed audit does not stop the run. The harness prints the failure and records it in the result JSON.
+The harness prints the audit and records it in the result JSON. A failed audit makes the result
+unpublishable. The Quartz.NET and TickerQ targets stop the cell instead when they see lost or duplicated work.
 
 ## Run the five-way battery
 
@@ -64,17 +68,19 @@ OUT_DIR=benchmarks/results/my-run ROUNDS=5 bash benchmarks/blog/run-blog.sh
 
 The script skips cells that already have a result, so you can stop it and start it again. At the end,
 [blog/summarize.py](blog/summarize.py) writes `summary.md` into `OUT_DIR`, with the median and range of each
-cell across rounds. `benchmarks/results/` is in `.gitignore`.
+cell across rounds. It leaves out a round whose audit failed or that ran with a diagnostic variable engaged,
+and says so next to the system name. `benchmarks/results/` is in `.gitignore`.
 
 ## Tuning and diagnostic variables
 
-Every variable is optional. The default is the setting that the battery uses.
+Every variable is optional. The default is the setting that the battery uses. A diagnostic variable is
+recorded in the result's `DiagnosticKnobs` and makes the result unpublishable.
 
 | Variable | Default | Effect |
 |---|---|---|
 | `BACKWAVE_BENCH_HANGFIRE_POLL_MS` | `200` | Hangfire `QueuePollInterval` |
 | `BACKWAVE_BENCH_HANGFIRE_LONG_POLLING` | off | `1` turns on Hangfire.PostgreSql long polling |
-| `BACKWAVE_QUARTZ_CLUSTERED` | `true` | Quartz clustered job store |
+| `BACKWAVE_QUARTZ_CLUSTERED` | `true` | Quartz clustered job store. `false` is diagnostic, because the store is then not safe across nodes |
 | `BACKWAVE_QUARTZ_MAX_BATCH_SIZE` | slot count | Quartz `MaxBatchSize` |
 | `BACKWAVE_QUARTZ_IDLE_WAIT_MS` | `1000` | Quartz `IdleWaitTime` |
 | `BACKWAVE_QUARTZ_FIRE_AHEAD_MS` | `0` | Quartz batch trigger acquisition fire-ahead window |
@@ -86,4 +92,4 @@ Every variable is optional. The default is the setting that the battery uses.
 | `BACKWAVE_TICKERQ_FALLBACK_MS` | `10` | TickerQ fallback scan period |
 | `BACKWAVE_TICKERQ_MIN_POLL_MS` | `0` | TickerQ minimum scheduler wait |
 | `BACKWAVE_JOBMASTER_BUCKETS` | `1` | JobMaster bucket count |
-| `BACKWAVE_BENCH_DB_TRACE` | off | A file path. Writes one CSV row for each Npgsql and BackWave Postgres span. It slows every call, so never report a traced run |
+| `BACKWAVE_BENCH_DB_TRACE` | off | A file path. Writes one CSV row for each Npgsql and BackWave Postgres span. Diagnostic, because it slows every call |

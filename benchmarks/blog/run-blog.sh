@@ -11,7 +11,7 @@
 #   drain-noop      preload N noop jobs, time the drain             (headline throughput ceiling)
 #   drain-10ms      preload N jobs with a 10 ms handler             (overhead against real work)
 #   max-sustained   unpaced enqueue and processing at the same time (which side binds is per system)
-#   paced-50        50 jobs/s offered for 30 s                      (latency at a load all five carry)
+#   paced-50        50 jobs/s offered for 30 s                      (latency at a light load)
 #   paced-500       500 jobs/s offered for 30 s                     (JobMaster cannot carry it, so it is left out)
 #
 # Before each cell the script waits until the machine is at least IDLE_MIN percent idle over a 3 s sample, and
@@ -29,6 +29,9 @@ TARGETS="${TARGETS:-postgres postgres-4g hangfire-postgres quartz-postgres ticke
 WORKLOADS="${WORKLOADS:-drain-noop drain-10ms max-sustained paced-50 paced-500}"
 OUT_DIR="${OUT_DIR:-benchmarks/results/blog-$(date +%Y%m%d-%H%M)}"
 
+# Every competitor runs as many slots as BackWave's default pool, four per core and at least 8. The
+# four-group BackWave cell splits that same total, so all systems match on any host.
+SLOTS=$(( $(sysctl -n hw.ncpu) * 4 )); (( SLOTS < 8 )) && SLOTS=8
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT="$SCRIPT_DIR/../BackWave.Benchmarks"
 
@@ -46,10 +49,10 @@ wait_for_idle() {
   echo "$idle"
 }
 
-# postgres-4g is BackWave with its 40 slots split over four Worker Groups of 10.
+# postgres-4g is BackWave with its slots split over four Worker Groups.
 target_args() {
   case "$1" in
-    postgres-4g) echo "--target postgres --worker-groups 4 --pool-size 10" ;;
+    postgres-4g) echo "--target postgres --worker-groups 4 --pool-size $(( SLOTS / 4 ))" ;;
     *)           echo "--target $1" ;;
   esac
 }
@@ -69,7 +72,7 @@ workload_args() {
 {
   echo "commit $(git -C "$SCRIPT_DIR" rev-parse HEAD)"
   echo "host $(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.ncpu) cores, $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB"
-  echo "rounds $ROUNDS jobs $JOBS jobmaster_jobs $JOBMASTER_JOBS idle_min $IDLE_MIN"
+  echo "rounds $ROUNDS jobs $JOBS jobmaster_jobs $JOBMASTER_JOBS idle_min $IDLE_MIN slots $SLOTS"
   docker ps --format '{{.Names}} {{.Image}}'
 } > "$OUT_DIR/run-manifest.txt"
 
