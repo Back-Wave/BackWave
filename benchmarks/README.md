@@ -24,16 +24,18 @@ variable to use another server.
 | `tickerq-postgres` | TickerQ 10.4.0 | `BACKWAVE_TICKERQ_POSTGRES_DSN` | `tickerq_test` |
 | `jobmaster-postgres` | JobMaster 0.0.11-alpha | `BACKWAVE_JOBMASTER_POSTGRES_DSN` | `jobmaster_test` |
 | `masstransit-postgres` | MassTransit 8.5.12, SQL transport | `BACKWAVE_MASSTRANSIT_POSTGRES_DSN` | `masstransit_test` |
+| `acta-postgres` | Acta 1.0.0-rc.15 (release candidate) | `BACKWAVE_ACTA_POSTGRES_DSN` | `acta_test` |
 
-TickerQ, JobMaster, and MassTransit run in their own host processes, `BackWave.Benchmarks.TickerQHost`,
-`BackWave.Benchmarks.JobMasterHost`, and `BackWave.Benchmarks.MassTransitHost`, so that their package graphs
-stay apart from the harness. For example, the MassTransit SQL transport needs Dapper 2.1.89 or later, and
-Hangfire.PostgreSql in the harness runs on Dapper 2.0.123. A build of the harness also builds the three hosts
+TickerQ, JobMaster, MassTransit, and Acta run in their own host processes, `BackWave.Benchmarks.TickerQHost`,
+`BackWave.Benchmarks.JobMasterHost`, `BackWave.Benchmarks.MassTransitHost`, and `BackWave.Benchmarks.ActaHost`,
+so that their package graphs stay apart from the harness. For example, the MassTransit SQL transport needs
+Dapper 2.1.89 or later, and Hangfire.PostgreSql in the harness runs on Dapper 2.0.123. Acta.Postgres needs
+Npgsql 10.0.3 or later, and the harness runs Npgsql 9.0.3. A build of the harness also builds the four hosts
 and copies them next to it. The harness talks to each host over stdin and stdout.
 
 TickerQ and JobMaster get a fresh host process for each run, so their JIT and EF Core query caches are cold
-in every measured run. Warmup runs do not warm them. MassTransit gets one host process for each cell and a
-fresh bus for each run, so its warmup runs warm the JIT, as for the in-process targets.
+in every measured run. Warmup runs do not warm them. MassTransit and Acta get one host process for each cell,
+and a fresh bus or worker host for each run, so their warmup runs warm the JIT, as for the in-process targets.
 
 TickerQ stays on 10.4.0. Version 10.5.0 and later refuse to run jobs without a license certificate.
 
@@ -49,6 +51,27 @@ only the limit. The default for an endpoint configured by hand, two per core and
 slot count on hosts with more than 4 cores. The other settings are MassTransit defaults: a 1 s polling
 fallback behind LISTEN/NOTIFY, a 1 min lock, and no retry.
 
+Acta runs on 1.0.0-rc.15, a release candidate. Acta has no stable release yet. Acta and Acta.Postgres are
+Apache-2.0, and no code in them checks a license key. The Acta host pins Npgsql 10.0.3, the floor that
+Acta.Postgres states and the driver major that Acta certifies.
+
+Acta runs one worker, one `Run` of one namespace, in one process. Its `MaxConcurrentExecutors` is set to the
+slot count. Acta's default, four per core between 8 and 64, gives the same value on hosts with up to 16
+cores. Every other setting is the Acta default: a 1 s safety poll, a 45 s heartbeat, the in-process wake-up,
+`Audit` event recording, system jobs and crash recovery on, 15 attempts, and the reflection-based JSON input
+format. The handler never throws, so no retry runs. Before each run the host drops the `acta` schema and
+provisions it again through Acta's own migrations: it starts and stops a worker host with `MigrateOnStartup`,
+as Acta's own Verify tool does. The measured worker host then starts with `MigrateOnStartup` off. Each enqueue
+is one `IJobs.EnqueueAsync` call, one job and one transaction. A drain run enqueues the whole stream through
+an enqueue-only host before the worker starts. A sustained run enqueues through the worker host's own `IJobs`,
+because Acta's default wake-up reaches only workers in the same host. Across processes a worker learns of new
+work from its 1 s safety poll. A run ends when no job of the bench definition is Ready, Suspended, or
+Executing. The host then fails the cell unless every enqueued job completed in exactly one handler run, and
+Acta's own tables hold exactly the enqueued bench jobs, all Succeeded, each with `execution_number` 1. The
+rows of the `sys.alerts` and `sys.retention` system jobs never count. Acta's operator guide recommends a
+larger `max_wal_size` and `checkpoint_timeout` for sustained load. The battery runs every system on the same
+stock `postgres:17-alpine` server, so Acta runs on the server defaults, as every other system does.
+
 ## Run one cell
 
 ```sh
@@ -63,7 +86,7 @@ every option.
 Every system gets BackWave's default pool of run slots: four per core, at least 8. That is 40 on a
 10-core host. JobMaster rounds its slots up to a multiple of 5, so it gets more on some hosts, for example
 50 against 48 on 12 cores. End-to-end latency starts at the enqueue call, for every system. It stops at the
-completion instant the system records: the handler's return for TickerQ, Quartz.NET, and MassTransit, the success state
+completion instant the system records: the handler's return for TickerQ, Quartz.NET, MassTransit, and Acta, the success state
 for Hangfire and JobMaster, and the batched outcome write for BackWave, which comes later than the handler's
 return. After each run, a work audit checks three things:
 
@@ -72,14 +95,14 @@ return. After each run, a work audit checks three things:
 - The first and the last completion are inside the timed window.
 
 The harness prints the audit and records it in the result JSON. A failed audit makes the result
-unpublishable. The Quartz.NET, TickerQ, and MassTransit targets stop the cell instead when they see lost or
-duplicated work.
+unpublishable. The Quartz.NET, TickerQ, MassTransit, and Acta targets stop the cell instead when they see lost
+or duplicated work.
 
 ## Run the blog battery
 
 [blog/run-blog.sh](blog/run-blog.sh) runs the local comparison: BackWave in two shapes, Hangfire,
-Quartz.NET, TickerQ, JobMaster, and MassTransit, all on one Postgres server. The script header describes the workloads
-and the fairness controls. The script uses `top` and `sysctl` from macOS.
+Quartz.NET, TickerQ, JobMaster, MassTransit, and Acta, all on one Postgres server. The script header
+describes the workloads and the fairness controls. The script uses `top` and `sysctl` from macOS.
 
 ```sh
 docker compose up -d --wait postgres
@@ -122,4 +145,5 @@ recorded in the result's `DiagnosticKnobs` and makes the result unpublishable.
 | `BACKWAVE_MASSTRANSIT_PREFETCH_COUNT` | limit x 1.2 | MassTransit endpoint `PrefetchCount` |
 | `BACKWAVE_MASSTRANSIT_POLLING_MS` | `1000` | MassTransit SQL endpoint `PollingInterval` |
 | `BACKWAVE_MASSTRANSIT_CONNECTION_LIMIT` | slot count | MassTransit SQL transport `ConnectionLimit` |
+| `BACKWAVE_ACTA_MAX_CONCURRENT_EXECUTORS` | slot count | Acta worker `MaxConcurrentExecutors` |
 | `BACKWAVE_BENCH_DB_TRACE` | off | A file path. Writes one CSV row for each Npgsql and BackWave Postgres span. Diagnostic, because it slows every call |

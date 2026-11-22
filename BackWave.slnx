@@ -6,6 +6,7 @@
   </Configurations>
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/BackWave.Benchmarks/BackWave.Benchmarks.csproj" />
+    <Project Path="benchmarks/BackWave.Benchmarks.ActaHost/BackWave.Benchmarks.ActaHost.csproj" />
     <Project Path="benchmarks/BackWave.Benchmarks.JobMasterHost/BackWave.Benchmarks.JobMasterHost.csproj" />
     <Project Path="benchmarks/BackWave.Benchmarks.MassTransitHost/BackWave.Benchmarks.MassTransitHost.csproj" />
     <Project Path="benchmarks/BackWave.Benchmarks.TickerQHost/BackWave.Benchmarks.TickerQHost.csproj" />

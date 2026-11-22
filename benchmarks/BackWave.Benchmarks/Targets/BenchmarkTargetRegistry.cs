@@ -73,9 +73,14 @@ public static class BenchmarkTargetRegistry
             MassTransitPostgresTarget.ConnectionStringEnvVar,
             DatabaseDriver.Postgres,
             static () => new MassTransitPostgresTarget()),
+        "acta-postgres" or "acta-pg" => new BenchmarkTargetDescriptor(
+            "acta-postgres",
+            ActaPostgresTarget.ConnectionStringEnvVar,
+            DatabaseDriver.Postgres,
+            static () => new ActaPostgresTarget()),
         _ => throw new ArgumentException(
             $"Unknown target '{target}'. Expected 'postgres', 'sqlserver', 'oracle', " +
-            "'hangfire-postgres', 'hangfire-sqlserver', 'jobmaster-postgres', 'tickerq-postgres', 'quartz-postgres', or 'masstransit-postgres'."),
+            "'hangfire-postgres', 'hangfire-sqlserver', 'jobmaster-postgres', 'tickerq-postgres', 'quartz-postgres', 'masstransit-postgres', or 'acta-postgres'."),
     };
 
     /// <summary>Resolves a <c>--target</c> name to its target, or throws for a name nothing serves.</summary>

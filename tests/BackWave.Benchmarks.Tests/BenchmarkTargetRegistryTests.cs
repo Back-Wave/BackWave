@@ -30,6 +30,8 @@ public sealed class BenchmarkTargetRegistryTests
         { "quartz-pg", typeof(QuartzPostgresTarget) },
         { "masstransit-postgres", typeof(MassTransitPostgresTarget) },
         { "masstransit-pg", typeof(MassTransitPostgresTarget) },
+        { "acta-postgres", typeof(ActaPostgresTarget) },
+        { "acta-pg", typeof(ActaPostgresTarget) },
     };
 
     [Theory]

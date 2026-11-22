@@ -88,6 +88,7 @@ public sealed class ConnectionStringEndpointTests
             "tickerq-postgres", "tickerq-pg",
             "quartz-postgres", "quartz-pg",
             "masstransit-postgres", "masstransit-pg",
+            "acta-postgres", "acta-pg",
         ];
 
         foreach (var name in names)
