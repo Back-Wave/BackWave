@@ -48,6 +48,16 @@ public sealed class TuningDialsTests
     }
 
     [Fact]
+    public void Acta_executors_are_matched_to_backwave_pool_size()
+    {
+        var backwave = new PostgresBenchmarkTarget(PgDsn).TuningDials["worker-pool-size"];
+        var acta = new ActaPostgresTarget(PgDsn).TuningDials;
+
+        Assert.Equal(backwave, acta["worker-pool-size"]);
+        Assert.StartsWith(backwave + " ", acta["max-concurrent-executors"]);
+    }
+
+    [Fact]
     public void JobMaster_worker_count_is_the_smallest_multiple_of_five_at_or_above_backwave_pool_size()
     {
         // JobMaster sizes run slots as 5 x parallelism factor per bucket, so it cannot record a pool that

@@ -55,6 +55,8 @@
                       ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\BackWave.Benchmarks.MassTransitHost\BackWave.Benchmarks.MassTransitHost.csproj"
                       ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\BackWave.Benchmarks.ActaHost\BackWave.Benchmarks.ActaHost.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
   <Target Name="StageJobMasterHost" AfterTargets="Build">
@@ -93,6 +95,19 @@
     </ItemGroup>
     <Copy SourceFiles="@(MassTransitHostFiles)"
           DestinationFiles="@(MassTransitHostFiles->'$(OutDir)masstransit-host\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="StageActaHost" AfterTargets="Build">
+    <MSBuild Projects="..\BackWave.Benchmarks.ActaHost\BackWave.Benchmarks.ActaHost.csproj"
+             Targets="GetTargetPath" Properties="Configuration=$(Configuration)">
+      <Output TaskParameter="TargetOutputs" PropertyName="ActaHostTargetPath" />
+    </MSBuild>
+    <ItemGroup>
+      <ActaHostFiles Include="$([System.IO.Path]::GetDirectoryName($(ActaHostTargetPath)))\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ActaHostFiles)"
+          DestinationFiles="@(ActaHostFiles->'$(OutDir)acta-host\%(RecursiveDir)%(Filename)%(Extension)')"
           SkipUnchangedFiles="true" />
   </Target>
 

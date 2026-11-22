@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The Acta competitor host. It is a separate executable because Acta.Postgres requires Npgsql 10.0.3 and
+       Microsoft.Extensions.* 10.0.15 or later, while the harness runs Npgsql 9.0.3 and Microsoft.Extensions.Hosting
+       10.0.0; in one executable Acta would move BackWave, Hangfire, and Quartz.NET onto a driver they were never
+       measured on. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>false</IsTestProject>
+    <RootNamespace>BackWave.Benchmarks.ActaHost</RootNamespace>
+  </PropertyGroup>
+
+  <!-- 1.0.0-rc.15 is a release candidate; Acta has no stable release yet. Acta.Postgres brings the Acta runtime
+       with its [Job] source generator and analyzers. Npgsql is pinned to the floor Acta.Postgres states, which is
+       the driver major Acta certifies, and Hosting to the Microsoft.Extensions floor. -->
+  <ItemGroup>
+    <PackageReference Include="Acta.Postgres" Version="1.0.0-rc.15" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.15" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\BackWave.Benchmarks\Workload\WorkloadSpec.cs" Link="Shared\WorkloadSpec.cs" />
+    <Compile Include="..\BackWave.Benchmarks\Workload\ParallelProducer.cs" Link="Shared\ParallelProducer.cs" />
+    <Compile Include="..\BackWave.Benchmarks\Workload\CompletionLog.cs" Link="Shared\CompletionLog.cs" />
+    <Compile Include="..\BackWave.Benchmarks\Targets\ActaHostProtocol.cs" Link="Shared\ActaHostProtocol.cs" />
+    <Compile Include="..\BackWave.Benchmarks\Targets\ActaWorkCheck.cs" Link="Shared\ActaWorkCheck.cs" />
+  </ItemGroup>
+
+</Project>
