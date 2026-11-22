@@ -23,7 +23,10 @@ internal sealed record MassTransitTuning(
             ConnectionLimit: ReadInt(MassTransitHostProtocol.ConnectionLimitEnvVar, limit));
     }
 
-    /// <summary>The prefetch MassTransit derives from an endpoint's concurrent message limit when no prefetch is set.</summary>
+    /// <summary>
+    /// The prefetch MassTransit derives when an endpoint definition sets only a concurrent message limit. The default
+    /// for an endpoint configured by hand, max(2 x cores, 16), is less than the slot count.
+    /// </summary>
     private static int DerivedPrefetchCount(int concurrentMessageLimit) => concurrentMessageLimit * 12 / 10;
 
     private static int ReadInt(string name, int fallback)
@@ -89,7 +92,7 @@ public sealed class MassTransitPostgresTarget : IBenchmarkTarget
         ["db-connection-pool-size"] = "100 (ADO.NET default)",
         ["retry-policy"] = "none: the consumer never throws and MassTransit retries only when UseMessageRetry is configured, which it is not",
         ["concurrent-message-limit"] = _tuning.ConcurrentMessageLimit.ToString(CultureInfo.InvariantCulture),
-        ["prefetch-count"] = $"{_tuning.PrefetchCount} (MassTransit derives limit * 1.2 when only the limit is set)",
+        ["prefetch-count"] = $"{_tuning.PrefetchCount} (limit * 1.2, as MassTransit derives it when an endpoint definition sets only the limit; the hand-configured default max(2 x cores, 16) is less than the slot count)",
         ["polling-interval"] = $"{_tuning.PollingInterval.TotalMilliseconds:0}ms (MassTransit default 1s)",
         ["connection-limit"] = $"{_tuning.ConnectionLimit} (concurrent transport DB operations per host, matched to the slot count; MassTransit default 10)",
         ["lock-duration"] = "1 min (MassTransit default)",
