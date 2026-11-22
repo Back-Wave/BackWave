@@ -40,13 +40,14 @@ TickerQ stays on 10.4.0. Version 10.5.0 and later refuse to run jobs without a l
 MassTransit stays on 8.5.12, the last Apache-2.0 release. Version 9 is a commercial product. Without a license
 key, 9.3.0 fails at bus start with `ConfigurationException: License must be specified`.
 
-MassTransit is a message bus, not a job scheduler. The target sends one message to one queue for each job,
-and one consumer handles it. Messages are durable rows in Postgres. The consumer's concurrent message limit
-and the transport's connection limit are both set to the slot count. The connection limit default is 10,
-which would leave most consumers waiting for a connection to acknowledge a message. The prefetch is 1.2
-times the limit, the value MassTransit derives when an endpoint definition sets only the limit. The default
-for an endpoint configured by hand, two per core and at least 16, is less than the slot count. The other
-settings are MassTransit defaults: a 1 s polling fallback behind LISTEN/NOTIFY, a 1 min lock, and no retry.
+MassTransit is a message bus, not a job scheduler. The target sends one message to one queue for each job, and
+one consumer handles it. Messages are durable rows in Postgres. The consumer's concurrent message limit and
+the transport's connection limit are both set to the slot count. The connection limit default is 10, which
+would leave most consumers waiting for a connection to acknowledge a message. Sends take permits from the same
+limit. The prefetch is 1.2 times the limit, the value MassTransit derives when an endpoint definition sets
+only the limit. The default for an endpoint configured by hand, two per core and at least 16, is less than the
+slot count on hosts with more than 4 cores. The other settings are MassTransit defaults: a 1 s polling
+fallback behind LISTEN/NOTIFY, a 1 min lock, and no retry.
 
 ## Run one cell
 
