@@ -147,6 +147,30 @@ public sealed class SqlServerCustomSchemaTests
         Assert.Equal(1, (int)(await rows.ExecuteScalarAsync())!);
     }
 
+    [Fact]
+    public async Task ObserverCursor_UnderTheConfiguredSchema_IsNotHeldByAnOpenWriterInAnotherSchema()
+    {
+        var defaultStore = await SqlServerTestDatabase.CreateFreshStoreAsync();
+        var store = await FreshCustomSchemaStoreAsync();
+        var claim = new ObserverClaimRequest(
+            "obs", [JobState.Scheduled], WireName: null, Queue: null, "w1", MaxRows: 16, TimeSpan.FromMinutes(1), T0);
+        Assert.Empty((await store.ClaimObserverDeliveriesAsync(claim)).Deliveries);
+
+        await using var connection = new SqlConnection(SqlServerTestDatabase.ConnectionString);
+        await connection.OpenAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        Assert.Equal(EnqueueResult.Ok, await defaultStore.EnqueueAsync(Job(), now: T0, transaction));
+
+        var job = Job();
+        Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(job, now: T0));
+        var delivery = Assert.Single((await store.ClaimObserverDeliveriesAsync(claim)).Deliveries);
+        Assert.Equal(job.JobId, delivery.JobId);
+        await store.ReportObserverDeliveriesAsync(new ObserverDeliveryReport(
+            "obs", "w1", [new ObserverDeliveryOutcome(delivery.Position, ObserverDeliveryDisposition.Delivered)], T0));
+
+        Assert.Equal(delivery.Position, await store.GetObserverCursorAsync("obs"));
+    }
+
     [Theory]
     [InlineData("has space")]
     [InlineData("has-dash")]
