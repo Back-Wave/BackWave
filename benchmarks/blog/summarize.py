@@ -23,6 +23,7 @@ SYSTEMS = {
     "quartz-postgres": "Quartz.NET",
     "tickerq-postgres": "TickerQ",
     "jobmaster-postgres": "JobMaster",
+    "masstransit-postgres": "MassTransit",
 }
 WORKLOADS = ["drain-noop", "drain-10ms", "max-sustained", "paced-50", "paced-500"]
 

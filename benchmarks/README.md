@@ -73,10 +73,10 @@ The harness prints the audit and records it in the result JSON. A failed audit m
 unpublishable. The Quartz.NET, TickerQ, and MassTransit targets stop the cell instead when they see lost or
 duplicated work.
 
-## Run the five-way battery
+## Run the blog battery
 
-[blog/run-blog.sh](blog/run-blog.sh) runs the local five-way comparison: BackWave in two shapes, Hangfire,
-Quartz.NET, TickerQ, and JobMaster, all on one Postgres server. The script header describes the workloads
+[blog/run-blog.sh](blog/run-blog.sh) runs the local comparison: BackWave in two shapes, Hangfire,
+Quartz.NET, TickerQ, JobMaster, and MassTransit, all on one Postgres server. The script header describes the workloads
 and the fairness controls. The script uses `top` and `sysctl` from macOS.
 
 ```sh
