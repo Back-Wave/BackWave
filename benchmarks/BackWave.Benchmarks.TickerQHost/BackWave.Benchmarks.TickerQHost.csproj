@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The TickerQ competitor host. It is a separate executable because TickerQ.EntityFrameworkCore on
+       PostgreSQL needs Npgsql.EntityFrameworkCore.PostgreSQL 10, which requires Npgsql 10, while BackWave ships
+       on Npgsql 9; the two package graphs cannot share one executable. TickerQ also keeps process-wide static
+       state (the function registry, the cancellation-token manager), so the harness (TickerQPostgresTarget)
+       spawns a fresh process per run and kills it afterward. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>false</IsTestProject>
+    <RootNamespace>BackWave.Benchmarks.TickerQHost</RootNamespace>
+  </PropertyGroup>
+
+  <!-- 10.4.0 is the newest TickerQ release under MIT/Apache-2.0. From functional line 5.x (10.5.0, 11.5.0) TickerQ
+       ships under a commercial source-available agreement and blocks job execution until a license certificate
+       is installed; 11.5.x also targets net11.0 only. The TickerQ package carries the source generator that
+       registers [TickerFunction] methods. -->
+  <ItemGroup>
+    <PackageReference Include="TickerQ" Version="10.4.0" />
+    <PackageReference Include="TickerQ.EntityFrameworkCore" Version="10.4.0" />
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\BackWave.Benchmarks\Workload\WorkloadSpec.cs" Link="Shared\WorkloadSpec.cs" />
+    <Compile Include="..\BackWave.Benchmarks\Workload\ParallelProducer.cs" Link="Shared\ParallelProducer.cs" />
+    <Compile Include="..\BackWave.Benchmarks\Targets\TickerQHostProtocol.cs" Link="Shared\TickerQHostProtocol.cs" />
+  </ItemGroup>
+
+</Project>

@@ -19,6 +19,11 @@ internal sealed class JobMasterBenchmarkJob : IJobMasterHandler
     /// <summary>Message key carrying the handler delay in milliseconds.</summary>
     public const string DelayKey = "delayMs";
 
+    private static int _executions;
+
+    /// <summary>Handler executions in this process; the host is fresh per run, so this is the run's count.</summary>
+    public static int Executions => Volatile.Read(ref _executions);
+
     /// <summary>Completed when the timed window opens; every handler execution awaits it first.</summary>
     public static readonly TaskCompletionSource Gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -26,6 +31,7 @@ internal sealed class JobMasterBenchmarkJob : IJobMasterHandler
     public async Task HandleAsync(JobContext job)
     {
         await Gate.Task.ConfigureAwait(false);
+        Interlocked.Increment(ref _executions);
         var delayMs = job.MsgData.TryGetIntValue(DelayKey) ?? 0;
         if (delayMs > 0)
         {

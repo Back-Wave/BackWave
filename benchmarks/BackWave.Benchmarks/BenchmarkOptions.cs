@@ -66,6 +66,12 @@ public sealed record BenchmarkOptions
     /// <summary>Parses harness options from <c>--key value</c> arguments, applying defaults for omitted keys.</summary>
     public static BenchmarkOptions Parse(string[] args)
     {
+        if (args.Length % 2 != 0)
+        {
+            throw new ArgumentException(
+                $"Expected --key value pairs, got {args.Length} arguments: {string.Join(' ', args.Select(a => $"[{a}]"))}.");
+        }
+
         var result = new BenchmarkOptions();
         for (var i = 0; i < args.Length - 1; i += 2)
         {

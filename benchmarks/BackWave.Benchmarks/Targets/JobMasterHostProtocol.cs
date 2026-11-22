@@ -49,8 +49,16 @@ internal sealed record JobMasterHostRequest(string Op, WorkloadSpec? Spec);
 /// <param name="Error">The failure message, or null.</param>
 /// <param name="EnqueueTicks">Per-call enqueue latencies in ticks; only on a <c>samples</c> response.</param>
 /// <param name="EndToEndTicks">Per-job enqueue-to-success latencies in ticks; only on a <c>samples</c> response.</param>
+/// <param name="Executions">Handler executions the child counted; only on a <c>samples</c> response.</param>
+/// <param name="FirstCompletionUtcTicks">UTC ticks of the earliest successful completion; only on a <c>samples</c> response.</param>
+/// <param name="LastCompletionUtcTicks">UTC ticks of the latest successful completion; only on a <c>samples</c> response.</param>
+/// <param name="ProducerTicks">First to last enqueue of the producers, in ticks; only on a <c>samples</c> response.</param>
 internal sealed record JobMasterHostResponse(
     bool Ok,
     string? Error = null,
     long[]? EnqueueTicks = null,
-    long[]? EndToEndTicks = null);
+    long[]? EndToEndTicks = null,
+    int? Executions = null,
+    long? FirstCompletionUtcTicks = null,
+    long? LastCompletionUtcTicks = null,
+    long? ProducerTicks = null);

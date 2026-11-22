@@ -56,6 +56,7 @@ await provider.StartJobMasterRuntimeAsync().ConfigureAwait(false);
 await using var dataSource = NpgsqlDataSource.Create(dsn);
 var enqueuedAt = new ConcurrentDictionary<Guid, DateTimeOffset>();
 var enqueueLatencies = new List<TimeSpan>();
+TimeSpan? producerElapsed = null;
 var stdout = Console.Out;
 Respond(new JobMasterHostResponse(true));
 
@@ -113,6 +114,7 @@ async Task<JobMasterHostResponse> PreloadAsync(WorkloadSpec spec)
     var latencies = await ParallelProducer.RunAsync(spec, paceRatePerSecond: 0, EnqueueAsync, CancellationToken.None)
         .ConfigureAwait(false);
     enqueueLatencies.AddRange(latencies);
+    producerElapsed = ParallelProducer.LastElapsed;
     await WaitForCountAsync("SELECT count(*) FROM jm_job", spec.JobCount).ConfigureAwait(false);
     return new JobMasterHostResponse(true);
 }
@@ -126,6 +128,7 @@ async Task<JobMasterHostResponse> ExecuteAsync(WorkloadSpec spec)
         var latencies = await ParallelProducer.RunAsync(spec, spec.SustainedRatePerSecond, EnqueueAsync, CancellationToken.None)
             .ConfigureAwait(false);
         enqueueLatencies.AddRange(latencies);
+        producerElapsed = ParallelProducer.LastElapsed;
     }
 
     // Final statuses: Succeeded=5, Failed=7, Cancelled=8, Aborted=9.
@@ -137,6 +140,8 @@ async Task<JobMasterHostResponse> ExecuteAsync(WorkloadSpec spec)
 async Task<JobMasterHostResponse> SamplesAsync()
 {
     var endToEnd = new List<long>(enqueuedAt.Count);
+    long? firstCompletion = null;
+    long? lastCompletion = null;
     await using var command = dataSource.CreateCommand("SELECT id, finalized_at FROM jm_job WHERE status = 5 AND finalized_at IS NOT NULL");
     await using var reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
     while (await reader.ReadAsync().ConfigureAwait(false))
@@ -146,10 +151,14 @@ async Task<JobMasterHostResponse> SamplesAsync()
         if (enqueuedAt.TryGetValue(id, out var startedAt))
         {
             endToEnd.Add((finalizedAt - startedAt.UtcDateTime).Ticks);
+            firstCompletion = Math.Min(firstCompletion ?? long.MaxValue, finalizedAt.Ticks);
+            lastCompletion = Math.Max(lastCompletion ?? long.MinValue, finalizedAt.Ticks);
         }
     }
 
-    return new JobMasterHostResponse(true, EnqueueTicks: enqueueLatencies.Select(t => t.Ticks).ToArray(), EndToEndTicks: endToEnd.ToArray());
+    return new JobMasterHostResponse(true, EnqueueTicks: enqueueLatencies.Select(t => t.Ticks).ToArray(), EndToEndTicks: endToEnd.ToArray(),
+        Executions: JobMasterBenchmarkJob.Executions, FirstCompletionUtcTicks: firstCompletion, LastCompletionUtcTicks: lastCompletion,
+        ProducerTicks: producerElapsed?.Ticks);
 }
 
 async ValueTask EnqueueAsync(BenchJob job, CancellationToken cancellationToken)
@@ -157,8 +166,9 @@ async ValueTask EnqueueAsync(BenchJob job, CancellationToken cancellationToken)
     var data = WriteableMessageData.New()
         .SetStringValue(JobMasterBenchmarkJob.PayloadKey, job.Payload)
         .SetIntValue(JobMasterBenchmarkJob.DelayKey, job.DelayMs);
+    var calledAt = DateTimeOffset.UtcNow;
     var context = await JobMasterScheduler.Instance.OnceNowAsync<JobMasterBenchmarkJob>(data).ConfigureAwait(false);
-    enqueuedAt[context.Id] = DateTimeOffset.UtcNow;
+    enqueuedAt[context.Id] = calledAt;
 }
 
 async Task WaitForCountAsync(string sql, int target)

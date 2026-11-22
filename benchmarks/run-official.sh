@@ -2,7 +2,7 @@
 #
 # The scripted official Benchmark Harness battery (ADR 0027, bench-0142).
 #
-# Runs the full published matrix — BackWave vs Hangfire (and JobMaster on PostgreSQL), across the noop-drain,
+# Runs the full published matrix - BackWave vs Hangfire (and JobMaster, TickerQ, and Quartz.NET on PostgreSQL), across the noop-drain,
 # noop-sustained, and 10 ms-anchor workloads — plus the BackWave-only scale-out curve, and writes one
 # self-labelled JSON per cell (each carrying its own environment manifest and `publishable` flag).
 #
@@ -13,7 +13,8 @@
 # Connection strings default to the local docker-compose databases; override them for the pinned instance:
 #   export BACKWAVE_POSTGRES_DSN=...           BACKWAVE_SQLSERVER_DSN=...
 #   export BACKWAVE_HANGFIRE_POSTGRES_DSN=...  BACKWAVE_HANGFIRE_SQLSERVER_DSN=...
-#   export BACKWAVE_JOBMASTER_POSTGRES_DSN=...
+#   export BACKWAVE_JOBMASTER_POSTGRES_DSN=...  BACKWAVE_TICKERQ_POSTGRES_DSN=...
+#   export BACKWAVE_QUARTZ_POSTGRES_DSN=...
 #
 # Tunables (env overrides):
 #   MODE         official | local            (default: official)
@@ -53,13 +54,15 @@ bench() {
 }
 
 # The published matrix: noop drain (headline ceiling), noop sustained (contention), and the 10 ms anchor.
-for target in backwave_pg backwave_mssql hangfire_pg hangfire_mssql jobmaster_pg; do
+for target in backwave_pg backwave_mssql hangfire_pg hangfire_mssql jobmaster_pg tickerq_pg quartz_pg; do
   case "$target" in
     backwave_pg)     t=postgres ;;
     backwave_mssql)  t=sqlserver ;;
     hangfire_pg)     t=hangfire-postgres ;;
     hangfire_mssql)  t=hangfire-sqlserver ;;
     jobmaster_pg)    t=jobmaster-postgres ;;
+    tickerq_pg)      t=tickerq-postgres ;;
+    quartz_pg)       t=quartz-postgres ;;
   esac
   # Sustained runs fan the producer across $PRODUCERS tasks so the arrival side outpaces the cluster's drain
   # capacity — a single producer would cap sustained throughput at its own enqueue rate (bench-0137).
