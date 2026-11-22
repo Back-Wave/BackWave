@@ -41,6 +41,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     private readonly SemaphoreSlim _readyGate = new(1, 1);
     private bool _ready;
 
+    private readonly WakeUpHintCoalescer _postCommitHints;
+
     // Per-Queue unlimited-Queue cache (issue 0170). The Concurrency Limit (I3) and Paused flag (§5.8)
     // share one queue_limits row, mutated only by rare operator actions; a claim on a limited or paused
     // Queue must lock and read that row, but the common unlimited, unpaused Queue need not pay the
@@ -90,6 +92,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         _schema = new SchemaRewriter(options.SchemaName);
         _historyPolicy = JobHistoryPolicyResolver.Resolve(options.HistoryPolicy);
         _dataSource = NpgsqlDataSource.Create(options.ConnectionString);
+        _postCommitHints = new WakeUpHintCoalescer(SendHintsAsync, _logger);
     }
 
     // The one place a Postgres command is built, so the configured schema is swapped into every query
@@ -107,9 +110,16 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     /// <inheritdoc/>
     public StoreBounds Bounds => _options.Bounds;
 
-    /// <summary>Disposes the underlying connection pool. Safe to call more than once.</summary>
+    /// <summary>
+    /// Stops the Wake-Up Hint sends still in flight, then disposes the underlying connection pool.
+    /// Safe to call more than once.
+    /// </summary>
     /// <returns>A task that completes once the pool is disposed.</returns>
-    public ValueTask DisposeAsync() => _dataSource.DisposeAsync();
+    public async ValueTask DisposeAsync()
+    {
+        await _postCommitHints.DisposeAsync().ConfigureAwait(false);
+        await _dataSource.DisposeAsync().ConfigureAwait(false);
+    }
 
     // Migrate (if opted in) and verify the schema version exactly once.
     private async ValueTask EnsureReadyAsync(CancellationToken cancellationToken)
@@ -213,18 +223,31 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 throw new ArgumentException(
                     "The Postgres adapter enlists in NpgsqlTransaction instances only.", nameof(transaction));
             }
-            return await EnqueueCoreAsync(callerConnection, npgsqlTransaction, job, now, cancellationToken)
+            var (enlisted, enlistedHint) = await EnqueueCoreAsync(callerConnection, npgsqlTransaction, job, now, cancellationToken)
                 .ConfigureAwait(false);
+            if (enlistedHint is not null)
+            {
+                // ADO.NET gives no commit callback, but NOTIFY is transactional, so the Wake-Up Hint sent
+                // in the caller's transaction fires exactly on their commit, or never.
+                await PublishHintAsync(callerConnection, npgsqlTransaction, enlistedHint, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            return enlisted;
         }
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var ownTransaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-        var result = await EnqueueCoreAsync(connection, ownTransaction, job, now, cancellationToken).ConfigureAwait(false);
+        var (result, hintQueue) = await EnqueueCoreAsync(connection, ownTransaction, job, now, cancellationToken)
+            .ConfigureAwait(false);
         await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        if (hintQueue is not null)
+        {
+            _postCommitHints.Request(hintQueue);
+        }
         return result;
     }
 
-    private async ValueTask<EnqueueResult> EnqueueCoreAsync(
+    private async ValueTask<(EnqueueResult Result, string? HintQueue)> EnqueueCoreAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction, NewJob job, DateTimeOffset now,
         CancellationToken cancellationToken, Guid? workflowId = null)
     {
@@ -252,7 +275,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
             if (states.Count != job.Parents.Count)
             {
-                return EnqueueResult.UnknownParent;
+                return (EnqueueResult.UnknownParent, null);
             }
             foreach (var parentId in job.Parents)
             {
@@ -299,7 +322,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         insert.Parameters.AddWithValue("workflowId", (object?)workflowId ?? DBNull.Value);
         if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) == 0)
         {
-            return EnqueueResult.Duplicate;
+            return (EnqueueResult.Duplicate, null);
         }
 
         // Crash between the job row and its parent edges: rollback must leave neither (issue 0034).
@@ -325,13 +348,16 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await RecordTransitionAsync(connection, transaction, job.JobId, state, attempt: 0, now, cancellationToken)
             .ConfigureAwait(false);
 
-        if (state == JobState.Scheduled && job.DueTime <= now)
-        {
-            // Wake-Up Hint (§8): NOTIFY is transactional, so the hint fires on commit —
-            // including the caller's own commit under Transactional Enqueue — or never.
-            await PublishHintAsync(connection, transaction, job.Queue, cancellationToken).ConfigureAwait(false);
-        }
-        return EnqueueResult.Ok;
+        return (EnqueueResult.Ok, state == JobState.Scheduled && job.DueTime <= now ? job.Queue : null);
+    }
+
+    private async Task SendHintsAsync(IReadOnlyCollection<string> queues, CancellationToken cancellationToken)
+    {
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var notify = Cmd(
+            $"SELECT pg_notify('{_schema.HintChannel}', queue) FROM unnest(@queues) AS queue", connection);
+        notify.Parameters.AddWithValue("queues", queues.ToArray());
+        await notify.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async ValueTask PublishHintAsync(
@@ -2512,18 +2538,32 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 throw new ArgumentException(
                     "The Postgres adapter enlists in NpgsqlTransaction instances only.", nameof(transaction));
             }
-            return await EnqueueWorkflowCoreAsync(callerConnection, npgsqlTransaction, workflow, now, cancellationToken)
-                .ConfigureAwait(false);
+            var enlistedHints = new HashSet<string>(StringComparer.Ordinal);
+            var enlisted = await EnqueueWorkflowCoreAsync(
+                callerConnection, npgsqlTransaction, workflow, now, enlistedHints, cancellationToken).ConfigureAwait(false);
+            if (enlisted == WorkflowEnqueueResult.Ok)
+            {
+                foreach (var queue in enlistedHints)
+                {
+                    await PublishHintAsync(callerConnection, npgsqlTransaction, queue, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            return enlisted;
         }
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var ownTransaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-        var result = await EnqueueWorkflowCoreAsync(connection, ownTransaction, workflow, now, cancellationToken)
+        var hintQueues = new HashSet<string>(StringComparer.Ordinal);
+        var result = await EnqueueWorkflowCoreAsync(connection, ownTransaction, workflow, now, hintQueues, cancellationToken)
             .ConfigureAwait(false);
         // All-or-nothing: a non-Ok validation leaves nothing inserted, so only Ok commits.
         if (result == WorkflowEnqueueResult.Ok)
         {
             await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            foreach (var queue in hintQueues)
+            {
+                _postCommitHints.Request(queue);
+            }
         }
         else
         {
@@ -2534,7 +2574,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
     private async ValueTask<WorkflowEnqueueResult> EnqueueWorkflowCoreAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction, WorkflowDefinition workflow,
-        DateTimeOffset now, CancellationToken cancellationToken)
+        DateTimeOffset now, HashSet<string> hintQueues, CancellationToken cancellationToken)
     {
         // §5.1 / ADR 0023 admission rules for the whole graph, validated BEFORE any insert — a single
         // bad member rejects the whole batch and (because every write is in this transaction) leaves
@@ -2641,8 +2681,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // ordering makes that a no-op here — parents are still live when their children insert).
         foreach (var member in TopologicallyOrdered(workflow.Members))
         {
-            var applied = await EnqueueCoreAsync(connection, transaction, member, now, cancellationToken, workflow.WorkflowId)
-                .ConfigureAwait(false);
+            var (applied, hintQueue) = await EnqueueCoreAsync(
+                connection, transaction, member, now, cancellationToken, workflow.WorkflowId).ConfigureAwait(false);
+            if (hintQueue is not null)
+            {
+                hintQueues.Add(hintQueue);
+            }
             // A concurrent create can insert a member with the same JobId after this batch's existence
             // check passed (issue 0194); the member insert's ON CONFLICT reports it as Duplicate. Map it
             // to the defined result — the graph rolls back whole — rather than re-throwing.

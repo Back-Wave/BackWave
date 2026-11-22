@@ -133,8 +133,8 @@ public sealed class PostgresMutationSurvivorTests
         await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
         var now = DateTimeOffset.UtcNow;
 
-        // Parent enqueued BEFORE the listener exists, so its own (legitimate) due-now hint is not seen.
-        var parent = Job("await-q", dueTime: now);
+        // The parent is not due yet, so it publishes no hint of its own for the listener to catch.
+        var parent = Job("await-q", dueTime: now.AddHours(1));
         Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(parent, now));
 
         await using var listener = await HintListener.StartAsync();
