@@ -3141,8 +3141,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         long cursor;
         string? leaseOwner;
         DateTimeOffset? leaseExpiry;
+        bool resolvedAboveCursor;
         await using (var locked = Cmd(
-            "SELECT cursor_pos, lease_owner, lease_expiry FROM backwave.observers WHERE observer_id = @id FOR UPDATE",
+            "SELECT cursor_pos, lease_owner, lease_expiry, " +
+            "EXISTS (SELECT 1 FROM backwave.observer_deliveries d WHERE d.observer_id = @id AND d.resolution <> 0) " +
+            "FROM backwave.observers WHERE observer_id = @id FOR UPDATE",
             connection, transaction))
         {
             locked.Parameters.AddWithValue("id", request.ObserverId);
@@ -3163,6 +3166,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             cursor = reader.GetInt64(0);
             leaseOwner = reader.IsDBNull(1) ? null : reader.GetString(1);
             leaseExpiry = reader.IsDBNull(2) ? null : reader.GetFieldValue<DateTimeOffset>(2);
+            resolvedAboveCursor = reader.GetBoolean(3);
         }
 
         // Remember the subscription so cursor advance (on report) can tell matching rows from the ones
@@ -3234,6 +3238,14 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
         if (candidates.Count == 0)
         {
+            // A report stops the cursor at the Commit Horizon, so resolved rows can sit above it with no
+            // later report to sweep them.
+            if (resolvedAboveCursor)
+            {
+                await AdvanceObserverCursorAsync(
+                    connection, transaction, request.ObserverId, cursor, states, request.WireName, request.Queue,
+                    request.Now, cancellationToken).ConfigureAwait(false);
+            }
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return ObserverClaim.None(request.ObserverId);
         }
@@ -3374,13 +3386,20 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     /// <summary>
     /// Sweeps the cursor forward over the contiguous prefix of resolved matching rows — and over every
     /// non-matching row, which needs no delivery — stopping at the first matching row still Pending
-    /// (the head-of-line block). A dead-lettered row is recorded loudly as the cursor passes it. The
-    /// set-based analogue of the In-Memory reference's row-by-row sweep; the caller holds the row lock.
+    /// (the head-of-line block), and never past the Commit Horizon. A dead-lettered row is recorded
+    /// loudly as the cursor passes it. The set-based analogue of the In-Memory reference's row-by-row
+    /// sweep; the caller holds the row lock.
     /// </summary>
     private async Task AdvanceObserverCursorAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction, string observerId, long cursor,
         int[] states, string? wireName, string? queue, DateTimeOffset now, CancellationToken cancellationToken)
     {
+        if (await AdvanceCommitHorizonAsync(connection, transaction, cancellationToken).ConfigureAwait(false)
+            is not { } horizon)
+        {
+            return;
+        }
+
         // The first matching row after the cursor still unresolved — the cursor cannot pass it.
         long? block;
         await using (var blockCommand = Cmd(
@@ -3389,7 +3408,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             FROM backwave.job_transitions t
             JOIN backwave.jobs j ON j.job_id = t.job_id
             LEFT JOIN backwave.observer_deliveries d ON d.observer_id = @id AND d.position = t.position
-            WHERE t.position > @cursor
+            WHERE t.position > @cursor AND t.position <= @horizon
               AND t.state = ANY(@states)
               AND (@wire::text IS NULL OR j.wire_name = @wire::text)
               AND (@queue::text IS NULL OR j.queue = @queue::text)
@@ -3399,6 +3418,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         {
             blockCommand.Parameters.AddWithValue("id", observerId);
             blockCommand.Parameters.AddWithValue("cursor", cursor);
+            blockCommand.Parameters.AddWithValue("horizon", horizon);
             blockCommand.Parameters.AddWithValue("states", states);
             blockCommand.Parameters.AddWithValue("wire", (object?)wireName ?? DBNull.Value);
             blockCommand.Parameters.AddWithValue("queue", (object?)queue ?? DBNull.Value);
@@ -3406,13 +3426,14 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             block = result is DBNull or null ? null : (long)result;
         }
 
-        // The cursor sweeps to the last Position before the block (or to the end if nothing blocks).
+        // The cursor sweeps to the last Position before the block (or to the Commit Horizon if nothing blocks).
         long? newCursor;
         await using (var advance = Cmd(
-            "SELECT MAX(position) FROM backwave.job_transitions WHERE position > @cursor AND (@block::bigint IS NULL OR position < @block::bigint)",
+            "SELECT MAX(position) FROM backwave.job_transitions WHERE position > @cursor AND position <= @horizon AND (@block::bigint IS NULL OR position < @block::bigint)",
             connection, transaction))
         {
             advance.Parameters.AddWithValue("cursor", cursor);
+            advance.Parameters.AddWithValue("horizon", horizon);
             advance.Parameters.AddWithValue("block", (object?)block ?? DBNull.Value);
             var result = await advance.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             newCursor = result is DBNull or null ? null : (long)result;
@@ -3480,6 +3501,65 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     $"Moving the cursor of observer '{observerId}' affected {moved} rows; the row is locked FOR UPDATE by this transaction, so exactly 1 is the only possible count.");
             }
         }
+    }
+
+    private async Task<long?> AdvanceCommitHorizonAsync(
+        NpgsqlConnection connection, NpgsqlTransaction transaction, CancellationToken cancellationToken)
+    {
+        // Every part of one statement reads the snapshot taken when it starts, so P is fixed before a probe
+        // runs. The probes sit above the locked row, so they run on its epoch, after the lock.
+        CommitHorizon state;
+        long maxPosition;
+        bool previousFree;
+        bool currentFree;
+        await using (var step = Cmd(
+            """
+            WITH locked AS (
+                SELECT epoch, candidate_pos, horizon_pos FROM backwave.observer_log_horizon
+                WHERE id = 1
+                FOR UPDATE SKIP LOCKED)
+            SELECT h.horizon_pos, l.epoch, l.candidate_pos, l.horizon_pos,
+                   (SELECT COALESCE(MAX(position), 0) FROM backwave.job_transitions),
+                   CASE WHEN l.epoch IS NOT NULL THEN backwave.observer_log_epoch_free(1 - l.epoch) END,
+                   CASE WHEN l.epoch IS NOT NULL THEN backwave.observer_log_epoch_free(l.epoch) END
+            FROM backwave.observer_log_horizon h
+            LEFT JOIN locked l ON true
+            WHERE h.id = 1
+            """,
+            connection, transaction))
+        {
+            await using var reader = await step.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                Invariant.Degrade(
+                    _logger, InvariantTrigger.GuaranteedRowAbsent,
+                    "The Commit Horizon row is missing; the schema migration seeds it and nothing deletes it.");
+                return null;
+            }
+            if (reader.IsDBNull(1))
+            {
+                return reader.GetInt64(0);
+            }
+            state = new CommitHorizon(
+                reader.GetInt16(1), reader.IsDBNull(2) ? null : reader.GetInt64(2), reader.GetInt64(3));
+            maxPosition = reader.GetInt64(4);
+            previousFree = reader.GetBoolean(5);
+            currentFree = reader.GetBoolean(6);
+        }
+
+        var next = state.Advance(maxPosition, previousFree, currentFree);
+        if (next != state)
+        {
+            await using var write = Cmd(
+                "UPDATE backwave.observer_log_horizon " +
+                "SET epoch = @epoch, candidate_pos = @candidate, horizon_pos = @horizon WHERE id = 1",
+                connection, transaction);
+            write.Parameters.AddWithValue("epoch", (short)next.Epoch);
+            write.Parameters.AddWithValue("candidate", (object?)next.Candidate ?? DBNull.Value);
+            write.Parameters.AddWithValue("horizon", next.Horizon);
+            await write.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
+        return next.Horizon;
     }
 
     private static int[] ParseStates(string states) => states.Length == 0
