@@ -18,7 +18,7 @@ public static class PostgresTestDatabase
     private static bool _migrated;
 
     public static async ValueTask<PostgresJobStore> CreateFreshStoreAsync(
-        JobHistoryPolicy historyPolicy = JobHistoryPolicy.TransitionsAndFailureDetail)
+        JobHistoryPolicy historyPolicy = JobHistoryPolicy.TransitionsAndFailureDetail, StoreBounds? bounds = null)
     {
         await Gate.WaitAsync();
         try
@@ -64,6 +64,7 @@ public static class PostgresTestDatabase
         {
             ConnectionString = bounded,
             HistoryPolicy = historyPolicy,
+            Bounds = bounds ?? StoreBounds.Default,
         });
     }
 }
