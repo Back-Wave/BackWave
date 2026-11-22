@@ -35,6 +35,7 @@ public class NodeDriverCadenceTests
     {
         var driver = Driver(TimeSpan.FromSeconds(10));
         driver.Step(new NodeEvent.PollDue(T0)); // first poll sweeps
+        driver.Step(new NodeEvent.ClaimCompleted([], T0));
 
         var commands = driver.Step(new NodeEvent.PollDue(T0.AddSeconds(3))); // still inside the interval
 

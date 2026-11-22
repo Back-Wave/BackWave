@@ -59,7 +59,7 @@ public sealed record WorkerGroupOptions
     /// one batched report, keeping the writer single-threaded so throughput rises without opening more
     /// database connections. A poll or heartbeat tick, or the group going idle, flushes any partial buffer
     /// first, so this never adds latency to a lone result. When <see langword="null"/>, defaults to
-    /// <see cref="MaxClaimBatch"/>.
+    /// <see cref="MaxClaimBatch"/>. A value below 1 writes each outcome on its own, as 1 does.
     /// </summary>
     public int? MaxOutcomeBatch { get; init; }
 

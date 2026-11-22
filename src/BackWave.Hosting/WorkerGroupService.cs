@@ -137,8 +137,7 @@ internal sealed class WorkerGroupService(
     private readonly SemaphoreSlim _pollWake = new(0, 1);
     // <summary>The instant the group last went idle (its first empty poll with no next-due hint), or null while
     // busy. The idle ramp grows the delay by how long the group has actually been idle, not by how many empty
-    // polls have fired, so a drain tail's burst of empty re-polls cannot saturate the delay to the ceiling.
-    // Single pump thread touches it (the reader loop), so a plain field needs no synchronization.</summary>
+    // polls have fired, so a drain tail's burst of empty re-polls cannot saturate the delay to the ceiling.</summary>
     private DateTimeOffset? _idleSince;
 
     // Adaptive backoff runs only when a strictly larger ceiling is set: at or below the floor,
@@ -251,6 +250,27 @@ internal sealed class WorkerGroupService(
         return false;
     }
 
+    private readonly StoreLane _claim = new();
+
+    private readonly StoreLane _outcomeWrite = new();
+
+    private bool TakeAnswer(StoreLane lane)
+    {
+        if (lane.Take() is not { } ending)
+        {
+            return false;
+        }
+        if (ending.Fault is { } fault)
+        {
+            if (ending.FromStore)
+            {
+                _storeFault = fault.SourceException;
+            }
+            fault.Throw();
+        }
+        return true;
+    }
+
     private bool DegradesAsUnclassifiedStoreFault(Exception exception, CancellationToken stoppingToken) =>
         options.UnclassifiedStoreFaults == UnclassifiedStoreFaultAction.Degrade
         && ReferenceEquals(exception, _storeFault)
@@ -308,7 +328,8 @@ internal sealed class WorkerGroupService(
             WorkerId = _workerId,
             Policy = options.Policy,
             MaxClaimBatch = options.MaxClaimBatch,
-            MaxOutcomeBatch = options.MaxOutcomeBatch ?? options.MaxClaimBatch, // coalesce a claim batch's worth of outcomes
+            // A value below 1 has always meant one outcome per write, and the Driver's batches need at least one row.
+            MaxOutcomeBatch = Math.Max(1, options.MaxOutcomeBatch ?? options.MaxClaimBatch), // coalesce a claim batch's worth of outcomes
             PoolSize = options.PoolSize, // the Driver subtracts in-flight work from claims
             LeaseDuration = options.LeaseDuration,
             RetryPolicy = options.RetryPolicy,
@@ -369,6 +390,12 @@ internal sealed class WorkerGroupService(
         // ALREADY running unwinds with stoppingToken cancelled, which is exactly what a clean stop looks
         // like from there. Carried out explicitly so a halting pump writes nothing more to the store.
         Exception? halting = null;
+
+        // The store lanes do not run on stoppingToken, because a clean stop must not cancel the outcome
+        // write in flight: its rows finished, and a write cut off here rolls back, so the relinquish would
+        // return them to the queue to run again. The hand-back cancels the write lane when its budget runs
+        // out. A claim in flight is worth nothing once the stop begins, so the claim lane is cancelled then.
+        using var claimStopsWithThePump = stoppingToken.Register(static lane => ((StoreLane)lane!).Cancel(), _claim);
         try
         {
             await foreach (var nodeEvent in events.Reader.ReadAllAsync(stoppingToken).ConfigureAwait(false))
@@ -383,33 +410,28 @@ internal sealed class WorkerGroupService(
                 {
                     var commands = driver.Step(nodeEvent);
                     var issued = 0;
+                    var reached = false;
                     try
                     {
+                        reached = nodeEvent switch
+                        {
+                            NodeEvent.ClaimCompleted => TakeAnswer(_claim),
+                            NodeEvent.OutcomeBatchReported => TakeAnswer(_outcomeWrite),
+                            _ => false,
+                        };
                         foreach (var command in commands)
                         {
                             await ExecuteAsync(command, events.Writer, stoppingToken).ConfigureAwait(false);
                             issued++;
+                            reached |= command is not (Command.ClaimBatch or Command.ReportOutcomeBatch);
                         }
                     }
                     catch
                     {
-                        // A fault abandons the rest of this cycle's commands, but the Driver already
-                        // reserved the pool slots of every ClaimBatch it planned - it frees them only when
-                        // that batch's ClaimCompleted lands. Land an empty completion for each claim this
-                        // cycle never ran, so an abandoned cycle cannot strand a reservation and wedge the
-                        // pool shut. A maintenance sweep runs ahead of the claim on the same poll, so this
-                        // is the ordinary path whenever the store is unreachable, not a corner case.
-                        ReleaseUnissuedClaims(commands, issued, events.Writer, _clock.GetUtcNow());
+                        ReleaseUnissuedBatches(commands, issued, events.Writer, _clock.GetUtcNow());
                         throw;
                     }
-                    // A cycle that ran at least one command clears THIS Pump's prior degraded mark - the
-                    // store answered, so it is reachable again - without touching a sibling Pump's mark on
-                    // the same group. A cycle that ran none proves nothing about the store and must leave
-                    // the mark alone: a faulted claim lands an empty ClaimCompleted to free its reservation,
-                    // and a poll whose pool is already full issues no claim. Both reach here without a
-                    // round-trip, so clearing on them would erase the mark microseconds after the fault set
-                    // it and a group whose store is down would read healthy.
-                    if (issued > 0)
+                    if (reached)
                     {
                         health.ReportRecovered(options.Name, _workerId);
                     }
@@ -466,7 +488,7 @@ internal sealed class WorkerGroupService(
             // The pump loop has exited, so this group claims nothing more: give back what it holds. This
             // runs BEFORE the writer is completed, because the hand-back reads the events the stopping
             // executions are still writing and flushes the Driver's buffered outcomes through the
-            // ordinary command path, which writes their OutcomeReported events back to this very
+            // ordinary command path, which writes their OutcomeBatchReported events back to this very
             // channel - a completed writer would refuse every one of them.
             try
             {
@@ -475,7 +497,7 @@ internal sealed class WorkerGroupService(
             finally
             {
                 // Its own finally, because the hand-back rethrows a named violation on its way out. Left in
-                // the same block, that throw would skip both lines below: the channel would stay open for
+                // the same block, that throw would skip the lines below: the channel would stay open for
                 // the tickers to fill until host shutdown, and the Wake-Up Hint subscription would leak on
                 // exactly the path - a halt - that most needs the process left tidy.
                 //
@@ -485,6 +507,17 @@ internal sealed class WorkerGroupService(
                 if (hints is not null)
                 {
                     await hints.DisposeAsync().ConfigureAwait(false);
+                }
+
+                // A halting pump cancels its lane calls still in flight, so a store that honors the cancel
+                // writes nothing more. Last, because a store's cancellation callback can throw.
+                try
+                {
+                    _claim.Cancel();
+                }
+                finally
+                {
+                    _outcomeWrite.Cancel();
                 }
             }
         }
@@ -535,6 +568,8 @@ internal sealed class WorkerGroupService(
             {
                 using var budget = CancellationTokenSource.CreateLinkedTokenSource(_hostStopped.Token);
                 budget.CancelAfter(allowance - reserve);
+                using var writeStopsWithTheBudget =
+                    budget.Token.Register(static lane => ((StoreLane)lane!).Cancel(), _outcomeWrite);
                 await SettleFinishedExecutionsAsync(driver, events, budget.Token).ConfigureAwait(false);
             }
             catch (InvariantViolationException)
@@ -597,6 +632,7 @@ internal sealed class WorkerGroupService(
         NodeDriver driver, Channel<NodeEvent> events, CancellationToken budget)
     {
         await DrainInFlightAsync(budget).ConfigureAwait(false);
+        await SettleStoreLanesAsync(budget).ConfigureAwait(false);
 
         // Everything those executions wrote as they finished, through the ordinary command path, so
         // an outcome that landed after the pump loop exited settles exactly as one that landed a
@@ -620,7 +656,7 @@ internal sealed class WorkerGroupService(
             }
             foreach (var command in driver.Step(nodeEvent))
             {
-                await ExecuteAsync(command, events.Writer, budget).ConfigureAwait(false);
+                await ExecuteToCompletionAsync(command, events.Writer, budget).ConfigureAwait(false);
             }
         }
 
@@ -639,9 +675,32 @@ internal sealed class WorkerGroupService(
         // Through the ordinary command path too, so the buffered Failure Detail, Tags, Output, and
         // held-open spans settle exactly as they do on a poll-tick flush. Last, because the drain
         // above is what puts the final outcomes into the Driver's buffer in the first place.
-        if (driver.DrainBufferedOutcomes() is { } pending)
+        while (driver.DrainBufferedOutcomes() is { } pending)
         {
-            await ExecuteAsync(pending, events.Writer, budget).ConfigureAwait(false);
+            await ExecuteToCompletionAsync(pending, events.Writer, budget).ConfigureAwait(false);
+        }
+    }
+
+    private async Task SettleStoreLanesAsync(CancellationToken budget)
+    {
+        await Task.WhenAll(_claim.Running, _outcomeWrite.Running).WaitAsync(budget).ConfigureAwait(false);
+        foreach (var lane in (ReadOnlySpan<StoreLane>)[_claim, _outcomeWrite])
+        {
+            if (lane.Take()?.Fault is { SourceException: InvariantViolationException } violation)
+            {
+                violation.Throw();
+            }
+        }
+    }
+
+    private async Task ExecuteToCompletionAsync(
+        Command command, ChannelWriter<NodeEvent> events, CancellationToken budget)
+    {
+        await ExecuteAsync(command, events, budget).ConfigureAwait(false);
+        if (command is Command.ReportOutcomeBatch)
+        {
+            await _outcomeWrite.Running.WaitAsync(budget).ConfigureAwait(false);
+            TakeAnswer(_outcomeWrite);
         }
     }
 
@@ -796,11 +855,7 @@ internal sealed class WorkerGroupService(
         }
     }
 
-    // Frees the pool slots of every ClaimBatch a fault left un-issued. The Driver reserves a batch's slots
-    // when it plans the batch and frees them when that batch's ClaimCompleted lands, so the contract is one
-    // completion per planned batch - an empty result included. A cycle that faults part-way keeps that
-    // contract here: commands[issued] is the command that faulted and everything after it never ran.
-    private static void ReleaseUnissuedClaims(
+    private static void ReleaseUnissuedBatches(
         IReadOnlyList<Command> commands, int issued, ChannelWriter<NodeEvent> events, DateTimeOffset now)
     {
         for (var index = issued; index < commands.Count; index++)
@@ -808,6 +863,10 @@ internal sealed class WorkerGroupService(
             if (commands[index] is Command.ClaimBatch)
             {
                 events.TryWrite(new NodeEvent.ClaimCompleted([], now));
+            }
+            else if (commands[index] is Command.ReportOutcomeBatch)
+            {
+                events.TryWrite(new NodeEvent.OutcomeBatchReported([], now));
             }
         }
     }
@@ -884,54 +943,10 @@ internal sealed class WorkerGroupService(
                 break;
 
             case Command.ClaimBatch claim:
-                using (var claimActivity = BackWaveDiagnostics.StartReceive(claim.WorkerId, options.Name))
-                {
-                    var request = new ClaimRequest(claim.WorkerId, claim.Queues, claim.MaxJobs, claim.LeaseDuration, now);
-                    // ClaimBatchAsync (a Default Interface Method) returns the claimed jobs plus an advisory
-                    // next-due instant; an adapter that does not override it reports NextDue = null, so the
-                    // backoff simply falls back to the idle-time ramp. Only the adaptive pacer consumes
-                    // NextDue, so when the feature is off we take the plain ClaimAsync path and issue exactly
-                    // the single claim query the runtime issued before this feature existed.
-                    // A fault here needs no completion of its own: the batch counts as un-issued, and the
-                    // pump loop lands its empty ClaimCompleted as it abandons the cycle.
-                    ClaimResult result;
-                    try
-                    {
-                        result = AdaptivePoll
-                            ? await store.ClaimBatchAsync(request, stoppingToken).ConfigureAwait(false)
-                            : new ClaimResult(
-                                await store.ClaimAsync(request, stoppingToken).ConfigureAwait(false), NextDue: null);
-                    }
-                    catch (Exception fault) when (NoteStoreFault(fault))
-                    {
-                        throw;
-                    }
-                    var jobs = result.Jobs;
-                    BackWaveDiagnostics.RecordClaimed(claimActivity, jobs, now);
-                    foreach (var job in jobs)
-                    {
-                        // A claim leases a row the store matched as Scheduled and left Leased, so a terminal
-                        // state here means the row was settled behind the claim's own UPDATE. Executing it
-                        // would re-run an Attempt whose effect already landed, so halt before dispatch.
-                        if (job.State.IsTerminal())
-                        {
-                            throw Invariant.Halt(
-                                InvariantTrigger.ClaimedJobTerminal,
-                                $"Claim for worker '{claim.WorkerId}' returned job {job.JobId} " +
-                                $"({job.WireName}, attempt {job.Attempt}) in terminal state {job.State}.");
-                        }
-                        // A claim is the start of an Attempt: its Lease is now held (Trace).
-                        BackWaveLog.LeaseAcquired(logger, job.JobId, job.WireName, job.Attempt, job.Queue);
-                    }
-                    // Always report the claim's completion, an empty result included: the Driver reserved this
-                    // batch's slots against the pool at issue and frees them here, so a claim that returns
-                    // nothing must still land or the reservation would strand and wedge the pool.
-                    events.TryWrite(new NodeEvent.ClaimCompleted(jobs, now));
-                    if (AdaptivePoll)
-                    {
-                        UpdatePollBackoff(jobs.Count > 0, result.NextDue, now);
-                    }
-                }
+                _claim.Start(
+                    cancellationToken => ClaimAsync(claim, now, cancellationToken),
+                    () => new NodeEvent.ClaimCompleted([], _clock.GetUtcNow()),
+                    events);
                 break;
 
             case Command.ExecuteJob execute:
@@ -939,135 +954,10 @@ internal sealed class WorkerGroupService(
                 break;
 
             case Command.ReportOutcomeBatch batch:
-                // The Driver coalesces terminal outcomes (ADR 0035) and flushes them as one command. For
-                // each row, drain the Shell-stashed Failure Detail (§5.12, ADR 0011) / runtime Tag delta
-                // (ADR 0022) / Job Output (ADR 0026) keyed by (JobId, Attempt) — exactly as the single
-                // report did — and apply the whole batch in one fenced store write so the pump stays
-                // single-writer. Failure Detail rides only a Failure; Tags and Output always travel and the
-                // store keeps them only when the row applies (Output only on Success). Each row is fenced
-                // independently; the store returns one result per row, and the Driver re-polls on each
-                // applied outcome (a released Dependency may be due this instant).
-                var reports = new List<OutcomeReport>(batch.Outcomes.Count);
-                // The held-open process span for each row - and, on it, the Lease expiry this pump still
-                // believed that row held as its execution settled - kept positionally alongside the report
-                // it belongs to (the Storage Contract pairs results to reports by position too). Null where
-                // the execution stashed nothing. Read by the settlement below and by the fence check.
-                var pendingSpans =
-                    new (Activity? Span, string WireName, string Queue, DateTimeOffset? LeaseExpiry)?[batch.Outcomes.Count];
-                foreach (var outcome in batch.Outcomes)
-                {
-                    _failureDetail.TryRemove((outcome.JobId, outcome.Attempt), out var rowDetail);
-                    _bufferedTags.TryRemove((outcome.JobId, outcome.Attempt), out var rowTags);
-                    var rowHasOutput = _bufferedOutput.TryRemove((outcome.JobId, outcome.Attempt), out var rowOutput);
-                    if (_pendingProcessOutcomes.TryRemove((outcome.JobId, outcome.Attempt), out var span))
-                    {
-                        // Indexed by reports.Count, which is this row's position the instant before it is
-                        // appended below. Stashed, not settled: the settlement happens once the batch has
-                        // been applied, off the row the store actually took.
-                        pendingSpans[reports.Count] = span;
-                    }
-                    reports.Add(new OutcomeReport(outcome.JobId, outcome.WorkerId, outcome.Attempt, outcome.Outcome)
-                    {
-                        FailureDetail = outcome.Outcome is JobOutcome.Failure ? rowDetail : null,
-                        AddedTags = rowTags,
-                        // Cast the null arm to the nullable type: ReadOnlyMemory<byte> converts implicitly
-                        // from byte[] (and null → byte[]), so an un-cast `: null` would give a non-null
-                        // EMPTY blob, persisting a 0-byte output on every silent success instead of none.
-                        Output = rowHasOutput ? rowOutput : (ReadOnlyMemory<byte>?)null,
-                    });
-                }
-                IReadOnlyList<OutcomeReportResult> batchResults;
-                bool[] fencedByDesign;
-                try
-                {
-                    (batchResults, fencedByDesign) =
-                        await ApplyOutcomesAsync(reports, now, stoppingToken).ConfigureAwait(false);
-                }
-                finally
-                {
-                    // Settle the held-open process spans from the row as APPLIED, not as the handler left
-                    // it. ApplyOutcomesAsync rewrites a row whose Job Output the store rejected into a
-                    // terminal Failure, and a span closed on the original Success would record a
-                    // dead-lettered job as a success: no "dead-lettered" span event, no
-                    // backwave.jobs.dead_lettered increment, and no Dead-Lettered log, so an operator
-                    // alerting on any of the three is blind to the whole class. A Failure lands
-                    // retry-scheduled or dead-lettered (the disposition the Driver computed into this row's
-                    // next-due time), then it stops.
-                    // In a finally, because a store fault on the apply would otherwise leave every span in
-                    // the batch open forever - the pump already took them out of _pendingProcessOutcomes.
-                    for (var i = 0; i < reports.Count; i++)
-                    {
-                        if (pendingSpans[i] is { } settling)
-                        {
-                            BackWaveDiagnostics.CompleteProcess(
-                                settling.Span, reports[i].Outcome, settling.WireName, settling.Queue);
-                            LogSettlement(reports[i], settling.WireName, settling.Queue);
-                        }
-                    }
-                }
-                // The Storage Contract is one result per input row, in input order, and the Driver pairs the
-                // two by position. A short or long answer means some row's outcome is silently unreported or
-                // misattributed, so stop before the Driver acts on a mispaired result.
-                if (batchResults.Count != reports.Count)
-                {
-                    throw Invariant.Halt(
-                        InvariantTrigger.OutcomeBatchCountMismatch,
-                        $"Outcome batch of {reports.Count} row(s) came back with {batchResults.Count} result(s).");
-                }
-                for (var i = 0; i < batchResults.Count; i++)
-                {
-                    var rowResult = batchResults[i];
-                    if (rowResult.Result is OutcomeResult.StaleLease)
-                    {
-                        // The store's identity fence refused this write. Two ordinary races end here and
-                        // neither is a broken invariant: a Lease that lapsed before its outcome could be
-                        // reported (another node has since taken the job over, or this pump's own sweep
-                        // expired it), and a Job Output re-apply, where the rows the store already settled
-                        // on the rejected pass are fenced out by design - those rows only, so the check
-                        // below stays live for every other row in the batch. Both are logged at Debug and
-                        // counted nowhere - the invariant ledger is the surface a promotion rule reads FOR
-                        // ZEROS, so a healthy fleet that increments it makes the trigger meaningless.
-                        //
-                        // What no legal race produces is a fence that refuses a Lease this pump still
-                        // believes it holds: the store answered "not this worker's" about a Lease whose
-                        // expiry - as the claim set it and every renewed heartbeat pushed it out - is still
-                        // in the future by the pump's own clock. Only that contradiction is counted. The
-                        // belief is a lower bound (it advances only on renewals this pump saw), so the test
-                        // errs toward silence and never toward a false alarm.
-                        //
-                        // The clocks are the other reason it errs toward silence. The expiry is stamped
-                        // from THIS pump's clock and compared against it, but the node that expired the
-                        // Lease read its own, and the fleet is bound to no common time source. A peer that
-                        // runs a few seconds ahead expires a lapsed Lease legally, and this pump still sees
-                        // a future expiry. Only a window wider than any credible skew is a contradiction,
-                        // so one skewed node cannot make the zero-counter non-zero on a healthy fleet.
-                        if (!fencedByDesign[i] && pendingSpans[i]?.LeaseExpiry is { } until
-                            && now + Invariant.ClockSkewAllowance < until)
-                        {
-                            var detail =
-                                $"Outcome {reports[i].Outcome} for job {rowResult.JobId} (attempt {reports[i].Attempt}, " +
-                                $"worker '{reports[i].WorkerId}') was refused by the store's identity fence, but this " +
-                                $"pump's Lease on it runs to {until:o} and it is only {now:o}.";
-                            // 2003, not the 1601 Invariant.Degrade writes: the two ids split by ALTITUDE,
-                            // and 16xx is reserved for invariant sites that degrade BELOW the Hosting
-                            // boundary. This is the group-altitude counterpart, and it is the only one of
-                            // the pair that names the worker group - nothing puts the group on a log scope.
-                            // Emitting both double-pages an operator who follows that split and inflates a
-                            // count of 1601 by the whole pump fence family. The counter is what the
-                            // promotion rule reads, so it is recorded directly here rather than left to
-                            // Invariant.Degrade, which cannot write 1601 without breaking the band.
-                            HostingLog.WorkerGroupDegradedByInvariant(
-                                logger, options.Name, InvariantTrigger.OutcomeFenceRejected.ToString(), detail);
-                            BackWaveDiagnostics.RecordInvariantViolation(
-                                InvariantTrigger.OutcomeFenceRejected, InvariantAction.Degrade);
-                        }
-                        else
-                        {
-                            BackWaveLog.OutcomeFencedOut(logger, rowResult.JobId, reports[i].Attempt);
-                        }
-                    }
-                    events.TryWrite(new NodeEvent.OutcomeReported(rowResult.JobId, rowResult.Result, now));
-                }
+                _outcomeWrite.Start(
+                    cancellationToken => WriteOutcomesAsync(batch, now, cancellationToken),
+                    () => new NodeEvent.OutcomeBatchReported([], _clock.GetUtcNow()),
+                    events);
                 break;
 
             case Command.Heartbeat heartbeat:
@@ -1133,6 +1023,186 @@ internal sealed class WorkerGroupService(
                 }
                 break;
         }
+    }
+
+    private async Task<NodeEvent> ClaimAsync(
+        Command.ClaimBatch claim, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        using var claimActivity = BackWaveDiagnostics.StartReceive(claim.WorkerId, options.Name);
+        var request = new ClaimRequest(claim.WorkerId, claim.Queues, claim.MaxJobs, claim.LeaseDuration, now);
+        // ClaimBatchAsync (a Default Interface Method) returns the claimed jobs plus an advisory
+        // next-due instant; an adapter that does not override it reports NextDue = null, so the
+        // backoff simply falls back to the idle-time ramp. Only the adaptive pacer consumes
+        // NextDue, so when the feature is off we take the plain ClaimAsync path and issue exactly
+        // the single claim query the runtime issued before this feature existed.
+        ClaimResult result;
+        try
+        {
+            result = AdaptivePoll
+                ? await store.ClaimBatchAsync(request, cancellationToken).ConfigureAwait(false)
+                : new ClaimResult(
+                    await store.ClaimAsync(request, cancellationToken).ConfigureAwait(false), NextDue: null);
+        }
+        catch (Exception fault) when (_claim.NoteStoreFault(fault))
+        {
+            throw;
+        }
+        var jobs = result.Jobs;
+        BackWaveDiagnostics.RecordClaimed(claimActivity, jobs, now);
+        foreach (var job in jobs)
+        {
+            // A claim leases a row the store matched as Scheduled and left Leased, so a terminal
+            // state here means the row was settled behind the claim's own UPDATE. Executing it
+            // would re-run an Attempt whose effect already landed, so halt before dispatch.
+            if (job.State.IsTerminal())
+            {
+                throw Invariant.Halt(
+                    InvariantTrigger.ClaimedJobTerminal,
+                    $"Claim for worker '{claim.WorkerId}' returned job {job.JobId} " +
+                    $"({job.WireName}, attempt {job.Attempt}) in terminal state {job.State}.");
+            }
+            // A claim is the start of an Attempt: its Lease is now held (Trace).
+            BackWaveLog.LeaseAcquired(logger, job.JobId, job.WireName, job.Attempt, job.Queue);
+        }
+        if (AdaptivePoll)
+        {
+            UpdatePollBackoff(jobs.Count > 0, result.NextDue, now);
+        }
+        return new NodeEvent.ClaimCompleted(jobs, now);
+    }
+
+    private async Task<NodeEvent> WriteOutcomesAsync(
+        Command.ReportOutcomeBatch batch, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        // The Driver coalesces terminal outcomes (ADR 0035) and flushes them as one command. For
+        // each row, drain the Shell-stashed Failure Detail (§5.12, ADR 0011) / runtime Tag delta
+        // (ADR 0022) / Job Output (ADR 0026) keyed by (JobId, Attempt) — exactly as the single
+        // report did — and apply the whole batch in one fenced store write so the pump stays
+        // single-writer. Failure Detail rides only a Failure; Tags and Output always travel and the
+        // store keeps them only when the row applies (Output only on Success). Each row is fenced
+        // independently; the store returns one result per row, and the Driver re-polls on each
+        // applied outcome (a released Dependency may be due this instant).
+        var reports = new List<OutcomeReport>(batch.Outcomes.Count);
+        // The held-open process span for each row - and, on it, the Lease expiry this pump still
+        // believed that row held as its execution settled - kept positionally alongside the report
+        // it belongs to (the Storage Contract pairs results to reports by position too). Null where
+        // the execution stashed nothing. Read by the settlement below and by the fence check.
+        var pendingSpans =
+            new (Activity? Span, string WireName, string Queue, DateTimeOffset? LeaseExpiry)?[batch.Outcomes.Count];
+        foreach (var outcome in batch.Outcomes)
+        {
+            _failureDetail.TryRemove((outcome.JobId, outcome.Attempt), out var rowDetail);
+            _bufferedTags.TryRemove((outcome.JobId, outcome.Attempt), out var rowTags);
+            var rowHasOutput = _bufferedOutput.TryRemove((outcome.JobId, outcome.Attempt), out var rowOutput);
+            if (_pendingProcessOutcomes.TryRemove((outcome.JobId, outcome.Attempt), out var span))
+            {
+                // Indexed by reports.Count, which is this row's position the instant before it is
+                // appended below. Stashed, not settled: the settlement happens once the batch has
+                // been applied, off the row the store actually took.
+                pendingSpans[reports.Count] = span;
+            }
+            reports.Add(new OutcomeReport(outcome.JobId, outcome.WorkerId, outcome.Attempt, outcome.Outcome)
+            {
+                FailureDetail = outcome.Outcome is JobOutcome.Failure ? rowDetail : null,
+                AddedTags = rowTags,
+                // Cast the null arm to the nullable type: ReadOnlyMemory<byte> converts implicitly
+                // from byte[] (and null → byte[]), so an un-cast `: null` would give a non-null
+                // EMPTY blob, persisting a 0-byte output on every silent success instead of none.
+                Output = rowHasOutput ? rowOutput : (ReadOnlyMemory<byte>?)null,
+            });
+        }
+        IReadOnlyList<OutcomeReportResult> batchResults;
+        bool[] fencedByDesign;
+        try
+        {
+            (batchResults, fencedByDesign) =
+                await ApplyOutcomesAsync(reports, now, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Settle the held-open process spans from the row as APPLIED, not as the handler left
+            // it. ApplyOutcomesAsync rewrites a row whose Job Output the store rejected into a
+            // terminal Failure, and a span closed on the original Success would record a
+            // dead-lettered job as a success: no "dead-lettered" span event, no
+            // backwave.jobs.dead_lettered increment, and no Dead-Lettered log, so an operator
+            // alerting on any of the three is blind to the whole class. A Failure lands
+            // retry-scheduled or dead-lettered (the disposition the Driver computed into this row's
+            // next-due time), then it stops.
+            // In a finally, because a store fault on the apply would otherwise leave every span in
+            // the batch open forever - the pump already took them out of _pendingProcessOutcomes.
+            for (var i = 0; i < reports.Count; i++)
+            {
+                if (pendingSpans[i] is { } settling)
+                {
+                    BackWaveDiagnostics.CompleteProcess(
+                        settling.Span, reports[i].Outcome, settling.WireName, settling.Queue);
+                    LogSettlement(reports[i], settling.WireName, settling.Queue);
+                }
+            }
+        }
+        // The Storage Contract is one result per input row, in input order, and the Driver pairs the
+        // two by position. A short or long answer means some row's outcome is silently unreported or
+        // misattributed, so stop before the Driver acts on a mispaired result.
+        if (batchResults.Count != reports.Count)
+        {
+            throw Invariant.Halt(
+                InvariantTrigger.OutcomeBatchCountMismatch,
+                $"Outcome batch of {reports.Count} row(s) came back with {batchResults.Count} result(s).");
+        }
+        for (var i = 0; i < batchResults.Count; i++)
+        {
+            var rowResult = batchResults[i];
+            if (rowResult.Result is OutcomeResult.StaleLease)
+            {
+                // The store's identity fence refused this write. Two ordinary races end here and
+                // neither is a broken invariant: a Lease that lapsed before its outcome could be
+                // reported (another node has since taken the job over, or this pump's own sweep
+                // expired it), and a Job Output re-apply, where the rows the store already settled
+                // on the rejected pass are fenced out by design - those rows only, so the check
+                // below stays live for every other row in the batch. Both are logged at Debug and
+                // counted nowhere - the invariant ledger is the surface a promotion rule reads FOR
+                // ZEROS, so a healthy fleet that increments it makes the trigger meaningless.
+                //
+                // What no legal race produces is a fence that refuses a Lease this pump still
+                // believes it holds: the store answered "not this worker's" about a Lease whose
+                // expiry - as the claim set it and every renewed heartbeat pushed it out - is still
+                // in the future by the pump's own clock. Only that contradiction is counted. The
+                // belief is a lower bound (it advances only on renewals this pump saw), so the test
+                // errs toward silence and never toward a false alarm.
+                //
+                // The clocks are the other reason it errs toward silence. The expiry is stamped
+                // from THIS pump's clock and compared against it, but the node that expired the
+                // Lease read its own, and the fleet is bound to no common time source. A peer that
+                // runs a few seconds ahead expires a lapsed Lease legally, and this pump still sees
+                // a future expiry. Only a window wider than any credible skew is a contradiction,
+                // so one skewed node cannot make the zero-counter non-zero on a healthy fleet.
+                if (!fencedByDesign[i] && pendingSpans[i]?.LeaseExpiry is { } until
+                    && now + Invariant.ClockSkewAllowance < until)
+                {
+                    var detail =
+                        $"Outcome {reports[i].Outcome} for job {rowResult.JobId} (attempt {reports[i].Attempt}, " +
+                        $"worker '{reports[i].WorkerId}') was refused by the store's identity fence, but this " +
+                        $"pump's Lease on it runs to {until:o} and it is only {now:o}.";
+                    // 2003, not the 1601 Invariant.Degrade writes: the two ids split by ALTITUDE,
+                    // and 16xx is reserved for invariant sites that degrade BELOW the Hosting
+                    // boundary. This is the group-altitude counterpart, and it is the only one of
+                    // the pair that names the worker group - nothing puts the group on a log scope.
+                    // Emitting both double-pages an operator who follows that split and inflates a
+                    // count of 1601 by the whole pump fence family. The counter is what the
+                    // promotion rule reads, so it is recorded directly here rather than left to
+                    // Invariant.Degrade, which cannot write 1601 without breaking the band.
+                    HostingLog.WorkerGroupDegradedByInvariant(
+                        logger, options.Name, InvariantTrigger.OutcomeFenceRejected.ToString(), detail);
+                    BackWaveDiagnostics.RecordInvariantViolation(
+                        InvariantTrigger.OutcomeFenceRejected, InvariantAction.Degrade);
+                }
+                else
+                {
+                    BackWaveLog.OutcomeFencedOut(logger, rowResult.JobId, reports[i].Attempt);
+                }
+            }
+        }
+        return new NodeEvent.OutcomeBatchReported(batchResults, now);
     }
 
     // <summary>
@@ -1218,7 +1288,7 @@ internal sealed class WorkerGroupService(
             // A rejection that outlives the bound above, or names a row this batch never sent, is a
             // contradiction the pump found in the store's answer, so it halts rather than degrades.
             catch (Exception fault) when (fault is not (JobOutputTooLargeException or JobTagTooLongException)
-                && NoteStoreFault(fault))
+                && _outcomeWrite.NoteStoreFault(fault))
             {
                 throw;
             }

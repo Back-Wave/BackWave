@@ -77,6 +77,10 @@ internal enum Situation
 
     /// <summary>A cleanly stopping node handed its Leases back, so the run reached the Restart-Reclaim-Bound oracle.</summary>
     RelinquishReclaimed,
+
+    CompletionDuringOutcomeWrite,
+
+    PollDuringClaim,
 }
 
 /// <summary>
@@ -165,6 +169,8 @@ internal sealed class CoverageTracker
             [Situation.LimitSaturated] = r => r.LimitSaturations > 0,
             [Situation.BackpressureIdle] = r => r.BackpressureIdleTicks > 0,
             [Situation.RelinquishReclaimed] = r => r.LeasesRelinquished > 0,
+            [Situation.CompletionDuringOutcomeWrite] = r => r.CompletionsDuringOutcomeWrite > 0,
+            [Situation.PollDuringClaim] = r => r.PollsDuringClaim > 0,
         };
 
     static CoverageTracker()

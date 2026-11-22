@@ -35,17 +35,15 @@ internal sealed class NodeDriver(NodeOptions options)
     /// <summary>The remaining per-Queue claim batches of the current Weighted pass.</summary>
     private readonly Queue<Command.ClaimBatch> _weightedPlan = new();
 
-    /// <summary>
-    /// Slots reserved by claim batches already issued to the store but whose <see cref="NodeEvent.ClaimCompleted"/>
-    /// has not yet landed their jobs in <see cref="_executing"/>. A re-poll (an applied outcome, a mint, a Wake-Up
-    /// Hint) can enqueue another PollDue behind an in-flight claim on the pump's FIFO event queue; without this
-    /// reservation each such poll's <see cref="StartClaimPass"/> would read the pre-claim <see cref="_executing"/>
-    /// count and admit another full pool's worth, overshooting PoolSize under burst. The slots free when the
-    /// batch's ClaimCompleted lands — its claimed jobs then count as _executing instead. Each pump emits exactly
-    /// one ClaimCompleted per issued batch (an empty claim included), so a reservation is never stranded.
-    /// </summary>
-    private readonly Queue<int> _claimsInFlight = new();
-    private int _reservedSlots;
+    private int? _claimInFlight;
+
+    private int _pollsDuringClaim;
+
+    private int _pollsFromBeforeClaim;
+
+    private int _reportingSlots;
+
+    private bool _flushDeferred;
 
     /// <summary>When maintenance last ran; null until the first poll. Throttles the sweep.</summary>
     private DateTimeOffset? _lastMaintenance;
@@ -65,13 +63,21 @@ internal sealed class NodeDriver(NodeOptions options)
                 // holds its store Lease, so it must keep counting against the pool (StartClaimPass subtracts
                 // it). The buffered slots re-open only when the imminent flush's applied outcomes re-poll, so
                 // claiming them here too would over-admit past PoolSize (ADR 0035).
-                var firstClaim = StartClaimPass();
+                Command.ClaimBatch? firstClaim = null;
+                if (_claimInFlight is null)
+                {
+                    firstClaim = StartClaimPass();
+                }
+                else
+                {
+                    _pollsDuringClaim++;
+                }
                 var commands = new List<Command>();
                 // A poll tick is a flush trigger (ADR 0035): land any partial batch first, so released
                 // Dependencies are claimable on the flush's own re-poll.
-                if (_outcomeBuffer.Count > 0)
+                if (FlushOutcomes() is { } pollFlush)
                 {
-                    commands.Add(DrainOutcomeBatch());
+                    commands.Add(pollFlush);
                 }
                 if (maintenanceDue)
                 {
@@ -105,15 +111,12 @@ internal sealed class NodeDriver(NodeOptions options)
                 return decisions.Count == 0 ? [] : [new Command.MintDue(decisions)];
 
             case NodeEvent.ClaimCompleted claim:
-                // This claim resolved (its jobs, if any, become _executing below): free the slots it reserved.
-                // The freed reservation is the bound this claim was issued under, and the pool is sized against
-                // it: more jobs back than were asked for would over-admit past PoolSize and execute work no slot
-                // was held for. (A completion with no reservation in hand carries no bound to check.)
-                if (ReleaseClaim() is { } bound && claim.Jobs.Count > bound)
+                var bound = ReleaseClaim();
+                if (bound is { } asked && claim.Jobs.Count > asked)
                 {
                     throw Invariant.Halt(
                         InvariantTrigger.ClaimBatchOverrun,
-                        $"A claim bounded at {bound} job(s) returned {claim.Jobs.Count}.");
+                        $"A claim bounded at {asked} job(s) returned {claim.Jobs.Count}.");
                 }
                 var executions = new List<Command>(claim.Jobs.Count + 1);
                 foreach (var job in claim.Jobs)
@@ -124,11 +127,15 @@ internal sealed class NodeDriver(NodeOptions options)
                 // Weighted issues one batch per Queue. Credit advances at ISSUE, not allocation,
                 // so a pass interrupted before it drains strands none — advance for this batch now. A
                 // batch that returns work means the pass continues; an empty claim ends the pass and
-                // leaves the rest of the plan un-issued (uncharged, unreserved).
+                // leaves the rest of the plan un-issued (uncharged).
                 if (claim.Jobs.Count > 0 && _weightedPlan.TryDequeue(out var nextBatch))
                 {
                     ChargeIssued(nextBatch);
-                    executions.Add(Reserve(nextBatch));
+                    executions.Add(Issue(nextBatch));
+                }
+                else if (RunWaitingClaimPass(cameBackFull: claim.Jobs.Count == bound) is { } waitingPass)
+                {
+                    executions.Add(waitingPass);
                 }
                 return executions;
 
@@ -168,9 +175,9 @@ internal sealed class NodeDriver(NodeOptions options)
                 // leases of whatever is still executing. An idle node with a non-empty buffer would already
                 // have flushed on the drain-tail, so this mainly catches a partial batch under sustained load.
                 var heartbeatCommands = new List<Command>();
-                if (_outcomeBuffer.Count > 0)
+                if (FlushOutcomes() is { } heartbeatFlush)
                 {
-                    heartbeatCommands.Add(DrainOutcomeBatch());
+                    heartbeatCommands.Add(heartbeatFlush);
                 }
                 if (_executing.Count > 0)
                 {
@@ -194,12 +201,27 @@ internal sealed class NodeDriver(NodeOptions options)
                 }
                 return reactions;
 
-            case NodeEvent.OutcomeReported outcome:
+            case NodeEvent.OutcomeBatchReported reported:
+            {
+                _reportingSlots = 0;
+                var answered = new List<Command>();
                 // An applied terminal outcome may have released a Dependency due right now:
                 // re-poll so it is claimed promptly, not on the next timer tick. This decision
                 // lives here, not in either pump, so production and the deterministic harness
                 // drain everything due at this instant identically.
-                return outcome.Result == OutcomeResult.Applied ? [new Command.RequestPoll(outcome.Now)] : [];
+                foreach (var row in reported.Results)
+                {
+                    if (row.Result == OutcomeResult.Applied)
+                    {
+                        answered.Add(new Command.RequestPoll(reported.Now));
+                    }
+                }
+                if (reported.Results.Count > 0 && _flushDeferred && FlushOutcomes() is { } deferredFlush)
+                {
+                    answered.Add(deferredFlush);
+                }
+                return answered;
+            }
 
             case NodeEvent.MintCompleted mint:
                 // Minted-due-now instances run this cycle: re-poll when the mint produced work.
@@ -219,24 +241,48 @@ internal sealed class NodeDriver(NodeOptions options)
     private IReadOnlyList<Command> BufferOutcome(ReportedOutcome outcome)
     {
         _outcomeBuffer.Add(outcome);
-        return _outcomeBuffer.Count >= options.MaxOutcomeBatch || _executing.Count == 0
-            ? [DrainOutcomeBatch()]
-            : [];
+        return (_outcomeBuffer.Count >= options.MaxOutcomeBatch || _executing.Count == 0)
+            && FlushOutcomes() is { } flush
+                ? [flush]
+                : [];
     }
 
-    /// <summary>
-    /// Drains the outcome buffer into a single batch command, in completion order. Hands the existing list
-    /// to the command and swaps in a fresh one — no copy — since nothing mutates a drained buffer.
-    /// </summary>
-    private Command.ReportOutcomeBatch DrainOutcomeBatch()
+    private Command.ReportOutcomeBatch? FlushOutcomes()
     {
-        var batch = new Command.ReportOutcomeBatch(_outcomeBuffer);
-        _outcomeBuffer = [];
+        if (_outcomeBuffer.Count == 0)
+        {
+            return null;
+        }
+        if (_reportingSlots > 0)
+        {
+            _flushDeferred = true;
+            return null;
+        }
+        var batch = DrainOutcomeBatch();
+        _reportingSlots = batch.Outcomes.Count;
+        _flushDeferred = _outcomeBuffer.Count > 0;
         return batch;
     }
 
+    /// <summary>Drains up to <see cref="NodeOptions.MaxOutcomeBatch"/> buffered outcomes into one batch command, in completion order.</summary>
+    private Command.ReportOutcomeBatch DrainOutcomeBatch()
+    {
+        List<ReportedOutcome> rows;
+        if (_outcomeBuffer.Count <= options.MaxOutcomeBatch)
+        {
+            rows = _outcomeBuffer;
+            _outcomeBuffer = [];
+        }
+        else
+        {
+            rows = _outcomeBuffer.GetRange(0, options.MaxOutcomeBatch);
+            _outcomeBuffer.RemoveRange(0, options.MaxOutcomeBatch);
+        }
+        return new Command.ReportOutcomeBatch(rows);
+    }
+
     /// <summary>
-    /// Drains whatever outcomes are still buffered, for the Shell to report as this node stops. Returns
+    /// Drains the next batch of outcomes still buffered, for the Shell to report as this node stops. Returns
     /// null when the buffer is empty, so a clean stop with nothing pending issues no write.
     /// </summary>
     internal Command.ReportOutcomeBatch? DrainBufferedOutcomes()
@@ -259,20 +305,14 @@ internal sealed class NodeDriver(NodeOptions options)
     private Command.ClaimBatch? StartClaimPass()
     {
         _weightedPlan.Clear();
-        // Free capacity subtracts in-flight executions, buffered-but-unreported outcomes (ADR 0035), AND slots
-        // reserved by claims already issued but not yet completed. A completed job whose outcome has not yet
-        // been flushed still holds its store Lease; a claim already issued will land its jobs in _executing on
-        // its ClaimCompleted. Both occupy a pool slot now, so both count here — else a re-poll that fires while
-        // a claim is in flight would read the stale (pre-claim) counts and over-admit past PoolSize.
-        var available = Math.Min(
-            options.MaxClaimBatch, options.PoolSize - _executing.Count - _outcomeBuffer.Count - _reservedSlots);
+        var available = Math.Min(options.MaxClaimBatch, options.PoolSize - LeasedSlots);
         if (available <= 0)
         {
             return null;
         }
         if (_roundRobin is null)
         {
-            return Reserve(new Command.ClaimBatch(options.WorkerId, options.Policy.Queues, available, options.LeaseDuration));
+            return Issue(new Command.ClaimBatch(options.WorkerId, options.Policy.Queues, available, options.LeaseDuration));
         }
 
         var allocation = _roundRobin.Allocate(available);
@@ -294,33 +334,35 @@ internal sealed class NodeDriver(NodeOptions options)
         // Cleared by the next pass or never reached after an empty claim — is never issued and never
         // charged, so a dropped Queue keeps its credit instead of running a deficit.
         ChargeIssued(first);
-        return Reserve(first);
+        return Issue(first);
     }
 
-    /// <summary>
-    /// Reserves an issued claim's slots against the pool until its <see cref="NodeEvent.ClaimCompleted"/> lands,
-    /// then returns the batch so a caller can issue it in one expression. Paired with <see cref="ReleaseClaim"/>.
-    /// </summary>
-    private Command.ClaimBatch Reserve(Command.ClaimBatch batch)
+    private int LeasedSlots => _executing.Count + _outcomeBuffer.Count + _reportingSlots;
+
+    private Command.ClaimBatch Issue(Command.ClaimBatch batch)
     {
-        _claimsInFlight.Enqueue(batch.MaxJobs);
-        _reservedSlots += batch.MaxJobs;
+        _claimInFlight = batch.MaxJobs;
         return batch;
     }
 
-    /// <summary>
-    /// Frees the reservation of the oldest in-flight claim as its ClaimCompleted lands, returning the bound
-    /// that claim was issued under, or null when no reservation is outstanding.
-    /// </summary>
     private int? ReleaseClaim()
     {
-        if (_claimsInFlight.TryDequeue(out var slots))
-        {
-            _reservedSlots -= slots;
-            return slots;
-        }
+        var bound = _claimInFlight;
+        _claimInFlight = null;
+        return bound;
+    }
 
-        return null;
+    private Command.ClaimBatch? RunWaitingClaimPass(bool cameBackFull)
+    {
+        var waiting = _pollsDuringClaim + (cameBackFull ? _pollsFromBeforeClaim : 0);
+        _pollsDuringClaim = 0;
+        _pollsFromBeforeClaim = 0;
+        if (waiting == 0 || StartClaimPass() is not { } pass)
+        {
+            return null;
+        }
+        _pollsFromBeforeClaim = waiting - 1;
+        return pass;
     }
 
     /// <summary>

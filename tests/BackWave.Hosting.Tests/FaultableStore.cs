@@ -24,6 +24,7 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
     private int _unclassifiedMaintenanceFaults;
     private int _renewingHeartbeats;
     private readonly TaskCompletionSource _hangingClaimEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _hangingClaimCancelled = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _relinquishCalls;
     private int _misattributeObserverReports;
     private int _reportOutcomesCalls;
@@ -118,6 +119,36 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
     public bool FenceOutOutcomes { get; set; }
 
     /// <summary>
+    /// Outcome writes wait inside the store until <see cref="ReleaseOutcomeWrites"/> or until their token
+    /// is cancelled, as a real store's write does when it is cancelled before it commits.
+    /// </summary>
+    public bool HoldOutcomeWrites { get; set; }
+
+    private readonly TaskCompletionSource _heldOutcomeWriteEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private readonly TaskCompletionSource _outcomeWritesReleased = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task HeldOutcomeWriteEntered => _heldOutcomeWriteEntered.Task;
+
+    public void ReleaseOutcomeWrites() => _outcomeWritesReleased.TrySetResult();
+
+    /// <summary>
+    /// Claims wait inside the store until <see cref="ReleaseClaims"/>, then lease what is due. They ignore
+    /// their token, as a claim that commits before its cancellation reaches the store does.
+    /// </summary>
+    public bool HoldClaims { get; set; }
+
+    private readonly TaskCompletionSource _heldClaimEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private readonly TaskCompletionSource _claimsReleased = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task HeldClaimEntered => _heldClaimEntered.Task;
+
+    public void ReleaseClaims() => _claimsReleased.TrySetResult();
+
+    public DateTimeOffset? LastClaimAt { get; private set; }
+
+    /// <summary>
     /// The next N observer reports reach the store under a worker id that never held the claim, so the
     /// store's own claim-lease fence refuses them - the observer-report-fence trigger, raised by the real
     /// fence rather than a rewritten answer.
@@ -186,6 +217,9 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
 
     /// <summary>Completes when the first hanging claim is inside the store.</summary>
     public Task HangingClaimEntered => _hangingClaimEntered.Task;
+
+    /// <summary>Completes when a hanging claim's token is cancelled.</summary>
+    public Task HangingClaimCancelled => _hangingClaimCancelled.Task;
 
     private void ThrowIfMaintenanceArmed(string operation)
     {
@@ -272,6 +306,11 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
         {
             return HangUntilCancelledAsync(cancellationToken);
         }
+        if (HoldClaims && !_claimsReleased.Task.IsCompleted)
+        {
+            return HoldThenClaimAsync(request);
+        }
+        LastClaimAt = DateTimeOffset.UtcNow;
         if (RewriteClaimedState is null && OverClaimBy is null)
         {
             return inner.ClaimAsync(request, cancellationToken);
@@ -279,10 +318,26 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
         return MalformClaimAsync(request, cancellationToken);
     }
 
+    private async ValueTask<IReadOnlyList<JobRecord>> HoldThenClaimAsync(ClaimRequest request)
+    {
+        _heldClaimEntered.TrySetResult();
+        await _claimsReleased.Task.ConfigureAwait(false);
+        LastClaimAt = DateTimeOffset.UtcNow;
+        return await inner.ClaimAsync(request, CancellationToken.None).ConfigureAwait(false);
+    }
+
     private async ValueTask<IReadOnlyList<JobRecord>> HangUntilCancelledAsync(CancellationToken cancellationToken)
     {
         _hangingClaimEntered.TrySetResult();
-        await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            _hangingClaimCancelled.TrySetResult();
+            throw;
+        }
         return [];
     }
 
@@ -349,6 +404,10 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
     public ValueTask<IReadOnlyList<OutcomeReportResult>> ReportOutcomesAsync(
         IReadOnlyList<OutcomeReport> batch, DateTimeOffset now, CancellationToken cancellationToken = default)
     {
+        if (HoldOutcomeWrites && !_outcomeWritesReleased.Task.IsCompleted)
+        {
+            return HoldThenReportOutcomesAsync(batch, now, cancellationToken);
+        }
         Interlocked.Increment(ref _reportOutcomesCalls);
         LastOutcomeReportAt = DateTimeOffset.UtcNow;
         ThrowIfFailing();
@@ -372,6 +431,14 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
             return inner.ReportOutcomesAsync(batch, now, cancellationToken);
         }
         return MalformOutcomesAsync(batch, now, cancellationToken);
+    }
+
+    private async ValueTask<IReadOnlyList<OutcomeReportResult>> HoldThenReportOutcomesAsync(
+        IReadOnlyList<OutcomeReport> batch, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        _heldOutcomeWriteEntered.TrySetResult();
+        await _outcomeWritesReleased.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return await ReportOutcomesAsync(batch, now, cancellationToken).ConfigureAwait(false);
     }
 
     private async ValueTask<IReadOnlyList<OutcomeReportResult>> MalformOutcomesAsync(

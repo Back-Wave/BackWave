@@ -97,8 +97,10 @@ public class NodeDriverWeightedFairnessTests
                             work.Enqueue(new NodeEvent.ExecutionSucceeded(execute.Job, now));
                             break;
 
-                        // Everything else (ExpireLeases, LoadSchedules, ReportOutcomeBatch, Heartbeat,
-                        // RequestPoll, …) is store/clock work the credit accounting does not depend on.
+                        case Command.ReportOutcomeBatch batch:
+                            work.Enqueue(new NodeEvent.OutcomeBatchReported(
+                                [.. batch.Outcomes.Select(row => new OutcomeReportResult(row.JobId, OutcomeResult.Applied))], now));
+                            break;
                     }
                 }
             }

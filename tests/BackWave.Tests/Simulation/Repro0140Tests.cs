@@ -7,7 +7,7 @@ namespace BackWave.Tests.Simulation;
 ///
 /// Root cause was a Simulator model artifact, not a product bug: the Driver sizes a poll's claim up front
 /// (correctly reserving a slot per buffered-but-unreported outcome), then flushes the outcome buffer; the
-/// flushed outcome re-polls (OutcomeReported → RequestPoll). Both production pumps ENQUEUE that re-poll on
+/// flushed outcome re-polls (OutcomeBatchReported → RequestPoll). Both production pumps ENQUEUE that re-poll on
 /// their FIFO event queue, so it runs only after the outer poll's ClaimCompleted has landed its claimed jobs
 /// in the executing set — no over-admission. The Simulator instead drove the re-poll INLINE (depth-first
 /// recursion), so the nested poll sized its claim against a pool that did not yet reflect the outer claim and

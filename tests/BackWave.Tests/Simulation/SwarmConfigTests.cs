@@ -49,6 +49,7 @@ public class SwarmConfigTests
             Assert.Equal(a.IsolationCount, b.IsolationCount);
             Assert.Equal(a.PermanentLossProbability, b.PermanentLossProbability);
             Assert.Equal(a.OperatorActionCount, b.OperatorActionCount);
+            Assert.Equal(a.MaxStoreLaneLatency, b.MaxStoreLaneLatency);
 
             // The Schedule + Observer axes (issue 0201) are derived from the same Seed, so their populated
             // collections must match too — compare identity (count + ids), the only knobs the generator sets.

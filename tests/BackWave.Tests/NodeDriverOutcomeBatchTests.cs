@@ -136,4 +136,117 @@ public class NodeDriverOutcomeBatchTests
         var failure = Assert.IsType<JobOutcome.Failure>(Assert.Single(batch.Outcomes).Outcome);
         Assert.Equal("boom", failure.Error);
     }
+
+    private static NodeEvent.OutcomeBatchReported Applied(Command.ReportOutcomeBatch batch) => new(
+        [.. batch.Outcomes.Select(row => new OutcomeReportResult(row.JobId, OutcomeResult.Applied))], T0);
+
+    private static Command.ReportOutcomeBatch Flushed(IReadOnlyList<Command> commands)
+        => Assert.IsType<Command.ReportOutcomeBatch>(Assert.Single(commands.OfType<Command.ReportOutcomeBatch>()));
+
+    private static Guid[] Rows(Command.ReportOutcomeBatch batch) => [.. batch.Outcomes.Select(o => o.JobId)];
+
+    [Fact]
+    public void AFlushTrigger_WhileAWriteIsInFlight_WaitsForItsAnswer_ThenFlushesEverythingThatFinished()
+    {
+        var driver = Driver();
+        var a = Job();
+        var b = Job();
+        Claim(driver, a);
+        var first = Flushed(driver.Step(new NodeEvent.ExecutionSucceeded(a, T0)));
+
+        Claim(driver, b);
+        Assert.Empty(driver.Step(new NodeEvent.ExecutionSucceeded(b, T0)));
+        Assert.DoesNotContain(driver.Step(new NodeEvent.PollDue(T0)), command => command is Command.ReportOutcomeBatch);
+        Assert.DoesNotContain(driver.Step(new NodeEvent.HeartbeatDue(T0)), command => command is Command.ReportOutcomeBatch);
+
+        var answered = driver.Step(Applied(first));
+        Assert.Single(answered.OfType<Command.RequestPoll>());
+        Assert.Equal([b.JobId], Rows(Flushed(answered)));
+    }
+
+    [Fact]
+    public void AnAnswer_WithNoTriggerWaiting_LeavesTheBufferForTheNextTrigger()
+    {
+        var driver = Driver();
+        var a = Job();
+        var b = Job();
+        var c = Job();
+        Claim(driver, a, b, c);
+        driver.Step(new NodeEvent.ExecutionSucceeded(a, T0));
+        var first = Flushed(driver.Step(new NodeEvent.PollDue(T0)));
+
+        Assert.Empty(driver.Step(new NodeEvent.ExecutionSucceeded(b, T0)));
+        Assert.DoesNotContain(driver.Step(Applied(first)), command => command is Command.ReportOutcomeBatch);
+        Assert.Equal(1, driver.BufferedOutcomeCount);
+    }
+
+    [Fact]
+    public void AnEmptyAnswer_FreesTheWrite_WithoutStartingAnother()
+    {
+        var driver = Driver();
+        var a = Job();
+        var b = Job();
+        Claim(driver, a);
+        Flushed(driver.Step(new NodeEvent.ExecutionSucceeded(a, T0)));
+        Claim(driver, b);
+        Assert.Empty(driver.Step(new NodeEvent.ExecutionSucceeded(b, T0)));
+
+        Assert.Empty(driver.Step(new NodeEvent.OutcomeBatchReported([], T0)));
+        Assert.Equal(1, driver.BufferedOutcomeCount);
+
+        Assert.Equal([b.JobId], Rows(Flushed(driver.Step(new NodeEvent.PollDue(T0.AddSeconds(1))))));
+    }
+
+    [Fact]
+    public void RowsInFlight_KeepTheirPoolSlots_UntilTheirAnswerLands()
+    {
+        var driver = Driver(maxOutcomeBatch: 2, poolSize: 4);
+        var jobs = Enumerable.Range(0, 4).Select(_ => Job()).ToArray();
+        Claim(driver, jobs);
+        driver.Step(new NodeEvent.ExecutionSucceeded(jobs[0], T0));
+        var write = Flushed(driver.Step(new NodeEvent.ExecutionSucceeded(jobs[1], T0)));
+
+        Assert.DoesNotContain(driver.Step(new NodeEvent.PollDue(T0)), command => command is Command.ClaimBatch);
+
+        driver.Step(Applied(write));
+        var claim = Assert.Single(driver.Step(new NodeEvent.PollDue(T0)).OfType<Command.ClaimBatch>());
+        Assert.Equal(2, claim.MaxJobs);
+    }
+
+    [Fact]
+    public void ABufferThatOutgrowsTheBatchCap_WhileAWriteIsInFlight_FlushesInCappedBatches()
+    {
+        var driver = Driver(maxOutcomeBatch: 2);
+        var jobs = Enumerable.Range(0, 5).Select(_ => Job()).ToArray();
+        Claim(driver, jobs);
+        driver.Step(new NodeEvent.ExecutionSucceeded(jobs[0], T0));
+        var first = Flushed(driver.Step(new NodeEvent.ExecutionSucceeded(jobs[1], T0)));
+        foreach (var job in jobs[2..])
+        {
+            Assert.Empty(driver.Step(new NodeEvent.ExecutionSucceeded(job, T0)));
+        }
+
+        var second = Flushed(driver.Step(Applied(first)));
+        Assert.Equal([jobs[2].JobId, jobs[3].JobId], Rows(second));
+
+        Assert.Equal([jobs[4].JobId], Rows(Flushed(driver.Step(Applied(second)))));
+    }
+
+    [Fact]
+    public void TheStopDrain_TakesCappedBatches_EvenWithAWriteInFlight()
+    {
+        var driver = Driver(maxOutcomeBatch: 2);
+        var jobs = Enumerable.Range(0, 5).Select(_ => Job()).ToArray();
+        Claim(driver, jobs);
+        driver.Step(new NodeEvent.ExecutionSucceeded(jobs[0], T0));
+        Flushed(driver.Step(new NodeEvent.ExecutionSucceeded(jobs[1], T0)));
+        foreach (var job in jobs[2..])
+        {
+            driver.Step(new NodeEvent.ExecutionSucceeded(job, T0));
+        }
+
+        Assert.Equal([jobs[2].JobId, jobs[3].JobId], Rows(driver.DrainBufferedOutcomes()!));
+        Assert.Equal([jobs[4].JobId], Rows(driver.DrainBufferedOutcomes()!));
+        Assert.Null(driver.DrainBufferedOutcomes());
+    }
 }

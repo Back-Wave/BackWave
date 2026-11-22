@@ -149,6 +149,8 @@ public sealed class CoverageTrackerTests
             LimitSaturations = 1,
             BackpressureIdleTicks = 1,
             OutcomeBufferDropped = 1,
+            CompletionsDuringOutcomeWrite = 1,
+            PollsDuringClaim = 1,
             MintedJobs = [("sched", DateTimeOffset.UnixEpoch, JobState.Succeeded)],
             ObserverDeliveries = new Dictionary<string, (int Total, int Unique, int DeadLettered)>
             {

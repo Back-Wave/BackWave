@@ -52,10 +52,11 @@ public class WorkerPoolTests
         // so the slot stays occupied: this poll flushes the batch yet claims nothing.
         driver.Step(new NodeEvent.ExecutionSucceeded(first, T0.AddSeconds(2)));
         var flushPoll = driver.Step(new NodeEvent.PollDue(T0.AddSeconds(2)));
-        Assert.Single(flushPoll.OfType<Command.ReportOutcomeBatch>());
+        var flush = Assert.Single(flushPoll.OfType<Command.ReportOutcomeBatch>());
         Assert.Empty(flushPoll.OfType<Command.ClaimBatch>());
 
-        // Once the outcome is flushed the slot re-opens: the flush's re-poll claims exactly one job.
+        driver.Step(new NodeEvent.OutcomeBatchReported(
+            [.. flush.Outcomes.Select(row => new OutcomeReportResult(row.JobId, OutcomeResult.Applied))], T0.AddSeconds(2)));
         var oneFree = driver.Step(new NodeEvent.PollDue(T0.AddSeconds(3)));
         Assert.Equal(1, Assert.Single(oneFree.OfType<Command.ClaimBatch>()).MaxJobs);
     }
