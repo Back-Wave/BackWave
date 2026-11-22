@@ -48,4 +48,4 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Workflows](./workflows.md) covers the Workflows list, the member graph of `order-fulfillment`, member inspection, and a failed workflow.
 - [Tag filter](./tag-filter.md) covers the tag pills on jobs, the Label and key-value filters, the combined filter, and the "Top labels" facet.
 
-Secondary surfaces have no recipe yet: the Sample HTTP API and Swagger as a surface of their own, the MCP server at `/backwave-mcp`, the `BackWave.Demo` host, Recurring Schedules, Observers, and Executing now. Report them as not verified with this skill.
+Secondary surfaces have no recipe yet: the Sample HTTP API and Swagger as a surface of their own, the MCP server at `/backwave-mcp`, the `BackWave.Demo` host, Recurring Schedules, Observers, Executing now, and Pump Status (`/backwave/pumps`). Report them as not verified with this skill.
