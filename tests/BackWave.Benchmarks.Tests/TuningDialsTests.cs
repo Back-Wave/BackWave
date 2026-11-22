@@ -36,6 +36,18 @@ public sealed class TuningDialsTests
     }
 
     [Fact]
+    public void MassTransit_concurrent_message_and_connection_limits_are_matched_to_backwave_pool_size_and_retries_are_off()
+    {
+        var backwave = new PostgresBenchmarkTarget(PgDsn).TuningDials["worker-pool-size"];
+        var massTransit = new MassTransitPostgresTarget(PgDsn).TuningDials;
+
+        Assert.Equal(backwave, massTransit["worker-pool-size"]);
+        Assert.Equal(backwave, massTransit["concurrent-message-limit"]);
+        Assert.StartsWith(backwave + " ", massTransit["connection-limit"]);
+        Assert.Contains("none", massTransit["retry-policy"]);
+    }
+
+    [Fact]
     public void JobMaster_worker_count_is_the_smallest_multiple_of_five_at_or_above_backwave_pool_size()
     {
         // JobMaster sizes run slots as 5 x parallelism factor per bucket, so it cannot record a pool that

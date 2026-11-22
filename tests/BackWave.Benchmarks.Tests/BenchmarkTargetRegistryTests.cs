@@ -28,6 +28,8 @@ public sealed class BenchmarkTargetRegistryTests
         { "tickerq-pg", typeof(TickerQPostgresTarget) },
         { "quartz-postgres", typeof(QuartzPostgresTarget) },
         { "quartz-pg", typeof(QuartzPostgresTarget) },
+        { "masstransit-postgres", typeof(MassTransitPostgresTarget) },
+        { "masstransit-pg", typeof(MassTransitPostgresTarget) },
     };
 
     [Theory]
