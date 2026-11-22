@@ -87,7 +87,7 @@ public sealed class QuartzPostgresTarget : IBenchmarkTarget
 
     private readonly string _connectionString;
     private readonly QuartzTuning _tuning;
-    private readonly QuartzCompletionLog _completions = new();
+    private readonly CompletionLog _completions = new();
     private readonly List<TimeSpan> _enqueueLatencies = [];
     private readonly ConcurrentDictionary<string, DateTimeOffset> _enqueuedAt = new();
     private readonly TimeSpan _drainPollInterval = TimeSpan.FromMilliseconds(10);

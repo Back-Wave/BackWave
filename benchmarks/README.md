@@ -23,16 +23,31 @@ variable to use another server.
 | `quartz-postgres` | Quartz.NET 4.7.3, ADO.NET job store, clustered | `BACKWAVE_QUARTZ_POSTGRES_DSN` | `quartz_test` |
 | `tickerq-postgres` | TickerQ 10.4.0 | `BACKWAVE_TICKERQ_POSTGRES_DSN` | `tickerq_test` |
 | `jobmaster-postgres` | JobMaster 0.0.11-alpha | `BACKWAVE_JOBMASTER_POSTGRES_DSN` | `jobmaster_test` |
+| `masstransit-postgres` | MassTransit 8.5.12, SQL transport | `BACKWAVE_MASSTRANSIT_POSTGRES_DSN` | `masstransit_test` |
 
-TickerQ and JobMaster run in their own host processes, `BackWave.Benchmarks.TickerQHost` and
-`BackWave.Benchmarks.JobMasterHost`, so that their package graphs stay apart from the harness. A build of
-the harness also builds both hosts and copies them next to it. The harness talks to each host over stdin and
-stdout.
+TickerQ, JobMaster, and MassTransit run in their own host processes, `BackWave.Benchmarks.TickerQHost`,
+`BackWave.Benchmarks.JobMasterHost`, and `BackWave.Benchmarks.MassTransitHost`, so that their package graphs
+stay apart from the harness. For example, the MassTransit SQL transport needs Dapper 2.1.89 or later, and
+Hangfire.PostgreSql in the harness runs on Dapper 2.0.123. A build of the harness also builds the three hosts
+and copies them next to it. The harness talks to each host over stdin and stdout.
 
-Each run starts a fresh host process, so the JIT and the EF Core query caches of TickerQ and JobMaster are
-cold in every measured run. Warmup runs do not warm them.
+TickerQ and JobMaster get a fresh host process for each run, so their JIT and EF Core query caches are cold
+in every measured run. Warmup runs do not warm them. MassTransit gets one host process for each cell and a
+fresh bus for each run, so its warmup runs warm the JIT, as for the in-process targets.
 
 TickerQ stays on 10.4.0. Version 10.5.0 and later refuse to run jobs without a license certificate.
+
+MassTransit stays on 8.5.12, the last Apache-2.0 release. Version 9 is a commercial product. Without a license
+key, 9.3.0 fails at bus start with `ConfigurationException: License must be specified`.
+
+MassTransit is a message bus, not a job scheduler. The target sends one message to one queue for each job, and
+one consumer handles it. Messages are durable rows in Postgres. The consumer's concurrent message limit and
+the transport's connection limit are both set to the slot count. The connection limit default is 10, which
+would leave most consumers waiting for a connection to acknowledge a message. Sends take permits from the same
+limit. The prefetch is 1.2 times the limit, the value MassTransit derives when an endpoint definition sets
+only the limit. The default for an endpoint configured by hand, two per core and at least 16, is less than the
+slot count on hosts with more than 4 cores. The other settings are MassTransit defaults: a 1 s polling
+fallback behind LISTEN/NOTIFY, a 1 min lock, and no retry.
 
 ## Run one cell
 
@@ -48,7 +63,7 @@ every option.
 Every system gets BackWave's default pool of run slots: four per core, at least 8. That is 40 on a
 10-core host. JobMaster rounds its slots up to a multiple of 5, so it gets more on some hosts, for example
 50 against 48 on 12 cores. End-to-end latency starts at the enqueue call, for every system. It stops at the
-completion instant the system records: the handler's return for TickerQ and Quartz.NET, the success state
+completion instant the system records: the handler's return for TickerQ, Quartz.NET, and MassTransit, the success state
 for Hangfire and JobMaster, and the batched outcome write for BackWave, which comes later than the handler's
 return. After each run, a work audit checks three things:
 
@@ -57,12 +72,13 @@ return. After each run, a work audit checks three things:
 - The first and the last completion are inside the timed window.
 
 The harness prints the audit and records it in the result JSON. A failed audit makes the result
-unpublishable. The Quartz.NET and TickerQ targets stop the cell instead when they see lost or duplicated work.
+unpublishable. The Quartz.NET, TickerQ, and MassTransit targets stop the cell instead when they see lost or
+duplicated work.
 
-## Run the five-way battery
+## Run the blog battery
 
-[blog/run-blog.sh](blog/run-blog.sh) runs the local five-way comparison: BackWave in two shapes, Hangfire,
-Quartz.NET, TickerQ, and JobMaster, all on one Postgres server. The script header describes the workloads
+[blog/run-blog.sh](blog/run-blog.sh) runs the local comparison: BackWave in two shapes, Hangfire,
+Quartz.NET, TickerQ, JobMaster, and MassTransit, all on one Postgres server. The script header describes the workloads
 and the fairness controls. The script uses `top` and `sysctl` from macOS.
 
 ```sh
@@ -102,4 +118,8 @@ recorded in the result's `DiagnosticKnobs` and makes the result unpublishable.
 | `BACKWAVE_JOBMASTER_BUCKETS` | `1` | JobMaster bucket count |
 | `BACKWAVE_JOBMASTER_PARALLELISM_FACTOR` | slot count / 5, rounded up | JobMaster run slots per bucket, divided by 5 |
 | `BACKWAVE_JOBMASTER_BUCKET_BUFFER` | `1000` | Jobs JobMaster takes into memory per bucket on each 3 s tick |
+| `BACKWAVE_MASSTRANSIT_CONCURRENT_MESSAGE_LIMIT` | slot count | MassTransit endpoint `ConcurrentMessageLimit` |
+| `BACKWAVE_MASSTRANSIT_PREFETCH_COUNT` | limit x 1.2 | MassTransit endpoint `PrefetchCount` |
+| `BACKWAVE_MASSTRANSIT_POLLING_MS` | `1000` | MassTransit SQL endpoint `PollingInterval` |
+| `BACKWAVE_MASSTRANSIT_CONNECTION_LIMIT` | slot count | MassTransit SQL transport `ConnectionLimit` |
 | `BACKWAVE_BENCH_DB_TRACE` | off | A file path. Writes one CSV row for each Npgsql and BackWave Postgres span. Diagnostic, because it slows every call |

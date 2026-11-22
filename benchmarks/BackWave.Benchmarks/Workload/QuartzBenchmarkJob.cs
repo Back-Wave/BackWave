@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using Quartz;
 
 namespace BackWave.Benchmarks.Workload;
@@ -12,40 +11,10 @@ namespace BackWave.Benchmarks.Workload;
 public sealed record QuartzBenchInput(string Payload, int DelayMs);
 
 /// <summary>
-/// The instant each Quartz firing's handler finished, keyed by trigger name. Quartz deletes a one-off trigger
-/// when its firing completes, so the store keeps no completion timestamp to read back afterwards.
-/// </summary>
-public sealed class QuartzCompletionLog
-{
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _completedAt = new();
-    private int _executions;
-
-    /// <summary>The handler-finished instant per trigger name.</summary>
-    public IReadOnlyDictionary<string, DateTimeOffset> CompletedAt => _completedAt;
-
-    /// <summary>How many times the handler ran, so a trigger fired twice is not hidden by the keyed map.</summary>
-    public int Executions => Volatile.Read(ref _executions);
-
-    /// <summary>Records that the firing of <paramref name="triggerName"/> finished now.</summary>
-    public void Record(string triggerName)
-    {
-        _completedAt[triggerName] = DateTimeOffset.UtcNow;
-        Interlocked.Increment(ref _executions);
-    }
-
-    /// <summary>Forgets every recorded completion, before the next run.</summary>
-    public void Clear()
-    {
-        _completedAt.Clear();
-        _executions = 0;
-    }
-}
-
-/// <summary>
 /// The single job the Quartz.NET competitor drives, the twin of <see cref="BenchmarkJobs"/>: an optional
 /// spin-free async delay, then a completion stamp.
 /// </summary>
-public sealed class QuartzBenchmarkJob(QuartzCompletionLog completions) : IJob<QuartzBenchInput>
+public sealed class QuartzBenchmarkJob(CompletionLog completions) : IJob<QuartzBenchInput>
 {
     /// <inheritdoc/>
     public async ValueTask Execute(IJobExecutionContext context, QuartzBenchInput input, CancellationToken cancellationToken)

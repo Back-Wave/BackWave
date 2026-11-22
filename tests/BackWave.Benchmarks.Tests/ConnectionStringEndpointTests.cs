@@ -87,6 +87,7 @@ public sealed class ConnectionStringEndpointTests
             "jobmaster-postgres", "jobmaster-pg",
             "tickerq-postgres", "tickerq-pg",
             "quartz-postgres", "quartz-pg",
+            "masstransit-postgres", "masstransit-pg",
         ];
 
         foreach (var name in names)
