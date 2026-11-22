@@ -24,6 +24,7 @@ SYSTEMS = {
     "tickerq-postgres": "TickerQ",
     "jobmaster-postgres": "JobMaster",
     "masstransit-postgres": "MassTransit",
+    "acta-postgres": "Acta",
 }
 WORKLOADS = ["drain-noop", "drain-10ms", "max-sustained", "paced-50", "paced-500"]
 

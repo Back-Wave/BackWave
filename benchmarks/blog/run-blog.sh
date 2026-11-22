@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# The local battery behind the community blog post: BackWave, Hangfire, Quartz.NET, TickerQ, JobMaster, and
-# MassTransit's SQL transport, all on the same PostgreSQL, in local mode. Local numbers are indicative, never
-# official.
+# The local battery behind the community blog post: BackWave, Hangfire, Quartz.NET, TickerQ, JobMaster,
+# MassTransit's SQL transport, and Acta, all on the same PostgreSQL, in local mode. Local numbers are indicative,
+# never official.
 #
 # Each round runs every (workload, target) cell once, in a target order that rotates per round, so drift in
 # machine load or thermals spreads across all systems instead of landing on one. summarize.py takes the
@@ -30,7 +30,7 @@ ROUNDS="${ROUNDS:-5}"
 JOBS="${JOBS:-20000}"
 JOBMASTER_JOBS="${JOBMASTER_JOBS:-5000}"
 IDLE_MIN="${IDLE_MIN:-85}"
-TARGETS="${TARGETS:-postgres postgres-4g hangfire-postgres quartz-postgres tickerq-postgres jobmaster-postgres masstransit-postgres}"
+TARGETS="${TARGETS:-postgres postgres-4g hangfire-postgres quartz-postgres tickerq-postgres jobmaster-postgres masstransit-postgres acta-postgres}"
 WORKLOADS="${WORKLOADS:-drain-noop drain-10ms max-sustained paced-50 paced-500}"
 RETRY_FAILED="${RETRY_FAILED:-0}"
 OUT_DIR="${OUT_DIR:-benchmarks/results/blog-$(date +%Y%m%d-%H%M)}"
