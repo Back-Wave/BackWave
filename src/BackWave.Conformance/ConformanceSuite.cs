@@ -4866,6 +4866,124 @@ public abstract class ConformanceSuite
     }
 
     /// <summary>
+    /// Certifies that the cursor never passes a transition whose transaction is still open. A job enqueued
+    /// in a caller transaction holds a Position that is not committed while a later job commits and is
+    /// delivered. Once the caller commits, the held job's Scheduled transition is still delivered, and the
+    /// cursor then reaches the last Position. A store that serializes writers makes the later enqueue wait
+    /// for the caller, so no transition can commit late there: the clause commits first and certifies the
+    /// same delivery and cursor.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_13_Cursor_NeverPassesATransitionThatCommitsLate()
+    {
+        var store = await CreateStoreAsync();
+        if (!store.SupportsTransactionalEnqueue)
+        {
+            return;
+        }
+
+        Assert.Empty((await ClaimObsAsync(store, "obs", [JobState.Scheduled], T0)).Deliveries);
+        var delivered = new List<ObserverClaimedDelivery>();
+        async Task DeliverEverythingAsync()
+        {
+            for (var round = 0; round < 8; round++)
+            {
+                var claim = await ClaimObsAsync(store, "obs", [JobState.Scheduled], T0);
+                if (claim.Deliveries.Count == 0)
+                {
+                    return;
+                }
+                delivered.AddRange(claim.Deliveries);
+                await ReportObsAsync(store, "obs", T0, "w1",
+                    [.. claim.Deliveries.Select(d => new ObserverDeliveryOutcome(d.Position, ObserverDeliveryDisposition.Delivered))]);
+            }
+            Assert.Fail("The observer still had deliveries to claim after 8 rounds over two jobs.");
+        }
+
+        var held = Job();
+        var later = Job();
+        using (var transaction = BeginTransaction(store))
+        {
+            Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(held, now: T0, transaction));
+            var enqueueLater = Task.Run(async () => await store.EnqueueAsync(later, now: T0));
+            if (await Task.WhenAny(enqueueLater, Task.Delay(TimeSpan.FromSeconds(2))) == enqueueLater)
+            {
+                Assert.Equal(EnqueueResult.Ok, await enqueueLater);
+                await DeliverEverythingAsync();
+                Assert.Equal(later.JobId, Assert.Single(delivered).JobId);
+                transaction.Commit();
+            }
+            else
+            {
+                _output?.WriteLine(
+                    $"note: the later enqueue waited for the open transaction, so this store serializes writers "
+                    + $"and the held job cannot commit late ({nameof(Clause_5_13_Cursor_NeverPassesATransitionThatCommitsLate)})");
+                transaction.Commit();
+                Assert.Equal(EnqueueResult.Ok, await enqueueLater);
+            }
+        }
+
+        await DeliverEverythingAsync();
+        var deliveredTransitions = delivered.Select(d => (d.JobId, d.State)).ToList();
+        Assert.Contains((held.JobId, JobState.Scheduled), deliveredTransitions);
+        Assert.Contains((later.JobId, JobState.Scheduled), deliveredTransitions);
+        Assert.Equal(delivered.Max(d => d.Position), await store.GetObserverCursorAsync("obs"));
+    }
+
+    /// <summary>
+    /// Certifies that the cursor reaches the last delivered Position without another delivery. A job enqueued
+    /// in a caller transaction holds a Position while a later job commits and is delivered, and then the
+    /// caller rolls back. The next claim finds nothing to deliver, and the cursor is then at the later job's
+    /// Position. A store that serializes writers makes the later enqueue wait for the caller, so there the
+    /// clause rolls back first and certifies the same cursor.
+    /// </summary>
+    [Fact]
+    public async Task Clause_5_13_Cursor_CatchesUpWhenAnOpenTransactionRollsBack()
+    {
+        var store = await CreateStoreAsync();
+        if (!store.SupportsTransactionalEnqueue)
+        {
+            return;
+        }
+
+        Assert.Empty((await ClaimObsAsync(store, "obs", [JobState.Scheduled], T0)).Deliveries);
+        var later = Job();
+        async Task<long> DeliverLaterAsync()
+        {
+            var delivery = Assert.Single((await ClaimObsAsync(store, "obs", [JobState.Scheduled], T0)).Deliveries);
+            Assert.Equal(later.JobId, delivery.JobId);
+            await ReportObsAsync(store, "obs", T0, "w1",
+                [new ObserverDeliveryOutcome(delivery.Position, ObserverDeliveryDisposition.Delivered)]);
+            return delivery.Position;
+        }
+
+        long laterPosition;
+        using (var transaction = BeginTransaction(store))
+        {
+            Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(Job(), now: T0, transaction));
+            var enqueueLater = Task.Run(async () => await store.EnqueueAsync(later, now: T0));
+            if (await Task.WhenAny(enqueueLater, Task.Delay(TimeSpan.FromSeconds(2))) == enqueueLater)
+            {
+                Assert.Equal(EnqueueResult.Ok, await enqueueLater);
+                laterPosition = await DeliverLaterAsync();
+                transaction.Rollback();
+            }
+            else
+            {
+                _output?.WriteLine(
+                    $"note: the later enqueue waited for the open transaction, so this store serializes writers "
+                    + $"and the held job cannot hold the cursor ({nameof(Clause_5_13_Cursor_CatchesUpWhenAnOpenTransactionRollsBack)})");
+                transaction.Rollback();
+                Assert.Equal(EnqueueResult.Ok, await enqueueLater);
+                laterPosition = await DeliverLaterAsync();
+            }
+        }
+
+        Assert.Empty((await ClaimObsAsync(store, "obs", [JobState.Scheduled], T0)).Deliveries);
+        Assert.Equal(laterPosition, await store.GetObserverCursorAsync("obs"));
+    }
+
+    /// <summary>
     /// Certifies that a wire-name subscription delivers only matching transitions, and non-matching
     /// rows neither deliver nor block that observer's cursor.
     /// </summary>

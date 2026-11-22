@@ -3524,8 +3524,11 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         long cursor;
         string? leaseOwner;
         DateTimeOffset? leaseExpiry;
+        bool resolvedAboveCursor;
         await using (var locked = Cmd(
-            "SELECT cursor_pos, lease_owner, lease_expiry FROM backwave.observers WHERE observer_id = :id FOR UPDATE",
+            "SELECT cursor_pos, lease_owner, lease_expiry, CASE WHEN EXISTS (SELECT 1 FROM backwave.observer_deliveries d " +
+            "WHERE d.observer_id = :id AND d.resolution <> 0) THEN 1 ELSE 0 END " +
+            "FROM backwave.observers WHERE observer_id = :id FOR UPDATE",
             connection, transaction))
         {
             locked.Parameters.Add(Str("id", request.ObserverId));
@@ -3546,6 +3549,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             cursor = reader.GetInt64(0);
             leaseOwner = reader.IsDBNull(1) ? null : reader.GetString(1);
             leaseExpiry = reader.IsDBNull(2) ? null : ReadTstz(reader, 2);
+            resolvedAboveCursor = reader.GetInt32(3) == 1;
         }
 
         // Remember the subscription so cursor advance (on report) can tell matching rows from the ones this
@@ -3618,6 +3622,14 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
 
         if (candidates.Count == 0)
         {
+            // A report stops the cursor at the Commit Horizon, so resolved rows can sit above it with no
+            // later report to sweep them.
+            if (resolvedAboveCursor)
+            {
+                await AdvanceObserverCursorAsync(
+                    connection, transaction, request.ObserverId, cursor, states, request.WireName, request.Queue,
+                    request.Now, cancellationToken).ConfigureAwait(false);
+            }
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return ObserverClaim.None(request.ObserverId);
         }
@@ -3757,13 +3769,20 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
     /// <summary>
     /// Sweeps the cursor forward over the contiguous prefix of resolved matching rows - and over every
     /// non-matching row, which needs no delivery - stopping at the first matching row still Pending (the
-    /// head-of-line block). A dead-lettered row is recorded loudly as the cursor passes it. The set-based
-    /// analogue of the In-Memory reference's row-by-row sweep; the caller holds the row lock.
+    /// head-of-line block), and never past the Commit Horizon. A dead-lettered row is recorded loudly as
+    /// the cursor passes it. The set-based analogue of the In-Memory reference's row-by-row sweep; the
+    /// caller holds the row lock.
     /// </summary>
     private async Task AdvanceObserverCursorAsync(
         OracleConnection connection, OracleTransaction transaction, string observerId, long cursor,
         int[] states, string? wireName, string? queue, DateTimeOffset now, CancellationToken cancellationToken)
     {
+        if (await AdvanceCommitHorizonAsync(connection, transaction, cancellationToken).ConfigureAwait(false)
+            is not { } horizon)
+        {
+            return;
+        }
+
         // The first matching row after the cursor still unresolved - the cursor cannot pass it.
         long? block;
         await using (var blockCommand = Cmd(
@@ -3772,7 +3791,7 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
             FROM backwave.job_transitions t
             JOIN backwave.jobs j ON j.job_id = t.job_id
             LEFT JOIN backwave.observer_deliveries d ON d.observer_id = :id AND d.position = t.position
-            WHERE t.position > :cursor
+            WHERE t.position > :cursor AND t.position <= :horizon
               AND t.state IN ({StatesInClause(states)})
               AND (:wire IS NULL OR j.wire_name = :wire)
               AND (:queue IS NULL OR j.queue = :queue)
@@ -3782,19 +3801,21 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         {
             blockCommand.Parameters.Add(Str("id", observerId));
             blockCommand.Parameters.Add(Long("cursor", cursor));
+            blockCommand.Parameters.Add(Long("horizon", horizon));
             blockCommand.Parameters.Add(StrN("wire", wireName));
             blockCommand.Parameters.Add(StrN("queue", queue));
             var result = await blockCommand.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             block = result is null or DBNull ? null : Convert.ToInt64(result);
         }
 
-        // The cursor sweeps to the last Position before the block (or to the end if nothing blocks).
+        // The cursor sweeps to the last Position before the block (or to the Commit Horizon if nothing blocks).
         long? newCursor;
         await using (var advance = Cmd(
-            "SELECT MAX(position) FROM backwave.job_transitions WHERE position > :cursor AND (:block IS NULL OR position < :block)",
+            "SELECT MAX(position) FROM backwave.job_transitions WHERE position > :cursor AND position <= :horizon AND (:block IS NULL OR position < :block)",
             connection, transaction))
         {
             advance.Parameters.Add(Long("cursor", cursor));
+            advance.Parameters.Add(Long("horizon", horizon));
             advance.Parameters.Add(LongN("block", block));
             var result = await advance.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             newCursor = result is null or DBNull ? null : Convert.ToInt64(result);
@@ -3863,6 +3884,81 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     $"Moving the cursor of observer '{observerId}' affected {moved} rows; the row is locked FOR UPDATE by this transaction, so exactly 1 is the only possible count.");
             }
         }
+    }
+
+    private async Task<long?> AdvanceCommitHorizonAsync(
+        OracleConnection connection, OracleTransaction transaction, CancellationToken cancellationToken)
+    {
+        // Each statement reads its own snapshot, so P is fixed before a probe runs.
+        var epoch = OutLong("epoch");
+        var candidate = OutLong("candidate");
+        var horizon = OutLong("horizon");
+        var maxPosition = OutLong("max_position");
+        var previousFree = OutLong("previous_free");
+        var currentFree = OutLong("current_free");
+        await using (var step = Cmd(
+            """
+            DECLARE
+                locked_epoch     NUMBER;
+                locked_candidate NUMBER;
+                locked_horizon   NUMBER;
+            BEGIN
+                BEGIN
+                    SELECT epoch, candidate_pos, horizon_pos INTO locked_epoch, locked_candidate, locked_horizon
+                    FROM backwave.observer_log_horizon
+                    WHERE id = 1
+                    FOR UPDATE SKIP LOCKED;
+                EXCEPTION
+                    WHEN NO_DATA_FOUND THEN
+                        locked_epoch := NULL;
+                END;
+                :epoch := locked_epoch;
+                IF locked_epoch IS NULL THEN
+                    SELECT MAX(horizon_pos) INTO :horizon FROM backwave.observer_log_horizon WHERE id = 1;
+                ELSE
+                    :candidate := locked_candidate;
+                    :horizon := locked_horizon;
+                    SELECT COALESCE(MAX(position), 0) INTO :max_position FROM backwave.job_transitions;
+                    :previous_free := backwave.observer_log_epoch_free(1 - locked_epoch);
+                    :current_free := backwave.observer_log_epoch_free(locked_epoch);
+                END IF;
+            END;
+            """,
+            connection, transaction))
+        {
+            step.Parameters.AddRange(new[] { epoch, candidate, horizon, maxPosition, previousFree, currentFree });
+            await step.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        if (OutValue(epoch) is not { } lockedEpoch)
+        {
+            if (OutValue(horizon) is { } committed)
+            {
+                return committed;
+            }
+            Invariant.Degrade(
+                _logger, InvariantTrigger.GuaranteedRowAbsent,
+                "The Commit Horizon row is missing; the schema migration seeds it and nothing deletes it.");
+            return null;
+        }
+
+        var state = new CommitHorizon((int)lockedEpoch, OutValue(candidate), OutValue(horizon)!.Value);
+        var next = state.Advance(OutValue(maxPosition)!.Value, OutValue(previousFree) == 1, OutValue(currentFree) == 1);
+        if (next != state)
+        {
+            await using var write = Cmd(
+                "UPDATE backwave.observer_log_horizon " +
+                "SET epoch = :epoch, candidate_pos = :candidate, horizon_pos = :horizon WHERE id = 1",
+                connection, transaction);
+            write.Parameters.Add(Int("epoch", next.Epoch));
+            write.Parameters.Add(LongN("candidate", next.Candidate));
+            write.Parameters.Add(Long("horizon", next.Horizon));
+            await write.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
+        return next.Horizon;
+
+        static long? OutValue(OracleParameter parameter)
+            => parameter.Value is OracleDecimal { IsNull: false } value ? value.ToInt64() : null;
     }
 
     /// <summary>Renders a JobState int list as a SQL IN body; an empty subscription matches nothing.</summary>

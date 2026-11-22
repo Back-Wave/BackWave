@@ -154,7 +154,7 @@ public sealed class OracleCoordinatedMigrationTests : IAsyncLifetime
         await OracleMigrator.MigrateAsync(MigrationConnectionString, Schema);
 
         Assert.Equal(1, await SchemaVersionRowCountAsync());
-        Assert.Equal(4, await DeployedVersionAsync());
+        Assert.Equal(OracleMigrator.ExpectedSchemaVersion, await DeployedVersionAsync());
         await using var pumps = connection.CreateCommand();
         pumps.CommandText = $"SELECT count(*) FROM {Schema}.pumps";
         Assert.Equal(0, Convert.ToInt32(await pumps.ExecuteScalarAsync()));

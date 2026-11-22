@@ -1962,7 +1962,8 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         // just written has not reached the cap - the common 2-transition job pays no DELETE round-trip.
         long ordinal;
         await using (var insert = Cmd(
-            """
+            $"""
+            {RegisterTransitionWriter}
             INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
             OUTPUT inserted.ordinal
             SELECT @id, COALESCE(MAX(ordinal) + 1, 0), @now, @state, @attempt, @detail
@@ -2066,6 +2067,24 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             .ConfigureAwait(false);
     }
 
+    // READCOMMITTED reads the row version at any isolation level, so a caller's Transactional Enqueue
+    // never blocks a report's write of the row.
+    internal const string RegisterTransitionWriter =
+        """
+        DECLARE @bw_horizon_epoch smallint = (SELECT epoch FROM backwave.observer_log_horizon WITH (READCOMMITTED) WHERE id = 1), @bw_horizon_lock int;
+        IF @bw_horizon_epoch IS NOT NULL
+        BEGIN
+            IF @@TRANCOUNT = 0
+                THROW 51290, N'A Transition Log entry must be written inside a transaction, so that it registers on the Commit Horizon.', 1;
+            IF @bw_horizon_epoch = 0
+                EXEC @bw_horizon_lock = sp_getapplock @Resource = N'backwave.observer_log.0', @LockMode = 'Shared', @LockOwner = 'Transaction';
+            ELSE
+                EXEC @bw_horizon_lock = sp_getapplock @Resource = N'backwave.observer_log.1', @LockMode = 'Shared', @LockOwner = 'Transaction';
+            IF @bw_horizon_lock < 0
+                THROW 51290, N'sp_getapplock did not register this transaction on the Commit Horizon, so an Observer could pass its Transition Log entries.', 1;
+        END
+        """;
+
     // The keyed table variable the Transition Log INSERT reads its rows from.
     private const string DeclareTransitionBatch =
         "DECLARE @batch TABLE (job_id uniqueidentifier PRIMARY KEY, state int, attempt int, detail nvarchar(max));";
@@ -2075,7 +2094,8 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
     // statement. The caller declares @batch with at least the columns of DeclareTransitionBatch -
     // job_id (the key), state, attempt, and detail - and binds @now.
     private const string InsertTransitionsFromBatch =
-        """
+        $"""
+        {RegisterTransitionWriter}
         INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
         OUTPUT inserted.ordinal
         SELECT d.job_id, COALESCE(t.maxord, -1) + 1, @now, d.state, d.attempt, d.detail
@@ -3326,9 +3346,11 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         long cursor;
         string? leaseOwner;
         DateTimeOffset? leaseExpiry;
+        bool resolvedAboveCursor;
         await using (var locked = Cmd(
-            "SELECT cursor_pos, lease_owner, lease_expiry FROM backwave.observers WITH (UPDLOCK, ROWLOCK) " +
-            "WHERE observer_id = @id",
+            "SELECT cursor_pos, lease_owner, lease_expiry, CAST(CASE WHEN EXISTS (SELECT 1 FROM backwave.observer_deliveries d " +
+            "WHERE d.observer_id = @id AND d.resolution <> 0) THEN 1 ELSE 0 END AS bit) " +
+            "FROM backwave.observers WITH (UPDLOCK, ROWLOCK) WHERE observer_id = @id",
             connection, transaction))
         {
             locked.Parameters.AddWithValue("id", request.ObserverId);
@@ -3349,6 +3371,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             cursor = reader.GetInt64(0);
             leaseOwner = reader.IsDBNull(1) ? null : reader.GetString(1);
             leaseExpiry = reader.IsDBNull(2) ? null : reader.GetFieldValue<DateTimeOffset>(2);
+            resolvedAboveCursor = reader.GetBoolean(3);
         }
 
         // Remember the subscription so cursor advance (on report) can tell matching rows from the ones
@@ -3419,6 +3442,14 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
 
         if (candidates.Count == 0)
         {
+            // A report stops the cursor at the Commit Horizon, so resolved rows can sit above it with no
+            // later report to sweep them.
+            if (resolvedAboveCursor)
+            {
+                await AdvanceObserverCursorAsync(
+                    connection, transaction, request.ObserverId, cursor, states, request.WireName, request.Queue,
+                    request.Now, cancellationToken).ConfigureAwait(false);
+            }
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return ObserverClaim.None(request.ObserverId);
         }
@@ -3561,13 +3592,20 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
     /// <summary>
     /// Sweeps the cursor forward over the contiguous prefix of resolved matching rows — and over every
     /// non-matching row, which needs no delivery — stopping at the first matching row still Pending
-    /// (the head-of-line block). A dead-lettered row is recorded loudly as the cursor passes it. The
-    /// set-based analogue of the In-Memory reference's row-by-row sweep; the caller holds the row lock.
+    /// (the head-of-line block), and never past the Commit Horizon. A dead-lettered row is recorded
+    /// loudly as the cursor passes it. The set-based analogue of the In-Memory reference's row-by-row
+    /// sweep; the caller holds the row lock.
     /// </summary>
     private async Task AdvanceObserverCursorAsync(
         SqlConnection connection, SqlTransaction transaction, string observerId, long cursor,
         int[] states, string? wireName, string? queue, DateTimeOffset now, CancellationToken cancellationToken)
     {
+        if (await AdvanceCommitHorizonAsync(connection, transaction, cancellationToken).ConfigureAwait(false)
+            is not { } horizon)
+        {
+            return;
+        }
+
         // The first matching row after the cursor still unresolved — the cursor cannot pass it.
         long? block;
         await using (var blockCommand = Cmd(
@@ -3576,7 +3614,7 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
             FROM backwave.job_transitions t
             JOIN backwave.jobs j ON j.job_id = t.job_id
             LEFT JOIN backwave.observer_deliveries d ON d.observer_id = @id AND d.position = t.position
-            WHERE t.position > @cursor
+            WHERE t.position > @cursor AND t.position <= @horizon
               AND t.state IN ({StatesInClause(states)})
               AND (@wire IS NULL OR j.wire_name = @wire)
               AND (@queue IS NULL OR j.queue = @queue)
@@ -3586,19 +3624,21 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
         {
             blockCommand.Parameters.AddWithValue("id", observerId);
             blockCommand.Parameters.AddWithValue("cursor", cursor);
+            blockCommand.Parameters.AddWithValue("horizon", horizon);
             blockCommand.Parameters.Add("wire", SqlDbType.NVarChar, -1).Value = (object?)wireName ?? DBNull.Value;
             blockCommand.Parameters.Add("queue", SqlDbType.NVarChar, -1).Value = (object?)queue ?? DBNull.Value;
             var result = await blockCommand.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             block = result is DBNull or null ? null : (long)result;
         }
 
-        // The cursor sweeps to the last Position before the block (or to the end if nothing blocks).
+        // The cursor sweeps to the last Position before the block (or to the Commit Horizon if nothing blocks).
         long? newCursor;
         await using (var advance = Cmd(
-            "SELECT MAX(position) FROM backwave.job_transitions WHERE position > @cursor AND (@block IS NULL OR position < @block)",
+            "SELECT MAX(position) FROM backwave.job_transitions WHERE position > @cursor AND position <= @horizon AND (@block IS NULL OR position < @block)",
             connection, transaction))
         {
             advance.Parameters.AddWithValue("cursor", cursor);
+            advance.Parameters.AddWithValue("horizon", horizon);
             advance.Parameters.Add("block", SqlDbType.BigInt).Value = (object?)block ?? DBNull.Value;
             var result = await advance.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false);
             newCursor = result is DBNull or null ? null : (long)result;
@@ -3667,6 +3707,69 @@ public sealed class SqlServerJobStore(SqlServerStoreOptions options) : IJobStore
                     $"Moving the cursor of observer '{observerId}' affected {moved} rows; the row is held under UPDLOCK by this transaction, so exactly 1 is the only possible count.");
             }
         }
+    }
+
+    private async Task<long?> AdvanceCommitHorizonAsync(
+        SqlConnection connection, SqlTransaction transaction, CancellationToken cancellationToken)
+    {
+        // Under RCSI each statement reads its own snapshot, so P is fixed before a probe runs. APPLOCK_TEST
+        // takes no lock.
+        CommitHorizon state;
+        long maxPosition;
+        bool previousFree;
+        bool currentFree;
+        await using (var step = Cmd(
+            """
+            DECLARE @epoch smallint, @candidate bigint, @horizon bigint, @max bigint;
+            SELECT @epoch = epoch, @candidate = candidate_pos, @horizon = horizon_pos
+            FROM backwave.observer_log_horizon WITH (UPDLOCK, READPAST, ROWLOCK)
+            WHERE id = 1;
+            IF @epoch IS NULL
+                SELECT NULL, NULL, horizon_pos FROM backwave.observer_log_horizon WHERE id = 1;
+            ELSE
+            BEGIN
+                SELECT @max = COALESCE(MAX(position), 0) FROM backwave.job_transitions;
+                SELECT @epoch, @candidate, @horizon, @max,
+                       APPLOCK_TEST(N'public', CASE @epoch WHEN 0 THEN N'backwave.observer_log.1' ELSE N'backwave.observer_log.0' END,
+                                    N'Exclusive', N'Transaction'),
+                       APPLOCK_TEST(N'public', CASE @epoch WHEN 0 THEN N'backwave.observer_log.0' ELSE N'backwave.observer_log.1' END,
+                                    N'Exclusive', N'Transaction');
+            END
+            """,
+            connection, transaction))
+        {
+            await using var reader = await step.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                Invariant.Degrade(
+                    _logger, InvariantTrigger.GuaranteedRowAbsent,
+                    "The Commit Horizon row is missing; the schema migration seeds it and nothing deletes it.");
+                return null;
+            }
+            if (reader.IsDBNull(0))
+            {
+                return reader.GetInt64(2);
+            }
+            state = new CommitHorizon(
+                reader.GetInt16(0), reader.IsDBNull(1) ? null : reader.GetInt64(1), reader.GetInt64(2));
+            maxPosition = reader.GetInt64(3);
+            previousFree = reader.GetInt32(4) == 1;
+            currentFree = reader.GetInt32(5) == 1;
+        }
+
+        var next = state.Advance(maxPosition, previousFree, currentFree);
+        if (next != state)
+        {
+            await using var write = Cmd(
+                "UPDATE backwave.observer_log_horizon " +
+                "SET epoch = @epoch, candidate_pos = @candidate, horizon_pos = @horizon WHERE id = 1",
+                connection, transaction);
+            write.Parameters.Add("epoch", SqlDbType.SmallInt).Value = (short)next.Epoch;
+            write.Parameters.Add("candidate", SqlDbType.BigInt).Value = (object?)next.Candidate ?? DBNull.Value;
+            write.Parameters.Add("horizon", SqlDbType.BigInt).Value = next.Horizon;
+            await write.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
+        return next.Horizon;
     }
 
     /// <summary>Renders a JobState int list as a SQL IN body; an empty subscription matches nothing.</summary>
