@@ -36,7 +36,7 @@ internal sealed partial class HintJsonContext : JsonSerializerContext;
 [Collection("postgres")]
 public class WakeUpHintTests
 {
-    private static (WorkerGroupService Service, BackWaveClient Client, HintRecorder Recorder) Build(
+    internal static (WorkerGroupService Service, BackWaveClient Client, HintRecorder Recorder) Build(
         PostgresJobStore store, TimeSpan pollInterval)
     {
         var recorder = new HintRecorder();
