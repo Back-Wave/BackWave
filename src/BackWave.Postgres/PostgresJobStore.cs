@@ -3787,7 +3787,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     await using var connection = new NpgsqlConnection(connectionString);
                     await connection.OpenAsync(token).ConfigureAwait(false);
                     connection.Notification += (_, args) => onHint(args.Payload);
-                    await using (var listen = new NpgsqlCommand($"LISTEN {channel}", connection))
+                    await using (var listen = new NpgsqlCommand($"LISTEN \"{channel}\"", connection))
                     {
                         // uncounted round trip: this LISTEN runs on the subscription's own parked
                         // connection, once per dial, on a loop that outlives every store operation. It

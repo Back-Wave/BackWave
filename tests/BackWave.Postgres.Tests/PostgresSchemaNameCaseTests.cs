@@ -45,7 +45,7 @@ public sealed class PostgresSchemaNameCaseTests
         await service.StartAsync(CancellationToken.None);
         try
         {
-            await WakeUpHintTests.WaitForListenerAsync();
+            await WakeUpHintTests.WaitForListenerAsync(new SchemaRewriter(schema).HintChannel);
 
             var enqueuedAt = DateTimeOffset.UtcNow;
             if (transactional)

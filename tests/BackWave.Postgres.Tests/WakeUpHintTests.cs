@@ -64,14 +64,15 @@ public class WakeUpHintTests
     }
 
     /// <summary>The pump subscribes asynchronously; wait until the LISTEN backend is live.</summary>
-    internal static async Task WaitForListenerAsync()
+    internal static async Task WaitForListenerAsync(string? channel = null)
     {
         var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(15);
         await using var dataSource = NpgsqlDataSource.Create(PostgresTestDatabase.ConnectionString);
         while (DateTimeOffset.UtcNow < deadline)
         {
             await using var command = dataSource.CreateCommand(
-                "SELECT count(*) FROM pg_stat_activity WHERE query ILIKE 'LISTEN%'");
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND query ILIKE @listen");
+            command.Parameters.AddWithValue("listen", channel is null ? "LISTEN%" : $"LISTEN \"{channel}\"");
             if ((long)(await command.ExecuteScalarAsync())! > 0)
             {
                 return;
