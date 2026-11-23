@@ -23,8 +23,9 @@ public static class PostgresMigrator
     // a two-int32 key space that is DISJOINT from the single-bigint per-queue config lock (issue 0193),
     // so a migration lock and a queue-claim lock can never collide. This constant is LOAD-BEARING and
     // must NEVER change: two binaries that disagreed on it could migrate the same schema concurrently
-    // under different keys, defeating the coordination. objid = hashtext(schemaName) keeps independent
-    // schemas sharing one database from false-contending. Value is ASCII "BWM1" (BackWave Migration v1).
+    // under different keys, defeating the coordination. objid = hashtext(folded schema name) keeps
+    // independent schemas sharing one database from false-contending. Value is ASCII "BWM1" (BackWave
+    // Migration v1).
     private const int MigrationLockClassId = 0x42574D31;
 
     /// <summary>
@@ -99,7 +100,7 @@ public static class PostgresMigrator
             "SELECT pg_advisory_xact_lock(@classid, hashtext(@schema))", connection, transaction))
         {
             lockCommand.Parameters.AddWithValue("classid", MigrationLockClassId);
-            lockCommand.Parameters.AddWithValue("schema", schemaName);
+            lockCommand.Parameters.AddWithValue("schema", rewriter.FoldedName);
             // uncounted round trip: taking the migration advisory lock is part of provisioning the
             // schema, not of any store operation. It runs once at startup on the migrator's own
             // connection, before there is an operation in flight to charge it to.

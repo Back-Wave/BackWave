@@ -38,11 +38,19 @@ internal sealed partial class SchemaRewriter
 
         _schema = schemaName;
         _isDefault = string.Equals(schemaName, DefaultSchema, StringComparison.Ordinal);
-        HintChannel = _isDefault ? "backwave_hints" : schemaName + "_hints";
+        FoldedName = schemaName.ToLowerInvariant();
+        var channel = FoldedName + "_hints";
+        HintChannel = channel.Length > MaxSchemaLength ? channel[..MaxSchemaLength] : channel;
     }
 
+    // The schema name as Postgres stores it. Rewrite emits the name unquoted, and Postgres folds an
+    // unquoted identifier to lower case, so 'MySchema' and 'myschema' are one schema.
+    public string FoldedName { get; }
+
     // The LISTEN/NOTIFY channel for Wake-Up Hints, namespaced to the schema so two BackWave
-    // deployments in one database never cross-talk. Default schema keeps the historical channel name.
+    // deployments in one database do not cross-talk. Default schema keeps the historical channel name.
+    // pg_notify rejects a channel longer than 63 bytes, so the name is cut there. An unquoted LISTEN of
+    // the uncut name folds and cuts to this same channel, so nodes on older releases still hear it.
     public string HintChannel { get; }
 
     // Returns the SQL with the 'backwave' schema qualifier replaced by the configured name. Identity

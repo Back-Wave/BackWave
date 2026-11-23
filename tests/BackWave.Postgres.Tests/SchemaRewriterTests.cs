@@ -38,6 +38,19 @@ public sealed class SchemaRewriterTests
     }
 
     [Fact]
+    public void UpperCaseSchema_HintChannel_IsTheFoldedName()
+    {
+        Assert.Equal("myschema_hints", new SchemaRewriter("MySchema").HintChannel);
+    }
+
+    [Fact]
+    public void MaxLengthName_HintChannel_FitsTheIdentifierLimit()
+    {
+        var channel = new SchemaRewriter(new string('A', MaxSchemaLength)).HintChannel;
+        Assert.Equal(new string('a', MaxSchemaLength), channel);
+    }
+
+    [Fact]
     public void MaxLengthName_IsAccepted_AndRewrites()
     {
         var name = new string('a', MaxSchemaLength); // exactly at the cap — accepted
