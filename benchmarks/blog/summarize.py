@@ -2,7 +2,10 @@
 
 Each cell is the median across rounds of each round's single measured run, with the min and max across
 rounds. A round that failed, whose work audit failed, or that ran with a diagnostic knob engaged is left
-out of the figures and counted next to the system name.
+out of the figures and counted next to the system name. A round whose only audit problem is extra executions,
+with every job enqueued and succeeded, stays in the figures, and the Work audit column counts the extra runs.
+This covers the targets that report duplicates through the work audit. The MassTransit, Acta, and Quartz.NET
+hosts fail the whole round on a duplicate, so the summary leaves that round out.
 
 A paced round is carried when the producers delivered at least 98% of the offered rate and the system
 completed jobs at that rate too, over the whole window from the first enqueue to the last completion. A
@@ -47,9 +50,15 @@ def spread(values: list[float], fmt: str) -> str:
     return f"{format(median, fmt)} [{format(min(values), fmt)}-{format(max(values), fmt)}]"
 
 
+def duplicates_only(audit: dict) -> bool:
+    return (audit["Executions"] is not None
+            and audit["Succeeded"] == audit["JobCount"] == audit["EnqueueCalls"] < audit["Executions"]
+            and all(p.startswith("executions ") for p in audit["Problems"]))
+
+
 def clean(run: dict) -> bool:
     return (not run.get("_failed") and not run.get("Diagnostic")
-            and all(not a["Problems"] for a in run.get("WorkAudits", [])))
+            and all(not a["Problems"] or duplicates_only(a) for a in run.get("WorkAudits", [])))
 
 
 def slots(run: dict) -> int:
@@ -94,14 +103,22 @@ def row(target: str, all_runs: list[dict]) -> str:
 def audit(runs: list[dict]) -> str:
     audits = [a for r in runs for a in r.get("WorkAudits", [])]
     crashed = sum(1 for r in runs if r.get("_failed"))
-    failed = [a for a in audits if a["Problems"]]
+    failed = [a for a in audits if a["Problems"] and not duplicates_only(a)]
+    duplicated = [a for a in audits if a["Problems"] and duplicates_only(a)]
     if not audits and not crashed:
         return "n/a"
-    if not failed and not crashed:
+    if not failed and not crashed and not duplicated:
         return "PASS"
     parts = []
+    if duplicated:
+        extra = [a["Executions"] - a["JobCount"] for a in duplicated]
+        counts = f"{min(extra)}" if min(extra) == max(extra) else f"{min(extra)}-{max(extra)}"
+        parts.append(f"DUPLICATES {len(duplicated)}/{len(audits)}: {counts} extra executions "
+                     f"for {duplicated[0]['JobCount']:,} jobs, every job succeeded")
     if failed:
-        parts.append(f"FAIL {len(failed)}/{len(audits)}: {failed[0]['Problems'][0]}")
+        problems = failed[0]["Problems"]
+        reason = next((p for p in problems if not p.startswith("executions ")), problems[0])
+        parts.append(f"FAIL {len(failed)}/{len(audits)}: {reason}")
     if crashed:
         parts.append(f"{crashed} round(s) failed, see the .log")
     return "; ".join(parts)
