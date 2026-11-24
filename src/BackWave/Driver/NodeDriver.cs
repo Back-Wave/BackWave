@@ -255,8 +255,7 @@ internal sealed class NodeDriver(NodeOptions options)
         var flush = _outcomeBuffer.Count >= options.MaxOutcomeBatch || _executing.Count == 0
             ? FlushOutcomes()
             : null;
-        var fullClaim = Math.Min(options.MaxClaimBatch, options.PoolSize);
-        if (freeBefore >= fullClaim || FreeSlots < fullClaim)
+        if (freeBefore >= FullClaim || FreeSlots < FullClaim)
         {
             return flush is null ? [] : [flush];
         }
@@ -389,6 +388,16 @@ internal sealed class NodeDriver(NodeOptions options)
     /// <see cref="NodeOptions.UnwrittenOutcomeSlots"/> headroom first, and only those beyond it hold a pool
     /// slot. A faulted write closes the headroom. With no headroom this is the pool minus every Leased job.
     /// </summary>
+    /// <summary>
+    /// Whether a running job's finish, or the answer of a write, will re-poll before this pool can take a full
+    /// claim. With headroom open, a claim that just landed leaves its own jobs running, so a pass chained at
+    /// once would claim only the slots they leave and split the pool into two cohorts again.
+    /// </summary>
+    private bool FinishWillRePoll =>
+        !_outcomeWriteFaulted && options.UnwrittenOutcomeSlots > 0 && _executing.Count > 0 && FreeSlots < FullClaim;
+
+    private int FullClaim => Math.Min(options.MaxClaimBatch, options.PoolSize);
+
     private int FreeSlots
     {
         get
@@ -416,7 +425,7 @@ internal sealed class NodeDriver(NodeOptions options)
         var waiting = _pollsDuringClaim + (cameBackFull ? _pollsFromBeforeClaim : 0);
         _pollsDuringClaim = 0;
         _pollsFromBeforeClaim = 0;
-        if (waiting == 0 || StartClaimPass() is not { } pass)
+        if (waiting == 0 || FinishWillRePoll || StartClaimPass() is not { } pass)
         {
             return null;
         }

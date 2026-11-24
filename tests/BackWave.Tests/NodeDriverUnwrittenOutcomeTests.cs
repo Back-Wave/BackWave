@@ -76,6 +76,35 @@ public class NodeDriverUnwrittenOutcomeTests
         Assert.Equal(4, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
     }
 
+    [Theory]
+    [InlineData(0, 2)]
+    [InlineData(4, null)]
+    public void AShortClaimWithAWaitingPoll_ChainsAPartialPass_OnlyWithNoHeadroom(int unwrittenOutcomeSlots, int? chained)
+    {
+        var driver = Driver(unwrittenOutcomeSlots);
+        var claim = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.PollDue(T0))));
+        Assert.Equal(4, claim.MaxJobs);
+        driver.Step(new NodeEvent.PollDue(T0));
+
+        var landed = driver.Step(new NodeEvent.ClaimCompleted(Jobs(2), T0));
+
+        Assert.Equal(chained, Claim(landed)?.MaxJobs);
+    }
+
+    [Fact]
+    public void WithHeadroom_TheJobsOfAShortClaim_RepollForTheWholePool_WhenTheyFinish()
+    {
+        var driver = Driver(unwrittenOutcomeSlots: 4);
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.PollDue(T0));
+        var jobs = Jobs(2);
+        driver.Step(new NodeEvent.ClaimCompleted(jobs, T0));
+
+        Assert.DoesNotContain(Finish(driver, jobs[0]), command => command is Command.RequestPoll);
+        Assert.Contains(Finish(driver, jobs[1]), command => command is Command.RequestPoll);
+        Assert.Equal(4, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
+    }
+
     [Fact]
     public void AFinish_WhenAFullClaimIsAlreadyFree_DoesNotRepoll()
     {
