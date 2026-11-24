@@ -28,6 +28,8 @@ builder.Services.AddBackWave(backwave =>
 
 - **`AutoMigrate = true`** applies the embedded, versioned schema on startup. Leave it off and run the
   migration yourself if you manage schema out of band.
+- **`Max Auto Prepare=64`** in the connection string makes the store's statements prepared, which is
+  faster on a direct connection. Leave it out behind PgBouncer in transaction mode before 1.21.
 - **`SchemaName`** places BackWave's tables in a schema of your choosing (defaults to `public`).
 - **Transactional Enqueue** lets you enqueue on your own `NpgsqlTransaction` or `DbConnection`, so the
   job and the rows it depends on commit or roll back together. For EF Core unit-of-work integration,

@@ -13,6 +13,11 @@ public sealed record PostgresStoreOptions
     /// The Npgsql connection string the store opens its own connection pool from. Required —
     /// it must point at a database the store has rights to read, write, and (if
     /// <see cref="AutoMigrate"/> is on) create its schema in.
+    /// <para>
+    /// On a direct connection, add <c>Max Auto Prepare=64</c> to make the store's statements
+    /// server-side prepared statements, so the server skips parse and plan on each call. Leave it out
+    /// behind PgBouncer in transaction mode before 1.21, which breaks with prepared statements.
+    /// </para>
     /// </summary>
     public required string ConnectionString { get; init; }
 
