@@ -43,6 +43,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
     private readonly WakeUpHintCoalescer _postCommitHints;
 
+    // The one-statement claim (TryClaimInOneStatementAsync), fixed by the history policy at construction.
+    private readonly string _claimInOneStatement;
+
     // Per-Queue unlimited-Queue cache (issue 0170). The Concurrency Limit (I3) and Paused flag (§5.8)
     // share one queue_limits row, mutated only by rare operator actions; a claim on a limited or paused
     // Queue must lock and read that row, but the common unlimited, unpaused Queue need not pay the
@@ -93,6 +96,15 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         _historyPolicy = JobHistoryPolicyResolver.Resolve(options.HistoryPolicy);
         _dataSource = NpgsqlDataSource.Create(options.ConnectionString);
         _postCommitHints = new WakeUpHintCoalescer(SendHintsAsync, _logger);
+        _claimInOneStatement = _historyPolicy == JobHistoryPolicy.Off
+            ? $"WITH {ClaimCandidates} {ClaimUpdate}"
+            : $"""
+              WITH {ClaimCandidates},
+              claimed AS ({ClaimUpdate}),
+              leased AS (SELECT job_id, state, attempt, NULL::text AS detail, sequence AS ord FROM claimed),
+              {TransitionLogCtes("leased")}
+              SELECT * FROM claimed
+              """;
     }
 
     // The one place a Postgres command is built, so the configured schema is swapped into every query
@@ -442,127 +454,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 break;
             }
 
-            await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-
-            // Concurrency Limit (I3) and Paused flag (§5.8) live in one row: lock it so concurrent
-            // claimers of a limited Queue serialize on the slot count and a concurrent Pause is observed
-            // atomically. A Queue recently observed unlimited AND unpaused skips this round-trip and the
-            // lock entirely (issue 0170) — the common case pays nothing; see _unlimitedQueues.
-            var slots = int.MaxValue;
-            var paused = false;
-            int? configured = null;
-            if (!IsCachedUnlimited(queue))
-            {
-                // Serialize claim-vs-first-config on a key that exists BEFORE the row does (issue 0193):
-                // the FOR UPDATE below locks nothing when no queue_limits row exists yet, so it does not
-                // serialize against the FIRST pause/limit's INSERT — an in-flight claim could over-claim
-                // past a first-ever limit or slip past a first-ever pause. The advisory lock (below) is
-                // taken by both this read path and the operator setters, so they serialize with no row
-                // present. Scoped to the read path: a cached unlimited, unpaused Queue (issue 0170) skips
-                // this block entirely and still pays nothing.
-                await AcquireQueueConfigLockAsync(connection, transaction, queue, cancellationToken).ConfigureAwait(false);
-                // Capture the generation BEFORE the read so a concurrent operator change (which bumps it)
-                // is detected when we go to publish the stamp below (issue 0170).
-                var generation = Interlocked.Read(ref _queueConfigGeneration);
-                await using (var limit = Cmd(
-                    "SELECT max_concurrent, paused FROM backwave.queue_limits WHERE queue = @queue FOR UPDATE",
-                    connection, transaction))
-                {
-                    limit.Parameters.AddWithValue("queue", queue);
-                    await using var reader = await limit.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
-                    if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                    {
-                        configured = reader.IsDBNull(0) ? null : reader.GetInt32(0);
-                        paused = reader.GetBoolean(1);
-                    }
-                }
-                CacheQueueConfig(queue, configured, paused, generation);
-            }
-            if (paused)
-            {
-                await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
-                continue; // a Paused Queue yields nothing to Claim (§5.8)
-            }
-            if (configured is { } limitValue)
-            {
-                await using var leased = Cmd(
-                    "SELECT count(*) FROM backwave.jobs WHERE queue = @queue AND state = 2",
-                    connection, transaction);
-                leased.Parameters.AddWithValue("queue", queue);
-                if (await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not long inUse)
-                {
-                    throw Invariant.Halt(
-                        InvariantTrigger.LeasedCountAggregateNull,
-                        $"The leased-count aggregate for queue '{queue}' returned no value; COUNT(*) always returns one.");
-                }
-                slots = limitValue - (int)inUse;
-            }
-            if (slots <= 0)
-            {
-                await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
-                continue;
-            }
-
-            // The single contended operation: set-based FOR UPDATE SKIP LOCKED.
-            await using var claim = Cmd(
-                """
-                WITH candidates AS (
-                    SELECT job_id FROM backwave.jobs
-                    WHERE queue = @queue AND state = 0 AND due_time <= @now
-                    ORDER BY due_time, sequence
-                    LIMIT @take
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE backwave.jobs j
-                SET state = 2, attempt = j.attempt + 1, lease_owner = @worker, lease_expiry = @expiry
-                FROM candidates c
-                WHERE j.job_id = c.job_id
-                RETURNING j.job_id, j.wire_name, j.payload, j.queue, j.state, j.due_time, j.attempt,
-                          j.lease_owner, j.lease_expiry, j.cancel_requested, j.terminal_at,
-                          j.terminal_cause, j.schedule_id, j.parents_remaining, j.mode, j.trace_context,
-                          j.sequence, j.workflow_id, j.retry_cause,
-                          -- Job Tags (ADR 0022) ride back with the claim as a correlated aggregate in
-                          -- THIS round-trip — never a second SELECT — so the no-tags hot path pays only a
-                          -- PK-indexed empty lookup (NULL) and is never N+1. The empty-string-key => Label
-                          -- discriminator is reconstructed below. Always correct, no gating staleness.
-                          (SELECT json_agg(json_build_object('k', t.key, 'v', t.value))
-                           FROM backwave.job_tags t WHERE t.job_id = j.job_id)::text
-                """,
-                connection, transaction);
-            claim.Parameters.AddWithValue("queue", queue);
-            claim.Parameters.AddWithValue("now", request.Now.ToUniversalTime());
-            claim.Parameters.AddWithValue("take", Math.Min(maxJobs - claimed.Count, slots));
-            claim.Parameters.AddWithValue("worker", request.WorkerId);
-            claim.Parameters.AddWithValue("expiry", (request.Now + request.LeaseDuration).ToUniversalTime());
-            var queueClaims = new List<JobRecord>();
-            await using (var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
-            {
-                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                {
-                    var job = ReadJob(reader);
-                    if (job.State != JobState.Leased || !string.Equals(job.LeaseOwner, request.WorkerId, StringComparison.Ordinal))
-                    {
-                        throw Invariant.Halt(
-                            InvariantTrigger.ClaimedRowNotLeasedToWorker,
-                            $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
-                    }
-                    // Column 19 is the correlated tag aggregate (json or NULL when the job has none).
-                    if (!reader.IsDBNull(19))
-                    {
-                        job = job with { Tags = ParseTagsJson(reader.GetString(19)) };
-                    }
-                    queueClaims.Add(job);
-                }
-            }
-            // Crash after the lease write, before commit: rollback must un-lease every row (issue 0034).
-            await FailpointAsync("claim", cancellationToken).ConfigureAwait(false);
-            // Transition Log (§5.12): one Leased entry per claimed job at its post-claim Attempt, in
-            // ONE set-based INSERT in this same transaction (atomic with the lease write).
-            await RecordTransitionsBatchAsync(
-                connection, transaction,
-                [.. queueClaims.Select(j => (j.JobId, JobState.Leased, j.Attempt, (string?)null))],
-                request.Now, cancellationToken).ConfigureAwait(false);
-            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
+            var take = maxJobs - claimed.Count;
+            var queueClaims = IsCachedUnlimited(queue)
+                ? await TryClaimInOneStatementAsync(connection, request, queue, take, cancellationToken).ConfigureAwait(false)
+                : null;
+            queueClaims ??= await ClaimInTransactionAsync(connection, request, queue, take, cancellationToken).ConfigureAwait(false);
 
             // RETURNING does not guarantee order; the contract's per-Queue
             // (DueTime, enqueue order) does (§5.2).
@@ -575,6 +471,201 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             ? await NextDueAsync(connection, request, cancellationToken).ConfigureAwait(false)
             : null;
         return (claimed, nextDue);
+    }
+
+    // The claim of a Queue recently seen unlimited and unpaused: one autocommit statement, so the lease
+    // write, its Leased transitions and any prune commit together in one round trip. Every CTE of the
+    // statement reads the snapshot it started with. A transition committed after that snapshot but
+    // before the row lock - another claimer leased the job and handed it back in that window - is
+    // missing from the ordinal read, so the insert collides on the primary key and the statement rolls
+    // back whole. Null then, and the caller claims the Queue the two-statement way, whose insert reads
+    // a snapshot taken after the locks.
+    private async ValueTask<List<JobRecord>?> TryClaimInOneStatementAsync(
+        NpgsqlConnection connection, ClaimRequest request, string queue, int take, CancellationToken cancellationToken)
+    {
+        // No seam inside one statement, so the failpoint fires before it: a crash here leaves nothing.
+        await FailpointAsync("claim", cancellationToken).ConfigureAwait(false);
+        await using var claim = Cmd(_claimInOneStatement, connection);
+        AddClaimParameters(claim, request, queue, take);
+        claim.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
+        try
+        {
+            return await ReadClaimedAsync(claim, request, cancellationToken).ConfigureAwait(false);
+        }
+        catch (PostgresException exception) when (IsTransitionOrdinalCollision(exception))
+        {
+            return null;
+        }
+    }
+
+    private static bool IsTransitionOrdinalCollision(PostgresException exception)
+        => exception is { SqlState: PostgresErrorCodes.UniqueViolation, ConstraintName: "job_transitions_pkey" };
+
+    private async ValueTask<List<JobRecord>> ClaimInTransactionAsync(
+        NpgsqlConnection connection, ClaimRequest request, string queue, int take, CancellationToken cancellationToken)
+    {
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+        // Concurrency Limit (I3) and Paused flag (§5.8) live in one row: lock it so concurrent
+        // claimers of a limited Queue serialize on the slot count and a concurrent Pause is observed
+        // atomically. A Queue recently observed unlimited AND unpaused skips this round-trip and the
+        // lock entirely (issue 0170) — the common case pays nothing; see _unlimitedQueues.
+        var slots = int.MaxValue;
+        var paused = false;
+        int? configured = null;
+        if (!IsCachedUnlimited(queue))
+        {
+            // Serialize claim-vs-first-config on a key that exists BEFORE the row does (issue 0193):
+            // the FOR UPDATE below locks nothing when no queue_limits row exists yet, so it does not
+            // serialize against the FIRST pause/limit's INSERT — an in-flight claim could over-claim
+            // past a first-ever limit or slip past a first-ever pause. The advisory lock (below) is
+            // taken by both this read path and the operator setters, so they serialize with no row
+            // present. Scoped to the read path: a cached unlimited, unpaused Queue (issue 0170) skips
+            // this block entirely and still pays nothing.
+            await AcquireQueueConfigLockAsync(connection, transaction, queue, cancellationToken).ConfigureAwait(false);
+            // Capture the generation BEFORE the read so a concurrent operator change (which bumps it)
+            // is detected when we go to publish the stamp below (issue 0170).
+            var generation = Interlocked.Read(ref _queueConfigGeneration);
+            await using (var limit = Cmd(
+                "SELECT max_concurrent, paused FROM backwave.queue_limits WHERE queue = @queue FOR UPDATE",
+                connection, transaction))
+            {
+                limit.Parameters.AddWithValue("queue", queue);
+                await using var reader = await limit.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+                if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    configured = reader.IsDBNull(0) ? null : reader.GetInt32(0);
+                    paused = reader.GetBoolean(1);
+                }
+            }
+            CacheQueueConfig(queue, configured, paused, generation);
+        }
+        if (paused)
+        {
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
+            return []; // a Paused Queue yields nothing to Claim (§5.8)
+        }
+        if (configured is { } limitValue)
+        {
+            await using var leased = Cmd(
+                "SELECT count(*) FROM backwave.jobs WHERE queue = @queue AND state = 2",
+                connection, transaction);
+            leased.Parameters.AddWithValue("queue", queue);
+            if (await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not long inUse)
+            {
+                throw Invariant.Halt(
+                    InvariantTrigger.LeasedCountAggregateNull,
+                    $"The leased-count aggregate for queue '{queue}' returned no value; COUNT(*) always returns one.");
+            }
+            slots = limitValue - (int)inUse;
+        }
+        if (slots <= 0)
+        {
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
+            return [];
+        }
+
+        await using var claim = Cmd($"WITH {ClaimCandidates} {ClaimUpdate}", connection, transaction);
+        AddClaimParameters(claim, request, queue, Math.Min(take, slots));
+        var queueClaims = await ReadClaimedAsync(claim, request, cancellationToken).ConfigureAwait(false);
+        // Crash after the lease write, before commit: rollback must un-lease every row (issue 0034).
+        await FailpointAsync("claim", cancellationToken).ConfigureAwait(false);
+        // Transition Log (§5.12): one Leased entry per claimed job at its post-claim Attempt, in
+        // ONE set-based INSERT in this same transaction (atomic with the lease write).
+        await RecordTransitionsBatchAsync(
+            connection, transaction,
+            [.. queueClaims.Select(j => (j.JobId, JobState.Leased, j.Attempt, (string?)null))],
+            request.Now, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
+        return queueClaims;
+    }
+
+    // The claim's candidate pick, the single contended operation: set-based FOR UPDATE SKIP LOCKED.
+    private const string ClaimCandidates =
+        """
+        candidates AS (
+            SELECT job_id FROM backwave.jobs
+            WHERE queue = @queue AND state = 0 AND due_time <= @now
+            ORDER BY due_time, sequence
+            LIMIT @take
+            FOR UPDATE SKIP LOCKED
+        )
+        """;
+
+    private const string ClaimUpdate =
+        """
+        UPDATE backwave.jobs j
+        SET state = 2, attempt = j.attempt + 1, lease_owner = @worker, lease_expiry = @expiry
+        FROM candidates c
+        WHERE j.job_id = c.job_id
+        RETURNING j.job_id, j.wire_name, j.payload, j.queue, j.state, j.due_time, j.attempt,
+                  j.lease_owner, j.lease_expiry, j.cancel_requested, j.terminal_at,
+                  j.terminal_cause, j.schedule_id, j.parents_remaining, j.mode, j.trace_context,
+                  j.sequence, j.workflow_id, j.retry_cause,
+                  -- Job Tags (ADR 0022) ride back with the claim as a correlated aggregate in
+                  -- THIS round-trip — never a second SELECT — so the no-tags hot path pays only a
+                  -- PK-indexed empty lookup (NULL) and is never N+1. The empty-string-key => Label
+                  -- discriminator is reconstructed in ReadClaimedAsync. Always correct, no gating staleness.
+                  (SELECT json_agg(json_build_object('k', t.key, 'v', t.value))
+                   FROM backwave.job_tags t WHERE t.job_id = j.job_id)::text AS tags
+        """;
+
+    // The Transition Log append (§5.12) and its per-job-life prune (§7) as CTEs over `source`, a CTE of
+    // (job_id, state, attempt, detail, ord) rows, for a statement that writes its own transitions. The
+    // same SQL as RecordTransitionsBatchAsync, which sends the prune as a second statement only when
+    // some job reached the cap. Here the prune always runs, and its cap filter leaves it nothing to
+    // delete until a job reaches the cap.
+    private static string TransitionLogCtes(string source) =>
+        $"""
+        logged AS (
+            INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
+            SELECT s.job_id, COALESCE(t.maxord, -1) + 1, @now, s.state, s.attempt, s.detail
+            FROM {source} s
+            LEFT JOIN (
+                SELECT job_id, MAX(ordinal) AS maxord FROM backwave.job_transitions
+                WHERE job_id IN (SELECT job_id FROM {source}) GROUP BY job_id
+            ) t ON t.job_id = s.job_id
+            ORDER BY s.ord
+            RETURNING job_id, ordinal
+        ),
+        pruned AS (
+            DELETE FROM backwave.job_transitions jt
+            USING logged l
+            WHERE l.ordinal >= @transitionCap AND jt.job_id = l.job_id AND jt.ordinal <= l.ordinal - @transitionCap
+        )
+        """;
+
+    private static void AddClaimParameters(NpgsqlCommand claim, ClaimRequest request, string queue, int take)
+    {
+        claim.Parameters.AddWithValue("queue", queue);
+        claim.Parameters.AddWithValue("now", request.Now.ToUniversalTime());
+        claim.Parameters.AddWithValue("take", take);
+        claim.Parameters.AddWithValue("worker", request.WorkerId);
+        claim.Parameters.AddWithValue("expiry", (request.Now + request.LeaseDuration).ToUniversalTime());
+    }
+
+    private static async ValueTask<List<JobRecord>> ReadClaimedAsync(
+        NpgsqlCommand claim, ClaimRequest request, CancellationToken cancellationToken)
+    {
+        var queueClaims = new List<JobRecord>();
+        await using var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var job = ReadJob(reader);
+            if (job.State != JobState.Leased || !string.Equals(job.LeaseOwner, request.WorkerId, StringComparison.Ordinal))
+            {
+                throw Invariant.Halt(
+                    InvariantTrigger.ClaimedRowNotLeasedToWorker,
+                    $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
+            }
+            // Column 19 is the correlated tag aggregate (json or NULL when the job has none).
+            if (!reader.IsDBNull(19))
+            {
+                job = job with { Tags = ParseTagsJson(reader.GetString(19)) };
+            }
+            queueClaims.Add(job);
+        }
+        return queueClaims;
     }
 
     // The earliest future instant a currently-empty claim could begin returning work through time alone,

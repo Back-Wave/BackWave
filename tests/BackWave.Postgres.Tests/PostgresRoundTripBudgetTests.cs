@@ -47,7 +47,7 @@ public sealed class PostgresRoundTripBudgetTests
 
     private static readonly Budget WarmClaim = new(
         "ClaimAsync of 32 jobs (one queue already seen unlimited)",
-        Statements: 2, Commits: 1);
+        Statements: 1, Commits: 0);
 
     private static readonly Budget ReportOutcomes = new(
         "ReportOutcomesAsync of 32 succeeded rows",
@@ -133,7 +133,8 @@ public sealed class PostgresRoundTripBudgetTests
         Assert.Equal(ClaimBatch, (await store.ClaimAsync(
             new ClaimRequest("budget-worker", ["budget"], ClaimBatch, Lease, T0))).Count);
 
-        // 1 claim UPDATE ... RETURNING + 1 batched transition insert + 1 COMMIT.
+        // 1 autocommit statement, so no COMMIT: the claim UPDATE ... RETURNING, the batched transition
+        // insert and the capped prune are CTEs of one statement.
         IReadOnlyList<JobRecord> claimed;
         Measured measured;
         using (var scope = PostgresRoundTrips.Observe())
