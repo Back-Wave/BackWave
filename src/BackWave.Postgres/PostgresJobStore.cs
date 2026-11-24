@@ -239,7 +239,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var ownTransaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         var (result, hintQueue) = await EnqueueCoreAsync(connection, ownTransaction, job, now, cancellationToken)
             .ConfigureAwait(false);
-        await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await ownTransaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         if (hintQueue is not null)
         {
             _postCommitHints.Request(hintQueue);
@@ -480,7 +480,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
             if (paused)
             {
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
                 continue; // a Paused Queue yields nothing to Claim (§5.8)
             }
             if (configured is { } limitValue)
@@ -499,7 +499,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
             if (slots <= 0)
             {
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
                 continue;
             }
 
@@ -562,7 +562,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 connection, transaction,
                 [.. queueClaims.Select(j => (j.JobId, JobState.Leased, j.Attempt, (string?)null))],
                 request.Now, cancellationToken).ConfigureAwait(false);
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
 
             // RETURNING does not guarantee order; the contract's per-Queue
             // (DueTime, enqueue order) does (§5.2).
@@ -753,7 +753,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
         if (await update.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not int newState)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return OutcomeResult.StaleLease; // the (workerId, attempt) fence
         }
 
@@ -781,7 +781,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             await ResolveChildLatchesAsync(connection, transaction, jobId, (JobState)newState, now, cancellationToken)
                 .ConfigureAwait(false);
         }
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return OutcomeResult.Applied;
     }
 
@@ -995,7 +995,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
         }
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
 
         // One result per input row, in input order, keyed by job id: matched ⇒ Applied, else StaleLease.
         var results = new OutcomeReportResult[count];
@@ -1317,7 +1317,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
         }
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return expired.Count;
     }
 
@@ -1370,7 +1370,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
         if (held.Count == 0)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return 0;
         }
 
@@ -1480,7 +1480,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
         }
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return held.Count;
     }
 
@@ -1527,7 +1527,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     .ConfigureAwait(false);
                 await AppendAuditAsync(connection, transaction, actor, OperatorAction.Cancel, jobId.ToString(), now, cancellationToken)
                     .ConfigureAwait(false);
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
                 return CancelResult.CancelledImmediately;
 
             case JobState.Leased:
@@ -1539,11 +1539,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 }
                 await AppendAuditAsync(connection, transaction, actor, OperatorAction.Cancel, jobId.ToString(), now, cancellationToken)
                     .ConfigureAwait(false);
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
                 return CancelResult.CancellationRequested;
 
             default:
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
                 return CancelResult.NotCancellable;
         }
     }
@@ -1574,7 +1574,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         update.Parameters.AddWithValue("now", now.ToUniversalTime());
         if (await update.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is null)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return RequeueResult.NotRequeueable;
         }
 
@@ -1583,7 +1583,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             .ConfigureAwait(false);
         await AppendAuditAsync(connection, transaction, actor, OperatorAction.Requeue, jobId.ToString(), now, cancellationToken)
             .ConfigureAwait(false);
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return RequeueResult.Requeued;
     }
 
@@ -1610,7 +1610,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var ownTransaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         var result = await RescheduleCoreAsync(connection, ownTransaction, jobId, dueTime, actor, now, cancellationToken)
             .ConfigureAwait(false);
-        await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await ownTransaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return result;
     }
 
@@ -1704,7 +1704,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             await upsert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         await AppendAuditAsync(connection, transaction, actor, action, queue, now, cancellationToken).ConfigureAwait(false);
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         InvalidateQueueConfig(); // pause/resume on this process is honored on the next claim (0170)
     }
 
@@ -1730,7 +1730,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         }
         if (schedule is null)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return TriggerScheduleResult.ScheduleNotFound;
         }
 
@@ -1759,7 +1759,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         }
         await AppendAuditAsync(connection, transaction, actor, OperatorAction.TriggerScheduleNow, scheduleId, now, cancellationToken)
             .ConfigureAwait(false);
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return TriggerScheduleResult.Triggered;
     }
 
@@ -2092,7 +2092,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
             if (schedule is null)
             {
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
                 continue; // another node already minted these ticks
             }
 
@@ -2147,7 +2147,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     .ConfigureAwait(false);
             }
             minted += mintedForDecision;
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         return minted;
@@ -2180,7 +2180,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         }
         await AppendAuditAsync(
             connection, transaction, actor, OperatorAction.SetConcurrencyLimit, queue, now, cancellationToken).ConfigureAwait(false);
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         InvalidateQueueConfig(); // a limit set/cleared on this process is honored on the next claim (0170)
     }
 
@@ -2579,7 +2579,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // All-or-nothing: a non-Ok validation leaves nothing inserted, so only Ok commits.
         if (result == WorkflowEnqueueResult.Ok)
         {
-            await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await ownTransaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             foreach (var queue in hintQueues)
             {
                 _postCommitHints.Request(queue);
@@ -3188,7 +3188,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             && !string.Equals(held, request.WorkerId, StringComparison.Ordinal)
             && leaseExpiry > request.Now)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return ObserverClaim.None(request.ObserverId);
         }
 
@@ -3246,7 +3246,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     connection, transaction, request.ObserverId, cursor, states, request.WireName, request.Queue,
                     request.Now, cancellationToken).ConfigureAwait(false);
             }
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return ObserverClaim.None(request.ObserverId);
         }
 
@@ -3276,7 +3276,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             await lease.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return new ObserverClaim(request.ObserverId, Acquired: true, candidates);
     }
 
@@ -3324,7 +3324,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // same connection.
         if (!found)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return ObserverReportOutcome.UnknownObserver; // nothing claimed, nothing to resolve
         }
 
@@ -3344,7 +3344,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // lapse leaves ITS future expiry here for the old owner's late report to read.
         if (!string.Equals(leaseOwner, report.WorkerId, StringComparison.Ordinal) || leaseExpiry <= report.Now)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             if (ObserverFence.IsContradiction(report))
             {
                 Invariant.Degrade(
@@ -3379,7 +3379,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             connection, transaction, report.ObserverId, cursor, states, wireName, queue, report.Now, cancellationToken)
             .ConfigureAwait(false);
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return ObserverReportOutcome.Applied;
     }
 

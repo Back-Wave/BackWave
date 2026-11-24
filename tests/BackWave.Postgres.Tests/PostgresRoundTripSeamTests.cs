@@ -4,7 +4,7 @@ namespace BackWave.Postgres.Tests;
 
 /// <summary>
 /// Guards the seam the round-trip budgets are measured through: every statement the Postgres adapter
-/// executes goes through one of the counted wrappers in PostgresRoundTrips.
+/// executes, and every COMMIT it sends, goes through one of the counted wrappers in PostgresRoundTrips.
 ///
 /// Without this the budgets are self-deceiving. A new bare <c>command.ExecuteNonQueryAsync(...)</c> in
 /// the store is a real round trip that the counter never sees, so the pinned numbers in
@@ -21,7 +21,7 @@ public sealed class PostgresRoundTripSeamTests
     // The Npgsql methods that actually leave for the server. The adapter calling one of these directly
     // is a round trip no budget can see.
     private static readonly Regex BareExecute = new(
-        @"\.(ExecuteNonQueryAsync|ExecuteReaderAsync|ExecuteScalarAsync)\s*\(",
+        @"\.(ExecuteNonQueryAsync|ExecuteReaderAsync|ExecuteScalarAsync|CommitAsync)\s*\(",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     // The only way past this gate, and deliberately a per-call-site one: a statement that belongs to no
@@ -64,8 +64,8 @@ public sealed class PostgresRoundTripSeamTests
 
              {string.Join(Environment.NewLine, offenders)}
 
-             Call ExecuteNonQueryCountedAsync / ExecuteReaderCountedAsync / ExecuteScalarCountedAsync
-             instead. If the statement genuinely belongs to no store operation - it runs on its own
+             Call ExecuteNonQueryCountedAsync / ExecuteReaderCountedAsync / ExecuteScalarCountedAsync /
+             CommitCountedAsync instead. If the statement genuinely belongs to no store operation - it runs on its own
              session, outside every operation the budgets measure - put a comment directly above the
              call that starts with "{ExemptionMarker}" and says why.
              """);
@@ -122,7 +122,8 @@ public sealed class PostgresRoundTripSeamTests
             {
                 continue;
             }
-            return text.StartsWith("CountStatement()", StringComparison.Ordinal);
+            return text.StartsWith("CountStatement()", StringComparison.Ordinal)
+                || text.StartsWith("CountCommit()", StringComparison.Ordinal);
         }
 
         return false;

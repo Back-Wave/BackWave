@@ -114,7 +114,7 @@ public static class PostgresMigrator
             await ApplyScriptsAsync(connection, transaction, rewriter, cancellationToken).ConfigureAwait(false);
         }
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // Runs every embedded schema script in version order on the given connection, optionally inside a

@@ -62,8 +62,20 @@ internal static class PostgresRoundTrips
         Flow.Value?.AddStatement();
     }
 
+    // One COMMIT left for the server. Npgsql sends it on its own and waits for the answer, so it is a
+    // round trip exactly like a statement, and the one an autocommit statement saves. BEGIN is not
+    // counted: Npgsql prepends it to the transaction's first statement, so it never waits on its own.
+    internal static void CountCommit()
+    {
+        if (Volatile.Read(ref _observers) == 0)
+        {
+            return;
+        }
+        Flow.Value?.AddCommit();
+    }
+
     // The adapter's execution entry points. Every ExecuteXxxAsync in the adapter goes through one of
-    // these, and that is enforced rather than trusted: PostgresRoundTripSeamTests fails the build's test
+    // these, and so does every COMMIT, and that is enforced rather than trusted: PostgresRoundTripSeamTests fails the build's test
     // pass on any bare driver call in src/BackWave.Postgres that is neither a wrapper body below nor
     // marked "uncounted round trip:" at the call site with a reason. The marked ones are statements
     // belonging to no operation - the Wake-Up Hint subscription's parked LISTEN session, and migration.
@@ -87,6 +99,13 @@ internal static class PostgresRoundTrips
         CountStatement();
         return command.ExecuteScalarAsync(cancellationToken);
     }
+
+    internal static Task CommitCountedAsync(
+        this NpgsqlTransaction transaction, CancellationToken cancellationToken)
+    {
+        CountCommit();
+        return transaction.CommitAsync(cancellationToken);
+    }
 }
 
 // The counts an observed async flow accumulated. Mutated through Interlocked because the store is free
@@ -95,13 +114,18 @@ internal static class PostgresRoundTrips
 internal sealed class PostgresRoundTripScope(PostgresRoundTripScope? outer) : IDisposable
 {
     private int _statements;
+    private int _commits;
     private bool _disposed;
 
     internal PostgresRoundTripScope? Outer { get; } = outer;
 
     internal int Statements => Volatile.Read(ref _statements);
 
+    internal int Commits => Volatile.Read(ref _commits);
+
     internal void AddStatement() => Interlocked.Increment(ref _statements);
+
+    internal void AddCommit() => Interlocked.Increment(ref _commits);
 
     public void Dispose()
     {
