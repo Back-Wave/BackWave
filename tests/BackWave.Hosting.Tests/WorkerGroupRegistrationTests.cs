@@ -55,6 +55,17 @@ public class WorkerGroupRegistrationTests
     }
 
     [Fact]
+    public void AddWorkerGroup_WithNegativeUnwrittenOutcomeSlots_Throws()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            new ServiceCollection().AddBackWave(backwave => backwave
+                .UseStore(new InMemoryJobStore())
+                .UseRegistry(new JobRegistry([]))
+                .AddWorkerGroup(Group("workers") with { UnwrittenOutcomeSlots = -1 })));
+        Assert.Contains(nameof(WorkerGroupOptions.UnwrittenOutcomeSlots), ex.Message);
+    }
+
+    [Fact]
     public void AddWorkerGroup_WithDuplicateName_Throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
