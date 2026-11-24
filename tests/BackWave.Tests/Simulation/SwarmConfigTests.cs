@@ -50,6 +50,7 @@ public class SwarmConfigTests
             Assert.Equal(a.PermanentLossProbability, b.PermanentLossProbability);
             Assert.Equal(a.OperatorActionCount, b.OperatorActionCount);
             Assert.Equal(a.MaxStoreLaneLatency, b.MaxStoreLaneLatency);
+            Assert.Equal(a.UnwrittenOutcomeSlots, b.UnwrittenOutcomeSlots);
 
             // The Schedule + Observer axes (issue 0201) are derived from the same Seed, so their populated
             // collections must match too — compare identity (count + ids), the only knobs the generator sets.
@@ -153,6 +154,8 @@ public class SwarmConfigTests
         var sawMultiQueue = false;
         var sawPerQueueLimits = false;
         var sawFinitePool = false;
+        var sawPooledWithoutHeadroom = false;
+        var sawUnwrittenHeadroom = false;
 
         for (var seed = 0UL; seed < 500; seed++)
         {
@@ -161,6 +164,8 @@ public class SwarmConfigTests
             if (o.TopologyQueues >= 2) sawMultiQueue = true;
             if (o.ConcurrencyLimits.Count > 0) sawPerQueueLimits = true;
             if (o.PoolSize != int.MaxValue) sawFinitePool = true;
+            if (o.PoolSize != int.MaxValue && o.UnwrittenOutcomeSlots == 0) sawPooledWithoutHeadroom = true;
+            if (o.UnwrittenOutcomeSlots > 0) sawUnwrittenHeadroom = true;
 
             // Still in-envelope: caps and pools never starve, healing-only isolation, the anchor keeps every
             // Queue served, and the two throttles stay within their tested regimes and never combine.
@@ -179,6 +184,11 @@ public class SwarmConfigTests
                 // in-flight == leases <= pool (no GC-pause zombie executions breaching the per-node cap).
                 Assert.Equal(0, o.TopologyQueues);
                 Assert.True(o.MaxExecutionDuration <= o.LeaseDuration, $"seed {seed}: pooled run lets executions outlive the Lease");
+                Assert.InRange(o.UnwrittenOutcomeSlots, 0, o.PoolSize);
+            }
+            else
+            {
+                Assert.Equal(0, o.UnwrittenOutcomeSlots);
             }
             Assert.Equal(0.0, o.PermanentLossProbability); // healing-only still holds
         }
@@ -186,6 +196,8 @@ public class SwarmConfigTests
         Assert.True(sawMultiQueue, "no multi-Queue topology generated");
         Assert.True(sawPerQueueLimits, "no per-Queue ConcurrencyLimits generated");
         Assert.True(sawFinitePool, "no finite Backpressure pool generated");
+        Assert.True(sawPooledWithoutHeadroom, "no finite pool kept every slot until its write answered");
+        Assert.True(sawUnwrittenHeadroom, "no finite pool freed slots before the outcome write");
     }
 
     [Fact]
@@ -232,6 +244,7 @@ public class SwarmConfigTests
         Assert.DoesNotContain(Situation.ScheduleMinted, report.NeverHitSituations);
         Assert.DoesNotContain(Situation.ObserverRedeliveryFired, report.NeverHitSituations);
         Assert.DoesNotContain(Situation.ObserverDeliveryUnderIsolation, report.NeverHitSituations);
+        Assert.DoesNotContain(Situation.ClaimIntoUnwrittenHeadroom, report.NeverHitSituations);
     }
 
     [Fact]

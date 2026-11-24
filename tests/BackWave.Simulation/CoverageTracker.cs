@@ -81,6 +81,9 @@ internal enum Situation
     CompletionDuringOutcomeWrite,
 
     PollDuringClaim,
+
+    /// <summary>A node claimed into slots that its finished jobs, still waiting for their outcome write, no longer held.</summary>
+    ClaimIntoUnwrittenHeadroom,
 }
 
 /// <summary>
@@ -171,6 +174,7 @@ internal sealed class CoverageTracker
             [Situation.RelinquishReclaimed] = r => r.LeasesRelinquished > 0,
             [Situation.CompletionDuringOutcomeWrite] = r => r.CompletionsDuringOutcomeWrite > 0,
             [Situation.PollDuringClaim] = r => r.PollsDuringClaim > 0,
+            [Situation.ClaimIntoUnwrittenHeadroom] = r => r.ClaimsIntoUnwrittenHeadroom > 0,
         };
 
     static CoverageTracker()
