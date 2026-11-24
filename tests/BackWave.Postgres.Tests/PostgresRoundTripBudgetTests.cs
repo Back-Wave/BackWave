@@ -67,7 +67,7 @@ public sealed class PostgresRoundTripBudgetTests
 
     private static readonly Budget Enqueue = new(
         "EnqueueAsync of one untagged job",
-        Statements: 1, Commits: 1);
+        Statements: 1, Commits: 0);
 
     private static readonly Budget EnqueueTagged = new(
         "EnqueueAsync of one job carrying three tags",
@@ -316,10 +316,10 @@ public sealed class PostgresRoundTripBudgetTests
         await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
         await store.EnqueueAsync(Job(), T0); // warms the one-time schema check, off the measured path
 
-        // 1 insert (the job row and its Scheduled transition in one CTE) + 1 COMMIT. Enqueue opens and
-        // commits its own transaction per job, so this fixed per-call cost is why enqueue barely moves
-        // when the claim and outcome paths get faster, and only a bulk enqueue on the Storage Contract
-        // can amortize it.
+        // 1 autocommit insert (the job row and its Scheduled transition in one CTE), and no COMMIT: a
+        // job with no parents and no tags is that one statement, so it needs no transaction of its own.
+        // This is still one round trip per job; only a bulk enqueue on the Storage Contract can
+        // amortize it.
         Measured measured;
         using (var scope = PostgresRoundTrips.Observe())
         {

@@ -265,10 +265,21 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         }
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await using var ownTransaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-        var (result, hintQueue) = await EnqueueCoreAsync(connection, ownTransaction, job, now, cancellationToken)
-            .ConfigureAwait(false);
-        await ownTransaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
+        EnqueueResult result;
+        string? hintQueue;
+        if (IsOneStatementEnqueue(job))
+        {
+            (result, hintQueue) = await EnqueueCoreAsync(connection, null, job, now, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            await using var ownTransaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            (result, hintQueue) = await EnqueueCoreAsync(connection, ownTransaction, job, now, cancellationToken)
+                .ConfigureAwait(false);
+            await ownTransaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
+        // The statement has committed either way, so the hint can never reach a Pump before the job.
         if (hintQueue is not null)
         {
             _postCommitHints.Request(hintQueue);
@@ -276,8 +287,16 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         return result;
     }
 
+    // A job with no parents and no tags is the job row and its first transition, one statement, and
+    // the first transition (ordinal 0) is below any cap of 1 or more, so nothing prunes. Run as autocommit
+    // it costs one round trip instead of two.
+    private bool IsOneStatementEnqueue(NewJob job) =>
+        job.Parents.Count == 0 && job.Tags.Count == 0 && _options.Bounds.MaxTransitionsPerJob >= 1;
+
+    // With a null transaction the caller has checked IsOneStatementEnqueue, so the insert is the only
+    // statement and commits on its own.
     private async ValueTask<(EnqueueResult Result, string? HintQueue)> EnqueueCoreAsync(
-        NpgsqlConnection connection, NpgsqlTransaction transaction, NewJob job, DateTimeOffset now,
+        NpgsqlConnection connection, NpgsqlTransaction? transaction, NewJob job, DateTimeOffset now,
         CancellationToken cancellationToken, Guid? workflowId = null)
     {
         // Lock the parents (if any) so a concurrent terminal transition cannot race the
@@ -360,6 +379,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // Workflow membership (ADR 0023): the immutable scalar, stamped once here at enqueue; null for
         // an ordinary job. The Core never reads it — it lives entirely above the determinism boundary.
         insert.Parameters.AddWithValue("workflowId", (object?)workflowId ?? DBNull.Value);
+        if (transaction is null)
+        {
+            // An autocommit insert has no seam after it, so the failpoint fires before: a crash there
+            // leaves nothing, as the rollback does on the transaction path.
+            await FailpointAsync("enqueue", cancellationToken).ConfigureAwait(false);
+        }
         if (!recordsHistory)
         {
             if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) == 0)
@@ -374,8 +399,16 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             {
                 return (EnqueueResult.Duplicate, null);
             }
-            await PruneTransitionsAsync(connection, transaction, job.JobId, ordinal, cancellationToken)
-                .ConfigureAwait(false);
+            if (transaction is not null)
+            {
+                await PruneTransitionsAsync(connection, transaction, job.JobId, ordinal, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        if (transaction is null)
+        {
+            return (EnqueueResult.Ok, job.DueTime <= now ? job.Queue : null);
         }
 
         // Crash between the job row and its parent edges: rollback must leave neither (issue 0034).
