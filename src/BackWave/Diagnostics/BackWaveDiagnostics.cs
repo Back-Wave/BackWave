@@ -156,6 +156,13 @@ public static class BackWaveDiagnostics
         "backwave.worker.slots.active", "{slot}",
         "Handler executions currently in flight in a worker group's pool; returns to zero when the pool drains.");
 
+    // Finished jobs whose outcome write has not answered: the Driver's buffered outcomes plus the rows of the
+    // write in flight. Each pump adds the change in its count after every Driver step and takes its count back
+    // to zero when it ends. Tagged with the consumer group, like the slot instruments.
+    private static readonly UpDownCounter<long> WorkerOutcomesUnwritten = Meter.CreateUpDownCounter<long>(
+        "backwave.worker.outcomes.unwritten", "{outcome}",
+        "Finished jobs in a worker group whose outcome write has not completed; returns to zero when the group is idle and its writes have answered.");
+
     // Impossible-state detections, at every altitude, behind ONE instrument tagged by trigger id: one
     // instrument per trigger would be a cardinality and a documentation problem, and a tagged counter
     // slices the same way. The instrument NAME, the two tag KEYS, and the tag VALUES are all public API -
@@ -504,6 +511,14 @@ public static class BackWaveDiagnostics
 
     internal static void RecordWorkerSlotReleased(JobRecord job, string? consumerGroup = null) =>
         WorkerSlotsActive.Add(-1, WorkerSlotTags(job, consumerGroup));
+
+    internal static void RecordUnwrittenOutcomes(string consumerGroup, int delta)
+    {
+        if (delta != 0)
+        {
+            WorkerOutcomesUnwritten.Add(delta, new KeyValuePair<string, object?>(ConsumerGroupKey, consumerGroup));
+        }
+    }
 
     // The destination tags for a worker-slot delta, plus the consumer group when one is in scope so the
     // active up/down counter joins to the per-group capacity gauge. A null group (the deterministic

@@ -250,6 +250,18 @@ internal sealed class WorkerGroupService(
         return false;
     }
 
+    // <summary>
+    // The Unwritten outcome count this pump last added to backwave.worker.outcomes.unwritten, so each update
+    // adds only the change. Written on the pump loop and then on the hand-back, never at the same time.
+    // </summary>
+    private int _unwrittenOutcomes;
+
+    private void ReportUnwrittenOutcomes(int unwritten)
+    {
+        BackWaveDiagnostics.RecordUnwrittenOutcomes(options.Name, unwritten - _unwrittenOutcomes);
+        _unwrittenOutcomes = unwritten;
+    }
+
     private readonly StoreLane _claim = new();
 
     private readonly StoreLane _outcomeWrite = new();
@@ -331,6 +343,7 @@ internal sealed class WorkerGroupService(
             // A value below 1 has always meant one outcome per write, and the Driver's batches need at least one row.
             MaxOutcomeBatch = Math.Max(1, options.MaxOutcomeBatch ?? options.MaxClaimBatch), // coalesce a claim batch's worth of outcomes
             PoolSize = options.PoolSize, // the Driver subtracts in-flight work from claims
+            UnwrittenOutcomeSlots = options.UnwrittenOutcomeSlots,
             LeaseDuration = options.LeaseDuration,
             RetryPolicy = options.RetryPolicy,
             RetryOverrides = registry.RetryOverrides, // per-job-type [Retry] overrides, loud-failure path (0051)
@@ -409,6 +422,7 @@ internal sealed class WorkerGroupService(
                 try
                 {
                     var commands = driver.Step(nodeEvent);
+                    ReportUnwrittenOutcomes(driver.UnwrittenOutcomeCount);
                     var issued = 0;
                     var reached = false;
                     try
@@ -496,6 +510,9 @@ internal sealed class WorkerGroupService(
             }
             finally
             {
+                // The pump is over, so none of its finished jobs waits on a write of its own any more.
+                ReportUnwrittenOutcomes(0);
+
                 // Its own finally, because the hand-back rethrows a named violation on its way out. Left in
                 // the same block, that throw would skip the lines below: the channel would stay open for
                 // the tickers to fill until host shutdown, and the Wake-Up Hint subscription would leak on
@@ -654,7 +671,9 @@ internal sealed class WorkerGroupService(
             {
                 continue;
             }
-            foreach (var command in driver.Step(nodeEvent))
+            var commands = driver.Step(nodeEvent);
+            ReportUnwrittenOutcomes(driver.UnwrittenOutcomeCount);
+            foreach (var command in commands)
             {
                 await ExecuteToCompletionAsync(command, events.Writer, budget).ConfigureAwait(false);
             }
