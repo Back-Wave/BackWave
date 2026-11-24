@@ -59,6 +59,9 @@ public sealed record WorkloadSpec
     /// </summary>
     public int? PumpPoolSize { get; init; }
 
+    /// <summary>The BackWave pump's UnwrittenOutcomeSlots. Defaults to 0, the product default.</summary>
+    public int PumpUnwrittenOutcomeSlots { get; init; }
+
     /// <summary>
     /// Number of independent worker-group pumps the BackWave target runs in one process, all serving the
     /// same queue. Defaults to 1; raising it measures whether in-process pump fan-out scales throughput the

@@ -54,6 +54,7 @@ public abstract class BackWaveTarget : IBenchmarkTarget
                 // Neutralized config — matched against the competitor so the comparison is honest.
                 ["worker-pool-size"] = workers.PoolSize.ToString(),
                 ["worker-groups"] = _runWorkerGroupCount.ToString(),
+                ["unwritten-outcome-slots"] = workers.UnwrittenOutcomeSlots.ToString(),
                 ["poll-interval"] = $"{workers.PollInterval.TotalMilliseconds:0}ms",
                 ["db-connection-pool-size"] = "100 (ADO.NET default)",
                 ["retry-policy"] = "no retries exercised (100% happy-path workload)",
@@ -346,7 +347,7 @@ public abstract class BackWaveTarget : IBenchmarkTarget
         // disposes the singletons it owns when the per-run host is torn down, so it must not own the
         // harness's long-lived store used for enqueue/reset/collect. Both point at the same database.
         // Remember the options this run actually used so TuningDials reports the swept pool size, not the default.
-        _runWorkerOptions = WorkerOptions(spec.PumpPoolSize);
+        _runWorkerOptions = WorkerOptions(spec.PumpPoolSize) with { UnwrittenOutcomeSlots = spec.PumpUnwrittenOutcomeSlots };
         _runWorkerGroupCount = Math.Max(1, spec.WorkerGroupCount);
         builder.Services.AddBackWave(backwave =>
         {
