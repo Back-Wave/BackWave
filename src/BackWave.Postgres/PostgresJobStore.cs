@@ -46,6 +46,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     // The one-statement claim (TryClaimInOneStatementAsync), fixed by the history policy at construction.
     private readonly string _claimInOneStatement;
 
+    // The one-round-trip outcome write (TryReportOutcomesInOneRoundTripAsync), fixed the same way.
+    private readonly string _reportOutcomesInOneRoundTrip;
+
     // Per-Queue unlimited-Queue cache (issue 0170). The Concurrency Limit (I3) and Paused flag (§5.8)
     // share one queue_limits row, mutated only by rare operator actions; a claim on a limited or paused
     // Queue must lock and read that row, but the common unlimited, unpaused Queue need not pay the
@@ -105,6 +108,20 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
               {TransitionLogCtes("leased")}
               SELECT * FROM claimed
               """;
+        _reportOutcomesInOneRoundTrip = $"""
+            {LockOutcomeRows};
+            WITH d AS (SELECT * FROM {OutcomeRows}),
+            gate AS (
+                SELECT EXISTS (
+                    SELECT 1 FROM backwave.job_parents p JOIN d ON p.parent_id = d.job_id WHERE d.state <> 0
+                ) AS has_children
+            ),
+            {OutcomeWrite}
+            {(_historyPolicy == JobHistoryPolicy.Off ? "" : "," + TransitionLogCtes("written"))}
+            SELECT w.job_id, w.state FROM written w
+            UNION ALL
+            SELECT NULL, NULL FROM gate WHERE gate.has_children
+            """;
     }
 
     // The one place a Postgres command is built, so the configured schema is swapped into every query
@@ -955,6 +972,147 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             (states[i], causes[i], dues[i], terminalAts[i]) = target;
         }
 
+        var vector = new OutcomeVector(ids, workers, attempts, states, causes, dues, terminalAts);
+        var matched = NeedsPerRowWrites(batch)
+            ? null
+            : await TryReportOutcomesInOneRoundTripAsync(batch, vector, now, cancellationToken).ConfigureAwait(false);
+        matched ??= await ReportOutcomesInTransactionAsync(batch, vector, now, cancellationToken).ConfigureAwait(false);
+
+        // One result per input row, in input order, keyed by job id: matched ⇒ Applied, else StaleLease.
+        var results = new OutcomeReportResult[count];
+        for (var i = 0; i < count; i++)
+        {
+            results[i] = new OutcomeReportResult(
+                batch[i].JobId,
+                matched.ContainsKey(batch[i].JobId) ? OutcomeResult.Applied : OutcomeResult.StaleLease);
+        }
+        return results;
+    }
+
+    // The set-valued payload of a batched outcome write, one entry per batch row in batch order.
+    private sealed record OutcomeVector(
+        Guid[] Ids, string[] Workers, int[] Attempts, int[] States, string?[] Causes,
+        DateTimeOffset?[] Dues, DateTimeOffset?[] TerminalAts)
+    {
+        public void AddTo(NpgsqlCommand command)
+        {
+            command.Parameters.AddWithValue("ids", Ids);
+            command.Parameters.AddWithValue("workers", Workers);
+            command.Parameters.AddWithValue("attempts", Attempts);
+            command.Parameters.AddWithValue("states", States);
+            command.Parameters.AddWithValue("causes", Causes);
+            command.Parameters.AddWithValue("dues", Dues);
+            command.Parameters.AddWithValue("terminalAts", TerminalAts);
+        }
+    }
+
+    // Output blobs and Tag deltas are per-row statements, so a batch carrying any of them takes the
+    // transaction.
+    private static bool NeedsPerRowWrites(IReadOnlyList<OutcomeReport> batch)
+    {
+        foreach (var row in batch)
+        {
+            if ((row.Outcome is JobOutcome.Success && row.Output is not null) || row.AddedTags is { Count: > 0 })
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The outcome write in one round trip: two statements in one command, which Npgsql runs as one
+    // implicit transaction that commits when the server reaches the end of the command. The first takes
+    // the row lock of every row the fence will match, in id order. The second then reads a snapshot taken
+    // after those locks, so no other transaction can still be changing these rows under it: a child
+    // enqueue that held a parent's lock has committed its edge into this snapshot, and one that comes
+    // later waits on the lock and then sees the parent terminal. The second statement writes only when
+    // no row it would make terminal parents a Dependency, because the latch cascade (invariant I2) must
+    // commit with the terminal write. Otherwise it writes nothing, returns null, and the caller runs the
+    // batch in a transaction that cascades.
+    private async ValueTask<Dictionary<Guid, int>?> TryReportOutcomesInOneRoundTripAsync(
+        IReadOnlyList<OutcomeReport> batch, OutcomeVector vector, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        if (Array.Exists(vector.States, state => state != 0))
+        {
+            // No seam inside one round trip, so the failpoint fires before it: a crash here leaves nothing.
+            await FailpointAsync("report-outcome", cancellationToken).ConfigureAwait(false);
+        }
+
+        var details = new string?[batch.Count];
+        for (var i = 0; i < batch.Count; i++)
+        {
+            details[i] = batch[i].Outcome is JobOutcome.Failure ? TransitionDetail(batch[i].FailureDetail) : null;
+        }
+
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var write = Cmd(_reportOutcomesInOneRoundTrip, connection);
+        vector.AddTo(write);
+        write.Parameters.AddWithValue("details", details);
+        write.Parameters.AddWithValue("now", now.ToUniversalTime());
+        write.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
+
+        var matched = new Dictionary<Guid, int>();
+        var gated = false;
+        await using (var reader = await write.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
+        {
+            await reader.NextResultAsync(cancellationToken).ConfigureAwait(false); // past the lock statement
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (reader.IsDBNull(0))
+                {
+                    gated = true;
+                    continue;
+                }
+                matched[reader.GetGuid(0)] = reader.GetInt32(1);
+            }
+        }
+        return gated ? null : matched;
+    }
+
+    // The fence every outcome write applies to each row independently (Effect-Once): the row is still
+    // leased to the reporting worker, at the reported attempt, and the lease is live.
+    private const string OutcomeFence =
+        "j.job_id = d.job_id AND j.state = 2 AND j.lease_owner = d.worker AND j.attempt = d.attempt AND j.lease_expiry > @now";
+
+    private const string OutcomeRows =
+        """
+        unnest(@ids::uuid[], @workers::text[], @attempts::int[], @states::int[], @causes::text[],
+               @dues::timestamptz[], @terminalAts::timestamptz[], @details::text[])
+            WITH ORDINALITY AS d(job_id, worker, attempt, state, cause, due, terminal_at, detail, ord)
+        """;
+
+    private const string LockOutcomeRows =
+        $"""
+        SELECT count(*) FROM (
+            SELECT 1 FROM backwave.jobs j, unnest(@ids::uuid[], @workers::text[], @attempts::int[]) AS d(job_id, worker, attempt)
+            WHERE {OutcomeFence}
+            ORDER BY j.job_id
+            FOR NO KEY UPDATE OF j
+        ) locked
+        """;
+
+    // The same column writes as the transaction's UPDATE, gated on the child-edge check.
+    private const string OutcomeWrite =
+        $"""
+        written AS (
+            UPDATE backwave.jobs j
+            SET state = d.state,
+                lease_owner = NULL,
+                lease_expiry = NULL,
+                terminal_at = d.terminal_at,
+                terminal_cause = d.cause,
+                due_time = COALESCE(d.due, j.due_time),
+                cancel_requested = CASE WHEN d.state = 4 THEN false ELSE j.cancel_requested END,
+                retry_cause = CASE WHEN d.state = 0 THEN 1 ELSE j.retry_cause END
+            FROM d, gate
+            WHERE NOT gate.has_children AND {OutcomeFence}
+            RETURNING j.job_id, j.state, j.attempt, d.detail, d.ord
+        )
+        """;
+
+    private async ValueTask<Dictionary<Guid, int>> ReportOutcomesInTransactionAsync(
+        IReadOnlyList<OutcomeReport> batch, OutcomeVector vector, DateTimeOffset now, CancellationToken cancellationToken)
+    {
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
@@ -985,14 +1143,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             """,
             connection, transaction))
         {
-            update.Parameters.AddWithValue("ids", ids);
-            update.Parameters.AddWithValue("workers", workers);
-            update.Parameters.AddWithValue("attempts", attempts);
-            update.Parameters.AddWithValue("states", states);
-            update.Parameters.AddWithValue("causes", causes);
-            update.Parameters.AddWithValue("dues", dues);
-            update.Parameters.AddWithValue("terminalAts", terminalAts);
-            update.Parameters.AddWithValue("now", nowUtc);
+            vector.AddTo(update);
+            update.Parameters.AddWithValue("now", now.ToUniversalTime());
             await using var reader = await update.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -1087,16 +1239,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         }
 
         await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
-
-        // One result per input row, in input order, keyed by job id: matched ⇒ Applied, else StaleLease.
-        var results = new OutcomeReportResult[count];
-        for (var i = 0; i < count; i++)
-        {
-            results[i] = new OutcomeReportResult(
-                batch[i].JobId,
-                matched.ContainsKey(batch[i].JobId) ? OutcomeResult.Applied : OutcomeResult.StaleLease);
-        }
-        return results;
+        return matched;
     }
 
     /// <summary>
@@ -2002,10 +2145,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             ids[i] = rows[i].JobId;
             states[i] = (int)rows[i].State;
             attempts[i] = rows[i].Attempt;
-            // Transitions records the row but never the detail; the full rung clamps and keeps it.
-            details[i] = _historyPolicy == JobHistoryPolicy.Transitions
-                ? null
-                : _options.Bounds.ClampFailureDetail(rows[i].FailureDetail);
+            details[i] = TransitionDetail(rows[i].FailureDetail);
         }
 
         // RETURNING the assigned ordinals lets the prune be skipped entirely (below) when no job in
@@ -2061,6 +2201,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         prune.Parameters.AddWithValue("cap", _options.Bounds.MaxTransitionsPerJob);
         await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    // The Failure Detail a transition row stores: Transitions records the row but never the detail; the
+    // full rung clamps and keeps it.
+    private string? TransitionDetail(string? failureDetail) => _historyPolicy == JobHistoryPolicy.Transitions
+        ? null
+        : _options.Bounds.ClampFailureDetail(failureDetail);
 
     // ── §5.7 Schedules & minting ────────────────────────────────────────────────
 

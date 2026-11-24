@@ -163,12 +163,12 @@ public sealed class PostgresTransitionPruneTests
     }
 
     [Fact]
-    public async Task A_batch_pays_for_the_prune_only_when_a_job_reaches_the_cap()
+    public async Task A_batch_that_takes_a_job_past_the_cap_prunes_it_in_the_same_round_trip()
     {
         // The round-trip half of the claim, measured against itself: two batched reports of the SAME
         // shape - two jobs, both retried, no output and no tags - where the only difference is that one
-        // job crossed the cap in the second. The gap between them is the whole cost of the prune, and it
-        // has to be exactly one statement.
+        // job crossed the cap in the second. The prune is a CTE of the write's own statement, so the gap
+        // between them is zero: both cost the one command the write always sends.
         await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
         var cap = store.Bounds.MaxTransitionsPerJob;
         var churner = Guid.NewGuid();
@@ -184,7 +184,7 @@ public sealed class PostgresTransitionPruneTests
         await FillTransitionsUpToAsync(churner, cap - 1);
         var atCap = await ReportRetryBatchAsync(store, next);
 
-        Assert.Equal(underCap + 1, atCap);
+        Assert.Equal((1, 1), (underCap, atCap));
         Assert.Equal(cap, (await store.GetJobHistoryAsync(churner)).Count);
     }
 

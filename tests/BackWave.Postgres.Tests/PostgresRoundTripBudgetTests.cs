@@ -51,7 +51,7 @@ public sealed class PostgresRoundTripBudgetTests
 
     private static readonly Budget ReportOutcomes = new(
         "ReportOutcomesAsync of 32 succeeded rows",
-        Statements: 3, Commits: 1);
+        Statements: 1, Commits: 0);
 
     private static readonly Budget ReportOutcomesWithOutput = new(
         "ReportOutcomesAsync of 32 succeeded rows, every one carrying job output",
@@ -161,17 +161,14 @@ public sealed class PostgresRoundTripBudgetTests
         // The plain drain: every row succeeded, none carries output or a tag delta, so nothing but the
         // fenced state write and the transition log runs.
         //
-        // 1 fenced batch UPDATE ... RETURNING + 1 batched transition insert + 1 child-latch probe = 3,
-        // independent of batch size. The UPDATE joins the outcome vector in through unnest() and applies
-        // the per-(worker, attempt) Effect-Once fence to every row independently, and its RETURNING
-        // reports which rows matched - so unlike Oracle, which has no set-valued RETURNING and pays an
-        // extra FOR UPDATE read to recover the same verdict, there is nothing to read back.
-        //
-        // The third statement is the child-latch probe: every row here is Succeeded, hence terminal,
-        // so the adapter asks once - SELECT DISTINCT parent_id ... = ANY(@ids) - whether any of these
-        // 32 ids parents a dependency. It finds none, and the per-parent cascade never runs. A batch
-        // of pure retries would not pay it at all: a retry row stays non-terminal and gates nothing.
-        // As above, no job in this batch is near the cap, so the batch recorder issues no prune DELETE.
+        // 1 command and no COMMIT, independent of batch size: two statements that Npgsql runs as one
+        // implicit transaction. The first locks the 32 fenced rows. The second, in a snapshot taken
+        // after those locks, checks once whether any row it makes terminal parents a Dependency, and
+        // since none does, writes the outcomes and their transitions as CTEs of one statement. The
+        // UPDATE joins the outcome vector in through unnest() and applies the per-(worker, attempt)
+        // Effect-Once fence to every row independently, and its RETURNING reports which rows matched -
+        // so unlike Oracle, which has no set-valued RETURNING and pays an extra FOR UPDATE read to
+        // recover the same verdict, there is nothing to read back.
         var batch = claimed
             .Select(job => new OutcomeReport(job.JobId, "budget-worker", job.Attempt, new JobOutcome.Success()))
             .ToArray();
