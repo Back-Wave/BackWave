@@ -176,4 +176,50 @@ public class NodeDriverUnwrittenOutcomeTests
         Assert.Equal(expected.Order(), heartbeat.JobIds.Order());
         Assert.DoesNotContain(write.Outcomes[0].JobId, heartbeat.JobIds);
     }
+
+    [Fact]
+    public void WithHeadroom_AHintDuringAnEmptyClaim_ClaimsAtOnce_BesideALongRunningJob()
+    {
+        var driver = Driver(unwrittenOutcomeSlots: 4);
+        Assert.Equal(4, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
+        driver.Step(new NodeEvent.ClaimCompleted(Jobs(1), T0));
+        Assert.Equal(3, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
+        driver.Step(new NodeEvent.PollDue(T0));
+
+        var landed = driver.Step(new NodeEvent.ClaimCompleted([], T0));
+
+        Assert.Equal(3, Claim(landed)?.MaxJobs);
+    }
+
+    [Fact]
+    public void WithHeadroom_TheJobsOfAShortClaim_RepollWhenTheyFinish_EvenBelowAFullClaim()
+    {
+        var driver = Driver(unwrittenOutcomeSlots: 4);
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.ClaimCompleted(Jobs(1), T0));
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.PollDue(T0));
+        var shortJob = Assert.Single(Jobs(1));
+        Assert.Null(Claim(driver.Step(new NodeEvent.ClaimCompleted([shortJob], T0))));
+
+        Assert.Contains(Finish(driver, shortJob), command => command is Command.RequestPoll);
+        Assert.Equal(3, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
+    }
+
+    [Fact]
+    public void WithHeadroom_TheJobsOfAShortClaim_RepollWhenTheirLeasesAreLost_EvenBelowAFullClaim()
+    {
+        var driver = Driver(unwrittenOutcomeSlots: 4);
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.ClaimCompleted(Jobs(1), T0));
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.PollDue(T0));
+        var lostJob = Assert.Single(Jobs(1));
+        driver.Step(new NodeEvent.ClaimCompleted([lostJob], T0));
+
+        var heartbeat = driver.Step(new NodeEvent.HeartbeatCompleted([new HeartbeatResult(lostJob.JobId, Renewed: false, CancelRequested: false)], T0));
+
+        Assert.Contains(heartbeat, command => command is Command.RequestPoll);
+        Assert.Equal(3, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
+    }
 }

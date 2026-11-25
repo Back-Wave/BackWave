@@ -35,6 +35,12 @@ internal sealed class NodeDriver(NodeOptions options)
 
     private int _pollsFromBeforeClaim;
 
+    /// <summary>
+    /// The jobs of a landed claim, still running, that the polls which waited on that claim now wait on. Null
+    /// when no poll waits this way. See <see cref="TakeWaitingPass"/>.
+    /// </summary>
+    private HashSet<Guid>? _passWaitsOn;
+
     /// <summary>When maintenance last ran; null until the first poll. Throttles the sweep.</summary>
     private DateTimeOffset? _lastMaintenance;
 
@@ -123,7 +129,7 @@ internal sealed class NodeDriver(NodeOptions options)
                     ChargeIssued(nextBatch);
                     executions.Add(Issue(nextBatch));
                 }
-                else if (RunWaitingClaimPass(cameBackFull: claim.Jobs.Count == bound) is { } waitingPass)
+                else if (RunWaitingClaimPass(claim.Jobs, cameBackFull: claim.Jobs.Count == bound) is { } waitingPass)
                 {
                     executions.Add(waitingPass);
                 }
@@ -171,6 +177,7 @@ internal sealed class NodeDriver(NodeOptions options)
                     if (!result.Renewed)
                     {
                         _executing.Remove(result.JobId);
+                        _passWaitsOn?.Remove(result.JobId);
                         reactions.Add(new Command.AbandonExecution(result.JobId));
                     }
                     else if (result.CancelRequested)
@@ -178,15 +185,19 @@ internal sealed class NodeDriver(NodeOptions options)
                         reactions.Add(new Command.SignalCancellation(result.JobId));
                     }
                 }
+                if (TakeWaitingPass())
+                {
+                    reactions.Add(new Command.RequestPoll(heartbeat.Now));
+                }
                 return reactions;
 
-            case NodeEvent.OutcomeBatchFaulted:
+            case NodeEvent.OutcomeBatchFaulted faulted:
                 _outcomes.Faulted();
-                return [];
+                return TakeWaitingPass() ? [new Command.RequestPoll(faulted.Now)] : [];
 
-            case NodeEvent.OutcomeBatchNotIssued:
+            case NodeEvent.OutcomeBatchNotIssued notIssued:
                 _outcomes.NotIssued();
-                return [];
+                return TakeWaitingPass() ? [new Command.RequestPoll(notIssued.Now)] : [];
 
             case NodeEvent.OutcomeBatchReported reported:
             {
@@ -202,6 +213,10 @@ internal sealed class NodeDriver(NodeOptions options)
                     {
                         answered.Add(new Command.RequestPoll(reported.Now));
                     }
+                }
+                if (answered.Count == 0 && TakeWaitingPass())
+                {
+                    answered.Add(new Command.RequestPoll(reported.Now));
                 }
                 if (deferredFlush is not null)
                 {
@@ -224,19 +239,20 @@ internal sealed class NodeDriver(NodeOptions options)
     /// flush trigger fires: the buffer reaches <see cref="NodeOptions.MaxOutcomeBatch"/>, or the node
     /// just went idle (the drain-tail, so a lone outcome never waits a whole poll interval before releasing its
     /// dependents). The poll and heartbeat ticks are the third trigger, handled in their own cases. It re-polls
-    /// when it makes <see cref="CanTakeFullClaim"/> true.
+    /// when it makes <see cref="CanTakeFullClaim"/> true, or when it is the last job a waiting pass waits on.
     /// </summary>
     private IReadOnlyList<Command> Finish(JobRecord job, JobOutcome outcome, DateTimeOffset now)
     {
         var couldTakeFullClaim = CanTakeFullClaim;
         _executing.Remove(job.JobId);
+        _passWaitsOn?.Remove(job.JobId);
         _outcomes.Add(new ReportedOutcome(job.JobId, options.WorkerId, job.Attempt, outcome));
         var commands = new List<Command>(2);
         if ((_outcomes.IsBufferFull || _executing.Count == 0) && _outcomes.TryFlush() is { } flush)
         {
             commands.Add(flush);
         }
-        if (!couldTakeFullClaim && CanTakeFullClaim)
+        if ((!couldTakeFullClaim && CanTakeFullClaim) || TakeWaitingPass())
         {
             commands.Add(new Command.RequestPoll(now));
         }
@@ -295,6 +311,7 @@ internal sealed class NodeDriver(NodeOptions options)
         {
             return null;
         }
+        _passWaitsOn = null;
         if (_roundRobin is null)
         {
             return Issue(new Command.ClaimBatch(options.WorkerId, options.Policy.Queues, available, options.LeaseDuration));
@@ -347,12 +364,29 @@ internal sealed class NodeDriver(NodeOptions options)
     private bool CanTakeFullClaim => FreeSlots >= FullClaim;
 
     /// <summary>
-    /// Whether, with the headroom open, the running jobs hold slots that their finishes give back. A claim that
-    /// just landed leaves its own jobs running, so a pass chained at once would claim only the slots they leave
-    /// and split the pool into two cohorts again.
+    /// Whether the polls that waited on a landed claim wait on its jobs instead of chaining a pass now: the
+    /// headroom is open, the claim returned jobs, and the pool cannot take a full claim. Those jobs give their
+    /// slots back when they finish, so a pass chained at once would claim only the slots they leave and split
+    /// the pool into two cohorts again.
     /// </summary>
-    private bool RunningJobsCanFreeAFullClaim =>
-        _outcomes.OpenHeadroom > 0 && _executing.Count > 0 && !CanTakeFullClaim;
+    private bool PassWaitsOnLandedJobs(IReadOnlyList<JobRecord> landed) =>
+        _outcomes.OpenHeadroom > 0 && landed.Count > 0 && !CanTakeFullClaim;
+
+    /// <summary>
+    /// Whether the pass that waits on a landed claim's jobs is due: they have all finished, or left, and a slot is
+    /// free. It is paid once, as a re-poll, even when the free slots are below a full claim, because a job that
+    /// runs on from an earlier claim can keep the pool from a full claim for as long as it runs. Any claim pass that
+    /// starts first pays it as well.
+    /// </summary>
+    private bool TakeWaitingPass()
+    {
+        if (_passWaitsOn is not { Count: 0 } || FreeSlots <= 0)
+        {
+            return false;
+        }
+        _passWaitsOn = null;
+        return true;
+    }
 
     private Command.ClaimBatch Issue(Command.ClaimBatch batch)
     {
@@ -367,12 +401,21 @@ internal sealed class NodeDriver(NodeOptions options)
         return bound;
     }
 
-    private Command.ClaimBatch? RunWaitingClaimPass(bool cameBackFull)
+    private Command.ClaimBatch? RunWaitingClaimPass(IReadOnlyList<JobRecord> landed, bool cameBackFull)
     {
         var waiting = _pollsDuringClaim + (cameBackFull ? _pollsFromBeforeClaim : 0);
         _pollsDuringClaim = 0;
         _pollsFromBeforeClaim = 0;
-        if (waiting == 0 || RunningJobsCanFreeAFullClaim || StartClaimPass() is not { } pass)
+        if (waiting == 0)
+        {
+            return null;
+        }
+        if (PassWaitsOnLandedJobs(landed))
+        {
+            _passWaitsOn = [.. landed.Select(job => job.JobId)];
+            return null;
+        }
+        if (StartClaimPass() is not { } pass)
         {
             return null;
         }
