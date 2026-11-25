@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using BackWave.Diagnostics;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
@@ -15,7 +16,7 @@ namespace BackWave.Sqlite;
 /// </summary>
 // The store drives migration/verification itself from EnsureReady (AutoMigrate is sugar over
 // MigrateAsync). Mirrors PostgresMigrator / SqlServerMigrator. ADR 0019, issue 0098.
-public static class SqliteMigrator
+public static partial class SqliteMigrator
 {
     /// <summary>The schema version this build of the adapter requires the database to be at.</summary>
     public const int ExpectedSchemaVersion = 5;
@@ -133,8 +134,10 @@ public static class SqliteMigrator
     // transaction. Shared by the coordinated (in-transaction) and opt-out (autocommit) paths. The WAL
     // pragma is intentionally NOT here - it runs once, before, outside any transaction. A script is
     // step N of the schema (its position in version order), and a step at or below the version the file
-    // is already stamped at is skipped: SQLite has no ADD COLUMN IF NOT EXISTS, so a step that adds a
-    // column cannot be made safe to run twice in SQL alone.
+    // is already stamped at is skipped, so a newer-stamped file is never stamped back down. SQLite has
+    // no ADD COLUMN IF NOT EXISTS, so each step that does run first drops every ADD COLUMN whose column
+    // the table already has: a file stamped below its real schema, or with no version row, re-runs
+    // cleanly.
     private static async Task ApplyScriptsAsync(
         SqliteConnection connection, SqliteTransaction? transaction, SchemaRewriter rewriter,
         CancellationToken cancellationToken)
@@ -151,16 +154,52 @@ public static class SqliteMigrator
         {
             await using var stream = assembly.GetManifestResourceStream(script)!;
             using var reader = new StreamReader(stream);
-            var sql = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
+            var sql = rewriter.Rewrite(await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false));
+
+            var present = new HashSet<(string Table, string Column)>();
+            foreach (var (table, column) in ColumnAdds(sql))
+            {
+                if (await ColumnExistsAsync(connection, transaction, table, column, cancellationToken).ConfigureAwait(false))
+                {
+                    present.Add((table, column));
+                }
+            }
 
             await using var command = connection.CreateCommand();
             command.Transaction = transaction;
-            command.CommandText = rewriter.Rewrite(sql);
+            command.CommandText = WithoutColumnAdds(sql, present);
             // uncounted round trip: schema DDL. The migration scripts run at boot on the migrator's
             // connection, outside every operation the budgets measure, and their cost is a one-time
             // constant per database rather than a cost per row.
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    private static IEnumerable<(string Table, string Column)> ColumnAdds(string sql)
+        => ColumnAddPattern().Matches(sql).Select(match => (match.Groups["table"].Value, match.Groups["column"].Value));
+
+    private static string WithoutColumnAdds(string sql, IReadOnlySet<(string Table, string Column)> present)
+        => ColumnAddPattern().Replace(
+            sql,
+            match => present.Contains((match.Groups["table"].Value, match.Groups["column"].Value)) ? "" : match.Value);
+
+    [GeneratedRegex(
+        @"^[ \t]*ALTER[ \t]+TABLE[ \t]+(?<table>\w+)[ \t]+ADD[ \t]+COLUMN[ \t]+(?<column>\w+)[^;]*;",
+        RegexOptions.Multiline | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex ColumnAddPattern();
+
+    private static async Task<bool> ColumnExistsAsync(
+        SqliteConnection connection, SqliteTransaction? transaction, string table, string column,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT count(*) FROM pragma_table_info($table) WHERE name = $column COLLATE NOCASE";
+        command.Parameters.AddWithValue("$table", table);
+        command.Parameters.AddWithValue("$column", column);
+        // uncounted round trip: migration's column probe before a schema step, on the migrator's
+        // connection at boot, never reached from a store operation.
+        return (long)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))! > 0;
     }
 
     // True when the deployed schema is at ExpectedSchemaVersion or newer. Probes for the version table
