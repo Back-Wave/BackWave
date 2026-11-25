@@ -1,9 +1,12 @@
+using System.Diagnostics;
 using BackWave.Hosting;
 using BackWave.Pro.Mcp.Tools;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Protocol;
 
 namespace BackWave.Pro.Mcp;
@@ -60,82 +63,101 @@ public static class BackWaveProMcpExtensions
             // The permission callbacks receive the live HttpContext; under streamable HTTP every
             // tool call is its own POST, so the accessor is correct per call.
             services.AddHttpContextAccessor();
-            // The mount does its own UseRouting/UseEndpoints (see UseBackWaveProMcp), which needs
-            // routing services even in hosts that never call AddRouting themselves.
-            services.AddRouting();
 
-            services.AddMcpServer(server => server.ServerInfo = new Implementation
-                {
-                    Name = "BackWave",
-                    Title = "BackWave job processing",
-                    Version = typeof(BackWaveProMcpExtensions).Assembly.GetName().Version?.ToString(3) ?? "0.0.0",
-                })
-                // Stateless: no session handshake required, no per-session server state — any node
-                // serves any request. The tool list is therefore fixed per node at startup.
-                .WithHttpTransport(transport => transport.Stateless = true)
-                // Explicit tool registration only — never assembly scanning. Each tool is registered
-                // with source-generated JSON options (BackWaveProMcpJson) so schema generation and
-                // result (de)serialization resolve without reflection, keeping the surface Native-AOT
-                // safe. The generic WithTools<T> closes the type at compile time, so the invocation
-                // path is a statically-known MethodInfo (no dynamic code).
-                .WithTools<QueueTools>(BackWaveProMcpJson.ToolOptions)
-                .WithTools<JobTools>(BackWaveProMcpJson.ToolOptions)
-                .WithTools<ReadTools>(BackWaveProMcpJson.ToolOptions)
-                .WithTools<ObserverTools>(BackWaveProMcpJson.ToolOptions)
-                .WithTools<SensitiveDataTools>(BackWaveProMcpJson.ToolOptions)
-                .WithTools<WriteTools>(BackWaveProMcpJson.ToolOptions)
-                .WithTools<WorkflowTools>(BackWaveProMcpJson.ToolOptions)
-                .WithRequestFilters(filters =>
-                {
-                    // The view gate fronts the whole surface: a denied request sees an empty tool
-                    // list, and a direct call (the backstop) gets a tool-execution error. Per-tool
-                    // gates layer onto this pipeline below via McpToolGates (0227); sensitive-data
-                    // locks (0226) slot into the same map.
-                    filters.AddListToolsFilter(next => async (context, cancellationToken) =>
-                        await ViewAllowedAsync(context.Services, options).ConfigureAwait(false)
-                            ? await next(context, cancellationToken).ConfigureAwait(false)
-                            : new ListToolsResult { Tools = [] });
-
-                    filters.AddCallToolFilter(next => async (context, cancellationToken) =>
-                        await ViewAllowedAsync(context.Services, options).ConfigureAwait(false)
-                            ? await next(context, cancellationToken).ConfigureAwait(false)
-                            : new CallToolResult
-                            {
-                                IsError = true,
-                                Content =
-                                [
-                                    new TextContentBlock
-                                    {
-                                        Text = "Permission denied: this request may not view the BackWave "
-                                            + "tool surface. The host's AuthorizeView callback denied it; "
-                                            + "authenticate the request to satisfy the host's policy, or have "
-                                            + "the host grant it in BackWaveProMcpOptions.AuthorizeView.",
-                                    },
-                                ],
-                            });
-
-                    // The generalized per-tool gating (0227): the list filter removes every tool
-                    // whose own gate denies this request — an unconfigured host presents the clean
-                    // read-only list, and granting one options callback surfaces exactly its
-                    // tool(s) — and the call filter is the backstop for a client that ignores (or
-                    // cached) the list. The name→gate mapping lives in McpToolGates; tools with no
-                    // entry there (the plain reads) pass through on the view gate alone.
-                    filters.AddListToolsFilter(next => async (context, cancellationToken) =>
-                    {
-                        var result = await next(context, cancellationToken).ConfigureAwait(false);
-                        return await McpToolGates
-                            .FilterListAsync(result, HttpContextOf(context.Services), options)
-                            .ConfigureAwait(false);
-                    });
-
-                    filters.AddCallToolFilter(next => async (context, cancellationToken) =>
-                        await McpToolGates
-                            .AllowsAsync(context.Params?.Name, HttpContextOf(context.Services), options)
-                            .ConfigureAwait(false)
-                            ? await next(context, cancellationToken).ConfigureAwait(false)
-                            : McpToolGates.DeniedResult(context.Params?.Name));
-                });
+            // The SDK keeps one MCP server per service collection, so registering it here would
+            // merge it with a host's own AddMcpServer. The server lives in a child provider that
+            // the mounts route through instead; the host disposes it with its own container.
+            services.AddSingleton(host => new ServerServices(BuildServerServices(host, options)));
         });
+    }
+
+    // MapMcp resolves the SDK's handler and server options from this provider, but in stateless
+    // mode each request's server runs on the host's request services, so the tools and the
+    // permission callbacks still resolve the host's BackWave services and IHttpContextAccessor.
+    private static ServiceProvider BuildServerServices(IServiceProvider host, BackWaveProMcpOptions options)
+    {
+        var services = new ServiceCollection();
+        // The SDK's HTTP handler and the branch's endpoint routing use the host's logging,
+        // lifetime, and diagnostics.
+        services.AddSingleton(host.GetRequiredService<ILoggerFactory>());
+        services.AddLogging();
+        services.AddSingleton(host.GetRequiredService<IHostApplicationLifetime>());
+        services.AddSingleton(host.GetRequiredService<DiagnosticListener>());
+        // The mount does its own UseRouting/UseEndpoints (see UseBackWaveProMcp).
+        services.AddRouting();
+
+        services.AddMcpServer(server => server.ServerInfo = new Implementation
+            {
+                Name = "BackWave",
+                Title = "BackWave job processing",
+                Version = typeof(BackWaveProMcpExtensions).Assembly.GetName().Version?.ToString(3) ?? "0.0.0",
+            })
+            // Stateless: no session handshake required, no per-session server state — any node
+            // serves any request. The tool list is therefore fixed per node at startup.
+            .WithHttpTransport(transport => transport.Stateless = true)
+            // Explicit tool registration only — never assembly scanning. Each tool is registered
+            // with source-generated JSON options (BackWaveProMcpJson) so schema generation and
+            // result (de)serialization resolve without reflection, keeping the surface Native-AOT
+            // safe. The generic WithTools<T> closes the type at compile time, so the invocation
+            // path is a statically-known MethodInfo (no dynamic code).
+            .WithTools<QueueTools>(BackWaveProMcpJson.ToolOptions)
+            .WithTools<JobTools>(BackWaveProMcpJson.ToolOptions)
+            .WithTools<ReadTools>(BackWaveProMcpJson.ToolOptions)
+            .WithTools<ObserverTools>(BackWaveProMcpJson.ToolOptions)
+            .WithTools<SensitiveDataTools>(BackWaveProMcpJson.ToolOptions)
+            .WithTools<WriteTools>(BackWaveProMcpJson.ToolOptions)
+            .WithTools<WorkflowTools>(BackWaveProMcpJson.ToolOptions)
+            .WithRequestFilters(filters =>
+            {
+                // The view gate fronts the whole surface: a denied request sees an empty tool
+                // list, and a direct call (the backstop) gets a tool-execution error. Per-tool
+                // gates layer onto this pipeline below via McpToolGates (0227); sensitive-data
+                // locks (0226) slot into the same map.
+                filters.AddListToolsFilter(next => async (context, cancellationToken) =>
+                    await ViewAllowedAsync(context.Services, options).ConfigureAwait(false)
+                        ? await next(context, cancellationToken).ConfigureAwait(false)
+                        : new ListToolsResult { Tools = [] });
+
+                filters.AddCallToolFilter(next => async (context, cancellationToken) =>
+                    await ViewAllowedAsync(context.Services, options).ConfigureAwait(false)
+                        ? await next(context, cancellationToken).ConfigureAwait(false)
+                        : new CallToolResult
+                        {
+                            IsError = true,
+                            Content =
+                            [
+                                new TextContentBlock
+                                {
+                                    Text = "Permission denied: this request may not view the BackWave "
+                                        + "tool surface. The host's AuthorizeView callback denied it; "
+                                        + "authenticate the request to satisfy the host's policy, or have "
+                                        + "the host grant it in BackWaveProMcpOptions.AuthorizeView.",
+                                },
+                            ],
+                        });
+
+                // The generalized per-tool gating (0227): the list filter removes every tool
+                // whose own gate denies this request — an unconfigured host presents the clean
+                // read-only list, and granting one options callback surfaces exactly its
+                // tool(s) — and the call filter is the backstop for a client that ignores (or
+                // cached) the list. The name→gate mapping lives in McpToolGates; tools with no
+                // entry there (the plain reads) pass through on the view gate alone.
+                filters.AddListToolsFilter(next => async (context, cancellationToken) =>
+                {
+                    var result = await next(context, cancellationToken).ConfigureAwait(false);
+                    return await McpToolGates
+                        .FilterListAsync(result, HttpContextOf(context.Services), options)
+                        .ConfigureAwait(false);
+                });
+
+                filters.AddCallToolFilter(next => async (context, cancellationToken) =>
+                    await McpToolGates
+                        .AllowsAsync(context.Params?.Name, HttpContextOf(context.Services), options)
+                        .ConfigureAwait(false)
+                        ? await next(context, cancellationToken).ConfigureAwait(false)
+                        : McpToolGates.DeniedResult(context.Params?.Name));
+            });
+        return services.BuildServiceProvider();
     }
 
     /// <summary>
@@ -181,6 +203,7 @@ public static class BackWaveProMcpExtensions
         // branch, exactly like the dashboard's mount.
         return app.Map(pathPrefix, branch =>
         {
+            branch.ApplicationServices = ServerServicesOf(branch.ApplicationServices);
             branch.UseRouting();
             branch.UseEndpoints(endpoints => endpoints.MapMcp());
         });
@@ -219,7 +242,32 @@ public static class BackWaveProMcpExtensions
                 $"The MCP path prefix must start with '/' (got '{pathPrefix}').", nameof(pathPrefix));
         }
 
-        return endpoints.MapMcp(pathPrefix);
+        return new ServerEndpointRouteBuilder(endpoints, ServerServicesOf(endpoints.ServiceProvider))
+            .MapMcp(pathPrefix);
+    }
+
+    private static IServiceProvider ServerServicesOf(IServiceProvider host)
+        => host.GetService<ServerServices>()?.Provider
+            ?? throw new InvalidOperationException(
+                "The BackWave MCP server is not registered. Call bw.AddMcp() inside the AddBackWave block.");
+
+    private sealed class ServerServices(ServiceProvider provider) : IDisposable, IAsyncDisposable
+    {
+        public IServiceProvider Provider => provider;
+
+        public void Dispose() => provider.Dispose();
+
+        public ValueTask DisposeAsync() => provider.DisposeAsync();
+    }
+
+    private sealed class ServerEndpointRouteBuilder(IEndpointRouteBuilder host, IServiceProvider serverServices)
+        : IEndpointRouteBuilder
+    {
+        public IServiceProvider ServiceProvider => serverServices;
+
+        public ICollection<EndpointDataSource> DataSources => host.DataSources;
+
+        public IApplicationBuilder CreateApplicationBuilder() => host.CreateApplicationBuilder();
     }
 
     // Fail closed when no HttpContext is visible: over the HTTP transport there always is one, so
