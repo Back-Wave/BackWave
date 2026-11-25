@@ -172,7 +172,8 @@ public sealed class OracleRefusedConnectionRecoveryTests(Xunit.Abstractions.ITes
         OutageTestSupport.AssertNotHalted(health, Group);
     }
 
-    // Returns the first degraded cause seen while waiting, or null when the group never degraded.
+    // Returns the first degraded cause seen while waiting, or null when the group never degraded. The read
+    // shares the store's pool, so a drop can fault it too; it retries a transient fault as any caller would.
     private static async Task<string?> WaitForSucceededAsync(OracleJobStore store, BackWaveHealth health, Guid jobId)
     {
         string? cause = null;
@@ -182,7 +183,14 @@ public sealed class OracleRefusedConnectionRecoveryTests(Xunit.Abstractions.ITes
             {
                 cause = degraded;
             }
-            return (await store.GetJobAsync(jobId))?.State == JobState.Succeeded;
+            try
+            {
+                return (await store.GetJobAsync(jobId))?.State == JobState.Succeeded;
+            }
+            catch (OracleException fault) when (store.IsTransientFault(fault))
+            {
+                return false;
+            }
         }, health, Group, $"job {jobId} to reach Succeeded", TimeSpan.FromMilliseconds(5));
         return cause;
     }
