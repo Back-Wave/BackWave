@@ -157,8 +157,7 @@ public static class BackWaveDiagnostics
         "Handler executions currently in flight in a worker group's pool; returns to zero when the pool drains.");
 
     // Finished jobs whose outcome write has not answered: the Driver's buffered outcomes plus the rows of the
-    // write in flight. Each pump adds the change in its count after every Driver step and takes its count back
-    // to zero when it ends. Tagged with the consumer group, like the slot instruments.
+    // write in flight. Tagged with the consumer group, like the slot instruments.
     private static readonly UpDownCounter<long> WorkerOutcomesUnwritten = Meter.CreateUpDownCounter<long>(
         "backwave.worker.outcomes.unwritten", "{outcome}",
         "Finished jobs in a worker group whose outcome write has not completed; returns to zero when the group is idle and its writes have answered.");

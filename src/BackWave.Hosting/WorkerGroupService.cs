@@ -256,6 +256,17 @@ internal sealed class WorkerGroupService(
     // </summary>
     private int _unwrittenOutcomes;
 
+    // <summary>
+    // Steps the Driver, then adds the change in its Unwritten outcome count to backwave.worker.outcomes.unwritten.
+    // Every Driver step of this pump goes through here, and the pump takes its count back to zero when it ends.
+    // </summary>
+    private IReadOnlyList<Command> Step(NodeDriver driver, NodeEvent nodeEvent)
+    {
+        var commands = driver.Step(nodeEvent);
+        ReportUnwrittenOutcomes(driver.UnwrittenOutcomeCount);
+        return commands;
+    }
+
     private void ReportUnwrittenOutcomes(int unwritten)
     {
         BackWaveDiagnostics.RecordUnwrittenOutcomes(options.Name, unwritten - _unwrittenOutcomes);
@@ -421,8 +432,7 @@ internal sealed class WorkerGroupService(
                 }
                 try
                 {
-                    var commands = driver.Step(nodeEvent);
-                    ReportUnwrittenOutcomes(driver.UnwrittenOutcomeCount);
+                    var commands = Step(driver, nodeEvent);
                     var issued = 0;
                     var reached = false;
                     try
@@ -672,8 +682,7 @@ internal sealed class WorkerGroupService(
             {
                 continue;
             }
-            var commands = driver.Step(nodeEvent);
-            ReportUnwrittenOutcomes(driver.UnwrittenOutcomeCount);
+            var commands = Step(driver, nodeEvent);
             foreach (var command in commands)
             {
                 await ExecuteToCompletionAsync(command, events.Writer, budget).ConfigureAwait(false);
