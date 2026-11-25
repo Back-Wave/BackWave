@@ -15,8 +15,9 @@ public sealed record PostgresStoreOptions
     /// <see cref="AutoMigrate"/> is on) create its schema in.
     /// <para>
     /// On a direct connection, add <c>Max Auto Prepare=64</c> to make the store's statements
-    /// server-side prepared statements, so the server skips parse and plan on each call. Leave it out
-    /// behind PgBouncer in transaction mode before 1.21, which breaks with prepared statements.
+    /// server-side prepared statements, so the server skips parse and plan on each call. 64 is how many
+    /// statements Npgsql keeps prepared on each connection. Do not set it behind PgBouncer in
+    /// transaction mode unless PgBouncer is 1.21 or later with <c>max_prepared_statements</c> above 0.
     /// </para>
     /// </summary>
     public required string ConnectionString { get; init; }
