@@ -68,6 +68,7 @@ internal sealed record Scenario
     public bool SabotageSlotDoubleRelease { get; init; }
     public bool SabotagePoolSize { get; init; }
     public bool SabotageUnwrittenOutcomeSlots { get; init; }
+    public bool SabotageHeadroomNeverCloses { get; init; }
     public bool SabotageOutcomeFence { get; init; }
     public bool SabotageBatchFence { get; init; }
     public bool SabotageMigrationSweep { get; init; }
@@ -130,6 +131,7 @@ internal sealed record Scenario
         SabotageSlotDoubleRelease = o.SabotageSlotDoubleRelease,
         SabotagePoolSize = o.SabotagePoolSize,
         SabotageUnwrittenOutcomeSlots = o.SabotageUnwrittenOutcomeSlots,
+        SabotageHeadroomNeverCloses = o.SabotageHeadroomNeverCloses,
         SabotageOutcomeFence = o.SabotageOutcomeFence,
         SabotageBatchFence = o.SabotageBatchFence,
         SabotageMigrationSweep = o.SabotageMigrationSweep,
@@ -189,6 +191,7 @@ internal sealed record Scenario
         SabotageSlotDoubleRelease = SabotageSlotDoubleRelease,
         SabotagePoolSize = SabotagePoolSize,
         SabotageUnwrittenOutcomeSlots = SabotageUnwrittenOutcomeSlots,
+        SabotageHeadroomNeverCloses = SabotageHeadroomNeverCloses,
         SabotageOutcomeFence = SabotageOutcomeFence,
         SabotageBatchFence = SabotageBatchFence,
         SabotageMigrationSweep = SabotageMigrationSweep,

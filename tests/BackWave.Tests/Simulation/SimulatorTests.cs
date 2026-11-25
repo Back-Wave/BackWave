@@ -1720,6 +1720,53 @@ public class SimulatorTests
         Assert.Equal(InvariantId.PerNodeCap, exception.InvariantId);
     }
 
+    private static SimulationOptions HeadroomUnderStoreFaults(ulong seed) => new()
+    {
+        Seed = seed,
+        PoolSize = 4,
+        UnwrittenOutcomeSlots = 4,
+        StoreFaultProbability = 0.1,
+        WorkloadDuration = TimeSpan.FromMinutes(10),
+        MaxExecutionDuration = TimeSpan.FromSeconds(5),
+        MaxStoreLaneLatency = TimeSpan.FromSeconds(3),
+    };
+
+    /// <summary>
+    /// A faulted outcome write closes the headroom until a write lands. Under store faults the nodes claim into
+    /// their headroom between faults, and the per-node-cap oracle checks every claim issued while it is closed.
+    /// </summary>
+    [Theory]
+    [InlineData(2896UL)]
+    [InlineData(2897UL)]
+    [InlineData(2898UL)]
+    public void UnwrittenOutcomeSlots_UnderStoreFaults_ClaimNothingIntoAClosedHeadroom(ulong seed)
+    {
+        var options = HeadroomUnderStoreFaults(seed);
+        var result = new Simulator(options).Run();
+
+        Assert.True(result.ClaimsIntoUnwrittenHeadroom > 0, $"seed {seed}: no claim used the headroom");
+        Assert.True(result.ClaimsWithHeadroomClosed > 0, $"seed {seed}: no claim ran while the headroom was closed");
+        Assert.Equal(200, result.Succeeded + result.DeadLettered + result.Cancelled + result.Quarantined);
+        Assert.Equal(result.FinalJobs, new Simulator(options).Run().FinalJobs);
+    }
+
+    /// <summary>
+    /// Oracle self-test for the closed headroom: the Driver hears a faulted write as one never issued, so it keeps
+    /// claiming into its headroom after the fault. A working oracle must fail the run and print the replay seed.
+    /// </summary>
+    [Theory]
+    [InlineData(2896UL)]
+    [InlineData(2897UL)]
+    public void HeadroomNeverClosesSelfTest_ClaimingAfterAFaultedWrite_FailsTheRun_AndPrintsTheSeed(ulong seed)
+    {
+        var exception = Assert.Throws<SimulationInvariantException>(
+            () => new Simulator(HeadroomUnderStoreFaults(seed) with { SabotageHeadroomNeverCloses = true }).Run());
+
+        Assert.Contains($"seed {seed}", exception.Message);
+        Assert.Contains("after a faulted outcome write closed it", exception.Message);
+        Assert.Equal(InvariantId.PerNodeCap, exception.InvariantId);
+    }
+
     [Theory]
     [InlineData(1UL)]
     [InlineData(2UL)]

@@ -111,6 +111,14 @@ internal sealed record SimulationOptions
     public bool SabotageUnwrittenOutcomeSlots { get; init; }
 
     /// <summary>
+    /// Oracle self-test for the closed headroom: a faulted outcome write reaches the Driver as a write never
+    /// issued, so the Driver keeps its headroom open after the fault, while the oracle still knows the write
+    /// faulted. A working oracle MUST fail the run. Pair with <see cref="UnwrittenOutcomeSlots"/>, store faults
+    /// and store lane latency. Never set in real regimes.
+    /// </summary>
+    public bool SabotageHeadroomNeverCloses { get; init; }
+
+    /// <summary>
     /// Wake-Up Hint delivery rate (ADR-0005): 0 = every hint dropped (no channel), 1 =
     /// every enqueue hints every node. Hints draw from their own rng stream so the
     /// workload is bit-identical across delivery rates — the hint-loss equivalence
@@ -578,6 +586,9 @@ internal sealed record SimulationResult(
     /// </summary>
     public int ClaimsIntoUnwrittenHeadroom { get; init; }
 
+    /// <summary>Claims a node issued while its last outcome write had faulted, so its headroom was closed.</summary>
+    public int ClaimsWithHeadroomClosed { get; init; }
+
     public int ClaimsLandedOnStop { get; init; }
 
     /// <summary>
@@ -703,6 +714,9 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         public HashSet<(Guid JobId, int Attempt)> AwaitingReport { get; } = [];
         public SimEvent? OutcomeWrite { get; set; }
         public SimEvent? Claim { get; set; }
+        // Whether the last outcome write this node's Driver was answered for faulted, which closes its headroom
+        // until a write lands. Read by the per-node-cap oracle at claim time. Cleared with a fresh Driver.
+        public bool HeadroomClosed { get; set; }
     }
 
     private readonly DeterministicRandom _rng = new(options.Seed);
@@ -813,6 +827,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     private int _outcomeWritesLandedOnStop;
     private int _pollsDuringClaim;
     private int _claimsIntoUnwrittenHeadroom;
+    private int _claimsWithHeadroomClosed;
     private int _claimsLandedOnStop;
     // Outcome-Provenance Oracle (issue 0068): a captured violation message, asserted in CheckInvariants
     // so the oracle "runs in the oracle" — the store applied an outcome whose reporter did not hold the
@@ -1300,6 +1315,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             OutcomeWritesLandedOnStop = _outcomeWritesLandedOnStop,
             PollsDuringClaim = _pollsDuringClaim,
             ClaimsIntoUnwrittenHeadroom = _claimsIntoUnwrittenHeadroom,
+            ClaimsWithHeadroomClosed = _claimsWithHeadroomClosed,
             ClaimsLandedOnStop = _claimsLandedOnStop,
             LeasesExpired = _leasesExpired,
             LeasesRelinquished = _leasesRelinquished,
@@ -1646,6 +1662,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 restarting.StoppedAt = null;
                 restarting.RelinquishLanded = false;
                 restarting.Driver = NewDriver(simEvent.Node);
+                restarting.HeadroomClosed = false;
                 restarting.PollDelay = options.PollInterval; // a fresh pump starts at the floor
                 restarting.IdleSince = null;
                 restarting.PollWoken = false;
@@ -1942,6 +1959,19 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         // it in the same ClaimCompleted batch — leaving those jobs Leased-but-never-executed, their
         // leases renewed by the Driver's heartbeat forever, so they never converged in the drain window.
         List<JobRecord>? deferredUnroutable = null;
+        switch (nodeEvent)
+        {
+            case NodeEvent.OutcomeBatchFaulted faulted:
+                node.HeadroomClosed = true;
+                if (options.SabotageHeadroomNeverCloses)
+                {
+                    nodeEvent = new NodeEvent.OutcomeBatchNotIssued(faulted.Now);
+                }
+                break;
+            case NodeEvent.OutcomeBatchReported:
+                node.HeadroomClosed = false;
+                break;
+        }
         // The command batch runs inside a try so the deferred Unroutable reports below run even when a later
         // command in the SAME batch faults (a follow-up claim hitting a transient store fault, say). The
         // foreach/switch body keeps its original indentation to stay a surgical diff.
@@ -1990,9 +2020,18 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     break;
 
                 case Command.ClaimBatch claim:
-                    var unwritten = UnwrittenOutcomes(node);
-                    if (unwritten > 0 && claim.MaxJobs > options.PoolSize - node.Executing.Count - unwritten)
+                    if (node.HeadroomClosed && options.UnwrittenOutcomeSlots > 0)
                     {
+                        _claimsWithHeadroomClosed++;
+                    }
+                    if (ClaimsIntoHeadroom(node, claim))
+                    {
+                        Invariant(
+                            InvariantId.PerNodeCap,
+                            !node.HeadroomClosed,
+                            $"node-{nodeIndex} claimed {claim.MaxJobs} into its unwritten-outcome headroom after a "
+                            + $"faulted outcome write closed it: {node.Executing.Count} in-flight executions and "
+                            + $"{UnwrittenOutcomes(node)} unwritten outcomes against a pool of {options.PoolSize}");
                         _claimsIntoUnwrittenHeadroom++;
                     }
                     if (options.MaxStoreLaneLatency > TimeSpan.Zero && !node.Down)
@@ -3166,7 +3205,10 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     /// <para>
     /// A second check under the same id bounds the Leases: the executions plus the Unwritten outcomes never
     /// exceed PoolSize plus <see cref="SimulationOptions.UnwrittenOutcomeSlots"/>. With no headroom that is the
-    /// pool itself. Its own sabotage builds the Driver with unbounded headroom.
+    /// pool itself. Its own sabotage builds the Driver with unbounded headroom. The bound is checked once more as
+    /// each claim is issued: after a faulted outcome write closes the headroom, the node claims nothing into it
+    /// until a write lands. The executions plus the Unwritten outcomes may still sit above PoolSize then, since
+    /// the jobs claimed into the headroom before the fault run on. Its sabotage keeps the Driver's headroom open.
     /// </para>
     /// </summary>
     private void CheckPerNodeCap()
@@ -3200,11 +3242,22 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
 
     /// <summary>
     /// A node's finished jobs whose outcome write has not answered: the outcomes its Driver buffers plus the
-    /// rows of its write in flight whose job it is not running again.
+    /// rows of its write in flight whose job it is not running again. The Driver counts those rows as well, so
+    /// this count is at most the Driver's.
     /// </summary>
     private static int UnwrittenOutcomes(SimNode node)
         => node.Driver.BufferedOutcomeCount
             + (node.OutcomeWrite?.Batch!.Outcomes.Count(row => !node.Executing.ContainsKey(row.JobId)) ?? 0);
+
+    /// <summary>
+    /// Whether a claim asks for more than the pool leaves when every Unwritten outcome holds a slot, so it fills
+    /// part of the headroom. Never true with no headroom, since the Driver then claims at most that much.
+    /// </summary>
+    private bool ClaimsIntoHeadroom(SimNode node, Command.ClaimBatch claim)
+    {
+        var unwritten = UnwrittenOutcomes(node);
+        return unwritten > 0 && claim.MaxJobs > options.PoolSize - node.Executing.Count - unwritten;
+    }
 
     /// <summary>
     /// Records that an applied outcome freed the Concurrency slot for one (jobId, attempt) on a limited Queue

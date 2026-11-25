@@ -146,6 +146,7 @@ internal static class SwarmEnvelope
             SabotageSlotDoubleRelease = false,
             SabotagePoolSize = false,
             SabotageUnwrittenOutcomeSlots = false,
+            SabotageHeadroomNeverCloses = false,
             SabotageOutcomeFence = false,
             SabotageBatchFence = false,
             SabotageMigrationSweep = false,
