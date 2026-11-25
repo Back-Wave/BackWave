@@ -114,11 +114,19 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
               {TransitionLogCtes("leased")}
               SELECT * FROM claimed
               """;
-        _enqueueJob = $"""
-            WITH inserted AS ({InsertJob} RETURNING job_id, state, attempt, NULL::text AS detail, sequence AS ord)
-            {(_historyPolicy == JobHistoryPolicy.Off ? "" : "," + TransitionLogCtes("inserted"))}
-            SELECT count(*) FROM inserted
-            """;
+        // A new job has no transitions, so its first one is ordinal 0 and is below any cap. The shared
+        // append-and-prune CTEs would find nothing to read or prune, but Postgres plans them again on every
+        // unprepared enqueue.
+        _enqueueJob = _historyPolicy == JobHistoryPolicy.Off
+            ? $"WITH inserted AS ({InsertJob} RETURNING job_id) SELECT count(*) FROM inserted"
+            : $"""
+              WITH inserted AS ({InsertJob} RETURNING job_id, state),
+              logged AS (
+                  INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
+                  SELECT job_id, 0, @now, state, 0, NULL FROM inserted
+              )
+              SELECT count(*) FROM inserted
+              """;
         _reportOutcomesInOneRoundTrip = OutcomeCommandSql(ChildEdgeGate);
         _reportOutcomesInTransaction = OutcomeCommandSql("SELECT false AS gated");
     }
@@ -400,7 +408,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // job. The Core never reads it; it lives entirely above the determinism boundary.
         insert.Parameters.AddWithValue("workflowId", (object?)workflowId ?? DBNull.Value);
         insert.Parameters.AddWithValue("now", now.ToUniversalTime());
-        insert.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
         return await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is 1L;
     }
 
