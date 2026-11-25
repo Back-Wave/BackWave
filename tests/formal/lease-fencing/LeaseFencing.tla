@@ -50,7 +50,7 @@
 (*    the latest version. Every plain FOR UPDATE in the model has all its  *)
 (*    predicates at that level.                                            *)
 (*                                                                         *)
-(* Sync commit: ad5b0ab. Line numbers cite the code at that commit.        *)
+(* Sync commit: 7716d9e. Line numbers cite the code at that commit.        *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
@@ -68,7 +68,7 @@ CONSTANTS
 ASSUME Adapter \in {"Postgres", "SqlServer", "Oracle"}
 ASSUME Mutants \subseteq {"OwnerOnlyFence", "ClaimNoDueRecheck", "ClaimNoOuterDue",
                           "RelinquishNoLeasedCheck", "OutcomeKeepsOwner", "ClaimNoLock",
-                          "ExpireNoOuterOrder"}
+                          "ExpireNoOuterWhere", "ExpireNoOuterOrder"}
 ASSUME ReportPaths \subseteq {"Single", "Batch"} /\ ReportPaths # {}
 ASSUME LeaseTicks >= 1
 
@@ -129,13 +129,17 @@ LockRow(s, j, mode, recheckPasses) ==
                 ELSE /\ sess' = [sess EXCEPT ![s].todo = @ \ {j}]
                      /\ UNCHANGED lockOf
 
-\* The claim selects every column (JobColumns, OracleJobStore.cs:4182-4185).
-\* The sweep selects attempt and orders by lease_expiry (1476, 1484); it
-\* reads state only in its ROWNUM subquery.
+\* The claim selects every column (JobColumns, OracleJobStore.cs:4183-4186).
+\* The sweep selects attempt, filters on state and lease_expiry in its outer
+\* WHERE, and orders by lease_expiry (1477, 1478, 1485).
+ExpireLockCols ==
+    {"attempt"}
+    \cup (IF Has("ExpireNoOuterWhere") THEN {} ELSE {"state", "expiry"})
+    \cup (IF Has("ExpireNoOuterOrder") THEN {} ELSE {"expiry"})
+
 LockLevelCols(op, r) ==
     CASE op = "Claim" -> r
-      [] op = "Expire" /\ Has("ExpireNoOuterOrder") -> <<r.attempt>>
-      [] op = "Expire" /\ ~Has("ExpireNoOuterOrder") -> <<r.attempt, r.expiry>>
+      [] op = "Expire" -> [c \in ExpireLockCols |-> r[c]]
 
 Begin(s, op, at, P) ==
     sess' = [sess EXCEPT ![s] = [Idle EXCEPT !.op = op, !.at = at, !.todo = P,
@@ -374,10 +378,11 @@ HeartbeatCommit(s) ==
    SQL Server  SqlServerJobStore.cs:1335-1338, 1401, 1419 (from 1315)
      SELECT TOP (@max) ... WITH (UPDLOCK, READPAST, ROWLOCK)
        WHERE state = 2 AND lease_expiry <= @now;  UPDATE j ... by id
-   Oracle  OracleJobStore.cs:1474-1485, 1548-1557, 1566-1578 (from 1454)
-     SELECT job_id, attempt FROM jobs WHERE job_id IN (
+   Oracle  OracleJobStore.cs:1475-1486, 1549-1558, 1567-1579 (from 1454)
+     SELECT job_id, attempt FROM jobs
+       WHERE state = 2 AND lease_expiry <= :now AND job_id IN (
        SELECT ... WHERE state = 2 AND lease_expiry <= :now ... ROWNUM <= :max)
-     FOR UPDATE SKIP LOCKED;  MERGE ... by id, no fence *)
+     ORDER BY lease_expiry FOR UPDATE SKIP LOCKED;  MERGE ... by id, no fence *)
 
 ExpirePick(at) == {j \in Jobs : row[j].state = Leased /\ Lapsed(row[j], at)}
 
@@ -422,7 +427,7 @@ ExpireCommit(s) ==
      SELECT ... WHERE state = 2 AND lease_owner = @owner ... FOR UPDATE
    SQL Server  SqlServerJobStore.cs:1501-1504, 1562-1563, 1578 (from 1486)
      SELECT ... WITH (UPDLOCK, ROWLOCK) WHERE state = 2 AND lease_owner = @owner
-   Oracle  OracleJobStore.cs:1651-1655, 1716-1723, 1738-1744 (from 1638)
+   Oracle  OracleJobStore.cs:1652-1656, 1717-1724, 1739-1745 (from 1639)
      SELECT ... WHERE state = 2 AND lease_owner = :owner ... FOR UPDATE
    Each then writes the locked rows by id. The lock waits. *)
 
@@ -470,7 +475,7 @@ RelinquishCommit(s) ==
      UPDATE ... SET due_time = @due FROM old
    SQL Server  SqlServerJobStore.cs:1767-1769 (RescheduleCoreAsync, from 1757)
      UPDATE ... SET due_time = @due WHERE job_id = @id AND state IN (0, 1)
-   Oracle  OracleJobStore.cs:1937-1942 (RescheduleCoreAsync, from 1921)
+   Oracle  OracleJobStore.cs:1938-1943 (RescheduleCoreAsync, from 1922)
      SELECT due_time ... WHERE job_id = :id AND state IN (0, 1) FOR UPDATE;
      UPDATE ... SET due_time = :due WHERE job_id = :id *)
 

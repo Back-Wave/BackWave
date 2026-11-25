@@ -77,7 +77,7 @@ SQL
 echo "oracle: $(printf '%s\n' "SET HEADING OFF FEEDBACK OFF" \
   "SELECT product || ' ' || version_full FROM product_component_version WHERE ROWNUM = 1;" | sql | grep -m1 .)"
 
-# The ExpireLeases shape (OracleJobStore.cs:1474-1485).
+# The ExpireLeases shape (OracleJobStore.cs:1475-1486).
 sweep_sql() {
   local outer_where="$1" outer_order="$2"
   cat <<SQL
@@ -214,7 +214,7 @@ if [[ $invalid -gt 0 ]]; then
 fi
 if [[ $notes -gt 0 ]]; then
   echo "Oracle did less than the model allows in $notes case(s) on $image. The Oracle configs still hold."
-  echo "expire-no-outer-order-oracle rests on case noorder: if noorder is a NOTE, that mutant does not match Oracle."
+  echo "expire-no-outer-where-and-order-oracle rests on case noorder: if noorder is a NOTE, that mutant does not match Oracle."
   exit 0
 fi
 echo "Every case matches the model's Oracle SKIP LOCKED rule on $image."

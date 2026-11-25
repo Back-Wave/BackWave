@@ -26,7 +26,7 @@ Bounds: 2 jobs (symmetric), 2 sessions for workers `w1` and `w2`, `MaxAttempts` 
 
 ## Does the change touch the model
 
-The model describes the code at the sync commit `ad5b0ab`. Compare the change with this coverage record. Line numbers are at the sync commit. Each method is the untraced body unless the table names another.
+The model describes the code at the sync commit `7716d9e`. Compare the change with this coverage record. Line numbers are at the sync commit. Each method is the untraced body unless the table names another.
 
 | Operation | Postgres `PostgresJobStore.cs` | SQL Server `SqlServerJobStore.cs` | Oracle `OracleJobStore.cs` | Model actions |
 |---|---|---|---|---|
@@ -34,9 +34,9 @@ The model describes the code at the sync commit `ad5b0ab`. Compare the change wi
 | ReportOutcome | `ReportOutcomeUntracedAsync` 683, SQL 742-745 | `ReportOutcomeUntracedAsync` 782, SQL 842-845 | `ReportOutcomeUntracedAsync` 850, SQL 909-911 | `ReportUpdate` |
 | ReportOutcomes | `ReportOutcomesUntracedAsync` 806, SQL 879-892 | `ReportOutcomesUntracedAsync` 908, SQL 995-1019 | `ReportOutcomesUntracedAsync` 972, SQL 1043-1047, 1066-1073, 1092-1117 | `ReportUpdate` (Postgres), `ReportLock`, `ReportCommit` |
 | Heartbeat | `HeartbeatAsync` 1130, SQL 1139-1141 | `HeartbeatAsync` 1250, SQL 1266-1272 | `HeartbeatAsync` 1377, SQL 1402-1405, 1421 | `HeartbeatUpdate`, `HeartbeatLock`, `HeartbeatCommit` |
-| ExpireLeases | `ExpireLeasesUntracedAsync` 1184, SQL 1202-1207, 1266-1268, 1281-1283 | `ExpireLeasesUntracedAsync` 1315, SQL 1335-1338, 1401, 1419 | `ExpireLeasesUntracedAsync` 1454, SQL 1474-1485, 1548-1557, 1566-1578 | `ExpireBegin`, `ExpireLock`, `ExpireCommit` |
-| RelinquishLeases | `RelinquishLeasesUntracedAsync` 1342, SQL 1355-1359, 1421-1423, 1444-1446 | `RelinquishLeasesUntracedAsync` 1486, SQL 1501-1504, 1562-1563, 1578 | `RelinquishLeasesUntracedAsync` 1638, SQL 1651-1655, 1716-1723, 1738-1744 | `RelinquishBegin`, `RelinquishLock`, `RelinquishCommit` |
-| Reschedule | `RescheduleCoreAsync` 1617, SQL 1632-1639 | `RescheduleCoreAsync` 1757, SQL 1767-1769 | `RescheduleCoreAsync` 1921, SQL 1937-1942 | `RescheduleLock`, `RescheduleCommit` |
+| ExpireLeases | `ExpireLeasesUntracedAsync` 1184, SQL 1202-1207, 1266-1268, 1281-1283 | `ExpireLeasesUntracedAsync` 1315, SQL 1335-1338, 1401, 1419 | `ExpireLeasesUntracedAsync` 1454, SQL 1475-1486, 1549-1558, 1567-1579 | `ExpireBegin`, `ExpireLock`, `ExpireCommit` |
+| RelinquishLeases | `RelinquishLeasesUntracedAsync` 1342, SQL 1355-1359, 1421-1423, 1444-1446 | `RelinquishLeasesUntracedAsync` 1486, SQL 1501-1504, 1562-1563, 1578 | `RelinquishLeasesUntracedAsync` 1639, SQL 1652-1656, 1717-1724, 1739-1745 | `RelinquishBegin`, `RelinquishLock`, `RelinquishCommit` |
+| Reschedule | `RescheduleCoreAsync` 1617, SQL 1632-1639 | `RescheduleCoreAsync` 1757, SQL 1767-1769 | `RescheduleCoreAsync` 1922, SQL 1938-1943 | `RescheduleLock`, `RescheduleCommit` |
 
 The model also depends on these facts. A change to any of them touches the model too:
 
@@ -47,7 +47,7 @@ The model also depends on these facts. A change to any of them touches the model
 To list the commits since the sync commit that touched covered code:
 
 ```sh
-git log --oneline ad5b0ab..HEAD -- src/BackWave.Postgres/PostgresJobStore.cs src/BackWave.SqlServer/SqlServerJobStore.cs src/BackWave.Oracle/OracleJobStore.cs src/BackWave.SqlServer/SqlServerMigrator.cs src/BackWave/Core/RetryPolicy.cs src/BackWave/Driver/NodeDriver.cs
+git log --oneline 7716d9e..HEAD -- src/BackWave.Postgres/PostgresJobStore.cs src/BackWave.SqlServer/SqlServerJobStore.cs src/BackWave.Oracle/OracleJobStore.cs src/BackWave.SqlServer/SqlServerMigrator.cs src/BackWave/Core/RetryPolicy.cs src/BackWave/Driver/NodeDriver.cs
 ```
 
 A commit touches the model when it changes a cited statement, its `WHERE`, its lock hints, its transaction, or the order of statements inside one transaction. A change elsewhere in these files needs only new line numbers.
@@ -92,7 +92,9 @@ Each config in `mutants/` plants one break and must end on the rule named in its
 | `claim-no-lock-{postgres,sqlserver,oracle}` | Claim read without its row lock | `SingleLease` |
 | `claim-no-due-recheck-oracle` | Oracle claim without the outer `due_time <= :now` and the C# due check, as before `6e1db1b` | pass |
 | `claim-no-outer-due-oracle` | Oracle claim without the outer `due_time <= :now` | pass |
-| `expire-no-outer-order-oracle` | Oracle ExpireLeases without its outer `ORDER BY lease_expiry` | `ExpireOnce` |
+| `expire-no-outer-where-oracle` | Oracle ExpireLeases without the outer `state = 2 AND lease_expiry <= :now`, as before `7716d9e` | pass |
+| `expire-no-outer-order-oracle` | Oracle ExpireLeases without its outer `ORDER BY lease_expiry` | pass |
+| `expire-no-outer-where-and-order-oracle` | Both of the two above | `ExpireOnce` |
 | `relinquish-no-leased-check-postgres` | RelinquishLeases without `state = 2` | pass |
 | `outcome-keeps-owner-postgres` | A `Succeeded` write that keeps `lease_owner` | pass |
 | `relinquish-no-leased-check-and-outcome-keeps-owner-postgres` | Both of the two above | `RelinquishOnlyHeld` |
@@ -102,18 +104,18 @@ Some mutant configs leave out a rule that would break first:
 - `claim-no-lock-*` leave out `ClaimOnlyDue`. With every rule on, it breaks first, when a reschedule commits between the read and the UPDATE. Without it, TLC shows the double lease.
 - `outcome-keeps-owner-postgres` and `relinquish-no-leased-check-and-outcome-keeps-owner-postgres` leave out `OwnerOnlyWhileLeased`, because a set `lease_owner` on a `Succeeded` row is the planted change itself.
 
-A mutant that passes removes a second guard. `relinquish-no-leased-check-postgres` passes because `OwnerOnlyWhileLeased` holds. The two Oracle claim mutants pass because the claim selects every column, so SKIP LOCKED skips any row that changed after the snapshot, and the outer predicates and the C# checks never see a row that is not Scheduled and due. They are second guards. Keep them: they stop being second guards if the select list or the lock rule changes.
+A mutant that passes removes a second guard. `relinquish-no-leased-check-postgres` passes because `OwnerOnlyWhileLeased` holds. The two Oracle claim mutants pass because the claim selects every column, so SKIP LOCKED skips any row that changed after the snapshot, and the outer predicates and the C# checks never see a row that is not Scheduled and due. The two single Oracle sweep mutants pass because the outer `WHERE` and the outer `ORDER BY` each read `lease_expiry`, so either one alone makes SKIP LOCKED skip a row that a lease write changed. They are second guards. Keep them: they stop being second guards if the select list or the lock rule changes.
 
 ## Oracle SKIP LOCKED rule
 
-The Oracle claim (`OracleJobStore.cs:581-592`) and the Oracle expiry sweep (1474-1485) pick their rows in a `ROWNUM` subquery and lock them in an outer `SELECT ... FOR UPDATE SKIP LOCKED`. The model uses this rule for that lock (`LockLevelCols` and `SnapshotCurrent` in the spec):
+The Oracle claim (`OracleJobStore.cs:581-592`) and the Oracle expiry sweep (1475-1486) pick their rows in a `ROWNUM` subquery and lock them in an outer `SELECT ... FOR UPDATE SKIP LOCKED`. The model uses this rule for that lock (`LockLevelCols` and `SnapshotCurrent` in the spec):
 
 - A row that another session holds is skipped.
 - A row is skipped when a column that the locking query level reads changed after the statement snapshot. The locking level is the outer select: its select list, its `WHERE`, and its `ORDER BY`.
 - A row where only other columns changed is locked, and it returns its latest values. This includes a column that only the `ROWNUM` subquery reads.
 - The statement does not restart.
 
-The claim selects every column, so any change makes it skip the row. The sweep selects `job_id, attempt` and orders by `lease_expiry`. It reads `state` only in its subquery. Every write that ends or renews a lease changes `lease_expiry`, so the outer `ORDER BY lease_expiry` is the only thing that keeps the sweep off a row that an outcome, a heartbeat, or another sweep committed after the snapshot. Without it, the sweep locks a row that an outcome wrote after the snapshot and writes it back to `Scheduled`, so a `Succeeded` job can run again. The mutant `expire-no-outer-order-oracle` shows this, and the probe case `noorder` measures the lock.
+The claim selects every column, so any change makes it skip the row. The sweep selects `job_id, attempt`, repeats `state = 2 AND lease_expiry <= :now` in its outer `WHERE`, and orders by `lease_expiry`. Every write that ends or renews a lease changes `lease_expiry`, so the outer predicates keep the sweep off a row that an outcome, a heartbeat, or another sweep committed after the snapshot. The outer `ORDER BY lease_expiry` does the same on its own. Without both, the sweep locks a row that an outcome wrote after the snapshot and writes it back to `Scheduled`, so a `Succeeded` job can run again. The mutant `expire-no-outer-where-and-order-oracle` shows this, and the probe case `noorder` measures the lock. The probe case `outerwhere` measures that a column read only in the outer `WHERE` also makes SKIP LOCKED skip the row.
 
 Evidence: measured on Oracle XE 21.3 (`gvenzl/oracle-xe:21-slim`) and Oracle Free 23.26 (`gvenzl/oracle-free:23-slim`) on 2026-11-25. Inferred for 19c, the oldest version the adapter supports. Each probe container needs about 20 GiB of free disk, so check `df -h /` first. Measure it again with:
 
@@ -124,7 +126,7 @@ tests/formal/lease-fencing/oracle-skip-locked-probe.sh gvenzl/oracle-free:23-sli
 
 The probe starts a private container, or reuses one that an earlier `--keep` run left. It removes a container it started. It runs the ExpireLeases statement shape on one lapsed row, and a second session commits a change to the row between the snapshot and the lock. Each case states what the rule predicts, lock or skip, and the probe prints the rows locked. A cold run takes about 1 minute on Free 23 and about 2 minutes on XE 21, which runs under amd64 emulation on an arm64 Mac. Exit codes:
 
-- 0: Oracle never locked a changed row where the model skips it. A `NOTE` line marks a case where Oracle did less than the model allows: it skipped a row that the model locks, or it restarted the statement. The Oracle configs still hold then. If `noorder` is a `NOTE`, `expire-no-outer-order-oracle` no longer matches Oracle.
+- 0: Oracle never locked a changed row where the model skips it. A `NOTE` line marks a case where Oracle did less than the model allows: it skipped a row that the model locks, or it restarted the statement. The Oracle configs still hold then. If `noorder` is a `NOTE`, `expire-no-outer-where-and-order-oracle` no longer matches Oracle.
 - 1: Oracle locked a changed row that the model skips. Do not trust an Oracle pass until `LockLevelCols` is fixed and `check.sh --all` matches again.
 - 2: no valid measurement. The setup failed, the control row was not locked, the change missed the window, or the subquery did not sleep.
 
