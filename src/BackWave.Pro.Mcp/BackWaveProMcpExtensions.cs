@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using ModelContextProtocol.AspNetCore;
 using ModelContextProtocol.Protocol;
 
 namespace BackWave.Pro.Mcp;
@@ -94,7 +95,7 @@ public static class BackWaveProMcpExtensions
             })
             // Stateless: no session handshake required, no per-session server state — any node
             // serves any request. The tool list is therefore fixed per node at startup.
-            .WithHttpTransport(transport => transport.Stateless = true)
+            .WithHttpTransport(transport => transport.SessionMode = HttpServerSessionMode.Stateless)
             // Explicit tool registration only — never assembly scanning. Each tool is registered
             // with source-generated JSON options (BackWaveProMcpJson) so schema generation and
             // result (de)serialization resolve without reflection, keeping the surface Native-AOT
