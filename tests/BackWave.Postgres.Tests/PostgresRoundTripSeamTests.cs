@@ -122,7 +122,7 @@ public sealed class PostgresRoundTripSeamTests
             {
                 continue;
             }
-            return text.StartsWith("CountStatement()", StringComparison.Ordinal)
+            return text.StartsWith("CountCommand()", StringComparison.Ordinal)
                 || text.StartsWith("CountCommit()", StringComparison.Ordinal);
         }
 

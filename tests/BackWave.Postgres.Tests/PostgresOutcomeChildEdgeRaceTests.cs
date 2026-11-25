@@ -15,11 +15,12 @@ namespace BackWave.Postgres.Tests;
 public sealed class PostgresOutcomeChildEdgeRaceTests
 {
     private static readonly DateTimeOffset T0 = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    private const string Reporter = "outcome-child-edge-race";
 
     [Fact]
     public async Task A_parent_finished_while_its_child_enqueue_holds_the_lock_still_releases_the_child()
     {
-        await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
+        await using var store = await PostgresTestDatabase.CreateFreshStoreAsync(applicationName: Reporter);
         var parent = new NewJob(Guid.NewGuid(), "race", "{}"u8.ToArray(), "race", T0);
         await store.EnqueueAsync(parent, T0);
         var claimed = Assert.Single(await store.ClaimAsync(new ClaimRequest("w1", ["race"], 1, TimeSpan.FromMinutes(5), T0)));
@@ -49,7 +50,7 @@ public sealed class PostgresOutcomeChildEdgeRaceTests
 
         var report = Task.Run(async () => await store.ReportOutcomesAsync(
             [new OutcomeReport(claimed.JobId, "w1", claimed.Attempt, new JobOutcome.Success())], T0));
-        await WaitUntilAStatementWaitsOnALockAsync();
+        await PostgresTestDatabase.WaitForLockWaitAsync(Reporter);
         release.SetResult();
 
         Assert.Equal(EnqueueResult.Ok, await enqueue);
@@ -58,23 +59,5 @@ public sealed class PostgresOutcomeChildEdgeRaceTests
         var released = (await store.GetJobAsync(child.JobId))!;
         Assert.Equal(JobState.Scheduled, released.State);
         Assert.Equal(0, released.ParentsRemaining);
-    }
-
-    private static async Task WaitUntilAStatementWaitsOnALockAsync()
-    {
-        await using var connection = new NpgsqlConnection(PostgresTestDatabase.ConnectionString);
-        await connection.OpenAsync();
-        await using var waiting = new NpgsqlCommand(
-            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
-            connection);
-        for (var attempt = 0; attempt < 200; attempt++)
-        {
-            if ((long)(await waiting.ExecuteScalarAsync())! > 0)
-            {
-                return;
-            }
-            await Task.Delay(25);
-        }
-        Assert.Fail("The outcome write never waited on the parent's row lock.");
     }
 }

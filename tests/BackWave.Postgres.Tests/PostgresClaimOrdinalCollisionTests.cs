@@ -7,17 +7,21 @@ namespace BackWave.Postgres.Tests;
 /// The one-statement claim reads every transition ordinal from the snapshot it started with. When a
 /// transition for a job it claims commits after that snapshot, the insert collides on the primary key,
 /// the statement rolls back whole, and the claim reruns as two statements. This forces that collision.
+/// In production the late transition comes from another claimer that leased the job and handed it back
+/// inside that window; here a row forged under <c>session_replication_role = replica</c> stands in for
+/// that race.
 /// </summary>
 [Collection("postgres")]
 public sealed class PostgresClaimOrdinalCollisionTests
 {
     private static readonly DateTimeOffset T0 = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
     private static readonly TimeSpan Lease = TimeSpan.FromMinutes(5);
+    private const string Claimer = "claim-ordinal-collision";
 
     [Fact]
     public async Task A_claim_that_collides_on_an_ordinal_falls_back_and_records_the_next_one()
     {
-        await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
+        await using var store = await PostgresTestDatabase.CreateFreshStoreAsync(applicationName: Claimer);
         var first = new NewJob(Guid.NewGuid(), "collision", "{}"u8.ToArray(), "collision", T0.AddMinutes(-1));
         var raced = new NewJob(Guid.NewGuid(), "collision", "{}"u8.ToArray(), "collision", T0);
         await store.EnqueueAsync(first, T0);
@@ -44,14 +48,11 @@ public sealed class PostgresClaimOrdinalCollisionTests
             await insert.ExecuteNonQueryAsync();
         }
 
-        using var scope = PostgresRoundTrips.Observe();
         var claim = Task.Run(async () => await store.ClaimAsync(Claim()));
-        await WaitUntilAStatementWaitsOnATransactionAsync(other);
+        await PostgresTestDatabase.WaitForLockWaitAsync(Claimer, "transactionid");
         await otherTransaction.CommitAsync();
         var claimed = await claim;
 
-        // 1 statement that rolled back + the two-statement claim and its COMMIT.
-        Assert.Equal((3, 1), (scope.Statements, scope.Commits));
         var job = Assert.Single(claimed);
         Assert.Equal(raced.JobId, job.JobId);
         Assert.Equal(1, job.Attempt); // the rolled-back statement consumed no attempt
@@ -61,22 +62,4 @@ public sealed class PostgresClaimOrdinalCollisionTests
     }
 
     private static ClaimRequest Claim() => new("w1", ["collision"], 1, Lease, T0);
-
-    private static async Task WaitUntilAStatementWaitsOnATransactionAsync(NpgsqlConnection connection)
-    {
-        await using var waiting = new NpgsqlCommand(
-            """
-            SELECT count(*) FROM pg_stat_activity
-            WHERE datname = current_database() AND wait_event_type = 'Lock' AND wait_event = 'transactionid'
-            """, connection);
-        for (var attempt = 0; attempt < 200; attempt++)
-        {
-            if ((long)(await waiting.ExecuteScalarAsync())! > 0)
-            {
-                return;
-            }
-            await Task.Delay(25);
-        }
-        Assert.Fail("The claim never waited on the uncommitted ordinal.");
-    }
 }

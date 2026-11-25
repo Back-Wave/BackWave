@@ -49,22 +49,22 @@ internal static class PostgresRoundTrips
         Interlocked.Decrement(ref _observers);
     }
 
-    // One statement left for the server. Counted at EXECUTION, never at construction: a round trip
-    // happens when a statement runs, and the place a command is BUILT is not the place it RUNS (the
+    // One command left for the server. Counted at EXECUTION, never at construction: a round trip
+    // happens when a command runs, and the place a command is BUILT is not the place it RUNS (the
     // dynamic-SQL query builders assemble theirs inline, and a command may be built and then never
-    // executed, or executed more than once). Counted BEFORE the call, so a statement that comes back as
+    // executed, or executed more than once). Counted BEFORE the call, so a command that comes back as
     // a PostgresException still counts: it made the trip.
-    internal static void CountStatement()
+    internal static void CountCommand()
     {
         if (Volatile.Read(ref _observers) == 0)
         {
             return;
         }
-        Flow.Value?.AddStatement();
+        Flow.Value?.AddCommand();
     }
 
     // One COMMIT left for the server. Npgsql sends it on its own and waits for the answer, so it is a
-    // round trip exactly like a statement, and the one an autocommit statement saves. BEGIN is not
+    // round trip exactly like a command, and the one an autocommit statement saves. BEGIN is not
     // counted: Npgsql prepends it to the transaction's first statement, so it never waits on its own.
     internal static void CountCommit()
     {
@@ -83,21 +83,21 @@ internal static class PostgresRoundTrips
     internal static Task<int> ExecuteNonQueryCountedAsync(
         this NpgsqlCommand command, CancellationToken cancellationToken)
     {
-        CountStatement();
+        CountCommand();
         return command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     internal static Task<NpgsqlDataReader> ExecuteReaderCountedAsync(
         this NpgsqlCommand command, CancellationToken cancellationToken)
     {
-        CountStatement();
+        CountCommand();
         return command.ExecuteReaderAsync(cancellationToken);
     }
 
     internal static Task<object?> ExecuteScalarCountedAsync(
         this NpgsqlCommand command, CancellationToken cancellationToken)
     {
-        CountStatement();
+        CountCommand();
         return command.ExecuteScalarAsync(cancellationToken);
     }
 
@@ -114,17 +114,17 @@ internal static class PostgresRoundTrips
 // completed, and the counts remain readable after Dispose so a test can assert outside the using block.
 internal sealed class PostgresRoundTripScope(PostgresRoundTripScope? outer) : IDisposable
 {
-    private int _statements;
+    private int _commands;
     private int _commits;
     private bool _disposed;
 
     internal PostgresRoundTripScope? Outer { get; } = outer;
 
-    internal int Statements => Volatile.Read(ref _statements);
+    internal int Commands => Volatile.Read(ref _commands);
 
     internal int Commits => Volatile.Read(ref _commits);
 
-    internal void AddStatement() => Interlocked.Increment(ref _statements);
+    internal void AddCommand() => Interlocked.Increment(ref _commands);
 
     internal void AddCommit() => Interlocked.Increment(ref _commits);
 
