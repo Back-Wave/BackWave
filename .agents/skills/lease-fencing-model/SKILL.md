@@ -26,7 +26,7 @@ Bounds: 2 jobs (symmetric), 2 sessions for workers `w1` and `w2`, `MaxAttempts` 
 
 ## Does the change touch the model
 
-The model describes the code at the sync commit `7716d9e`. Compare the change with this coverage record. Line numbers are at the sync commit. Each method is the untraced body unless the table names another.
+The model describes the code at the sync commit, the last commit that changed `LeaseFencing.tla`. Find it with `git log -1 --format=%h -- tests/formal/lease-fencing/LeaseFencing.tla`. Compare the change with this coverage record. Line numbers are at the sync commit. Each method is the untraced body unless the table names another.
 
 | Operation | Postgres `PostgresJobStore.cs` | SQL Server `SqlServerJobStore.cs` | Oracle `OracleJobStore.cs` | Model actions |
 |---|---|---|---|---|
@@ -47,7 +47,7 @@ The model also depends on these facts. A change to any of them touches the model
 To list the commits since the sync commit that touched covered code:
 
 ```sh
-git log --oneline 7716d9e..HEAD -- src/BackWave.Postgres/PostgresJobStore.cs src/BackWave.SqlServer/SqlServerJobStore.cs src/BackWave.Oracle/OracleJobStore.cs src/BackWave.SqlServer/SqlServerMigrator.cs src/BackWave/Core/RetryPolicy.cs src/BackWave/Driver/NodeDriver.cs
+git log --oneline "$(git log -1 --format=%H -- tests/formal/lease-fencing/LeaseFencing.tla)"..HEAD -- src/BackWave.Postgres/PostgresJobStore.cs src/BackWave.SqlServer/SqlServerJobStore.cs src/BackWave.Oracle/OracleJobStore.cs src/BackWave.SqlServer/SqlServerMigrator.cs src/BackWave/Core/RetryPolicy.cs src/BackWave/Driver/NodeDriver.cs
 ```
 
 A commit touches the model when it changes a cited statement, its `WHERE`, its lock hints, its transaction, or the order of statements inside one transaction. A change elsewhere in these files needs only new line numbers.
@@ -92,7 +92,7 @@ Each config in `mutants/` plants one break and must end on the rule named in its
 | `claim-no-lock-{postgres,sqlserver,oracle}` | Claim read without its row lock | `SingleLease` |
 | `claim-no-due-recheck-oracle` | Oracle claim without the outer `due_time <= :now` and the C# due check, as before `6e1db1b` | pass |
 | `claim-no-outer-due-oracle` | Oracle claim without the outer `due_time <= :now` | pass |
-| `expire-no-outer-where-oracle` | Oracle ExpireLeases without the outer `state = 2 AND lease_expiry <= :now`, as before `7716d9e` | pass |
+| `expire-no-outer-where-oracle` | Oracle ExpireLeases without the outer `state = 2 AND lease_expiry <= :now`, as the code was before the outer `WHERE` | pass |
 | `expire-no-outer-order-oracle` | Oracle ExpireLeases without its outer `ORDER BY lease_expiry` | pass |
 | `expire-no-outer-where-and-order-oracle` | Both of the two above | `ExpireOnce` |
 | `relinquish-no-leased-check-postgres` | RelinquishLeases without `state = 2` | pass |

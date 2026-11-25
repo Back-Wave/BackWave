@@ -50,7 +50,8 @@
 (*    the latest version. Every plain FOR UPDATE in the model has all its  *)
 (*    predicates at that level.                                            *)
 (*                                                                         *)
-(* Sync commit: 7716d9e. Line numbers cite the code at that commit.        *)
+(* Sync commit: the last commit that changed this file. Line numbers       *)
+(* cite the code at that commit.                                           *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
