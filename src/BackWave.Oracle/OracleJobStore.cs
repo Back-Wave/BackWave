@@ -599,16 +599,13 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     var job = ReadJob(reader);
-                    // Oracle has no multi-row RETURNING, so the claim reads the row BEFORE it leases it.
-                    // The post-lease state is therefore synthesized in memory and cannot be checked; what
-                    // can be is that the row honored the outer statement's own Scheduled and due
-                    // predicates, which FOR UPDATE re-evaluates after it takes the lock. The predicates
-                    // are repeated there and not left to the ROWNUM subquery alone, so the check rests on
-                    // a test the locking query level actually makes. The due test matters because a
-                    // reschedule can move a Scheduled job's due time after the subquery picked it. No test
-                    // can force that move between the ROWNUM subquery and the lock, so the outer
-                    // due_time <= :now predicate is defense in depth. The reschedule race conformance fact
-                    // and the Torture claim checks cover the invariant end to end.
+                    // Oracle has no multi-row RETURNING, so the claim reads the row BEFORE it leases it and
+                    // synthesizes the post-lease state in memory. SKIP LOCKED does not re-evaluate a row that
+                    // changed after the statement snapshot: it skips the row, but only when the change touches
+                    // a column this query level reads. This level reads state and due_time, so a job that a
+                    // claim or reschedule changed after the subquery picked it is skipped (measured on Oracle
+                    // 21 and 23, not on 19c). The checks below guard any version that behaves otherwise. The
+                    // reschedule race conformance fact and the Torture claim checks cover the invariant end to end.
                     if (job.State != JobState.Scheduled)
                     {
                         throw Invariant.Halt(
