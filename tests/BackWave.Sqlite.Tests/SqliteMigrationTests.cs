@@ -127,8 +127,6 @@ public sealed class SqliteMigrationTests
         Assert.Equal(LogLevel.Warning, skew.Level);
     }
 
-    // A file whose stored version is lower than its real schema, or whose version row is gone, must
-    // migrate back to current: every step is safe to run again on a schema that already has it.
     [Theory]
     [InlineData("backwave", "UPDATE backwave_schema_version SET version = 1", true)]
     [InlineData("backwave", "DELETE FROM backwave_schema_version", true)]
