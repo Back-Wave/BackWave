@@ -271,23 +271,8 @@ internal sealed class NodeDriver(NodeOptions options)
     /// either commits them or drops them, and a renewal would take the row locks it holds in another order.
     /// Each id once, because the store answers one result per requested job.
     /// </summary>
-    private IReadOnlyList<Guid> LeasesToRenew()
-    {
-        if (options.UnwrittenOutcomeSlots <= 0 || _outcomes.BufferedCount == 0)
-        {
-            return [.. _executing];
-        }
-        var renewing = new List<Guid>(_executing);
-        var listed = new HashSet<Guid>(_executing);
-        foreach (var jobId in _outcomes.BufferedJobIds)
-        {
-            if (listed.Add(jobId))
-            {
-                renewing.Add(jobId);
-            }
-        }
-        return renewing;
-    }
+    private IReadOnlyList<Guid> LeasesToRenew() =>
+        _outcomes.HasHeadroom ? [.. _executing.Union(_outcomes.BufferedJobIds)] : [.. _executing];
 
     /// <summary>
     /// Drains the next batch of outcomes still buffered, for the Shell to report as this node stops. Returns
