@@ -685,6 +685,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     {
         var queueClaims = new List<JobRecord>();
         await using var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        var tags = reader.GetOrdinal("tags");
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             var job = ReadJob(reader);
@@ -694,10 +695,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     InvariantTrigger.ClaimedRowNotLeasedToWorker,
                     $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
             }
-            // Column 19 is the correlated tag aggregate (json or NULL when the job has none).
-            if (!reader.IsDBNull(19))
+            // The correlated tag aggregate: json, or NULL when the job has none.
+            if (!reader.IsDBNull(tags))
             {
-                job = job with { Tags = ParseTagsJson(reader.GetString(19)) };
+                job = job with { Tags = ParseTagsJson(reader.GetString(tags)) };
             }
             queueClaims.Add(job);
         }
