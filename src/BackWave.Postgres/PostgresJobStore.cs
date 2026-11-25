@@ -49,6 +49,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     // The one-round-trip outcome write (TryReportOutcomesInOneRoundTripAsync), fixed the same way.
     private readonly string _reportOutcomesInOneRoundTrip;
 
+    // The job insert and its first transition, one statement whose transition exists only for a row it
+    // inserted, so a Duplicate writes nothing. Fixed the same way.
+    private readonly string _enqueueJob;
+
     // Per-Queue unlimited-Queue cache (issue 0170). The Concurrency Limit (I3) and Paused flag (§5.8)
     // share one queue_limits row, mutated only by rare operator actions; a claim on a limited or paused
     // Queue must lock and read that row, but the common unlimited, unpaused Queue need not pay the
@@ -108,6 +112,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
               {TransitionLogCtes("leased")}
               SELECT * FROM claimed
               """;
+        _enqueueJob = $"""
+            WITH inserted AS ({InsertJob} RETURNING job_id, state, attempt, NULL::text AS detail, sequence AS ord)
+            {(_historyPolicy == JobHistoryPolicy.Off ? "" : "," + TransitionLogCtes("inserted"))}
+            SELECT count(*) FROM inserted
+            """;
         _reportOutcomesInOneRoundTrip = $"""
             {LockOutcomeRows};
             WITH d AS (SELECT * FROM {OutcomeRows}),
@@ -289,11 +298,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         return result;
     }
 
-    // A job with no parents and no tags is the job row and its first transition, one statement, and
-    // the first transition (ordinal 0) is below any cap of 1 or more, so nothing prunes. Run as autocommit
-    // it costs one round trip instead of two.
-    private bool IsOneStatementEnqueue(NewJob job) =>
-        job.Parents.Count == 0 && job.Tags.Count == 0 && _options.Bounds.MaxTransitionsPerJob >= 1;
+    // A job with no parents and no tags is the job row and its first transition, one statement. Run as
+    // autocommit it costs one round trip instead of two.
+    private static bool IsOneStatementEnqueue(NewJob job) => job.Parents.Count == 0 && job.Tags.Count == 0;
 
     // With a null transaction the caller has checked IsOneStatementEnqueue, so the insert is the only
     // statement and commits on its own.
@@ -345,26 +352,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             : pendingParents.Count > 0 ? JobState.AwaitingParent
             : JobState.Scheduled;
 
-        const string insertJob =
-            """
-            INSERT INTO backwave.jobs
-                (job_id, wire_name, payload, trace_context, queue, state, due_time, parents_remaining, mode,
-                 terminal_at, terminal_cause, workflow_id)
-            VALUES (@id, @wire, @payload, @trace::text, @queue, @state, @due, @remaining, @mode, @terminalAt, @terminalCause, @workflowId)
-            ON CONFLICT (job_id) DO NOTHING
-            """;
-        // The transition row exists only for a job row this statement inserted, so a Duplicate writes nothing.
-        var recordsHistory = _historyPolicy != JobHistoryPolicy.Off;
-        await using var insert = Cmd(
-            recordsHistory
-                ? $"""
-                  WITH inserted AS ({insertJob} RETURNING job_id)
-                  INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
-                  SELECT job_id, 0, @now, @state, 0, NULL FROM inserted
-                  RETURNING ordinal
-                  """
-                : insertJob,
-            connection, transaction);
+        await using var insert = Cmd(_enqueueJob, connection, transaction);
         insert.Parameters.AddWithValue("id", job.JobId);
         insert.Parameters.AddWithValue("wire", job.WireName);
         insert.Parameters.AddWithValue("payload", job.Payload.ToArray());
@@ -387,25 +375,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             // leaves nothing, as the rollback does on the transaction path.
             await FailpointAsync("enqueue", cancellationToken).ConfigureAwait(false);
         }
-        if (!recordsHistory)
+        insert.Parameters.AddWithValue("now", now.ToUniversalTime());
+        insert.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
+        if (await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not 1L)
         {
-            if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) == 0)
-            {
-                return (EnqueueResult.Duplicate, null);
-            }
-        }
-        else
-        {
-            insert.Parameters.AddWithValue("now", now.ToUniversalTime());
-            if (await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not long ordinal)
-            {
-                return (EnqueueResult.Duplicate, null);
-            }
-            if (transaction is not null)
-            {
-                await PruneTransitionsAsync(connection, transaction, job.JobId, ordinal, cancellationToken)
-                    .ConfigureAwait(false);
-            }
+            return (EnqueueResult.Duplicate, null);
         }
 
         if (transaction is null)
@@ -432,6 +406,16 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
         return (EnqueueResult.Ok, state == JobState.Scheduled && job.DueTime <= now ? job.Queue : null);
     }
+
+    private const string InsertJob =
+        """
+        INSERT INTO backwave.jobs
+            (job_id, wire_name, payload, trace_context, queue, state, due_time, parents_remaining, mode,
+             terminal_at, terminal_cause, workflow_id)
+        VALUES (@id, @wire, @payload, @trace::text, @queue, @state, @due, @remaining, @mode, @terminalAt,
+                @terminalCause, @workflowId)
+        ON CONFLICT (job_id) DO NOTHING
+        """;
 
     private async Task SendHintsAsync(IReadOnlyCollection<string> queues, CancellationToken cancellationToken)
     {
@@ -663,10 +647,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         """;
 
     // The Transition Log append (§5.12) and its per-job-life prune (§7) as CTEs over `source`, a CTE of
-    // (job_id, state, attempt, detail, ord) rows, for a statement that writes its own transitions. The
-    // same SQL as RecordTransitionsBatchAsync, which sends the prune as a second statement only when
-    // some job reached the cap. Here the prune always runs, and its cap filter leaves it nothing to
-    // delete until a job reaches the cap.
+    // (job_id, state, attempt, detail, ord) rows with each job at most once, appended in `ord` order. The
+    // only SQL that writes a transition. Every CTE reads the statement's one snapshot, so a transaction
+    // path runs it after the statement that locks the jobs, and the ordinal read sees every committed
+    // transition of a locked job. The prune deletes only rows older than the new one, which that
+    // snapshot sees, and its cap filter leaves it nothing to delete until a job reaches the cap.
     private static string TransitionLogCtes(string source) =>
         $"""
         logged AS (
@@ -2076,85 +2061,20 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await audit.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    // Appends one Transition Log entry (spec §5.12) for a job's resulting state, inside the SAME
-    // transaction as the state change it records — a crash leaves neither or both (§4). The
-    // ordinal is the per-job max + 1 (a sub-select against the same table), so it climbs even as
-    // oldest rows age out. The trailing bounded delete enforces MaxTransitionsPerJob (§7): once the
-    // cap is exceeded, the oldest entry is dropped, and it runs only when this entry put the cap in
-    // play. `now` is always the caller's clock - the database clock is never consulted (Virtual
-    // Time stays meaningful in the Conformance Suite).
-    // `failureDetail` is the Shell-captured exception text, written only on a failing transition
-    // (§5.12) and clamped to MaxFailureDetailBytes; null on every other transition.
-    private async Task RecordTransitionAsync(
+    // Appends one Transition Log entry (§5.12) for a job's resulting state, inside the SAME transaction
+    // as the state change it records. `failureDetail` is the Shell-captured exception text, written only
+    // on a failing transition (§5.12); null on every other transition.
+    private Task RecordTransitionAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction, Guid jobId, JobState state,
         int attempt, DateTimeOffset now, CancellationToken cancellationToken, string? failureDetail = null)
-    {
-        // Job History Policy (§5.12, ADR 0011) gates writes, not schema. Off appends no row at all;
-        // Transitions appends the row but never the detail; the full rung keeps the clamped detail.
-        // The table always exists — flipping the policy is config, never a migration.
-        if (_historyPolicy == JobHistoryPolicy.Off)
-        {
-            return;
-        }
-        if (_historyPolicy == JobHistoryPolicy.Transitions)
-        {
-            failureDetail = null; // record the transition, but never the detail it would have carried
-        }
+        => RecordTransitionsBatchAsync(
+            connection, transaction, [(jobId, state, attempt, failureDetail)], now, cancellationToken);
 
-        // RETURNING the assigned ordinal lets PruneTransitionsAsync skip the DELETE when the entry
-        // just written has not reached the cap - the common 2-transition job pays no DELETE round-trip.
-        long ordinal;
-        await using (var insert = Cmd(
-            """
-            INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
-            SELECT @id, COALESCE(MAX(ordinal) + 1, 0), @now, @state, @attempt, @detail
-            FROM backwave.job_transitions WHERE job_id = @id
-            RETURNING ordinal
-            """,
-            connection, transaction))
-        {
-            insert.Parameters.AddWithValue("id", jobId);
-            insert.Parameters.AddWithValue("now", now.ToUniversalTime());
-            insert.Parameters.AddWithValue("state", (int)state);
-            insert.Parameters.AddWithValue("attempt", attempt);
-            insert.Parameters.AddWithValue(
-                "detail", (object?)_options.Bounds.ClampFailureDetail(failureDetail) ?? DBNull.Value);
-            ordinal = (long)(await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
-        }
-
-        await PruneTransitionsAsync(connection, transaction, jobId, ordinal, cancellationToken).ConfigureAwait(false);
-    }
-
-    private async Task PruneTransitionsAsync(
-        NpgsqlConnection connection, NpgsqlTransaction transaction, Guid jobId, long newestOrdinal,
-        CancellationToken cancellationToken)
-    {
-        if (newestOrdinal < _options.Bounds.MaxTransitionsPerJob)
-        {
-            return;
-        }
-        await using var prune = Cmd(
-            """
-            DELETE FROM backwave.job_transitions
-            WHERE job_id = @id AND ordinal <= (
-                SELECT MAX(ordinal) FROM backwave.job_transitions WHERE job_id = @id
-            ) - @cap
-            """,
-            connection, transaction);
-        prune.Parameters.AddWithValue("id", jobId);
-        prune.Parameters.AddWithValue("cap", _options.Bounds.MaxTransitionsPerJob);
-        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
-    }
-
-    // Appends a BATCH of Transition Log entries (§5.12) in ONE set-based INSERT — the per-row
-    // recorder amortized for the claim, batched-report, and lease-sweep paths, where each job
-    // appears exactly once per batch so its ordinal (the per-job MAX(ordinal)+1) is well-defined.
-    // Runs inside the caller's transaction, so the whole batch is atomic with the lease/outcome
-    // write, exactly as the per-row calls were. The global Position rides the job_transitions
-    // SEQUENCE default, one nextval per row. One set-based DELETE prunes the batch to
-    // MaxTransitionsPerJob (§7). Honors the history policy: Off writes nothing; Transitions writes
-    // the rows but never the detail; the full rung keeps the clamped detail. `now` is always the
-    // caller's clock.
+    // Appends a batch of Transition Log entries (§5.12) and prunes each job to MaxTransitionsPerJob (§7)
+    // in one statement, inside the caller's transaction and after the statement that locked the jobs.
+    // Each job appears at most once per batch. Honors the history policy: Off writes nothing;
+    // Transitions writes the rows but never the detail; the full rung keeps the clamped detail. `now` is
+    // always the caller's clock.
     private async Task RecordTransitionsBatchAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction,
         IReadOnlyList<(Guid JobId, JobState State, int Attempt, string? FailureDetail)> rows,
@@ -2177,59 +2097,25 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             details[i] = TransitionDetail(rows[i].FailureDetail);
         }
 
-        // RETURNING the assigned ordinals lets the prune be skipped entirely (below) when no job in
-        // the batch has reached the cap — the common 2-transition job pays no DELETE round-trip.
-        var maxNewOrdinal = -1L;
-        await using (var insert = Cmd(
-            """
-            INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
-            SELECT u.id, COALESCE(t.maxord, -1) + 1, @now, u.state, u.attempt, u.detail
-            FROM unnest(@ids::uuid[], @states::int[], @attempts::int[], @details::text[])
-                 WITH ORDINALITY AS u(id, state, attempt, detail, ord)
-            LEFT JOIN (
-                SELECT job_id, MAX(ordinal) AS maxord FROM backwave.job_transitions
-                WHERE job_id = ANY(@ids) GROUP BY job_id
-            ) t ON t.job_id = u.id
-            ORDER BY u.ord
-            RETURNING ordinal
-            """,
-            connection, transaction))
-        {
-            insert.Parameters.AddWithValue("ids", ids);
-            insert.Parameters.AddWithValue("states", states);
-            insert.Parameters.AddWithValue("attempts", attempts);
-            insert.Parameters.AddWithValue("details", details);
-            insert.Parameters.AddWithValue("now", now.ToUniversalTime());
-            await using var reader = await insert.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            {
-                var ordinal = reader.GetInt64(0);
-                if (ordinal > maxNewOrdinal)
-                {
-                    maxNewOrdinal = ordinal;
-                }
-            }
-        }
-
-        // Per-job-life cap (§7): skip the prune entirely unless some job's new ordinal reached the
-        // cap — a job nowhere near MaxTransitionsPerJob never pays the DELETE. When some job did
-        // reach it, one set-based DELETE keeps only the newest MaxTransitionsPerJob per job (the
-        // correlated MAX no-ops for the jobs still under the cap).
-        if (maxNewOrdinal < _options.Bounds.MaxTransitionsPerJob)
-        {
-            return;
-        }
-        await using var prune = Cmd(
-            """
-            DELETE FROM backwave.job_transitions jt
-            WHERE jt.job_id = ANY(@ids)
-              AND jt.ordinal <= (SELECT MAX(ordinal) FROM backwave.job_transitions x WHERE x.job_id = jt.job_id) - @cap
-            """,
-            connection, transaction);
-        prune.Parameters.AddWithValue("ids", ids);
-        prune.Parameters.AddWithValue("cap", _options.Bounds.MaxTransitionsPerJob);
-        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        await using var record = Cmd(RecordTransitions, connection, transaction);
+        record.Parameters.AddWithValue("ids", ids);
+        record.Parameters.AddWithValue("states", states);
+        record.Parameters.AddWithValue("attempts", attempts);
+        record.Parameters.AddWithValue("details", details);
+        record.Parameters.AddWithValue("now", now.ToUniversalTime());
+        record.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
+        await record.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    private static readonly string RecordTransitions =
+        $"""
+        WITH entries AS (
+            SELECT * FROM unnest(@ids::uuid[], @states::int[], @attempts::int[], @details::text[])
+                WITH ORDINALITY AS u(job_id, state, attempt, detail, ord)
+        ),
+        {TransitionLogCtes("entries")}
+        SELECT count(*) FROM logged
+        """;
 
     // The Failure Detail a transition row stores: Transitions records the row but never the detail; the
     // full rung clamps and keeps it.

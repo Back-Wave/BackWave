@@ -96,12 +96,9 @@ public sealed class PostgresRoundTripBudgetTests
         // No per-row anything. The claim is a single set-based FOR UPDATE SKIP LOCKED whose RETURNING
         // hands back the whole job row, so 32 jobs cost the same statement as 1. Tags ride back inside
         // that same statement as a correlated json_agg, which is why there is no tag-hydration trip
-        // here the way there is in the job listing below. The transition insert is set-based over
-        // unnest(), and its own RETURNING hands back the assigned ordinals, so - unlike Oracle, which
-        // rejects RETURNING on an INSERT ... SELECT and has to read the highest ordinal back - there is
-        // no second statement to learn them. No prune DELETE either: the batch recorder issues one only
-        // when some job in the batch reached MaxTransitionsPerJob, and a freshly claimed job is on its
-        // second transition.
+        // here the way there is in the job listing below. The transition write is one set-based
+        // statement over unnest() that appends and prunes together, so - unlike Oracle, which has to
+        // read the highest ordinal back - there is no second statement for the ordinals or the prune.
         //
         // The concurrency-limit count is absent because this queue has no queue_limits row: `configured`
         // comes back null, so the "count leased rows" statement never runs. A limited queue costs 6.
