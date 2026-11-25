@@ -267,7 +267,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         EnqueueResult result;
         string? hintQueue;
-        if (IsOneStatementEnqueue(job))
+        // Inside an ambient TransactionScope the connection enlists, so an autocommit insert would join a
+        // scope the store cannot see commit. The transaction path refuses it as it always has.
+        if (IsOneStatementEnqueue(job) && System.Transactions.Transaction.Current is null)
         {
             (result, hintQueue) = await EnqueueCoreAsync(connection, null, job, now, cancellationToken)
                 .ConfigureAwait(false);
