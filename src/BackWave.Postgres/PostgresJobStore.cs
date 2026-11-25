@@ -46,8 +46,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     // The one-statement claim (TryClaimInOneStatementAsync), fixed by the history policy at construction.
     private readonly string _claimInOneStatement;
 
-    // The one-round-trip outcome write (TryReportOutcomesInOneRoundTripAsync), fixed the same way.
+    // The outcome write, fixed the same way: gated on the child-edge check for the one-round-trip path
+    // (TryReportOutcomesInOneRoundTripAsync), ungated inside the transaction that cascades.
     private readonly string _reportOutcomesInOneRoundTrip;
+    private readonly string _reportOutcomesInTransaction;
 
     // The job insert and its first transition, one statement whose transition exists only for a row it
     // inserted, so a Duplicate writes nothing. Fixed the same way.
@@ -117,20 +119,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             {(_historyPolicy == JobHistoryPolicy.Off ? "" : "," + TransitionLogCtes("inserted"))}
             SELECT count(*) FROM inserted
             """;
-        _reportOutcomesInOneRoundTrip = $"""
-            {LockOutcomeRows};
-            WITH d AS (SELECT * FROM {OutcomeRows}),
-            gate AS (
-                SELECT EXISTS (
-                    SELECT 1 FROM backwave.job_parents p JOIN d ON p.parent_id = d.job_id WHERE d.state <> 0
-                ) AS has_children
-            ),
-            {OutcomeWrite}
-            {(_historyPolicy == JobHistoryPolicy.Off ? "" : "," + TransitionLogCtes("written"))}
-            SELECT w.job_id, w.state FROM written w
-            UNION ALL
-            SELECT NULL, NULL FROM gate WHERE gate.has_children
-            """;
+        _reportOutcomesInOneRoundTrip = OutcomeCommandSql(ChildEdgeGate);
+        _reportOutcomesInTransaction = OutcomeCommandSql("SELECT false AS gated");
     }
 
     // The one place a Postgres command is built, so the configured schema is swapped into every query
@@ -957,63 +947,63 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         }
 
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
-        var nowUtc = now.ToUniversalTime();
-
-        // The set-valued payload: each row's fence keys (worker, attempt) plus its COMPUTED target
-        // state and the per-state columns (terminal instant, cause, retry due-time). Output blobs and
-        // Tag deltas stay OUT of this vector — the few rows carrying them get a per-row write below,
-        // inside this same transaction, so the common pure-drain row rides the batch UPDATE alone.
-        var count = batch.Count;
-        var ids = new Guid[count];
-        var workers = new string[count];
-        var attempts = new int[count];
-        var states = new int[count];
-        var causes = new string?[count];
-        var dues = new DateTimeOffset?[count];
-        var terminalAts = new DateTimeOffset?[count];
-        for (var i = 0; i < count; i++)
-        {
-            var row = batch[i];
-            ids[i] = row.JobId;
-            workers[i] = row.WorkerId;
-            attempts[i] = row.Attempt;
-            // Success → Succeeded (3, terminal now); Failure with a retry instant → Scheduled (0, due
-            // then, NOT terminal); Failure at the ceiling → Dead-Lettered (5); Cancelled → 4; Unroutable
-            // → Quarantined (6). The cause rides terminal failures/cancel/unroutable; due rides retry.
-            (int State, string? Cause, DateTimeOffset? Due, DateTimeOffset? TerminalAt) target = row.Outcome switch
-            {
-                JobOutcome.Success => (3, null, null, nowUtc),
-                JobOutcome.Failure { NextDueTime: { } retryAt } => (0, null, retryAt.ToUniversalTime(), null),
-                JobOutcome.Failure failure => (5, failure.Error, null, nowUtc),
-                JobOutcome.Cancelled cancelled => (4, cancelled.Cause, null, nowUtc),
-                JobOutcome.Unroutable unroutable => (6, unroutable.Reason, null, nowUtc),
-                _ => throw new ArgumentOutOfRangeException(nameof(batch)),
-            };
-            (states[i], causes[i], dues[i], terminalAts[i]) = target;
-        }
-
-        var vector = new OutcomeVector(ids, workers, attempts, states, causes, dues, terminalAts);
+        var vector = OutcomeVector.From(batch, now.ToUniversalTime(), TransitionDetail);
         var matched = NeedsPerRowWrites(batch)
             ? null
-            : await TryReportOutcomesInOneRoundTripAsync(batch, vector, now, cancellationToken).ConfigureAwait(false);
+            : await TryReportOutcomesInOneRoundTripAsync(vector, now, cancellationToken).ConfigureAwait(false);
         matched ??= await ReportOutcomesInTransactionAsync(batch, vector, now, cancellationToken).ConfigureAwait(false);
 
-        // One result per input row, in input order, keyed by job id: matched ⇒ Applied, else StaleLease.
-        var results = new OutcomeReportResult[count];
-        for (var i = 0; i < count; i++)
+        // One result per input row, in input order, keyed by job id: Applied when matched, else StaleLease.
+        var results = new OutcomeReportResult[batch.Count];
+        for (var i = 0; i < batch.Count; i++)
         {
             results[i] = new OutcomeReportResult(
                 batch[i].JobId,
-                matched.ContainsKey(batch[i].JobId) ? OutcomeResult.Applied : OutcomeResult.StaleLease);
+                matched.Contains(batch[i].JobId) ? OutcomeResult.Applied : OutcomeResult.StaleLease);
         }
         return results;
     }
 
-    // The set-valued payload of a batched outcome write, one entry per batch row in batch order.
+    // The set-valued payload of a batched outcome write, one entry per batch row in batch order: each
+    // row's fence keys (worker, attempt) plus its COMPUTED target state, the per-state columns (terminal
+    // instant, cause, retry due-time) and the detail its transition records. Output blobs and Tag deltas
+    // stay out of it: the few rows carrying them get a per-row write inside the transaction.
     private sealed record OutcomeVector(
         Guid[] Ids, string[] Workers, int[] Attempts, int[] States, string?[] Causes,
-        DateTimeOffset?[] Dues, DateTimeOffset?[] TerminalAts)
+        DateTimeOffset?[] Dues, DateTimeOffset?[] TerminalAts, string?[] Details)
     {
+        public static OutcomeVector From(
+            IReadOnlyList<OutcomeReport> batch, DateTimeOffset nowUtc, Func<string?, string?> transitionDetail)
+        {
+            var count = batch.Count;
+            var vector = new OutcomeVector(
+                new Guid[count], new string[count], new int[count], new int[count], new string?[count],
+                new DateTimeOffset?[count], new DateTimeOffset?[count], new string?[count]);
+            for (var i = 0; i < count; i++)
+            {
+                var row = batch[i];
+                vector.Ids[i] = row.JobId;
+                vector.Workers[i] = row.WorkerId;
+                vector.Attempts[i] = row.Attempt;
+                // Success -> Succeeded (3, terminal now); Failure with a retry instant -> Scheduled (0, due
+                // then, NOT terminal); Failure at the ceiling -> Dead-Lettered (5); Cancelled -> 4;
+                // Unroutable -> Quarantined (6). The cause rides terminal failures/cancel/unroutable; due
+                // rides retry. Failure Detail rides only a failing transition.
+                (int State, string? Cause, DateTimeOffset? Due, DateTimeOffset? TerminalAt) target = row.Outcome switch
+                {
+                    JobOutcome.Success => (3, null, null, nowUtc),
+                    JobOutcome.Failure { NextDueTime: { } retryAt } => (0, null, retryAt.ToUniversalTime(), null),
+                    JobOutcome.Failure failure => (5, failure.Error, null, nowUtc),
+                    JobOutcome.Cancelled cancelled => (4, cancelled.Cause, null, nowUtc),
+                    JobOutcome.Unroutable unroutable => (6, unroutable.Reason, null, nowUtc),
+                    _ => throw new ArgumentOutOfRangeException(nameof(batch)),
+                };
+                (vector.States[i], vector.Causes[i], vector.Dues[i], vector.TerminalAts[i]) = target;
+                vector.Details[i] = row.Outcome is JobOutcome.Failure ? transitionDetail(row.FailureDetail) : null;
+            }
+            return vector;
+        }
+
         public void AddTo(NpgsqlCommand command)
         {
             command.Parameters.AddWithValue("ids", Ids);
@@ -1023,6 +1013,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             command.Parameters.AddWithValue("causes", Causes);
             command.Parameters.AddWithValue("dues", Dues);
             command.Parameters.AddWithValue("terminalAts", TerminalAts);
+            command.Parameters.AddWithValue("details", Details);
         }
     }
 
@@ -1040,53 +1031,77 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         return false;
     }
 
-    // The outcome write in one round trip: two statements in one command, which Npgsql runs as one
-    // implicit transaction that commits when the server reaches the end of the command. The first takes
-    // the row lock of every row the fence will match, in id order. The second then reads a snapshot taken
-    // after those locks, so no other transaction can still be changing these rows under it: a child
-    // enqueue that held a parent's lock has committed its edge into this snapshot, and one that comes
-    // later waits on the lock and then sees the parent terminal. The second statement writes only when
-    // no row it would make terminal parents a Dependency, because the latch cascade (invariant I2) must
-    // commit with the terminal write. Otherwise it writes nothing, returns null, and the caller runs the
-    // batch in a transaction that cascades.
-    private async ValueTask<Dictionary<Guid, int>?> TryReportOutcomesInOneRoundTripAsync(
-        IReadOnlyList<OutcomeReport> batch, OutcomeVector vector, DateTimeOffset now, CancellationToken cancellationToken)
+    // The outcome write in one round trip: the outcome command with the child-edge gate, which Npgsql
+    // runs as one implicit transaction that commits when the server reaches the end of the command. The
+    // write happens only when no row it would make terminal parents a Dependency, because the latch
+    // cascade (invariant I2) must commit with the terminal write. Otherwise it writes nothing, returns
+    // null, and the caller runs the batch in the transaction that cascades.
+    private async ValueTask<HashSet<Guid>?> TryReportOutcomesInOneRoundTripAsync(
+        OutcomeVector vector, DateTimeOffset now, CancellationToken cancellationToken)
     {
-        var details = new string?[batch.Count];
-        for (var i = 0; i < batch.Count; i++)
-        {
-            details[i] = batch[i].Outcome is JobOutcome.Failure ? TransitionDetail(batch[i].FailureDetail) : null;
-        }
-
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await using var write = Cmd(_reportOutcomesInOneRoundTrip, connection);
+        var (gated, applied) = await WriteOutcomesAsync(
+            _reportOutcomesInOneRoundTrip, connection, null, vector, now, cancellationToken).ConfigureAwait(false);
+        return gated ? null : applied;
+    }
+
+    // Runs an outcome command and returns whether the gate held the write back, and the ids it applied.
+    private async ValueTask<(bool Gated, HashSet<Guid> Applied)> WriteOutcomesAsync(
+        string sql, NpgsqlConnection connection, NpgsqlTransaction? transaction, OutcomeVector vector,
+        DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        await using var write = Cmd(sql, connection, transaction);
         vector.AddTo(write);
-        write.Parameters.AddWithValue("details", details);
         write.Parameters.AddWithValue("now", now.ToUniversalTime());
         write.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
 
-        var matched = new Dictionary<Guid, int>();
+        var applied = new HashSet<Guid>();
         var gated = false;
-        await using (var reader = await write.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
+        await using var reader = await write.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        await reader.NextResultAsync(cancellationToken).ConfigureAwait(false); // past LockOutcomeRows
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            await reader.NextResultAsync(cancellationToken).ConfigureAwait(false); // past the lock statement
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            gated = reader.GetBoolean(0);
+            if (!reader.IsDBNull(1))
             {
-                if (reader.IsDBNull(0))
-                {
-                    gated = true;
-                    continue;
-                }
-                matched[reader.GetGuid(0)] = reader.GetInt32(1);
+                applied.Add(reader.GetGuid(1));
             }
         }
-        return gated ? null : matched;
+        return (gated, applied);
     }
+
+    // The outcome command: two statements, sent as one round trip. The first takes the row lock of every
+    // row the fence will match, in id order. The second then reads a snapshot taken after those locks,
+    // so no other transaction can still be changing these rows under it: a child enqueue that held a
+    // parent's lock has committed its edge into this snapshot, and one that comes later waits on the lock
+    // and then sees the parent terminal; and the transition ordinals it reads are the latest. The second
+    // writes the outcomes and their transitions unless `gate` says to hold back, and returns one row per
+    // applied job, or one row with a null job id when it applied none, each carrying the gate.
+    private string OutcomeCommandSql(string gate) =>
+        $"""
+        {LockOutcomeRows};
+        WITH d AS (SELECT * FROM {OutcomeRows}),
+        gate AS ({gate}),
+        {OutcomeWrite}
+        {(_historyPolicy == JobHistoryPolicy.Off ? "" : "," + TransitionLogCtes("written"))}
+        SELECT gate.gated, w.job_id FROM gate LEFT JOIN written w ON true
+        """;
+
+    // True when a row the batch would make terminal parents a Dependency.
+    private const string ChildEdgeGate =
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM backwave.job_parents p JOIN d ON p.parent_id = d.job_id WHERE d.state <> 0
+        ) AS gated
+        """;
 
     // The fence every outcome write applies to each row independently (Effect-Once): the row is still
     // leased to the reporting worker, at the reported attempt, and the lease is live.
     private const string OutcomeFence =
-        "j.job_id = d.job_id AND j.state = 2 AND j.lease_owner = d.worker AND j.attempt = d.attempt AND j.lease_expiry > @now";
+        """
+        j.job_id = d.job_id AND j.state = 2 AND j.lease_owner = d.worker AND j.attempt = d.attempt
+          AND j.lease_expiry > @now
+        """;
 
     private const string OutcomeRows =
         """
@@ -1095,17 +1110,22 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             WITH ORDINALITY AS d(job_id, worker, attempt, state, cause, due, terminal_at, detail, ord)
         """;
 
+    // Takes the locks only. Its one row, the count of rows locked, is not read.
     private const string LockOutcomeRows =
         $"""
         SELECT count(*) FROM (
-            SELECT 1 FROM backwave.jobs j, unnest(@ids::uuid[], @workers::text[], @attempts::int[]) AS d(job_id, worker, attempt)
+            SELECT 1 FROM backwave.jobs j, {OutcomeRows}
             WHERE {OutcomeFence}
             ORDER BY j.job_id
             FOR NO KEY UPDATE OF j
         ) locked
         """;
 
-    // The same column writes as the transaction's UPDATE, gated on the child-edge check.
+    // One fenced multi-row UPDATE: the fence applies to every row INDEPENDENTLY. A row whose lease is no
+    // longer live fails to join and changes nothing (StaleLease). due_time moves only for a retry row
+    // (COALESCE keeps it for everyone else); cancel_requested clears only for a Cancelled row.
+    // terminal_at/terminal_cause carry per-row (null for retry). retry_cause records a handler-failure
+    // retry and is left alone on every terminal row.
     private const string OutcomeWrite =
         $"""
         written AS (
@@ -1119,60 +1139,28 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 cancel_requested = CASE WHEN d.state = 4 THEN false ELSE j.cancel_requested END,
                 retry_cause = CASE WHEN d.state = 0 THEN 1 ELSE j.retry_cause END
             FROM d, gate
-            WHERE NOT gate.has_children AND {OutcomeFence}
+            WHERE NOT gate.gated AND {OutcomeFence}
             RETURNING j.job_id, j.state, j.attempt, d.detail, d.ord
         )
         """;
 
-    private async ValueTask<Dictionary<Guid, int>> ReportOutcomesInTransactionAsync(
+    private async ValueTask<HashSet<Guid>> ReportOutcomesInTransactionAsync(
         IReadOnlyList<OutcomeReport> batch, OutcomeVector vector, DateTimeOffset now, CancellationToken cancellationToken)
     {
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-        // One fenced multi-row UPDATE: the WHERE applies the per-(worker, attempt) Effect-Once fence to
-        // every row INDEPENDENTLY. A row whose lease is no longer live simply fails to join and changes
-        // nothing (StaleLease); a matched row applies and is returned via RETURNING, keyed by job id.
-        // due_time moves only for a retry row (COALESCE keeps it for everyone else); cancel_requested
-        // clears only for a Cancelled row. terminal_at/terminal_cause carry per-row (null for retry).
-        // retry_cause records a handler-failure retry and is left alone on every terminal row.
-        var matched = new Dictionary<Guid, int>();
-        await using (var update = Cmd(
-            """
-            UPDATE backwave.jobs j
-            SET state = d.state,
-                lease_owner = NULL,
-                lease_expiry = NULL,
-                terminal_at = d.terminal_at,
-                terminal_cause = d.cause,
-                due_time = COALESCE(d.due, j.due_time),
-                cancel_requested = CASE WHEN d.state = 4 THEN false ELSE j.cancel_requested END,
-                retry_cause = CASE WHEN d.state = 0 THEN 1 ELSE j.retry_cause END
-            FROM unnest(@ids::uuid[], @workers::text[], @attempts::int[], @states::int[],
-                        @causes::text[], @dues::timestamptz[], @terminalAts::timestamptz[])
-                 AS d(job_id, worker, attempt, state, cause, due, terminal_at)
-            WHERE j.job_id = d.job_id AND j.state = 2 AND j.lease_owner = d.worker
-              AND j.attempt = d.attempt AND j.lease_expiry > @now
-            RETURNING j.job_id, j.state
-            """,
-            connection, transaction))
-        {
-            vector.AddTo(update);
-            update.Parameters.AddWithValue("now", now.ToUniversalTime());
-            await using var reader = await update.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            {
-                matched[reader.GetGuid(0)] = reader.GetInt32(1);
-            }
-        }
+        // The outcome write and its transitions, the same command as the one-round-trip path without the gate.
+        var (_, applied) = await WriteOutcomesAsync(
+            _reportOutcomesInTransaction, connection, transaction, vector, now, cancellationToken).ConfigureAwait(false);
 
-        // Output and Tag deltas land ONLY for matched rows — a fenced-out (StaleLease) row leaves
+        // Output and Tag deltas land ONLY for applied rows — a fenced-out (StaleLease) row leaves
         // nothing a stale node buffered. Output persists only on a Success outcome; Tags union onto
         // the job's existing tags (set semantics, so an identical tag is a no-op). Both ride this
-        // same fenced transaction, keeping the common drain row a pure batch UPDATE.
+        // same fenced transaction.
         foreach (var row in batch)
         {
-            if (!matched.ContainsKey(row.JobId))
+            if (!applied.Contains(row.JobId))
             {
                 continue;
             }
@@ -1190,35 +1178,19 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
         }
 
-        // Transition Log (§5.12): one entry per matched row for its resulting state at this Attempt,
-        // in ONE set-based INSERT atomic with the outcome write. Failure Detail rides only a failing
-        // transition; every other outcome records null. The batch honors the history policy (Off
-        // appends nothing), so the noop-drain hot path adds no transition statements at all.
-        var transitionRows = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(matched.Count);
-        foreach (var row in batch)
-        {
-            if (matched.TryGetValue(row.JobId, out var newState))
-            {
-                transitionRows.Add((row.JobId, (JobState)newState, row.Attempt,
-                    row.Outcome is JobOutcome.Failure ? row.FailureDetail : null));
-            }
-        }
-        await RecordTransitionsBatchAsync(connection, transaction, transitionRows, now, cancellationToken)
-            .ConfigureAwait(false);
-
         // First-level child-latch resolution for the matched TERMINAL ids only (a retry row stays
         // non-terminal and gates nothing). One lookup finds the few terminal parents that actually
         // gate a Dependency; the existing per-parent cascade then resolves each recursively, so a deep
         // dependency graph stays correct. The common no-children batch adds zero per-job statements.
-        var terminalIds = new List<Guid>();
-        foreach (var (jobId, state) in matched)
+        var terminal = new Dictionary<Guid, JobState>();
+        for (var i = 0; i < vector.Ids.Length; i++)
         {
-            if (((JobState)state).IsTerminal())
+            if (applied.Contains(vector.Ids[i]) && ((JobState)vector.States[i]).IsTerminal())
             {
-                terminalIds.Add(jobId);
+                terminal[vector.Ids[i]] = (JobState)vector.States[i];
             }
         }
-        if (terminalIds.Count > 0)
+        if (terminal.Count > 0)
         {
             // Crash after the terminal write, before the latch cascade: rollback must leave every
             // parent non-terminal and every child latch un-resolved (issue 0034, invariant I2). Kept a
@@ -1230,7 +1202,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 "SELECT DISTINCT parent_id FROM backwave.job_parents WHERE parent_id = ANY(@ids)",
                 connection, transaction))
             {
-                withChildren.Parameters.AddWithValue("ids", terminalIds.ToArray());
+                withChildren.Parameters.AddWithValue("ids", terminal.Keys.ToArray());
                 await using var reader = await withChildren.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
@@ -1240,20 +1212,20 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             parents.Sort(); // deterministic lock order, as everywhere else (issue 0032)
             foreach (var parentId in parents)
             {
-                if (!matched.TryGetValue(parentId, out var parentState))
+                if (!terminal.TryGetValue(parentId, out var parentState))
                 {
                     throw Invariant.Halt(
                         InvariantTrigger.ParentJobMissingFromBatch,
                         $"Parent job {parentId} came back from a lookup restricted to this batch's own terminal ids, yet it is absent from that batch.");
                 }
                 await ResolveChildLatchesAsync(
-                    connection, transaction, parentId, (JobState)parentState, now, cancellationToken)
+                    connection, transaction, parentId, parentState, now, cancellationToken)
                     .ConfigureAwait(false);
             }
         }
 
         await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
-        return matched;
+        return applied;
     }
 
     /// <summary>

@@ -55,7 +55,7 @@ public sealed class PostgresRoundTripBudgetTests
 
     private static readonly Budget ReportOutcomesWithOutput = new(
         "ReportOutcomesAsync of 32 succeeded rows, every one carrying job output",
-        Statements: 35, Commits: 1);
+        Statements: 34, Commits: 1);
 
     private static readonly Budget ExpireLeases = new(
         "ExpireLeasesAsync over 32 expired leases, all rescheduled",
@@ -193,8 +193,10 @@ public sealed class PostgresRoundTripBudgetTests
         var claimed = await store.ClaimAsync(new ClaimRequest("budget-worker", ["budget"], ClaimBatch, Lease, T0));
         Assert.Equal(ClaimBatch, claimed.Count);
 
-        // The drain budget above plus ONE STATEMENT PER BLOB: 3 + 32 = 35. This is the one honest
-        // per-row cost left on the Postgres outcome path, and pinning it is how it stays visible.
+        // A batch carrying output takes the transaction: 1 outcome command (the write and its
+        // transitions, as on the drain path) + ONE STATEMENT PER BLOB + 1 child-latch lookup = 34, and
+        // the COMMIT. The blobs are the one honest per-row cost left on the Postgres outcome path, and
+        // pinning it is how it stays visible.
         //
         // Output is deliberately kept out of the fenced batch vector: the vector carries only the
         // columns every row in a drain has, so the common pure-drain row (the budget above) rides one
@@ -203,8 +205,8 @@ public sealed class PostgresRoundTripBudgetTests
         //
         // Postgres can do better than this - unnest(@ids::uuid[], @outputs::bytea[]) would fold all 32
         // into the batch the same way the state vector already folds - and when someone does that work,
-        // this number should fall to 4 and be recorded here in the same commit. Until then 35 is the
-        // truth, and a budget that quietly said 4 would be a number nobody could trust.
+        // this number should fall to 2 and be recorded here in the same commit. Until then 34 is the
+        // truth, and a budget that quietly said 2 would be a number nobody could trust.
         var payload = new byte[4_096];
         Random.Shared.NextBytes(payload);
         var batch = claimed
