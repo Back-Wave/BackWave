@@ -270,7 +270,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // scope the store cannot see commit. The transaction path refuses it as it always has.
         if (IsOneStatementEnqueue(job) && System.Transactions.Transaction.Current is null)
         {
-            (result, hintQueue) = await EnqueueCoreAsync(connection, null, job, now, cancellationToken)
+            (result, hintQueue) = await EnqueueInOneStatementAsync(connection, job, now, cancellationToken)
                 .ConfigureAwait(false);
         }
         else
@@ -292,10 +292,20 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     // autocommit it costs one round trip instead of two.
     private static bool IsOneStatementEnqueue(NewJob job) => job.Parents.Count == 0 && job.Tags.Count == 0;
 
-    // With a null transaction the caller has checked IsOneStatementEnqueue, so the insert is the only
-    // statement and commits on its own.
+    private async ValueTask<(EnqueueResult Result, string? HintQueue)> EnqueueInOneStatementAsync(
+        NpgsqlConnection connection, NewJob job, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        // An autocommit insert has no seam after it, so the failpoint fires before: a crash there
+        // leaves nothing, as the rollback does on the transaction path.
+        await FailpointAsync("enqueue", cancellationToken).ConfigureAwait(false);
+        return await InsertJobAsync(
+                connection, null, job, JobState.Scheduled, 0, null, now, null, cancellationToken).ConfigureAwait(false)
+            ? (EnqueueResult.Ok, job.DueTime <= now ? job.Queue : null)
+            : (EnqueueResult.Duplicate, null);
+    }
+
     private async ValueTask<(EnqueueResult Result, string? HintQueue)> EnqueueCoreAsync(
-        NpgsqlConnection connection, NpgsqlTransaction? transaction, NewJob job, DateTimeOffset now,
+        NpgsqlConnection connection, NpgsqlTransaction transaction, NewJob job, DateTimeOffset now,
         CancellationToken cancellationToken, Guid? workflowId = null)
     {
         // Lock the parents (if any) so a concurrent terminal transition cannot race the
@@ -342,39 +352,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             : pendingParents.Count > 0 ? JobState.AwaitingParent
             : JobState.Scheduled;
 
-        await using var insert = Cmd(_enqueueJob, connection, transaction);
-        insert.Parameters.AddWithValue("id", job.JobId);
-        insert.Parameters.AddWithValue("wire", job.WireName);
-        insert.Parameters.AddWithValue("payload", job.Payload.ToArray());
-        insert.Parameters.AddWithValue("trace", (object?)job.TraceContext ?? DBNull.Value);
-        insert.Parameters.AddWithValue("queue", job.Queue);
-        insert.Parameters.AddWithValue("state", (int)state);
-        insert.Parameters.AddWithValue("due", job.DueTime.ToUniversalTime());
-        insert.Parameters.AddWithValue("remaining", pendingParents.Count);
-        insert.Parameters.AddWithValue("mode", (int)job.Mode);
-        insert.Parameters.AddWithValue("terminalAt",
-            cancelledByParent is not null ? now.ToUniversalTime() : DBNull.Value);
-        insert.Parameters.AddWithValue("terminalCause",
-            cancelledByParent is not null ? ParentFailureCause(cancelledByParent.Value) : DBNull.Value);
-        // Workflow membership (ADR 0023): the immutable scalar, stamped once here at enqueue; null for
-        // an ordinary job. The Core never reads it — it lives entirely above the determinism boundary.
-        insert.Parameters.AddWithValue("workflowId", (object?)workflowId ?? DBNull.Value);
-        if (transaction is null)
-        {
-            // An autocommit insert has no seam after it, so the failpoint fires before: a crash there
-            // leaves nothing, as the rollback does on the transaction path.
-            await FailpointAsync("enqueue", cancellationToken).ConfigureAwait(false);
-        }
-        insert.Parameters.AddWithValue("now", now.ToUniversalTime());
-        insert.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
-        if (await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not 1L)
+        if (!await InsertJobAsync(
+                connection, transaction, job, state, pendingParents.Count, cancelledByParent, now, workflowId,
+                cancellationToken).ConfigureAwait(false))
         {
             return (EnqueueResult.Duplicate, null);
-        }
-
-        if (transaction is null)
-        {
-            return (EnqueueResult.Ok, job.DueTime <= now ? job.Queue : null);
         }
 
         // Crash between the job row and its parent edges: rollback must leave neither (issue 0034).
@@ -395,6 +377,35 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await InsertTagsAsync(connection, transaction, job.JobId, job.Tags, cancellationToken).ConfigureAwait(false);
 
         return (EnqueueResult.Ok, state == JobState.Scheduled && job.DueTime <= now ? job.Queue : null);
+    }
+
+    // The job row and its first transition, in one statement on the caller's transaction or, with none,
+    // as autocommit. False when the job id already exists (a Duplicate), which writes nothing.
+    private async ValueTask<bool> InsertJobAsync(
+        NpgsqlConnection connection, NpgsqlTransaction? transaction, NewJob job, JobState state,
+        int parentsRemaining, JobState? cancelledByParent, DateTimeOffset now, Guid? workflowId,
+        CancellationToken cancellationToken)
+    {
+        await using var insert = Cmd(_enqueueJob, connection, transaction);
+        insert.Parameters.AddWithValue("id", job.JobId);
+        insert.Parameters.AddWithValue("wire", job.WireName);
+        insert.Parameters.AddWithValue("payload", job.Payload.ToArray());
+        insert.Parameters.AddWithValue("trace", (object?)job.TraceContext ?? DBNull.Value);
+        insert.Parameters.AddWithValue("queue", job.Queue);
+        insert.Parameters.AddWithValue("state", (int)state);
+        insert.Parameters.AddWithValue("due", job.DueTime.ToUniversalTime());
+        insert.Parameters.AddWithValue("remaining", parentsRemaining);
+        insert.Parameters.AddWithValue("mode", (int)job.Mode);
+        insert.Parameters.AddWithValue("terminalAt",
+            cancelledByParent is not null ? now.ToUniversalTime() : DBNull.Value);
+        insert.Parameters.AddWithValue("terminalCause",
+            cancelledByParent is { } parentState ? ParentFailureCause(parentState) : DBNull.Value);
+        // Workflow membership (ADR 0023): the immutable scalar, stamped once here at enqueue; null for
+        // an ordinary job. The Core never reads it — it lives entirely above the determinism boundary.
+        insert.Parameters.AddWithValue("workflowId", (object?)workflowId ?? DBNull.Value);
+        insert.Parameters.AddWithValue("now", now.ToUniversalTime());
+        insert.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
+        return await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is 1L;
     }
 
     private const string InsertJob =
