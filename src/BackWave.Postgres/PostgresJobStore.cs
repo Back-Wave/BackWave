@@ -181,7 +181,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
     // Test-only failpoint (issue 0034): a no-op in production (hook null), but a test arms
     // PostgresStoreOptions.FaultHook to throw at a named point between the effects of a
-    // multi-effect operation, proving the surrounding transaction makes them all-or-nothing.
+    // multi-effect operation, proving the surrounding transaction makes them all-or-nothing. A path
+    // that writes in one statement has no point between effects, so it reaches no failpoint.
     private Task FailpointAsync(string name, CancellationToken cancellationToken)
         => _options.FaultHook?.Invoke(name, cancellationToken) ?? Task.CompletedTask;
 
@@ -294,15 +295,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
     private async ValueTask<(EnqueueResult Result, string? HintQueue)> EnqueueInOneStatementAsync(
         NpgsqlConnection connection, NewJob job, DateTimeOffset now, CancellationToken cancellationToken)
-    {
-        // An autocommit insert has no seam after it, so the failpoint fires before: a crash there
-        // leaves nothing, as the rollback does on the transaction path.
-        await FailpointAsync("enqueue", cancellationToken).ConfigureAwait(false);
-        return await InsertJobAsync(
+        => await InsertJobAsync(
                 connection, null, job, JobState.Scheduled, 0, null, now, null, cancellationToken).ConfigureAwait(false)
             ? (EnqueueResult.Ok, job.DueTime <= now ? job.Queue : null)
             : (EnqueueResult.Duplicate, null);
-    }
 
     private async ValueTask<(EnqueueResult Result, string? HintQueue)> EnqueueCoreAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction, NewJob job, DateTimeOffset now,
@@ -522,8 +518,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     private async ValueTask<List<JobRecord>?> TryClaimInOneStatementAsync(
         NpgsqlConnection connection, ClaimRequest request, string queue, int take, CancellationToken cancellationToken)
     {
-        // No seam inside one statement, so the failpoint fires before it: a crash here leaves nothing.
-        await FailpointAsync("claim", cancellationToken).ConfigureAwait(false);
         await using var claim = Cmd(_claimInOneStatement, connection);
         AddClaimParameters(claim, request, queue, take);
         claim.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);

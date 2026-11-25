@@ -64,7 +64,7 @@ public sealed class PostgresStoreTelemetryTests
         // A fault with nothing transient about it: the worker's fail-stop signal.
         await using var armed = FaultArmedStore("enqueue", _ => new FaultInjectedException("enqueue"));
 
-        await Assert.ThrowsAsync<FaultInjectedException>(async () => await armed.EnqueueAsync(Job(), T0));
+        await Assert.ThrowsAsync<FaultInjectedException>(async () => await armed.EnqueueAsync(TaggedJob(), T0));
 
         var fault = Assert.Single(Mine(faults, marker));
         Assert.Equal(1, fault.Value);
@@ -91,7 +91,7 @@ public sealed class PostgresStoreTelemetryTests
         // rather than fail-stopping, so the counter must not report it as terminal.
         await using var armed = FaultArmedStore("enqueue", _ => new TimeoutException("injected"));
 
-        await Assert.ThrowsAsync<TimeoutException>(async () => await armed.EnqueueAsync(Job(), T0));
+        await Assert.ThrowsAsync<TimeoutException>(async () => await armed.EnqueueAsync(TaggedJob(), T0));
 
         var fault = Assert.Single(Mine(faults, marker));
         Assert.Equal("transient", fault.Kind);
@@ -118,6 +118,9 @@ public sealed class PostgresStoreTelemetryTests
     // ── harness ─────────────────────────────────────────────────────────────────
 
     private static NewJob Job() => new(Guid.NewGuid(), "telemetry-probe", default, "default", T0);
+
+    // A tagged job enqueues in a transaction, which is where the "enqueue" failpoint sits.
+    private static NewJob TaggedJob() => Job() with { Tags = JobTags.Empty.WithTag("probe", "fault") };
 
     // A second store on the same test database whose failpoint hook throws the exception the test picks
     // - the exception TYPE is the input to the adapter's transient/terminal classification.
