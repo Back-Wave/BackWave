@@ -494,8 +494,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             var take = maxJobs - claimed.Count;
             var queueClaims = IsCachedUnlimited(queue)
                 ? await TryClaimInOneStatementAsync(connection, request, queue, take, cancellationToken).ConfigureAwait(false)
-                : null;
-            queueClaims ??= await ClaimInTransactionAsync(connection, request, queue, take, cancellationToken).ConfigureAwait(false);
+                  ?? await ClaimInTransactionAsync(connection, request, queue, take, readConfig: false, cancellationToken)
+                      .ConfigureAwait(false)
+                : await ClaimInTransactionAsync(connection, request, queue, take, readConfig: true, cancellationToken)
+                    .ConfigureAwait(false);
 
             // RETURNING does not guarantee order; the contract's per-Queue
             // (DueTime, enqueue order) does (§5.2).
@@ -538,8 +540,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     private static bool IsTransitionOrdinalCollision(PostgresException exception)
         => exception is { SqlState: PostgresErrorCodes.UniqueViolation, ConstraintName: "job_transitions_pkey" };
 
+    // `readConfig` is false only for a Queue the caller found cached unlimited and unpaused.
     private async ValueTask<List<JobRecord>> ClaimInTransactionAsync(
-        NpgsqlConnection connection, ClaimRequest request, string queue, int take, CancellationToken cancellationToken)
+        NpgsqlConnection connection, ClaimRequest request, string queue, int take, bool readConfig,
+        CancellationToken cancellationToken)
     {
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
@@ -550,7 +554,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         var slots = int.MaxValue;
         var paused = false;
         int? configured = null;
-        if (!IsCachedUnlimited(queue))
+        if (readConfig)
         {
             // Serialize claim-vs-first-config on a key that exists BEFORE the row does (issue 0193):
             // the FOR UPDATE below locks nothing when no queue_limits row exists yet, so it does not
@@ -960,9 +964,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
         var vector = OutcomeVector.From(batch, now.ToUniversalTime(), TransitionDetail);
         var matched = NeedsPerRowWrites(batch)
-            ? null
-            : await TryReportOutcomesInOneRoundTripAsync(vector, now, cancellationToken).ConfigureAwait(false);
-        matched ??= await ReportOutcomesInTransactionAsync(batch, vector, now, cancellationToken).ConfigureAwait(false);
+            ? await ReportOutcomesInTransactionAsync(batch, vector, now, cancellationToken).ConfigureAwait(false)
+            : await TryReportOutcomesInOneRoundTripAsync(vector, now, cancellationToken).ConfigureAwait(false)
+              ?? await ReportOutcomesInTransactionAsync(batch, vector, now, cancellationToken).ConfigureAwait(false);
 
         // One result per input row, in input order, keyed by job id: Applied when matched, else StaleLease.
         var results = new OutcomeReportResult[batch.Count];
