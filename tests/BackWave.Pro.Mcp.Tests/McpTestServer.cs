@@ -88,6 +88,9 @@ public sealed class McpTestServer : IAsyncDisposable
         return new McpTestClient(http, _prefix);
     }
 
+    /// <summary>An <see cref="HttpClient"/> against the host, for clients other than <see cref="McpTestClient"/>.</summary>
+    public HttpClient CreateHttpClient() => _app.GetTestClient();
+
     /// <summary>Enqueues one job straight through the store; it stays Scheduled (no workers run).</summary>
     public async Task<Guid> SeedJobAsync(string queue, string wireName = "test-job")
     {

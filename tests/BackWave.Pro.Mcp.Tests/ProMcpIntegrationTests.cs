@@ -1,4 +1,6 @@
 using System.Text.Json;
+using ModelContextProtocol.Client;
+using ModelContextProtocol.Protocol;
 
 namespace BackWave.Pro.Mcp.Tests;
 
@@ -117,5 +119,28 @@ public sealed class ProMcpIntegrationTests
 
         var opsClient = server.CreateClient(http => http.DefaultRequestHeaders.Add("X-Ops", "1"));
         Assert.Single(await opsClient.ListToolsAsync(), t => t.Name == "get_queue_depths");
+    }
+
+    [Theory]
+    [InlineData(McpMountShape.Use)]
+    [InlineData(McpMountShape.Map)]
+    public async Task SdkClient_OnTheCurrentProtocol_SeesTheGatedToolSurface(McpMountShape shape)
+    {
+        await using var server = await McpTestServer.StartAsync(mountShape: shape);
+        var http = server.CreateHttpClient();
+        var transport = new HttpClientTransport(
+            new HttpClientTransportOptions { Endpoint = new Uri(http.BaseAddress!, "/backwave-mcp") }, http);
+
+        await using var client = await McpClient.CreateAsync(transport);
+        var tools = (await client.ListToolsAsync()).Select(t => t.Name).ToList();
+
+        Assert.Equal("2026-07-28", client.NegotiatedProtocolVersion);
+        Assert.Contains("get_queue_depths", tools);
+        Assert.DoesNotContain("cancel_job", tools);
+        Assert.NotEqual(true, (await client.CallToolAsync("get_queue_depths")).IsError);
+        var cancel = await client.CallToolAsync(
+            "cancel_job", new Dictionary<string, object?> { ["job_id"] = Guid.NewGuid().ToString() });
+        Assert.True(cancel.IsError);
+        Assert.StartsWith("Permission denied", Assert.IsType<TextContentBlock>(Assert.Single(cancel.Content)).Text);
     }
 }
