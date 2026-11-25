@@ -174,6 +174,12 @@ internal sealed class NodeDriver(NodeOptions options)
                 var reactions = new List<Command>();
                 foreach (var result in heartbeat.Results)
                 {
+                    // A buffered outcome, or a job that finished after the heartbeat went out, runs no more:
+                    // there is nothing to abandon or cancel, and its outcome write answers for its Lease.
+                    if (!_executing.Contains(result.JobId))
+                    {
+                        continue;
+                    }
                     if (!result.Renewed)
                     {
                         _executing.Remove(result.JobId);

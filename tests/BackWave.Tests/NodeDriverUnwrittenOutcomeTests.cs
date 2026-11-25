@@ -222,4 +222,24 @@ public class NodeDriverUnwrittenOutcomeTests
         Assert.Contains(heartbeat, command => command is Command.RequestPoll);
         Assert.Equal(3, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
     }
+
+    [Fact]
+    public void AHeartbeatResult_ForAJobThatNoLongerRuns_IsNotActedOn()
+    {
+        var driver = Driver(unwrittenOutcomeSlots: 4);
+        var jobs = Claimed(driver);
+        Finish(driver, jobs[0]);
+        Finish(driver, jobs[1]);
+
+        var reactions = driver.Step(new NodeEvent.HeartbeatCompleted(
+        [
+            new HeartbeatResult(jobs[0].JobId, Renewed: false, CancelRequested: false),
+            new HeartbeatResult(jobs[1].JobId, Renewed: true, CancelRequested: true),
+            new HeartbeatResult(jobs[2].JobId, Renewed: false, CancelRequested: false),
+            new HeartbeatResult(jobs[3].JobId, Renewed: true, CancelRequested: true),
+        ], T0));
+
+        Assert.Equal(jobs[2].JobId, Assert.Single(reactions.OfType<Command.AbandonExecution>()).JobId);
+        Assert.Equal(jobs[3].JobId, Assert.Single(reactions.OfType<Command.SignalCancellation>()).JobId);
+    }
 }
