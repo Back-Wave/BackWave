@@ -6,26 +6,20 @@ namespace BackWave.Driver;
 /// <summary>
 /// The sans-I/O state machine holding a node's logic: Step(event) → Commands.
 /// It never awaits, times, or threads — the production pump and the Simulator are its
-/// two callers, and both own all I/O and clocks. Its only state is the set of jobs this
-/// node is currently executing.
+/// two callers, and both own all I/O and clocks. Its state is the jobs this node is executing, its
+/// Unwritten outcomes, and the claim in flight with the polls that wait on it.
 /// </summary>
 internal sealed class NodeDriver(NodeOptions options)
 {
     private readonly HashSet<Guid> _executing = [];
 
-    /// <summary>
-    /// Terminal outcomes buffered for a coalesced report (ADR 0035), in completion order. The pump stays
-    /// single-writer: outcomes flush together as one <see cref="Command.ReportOutcomeBatch"/> instead of one
-    /// write each. A crash discards this buffer (a fresh Driver is installed), so those leases lapse and the
-    /// jobs are reclaimed — At-Least-Once working as designed.
-    /// </summary>
-    private List<ReportedOutcome> _outcomeBuffer = [];
+    private readonly UnwrittenOutcomes _outcomes = new(options.MaxOutcomeBatch, options.UnwrittenOutcomeSlots);
 
     /// <summary>
     /// How many terminal outcomes are buffered but not yet flushed. A crash discards them (a fresh Driver
     /// is installed), so the deterministic harness reads this to observe the buffer-loss-on-crash window.
     /// </summary>
-    internal int BufferedOutcomeCount => _outcomeBuffer.Count;
+    internal int BufferedOutcomeCount => _outcomes.BufferedCount;
     private readonly Core.SmoothWeightedRoundRobin? _roundRobin =
         options.Policy is Core.DispatchPolicy.Weighted weighted
             ? new Core.SmoothWeightedRoundRobin(weighted.Weights)
@@ -40,17 +34,6 @@ internal sealed class NodeDriver(NodeOptions options)
     private int _pollsDuringClaim;
 
     private int _pollsFromBeforeClaim;
-
-    private int _reportingSlots;
-
-    private bool _flushDeferred;
-
-    /// <summary>
-    /// Whether the last outcome write faulted. It closes the
-    /// <see cref="NodeOptions.UnwrittenOutcomeSlots"/> headroom until a write lands again, so a
-    /// node whose writes fail holds a slot for every Unwritten outcome and claims no more than with no headroom.
-    /// </summary>
-    private bool _outcomeWriteFaulted;
 
     /// <summary>When maintenance last ran; null until the first poll. Throttles the sweep.</summary>
     private DateTimeOffset? _lastMaintenance;
@@ -82,7 +65,7 @@ internal sealed class NodeDriver(NodeOptions options)
                 var commands = new List<Command>();
                 // A poll tick is a flush trigger (ADR 0035): land any partial batch first, so released
                 // Dependencies are claimable on the flush's own re-poll.
-                if (FlushOutcomes() is { } pollFlush)
+                if (_outcomes.TryFlush() is { } pollFlush)
                 {
                     commands.Add(pollFlush);
                 }
@@ -171,7 +154,7 @@ internal sealed class NodeDriver(NodeOptions options)
                 // leases of whatever is still executing. An idle node with a non-empty buffer would already
                 // have flushed on the drain-tail, so this mainly catches a partial batch under sustained load.
                 var heartbeatCommands = new List<Command>();
-                if (FlushOutcomes() is { } heartbeatFlush)
+                if (_outcomes.TryFlush() is { } heartbeatFlush)
                 {
                     heartbeatCommands.Add(heartbeatFlush);
                 }
@@ -198,18 +181,16 @@ internal sealed class NodeDriver(NodeOptions options)
                 return reactions;
 
             case NodeEvent.OutcomeBatchFaulted:
-                _outcomeWriteFaulted = true;
-                _reportingSlots = 0;
+                _outcomes.Faulted();
                 return [];
 
             case NodeEvent.OutcomeBatchNotIssued:
-                _reportingSlots = 0;
+                _outcomes.NotIssued();
                 return [];
 
             case NodeEvent.OutcomeBatchReported reported:
             {
-                _outcomeWriteFaulted = false;
-                _reportingSlots = 0;
+                var deferredFlush = _outcomes.Landed();
                 var answered = new List<Command>();
                 // An applied terminal outcome may have released a Dependency due right now:
                 // re-poll so it is claimed promptly, not on the next timer tick. This decision
@@ -222,7 +203,7 @@ internal sealed class NodeDriver(NodeOptions options)
                         answered.Add(new Command.RequestPoll(reported.Now));
                     }
                 }
-                if (_flushDeferred && FlushOutcomes() is { } deferredFlush)
+                if (deferredFlush is not null)
                 {
                     answered.Add(deferredFlush);
                 }
@@ -253,9 +234,9 @@ internal sealed class NodeDriver(NodeOptions options)
     {
         var freeBefore = FreeSlots;
         _executing.Remove(job.JobId);
-        _outcomeBuffer.Add(new ReportedOutcome(job.JobId, options.WorkerId, job.Attempt, outcome));
-        var flush = _outcomeBuffer.Count >= options.MaxOutcomeBatch || _executing.Count == 0
-            ? FlushOutcomes()
+        _outcomes.Add(new ReportedOutcome(job.JobId, options.WorkerId, job.Attempt, outcome));
+        var flush = _outcomes.IsBufferFull || _executing.Count == 0
+            ? _outcomes.TryFlush()
             : null;
         if (freeBefore >= FullClaim || FreeSlots < FullClaim)
         {
@@ -272,62 +253,27 @@ internal sealed class NodeDriver(NodeOptions options)
     /// </summary>
     private IReadOnlyList<Guid> LeasesToRenew()
     {
-        if (options.UnwrittenOutcomeSlots <= 0 || _outcomeBuffer.Count == 0)
+        if (options.UnwrittenOutcomeSlots <= 0 || _outcomes.BufferedCount == 0)
         {
             return [.. _executing];
         }
         var renewing = new List<Guid>(_executing);
         var listed = new HashSet<Guid>(_executing);
-        foreach (var row in _outcomeBuffer)
+        foreach (var jobId in _outcomes.BufferedJobIds)
         {
-            if (listed.Add(row.JobId))
+            if (listed.Add(jobId))
             {
-                renewing.Add(row.JobId);
+                renewing.Add(jobId);
             }
         }
         return renewing;
-    }
-
-    private Command.ReportOutcomeBatch? FlushOutcomes()
-    {
-        if (_outcomeBuffer.Count == 0)
-        {
-            return null;
-        }
-        if (_reportingSlots > 0)
-        {
-            _flushDeferred = true;
-            return null;
-        }
-        var batch = DrainOutcomeBatch();
-        _reportingSlots = batch.Outcomes.Count;
-        _flushDeferred = _outcomeBuffer.Count > 0;
-        return batch;
-    }
-
-    /// <summary>Drains up to <see cref="NodeOptions.MaxOutcomeBatch"/> buffered outcomes into one batch command, in completion order.</summary>
-    private Command.ReportOutcomeBatch DrainOutcomeBatch()
-    {
-        List<ReportedOutcome> rows;
-        if (_outcomeBuffer.Count <= options.MaxOutcomeBatch)
-        {
-            rows = _outcomeBuffer;
-            _outcomeBuffer = [];
-        }
-        else
-        {
-            rows = _outcomeBuffer.GetRange(0, options.MaxOutcomeBatch);
-            _outcomeBuffer.RemoveRange(0, options.MaxOutcomeBatch);
-        }
-        return new Command.ReportOutcomeBatch(rows);
     }
 
     /// <summary>
     /// Drains the next batch of outcomes still buffered, for the Shell to report as this node stops. Returns
     /// null when the buffer is empty, so a clean stop with nothing pending issues no write.
     /// </summary>
-    internal Command.ReportOutcomeBatch? DrainBufferedOutcomes()
-        => _outcomeBuffer.Count > 0 ? DrainOutcomeBatch() : null;
+    internal Command.ReportOutcomeBatch? DrainBufferedOutcomes() => _outcomes.DrainBuffered();
 
     /// <summary>
     /// Starts a claim pass and returns its first claim, or null when the pool is full.
@@ -383,7 +329,7 @@ internal sealed class NodeDriver(NodeOptions options)
     /// in flight. Each still holds its store Lease. The production pump reads it after each step for the
     /// unwritten-outcomes metric.
     /// </summary>
-    internal int UnwrittenOutcomeCount => _outcomeBuffer.Count + _reportingSlots;
+    internal int UnwrittenOutcomeCount => _outcomes.Count;
 
     /// <summary>
     /// The pool slots a claim may fill. A running job holds one. The Unwritten outcomes fill the
@@ -396,18 +342,11 @@ internal sealed class NodeDriver(NodeOptions options)
     /// once would claim only the slots they leave and split the pool into two cohorts again.
     /// </summary>
     private bool FinishWillRePoll =>
-        !_outcomeWriteFaulted && options.UnwrittenOutcomeSlots > 0 && _executing.Count > 0 && FreeSlots < FullClaim;
+        _outcomes.OpenHeadroom > 0 && _executing.Count > 0 && FreeSlots < FullClaim;
 
     private int FullClaim => Math.Min(options.MaxClaimBatch, options.PoolSize);
 
-    private int FreeSlots
-    {
-        get
-        {
-            var headroom = _outcomeWriteFaulted ? 0 : options.UnwrittenOutcomeSlots;
-            return options.PoolSize - _executing.Count - Math.Max(0, UnwrittenOutcomeCount - headroom);
-        }
-    }
+    private int FreeSlots => options.PoolSize - _executing.Count - _outcomes.SlotsHeld;
 
     private Command.ClaimBatch Issue(Command.ClaimBatch batch)
     {
