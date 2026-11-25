@@ -23,6 +23,7 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
     private int _unclassifiedReportFaults;
     private int _unclassifiedMaintenanceFaults;
     private int _renewingHeartbeats;
+    private int _expireLeasesCalls;
     private readonly TaskCompletionSource _hangingClaimEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _hangingClaimCancelled = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _relinquishCalls;
@@ -208,6 +209,9 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
 
     /// <summary>How many heartbeats carrying at least one job came back with every Lease renewed.</summary>
     public int RenewingHeartbeats => Volatile.Read(ref _renewingHeartbeats);
+
+    /// <summary>How many lease-expiry sweeps reached the store, one per maintenance pass of a poll.</summary>
+    public int ExpireLeasesCalls => Volatile.Read(ref _expireLeasesCalls);
 
     /// <summary>
     /// Claims wait inside the store until their token is cancelled, so a host stop meets the
@@ -519,6 +523,7 @@ public sealed class FaultableStore(IJobStore inner) : IJobStore, IWakeUpHintSour
         DateTimeOffset now, int maxJobs, IReadOnlyList<string> queues, RetryDisposition disposition,
         CancellationToken cancellationToken = default)
     {
+        Interlocked.Increment(ref _expireLeasesCalls);
         ThrowIfFailing();
         ThrowIfMaintenanceArmed("expire leases");
         return inner.ExpireLeasesAsync(now, maxJobs, queues, disposition, cancellationToken);

@@ -72,7 +72,7 @@ public class OutcomeWriteOverlapTests
 
     private static WebApplication BuildHost(
         IJobStore store, PingBoard board, int poolSize, ILoggerProvider? logs = null, TimeSpan? shutdownBudget = null,
-        int? maxOutcomeBatch = null, int unwrittenOutcomeSlots = 0)
+        int? maxOutcomeBatch = null, int unwrittenOutcomeSlots = 0, TimeSpan? maintenanceInterval = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
@@ -82,20 +82,21 @@ public class OutcomeWriteOverlapTests
         }
         builder.Services.AddSingleton(board);
         builder.Services.AddTransient<IJobHandler<PingJob>, BoardPingHandler>();
+        var group = new WorkerGroupOptions
+        {
+            Name = "workers",
+            Policy = new DispatchPolicy.Strict(["default"]),
+            PollInterval = FastPoll,
+            PoolSize = poolSize,
+            LeaseDuration = TimeSpan.FromMinutes(5),
+            ShutdownBudget = shutdownBudget ?? TimeSpan.FromSeconds(5),
+            MaxOutcomeBatch = maxOutcomeBatch,
+            UnwrittenOutcomeSlots = unwrittenOutcomeSlots,
+        };
         builder.Services.AddBackWave(backwave => backwave
             .UseStore(store)
             .UseRegistry(Registry)
-            .AddWorkerGroup(new WorkerGroupOptions
-            {
-                Name = "workers",
-                Policy = new DispatchPolicy.Strict(["default"]),
-                PollInterval = FastPoll,
-                PoolSize = poolSize,
-                LeaseDuration = TimeSpan.FromMinutes(5),
-                ShutdownBudget = shutdownBudget ?? TimeSpan.FromSeconds(5),
-                MaxOutcomeBatch = maxOutcomeBatch,
-                UnwrittenOutcomeSlots = unwrittenOutcomeSlots,
-            }));
+            .AddWorkerGroup(maintenanceInterval is { } interval ? group with { MaintenanceInterval = interval } : group));
         return builder.Build();
     }
 
@@ -158,6 +159,16 @@ public class OutcomeWriteOverlapTests
         await app.StopAsync();
     }
 
+    private static async Task WaitForSweepsAsync(FaultableStore store, int sweeps)
+    {
+        var deadline = DateTimeOffset.UtcNow + TestTimeout;
+        while (store.ExpireLeasesCalls < sweeps)
+        {
+            Assert.True(DateTimeOffset.UtcNow < deadline, $"the pump swept {store.ExpireLeasesCalls} times, never {sweeps}");
+            await Task.Delay(10);
+        }
+    }
+
     [Fact]
     public async Task ARowBeingWritten_KeepsItsPoolSlot_UntilTheWriteAnswers()
     {
@@ -188,7 +199,8 @@ public class OutcomeWriteOverlapTests
         using var unwritten = new UnwrittenOutcomesRecorder("workers");
         var store = new FaultableStore(new InMemoryJobStore()) { HoldOutcomeWrites = true };
         var board = new PingBoard();
-        await using var app = BuildHost(store, board, poolSize: 1, unwrittenOutcomeSlots: 1);
+        await using var app = BuildHost(
+            store, board, poolSize: 1, unwrittenOutcomeSlots: 1, maintenanceInterval: TimeSpan.Zero);
         await app.StartAsync();
         var client = app.Services.GetRequiredService<BackWaveClient>();
         var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
@@ -201,8 +213,10 @@ public class OutcomeWriteOverlapTests
         Assert.Equal(JobState.Leased, (await monitor.GetJobAsync(first))!.State);
         await unwritten.WaitForAsync(2, TestTimeout);
 
+        var lastClaim = store.LastClaimAt;
         var third = await client.EnqueueAsync(new PingJob("third"), dueTime: DateTimeOffset.UtcNow);
-        await Task.Delay(FastPoll * 20);
+        await WaitForSweepsAsync(store, store.ExpireLeasesCalls + 2);
+        Assert.Equal(lastClaim, store.LastClaimAt);
         Assert.False(board.HasRun("third"), "the third job ran while two finished jobs filled the pool and its one extra slot");
         Assert.Equal(JobState.Scheduled, (await monitor.GetJobAsync(third))!.State);
 
