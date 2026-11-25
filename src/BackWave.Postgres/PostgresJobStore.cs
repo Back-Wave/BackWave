@@ -1065,12 +1065,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     private async ValueTask<Dictionary<Guid, int>?> TryReportOutcomesInOneRoundTripAsync(
         IReadOnlyList<OutcomeReport> batch, OutcomeVector vector, DateTimeOffset now, CancellationToken cancellationToken)
     {
-        if (Array.Exists(vector.States, state => state != 0))
-        {
-            // No seam inside one round trip, so the failpoint fires before it: a crash here leaves nothing.
-            await FailpointAsync("report-outcome", cancellationToken).ConfigureAwait(false);
-        }
-
         var details = new string?[batch.Count];
         for (var i = 0; i < batch.Count; i++)
         {
