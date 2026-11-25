@@ -127,6 +127,57 @@ public sealed class SqliteMigrationTests
         Assert.Equal(LogLevel.Warning, skew.Level);
     }
 
+    // A file whose stored version is lower than its real schema, or whose version row is gone, must
+    // migrate back to current: every step is safe to run again on a schema that already has it.
+    [Theory]
+    [InlineData("backwave", "UPDATE backwave_schema_version SET version = 1", true)]
+    [InlineData("backwave", "DELETE FROM backwave_schema_version", true)]
+    [InlineData("backwave", "UPDATE backwave_schema_version SET version = 1", false)]
+    [InlineData("backwave", "DELETE FROM backwave_schema_version", false)]
+    [InlineData("tenant_a", "UPDATE tenant_a_schema_version SET version = 1", true)]
+    [InlineData("tenant_a", "DELETE FROM tenant_a_schema_version", true)]
+    public async Task Migration_reruns_cleanly_on_a_schema_whose_stored_version_is_stale(
+        string prefix, string corruption, bool coordinate)
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"backwave_sqlite_{Guid.NewGuid():N}.db");
+        var connectionString = $"Data Source={path}";
+        try
+        {
+            await SqliteMigrator.MigrateAsync(connectionString, prefix, coordinate);
+
+            await using (var connection = new SqliteConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                await using var corrupt = connection.CreateCommand();
+                corrupt.CommandText = corruption;
+                await corrupt.ExecuteNonQueryAsync();
+            }
+            SqliteConnection.ClearAllPools();
+
+            await SqliteMigrator.MigrateAsync(connectionString, prefix, coordinate);
+            await SqliteMigrator.VerifySchemaVersionAsync(connectionString, prefix);
+
+            await using (var connection = new SqliteConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                Assert.Equal(SqliteMigrator.ExpectedSchemaVersion.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    await ScalarText(connection, $"SELECT group_concat(version) FROM {prefix}_schema_version"));
+                Assert.Equal("1", await ScalarText(connection,
+                    $"SELECT count(*) FROM pragma_table_info('{prefix}_jobs') WHERE name = 'retry_cause'"));
+                Assert.Equal("1", await ScalarText(connection,
+                    $"SELECT count(*) FROM pragma_table_info('{prefix}_operator_audit') WHERE name = 'detail'"));
+            }
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            foreach (var suffix in new[] { "", "-wal", "-shm" })
+            {
+                try { File.Delete(path + suffix); } catch (IOException) { }
+            }
+        }
+    }
+
     [Theory]
     [InlineData("3.45.1", true)]
     [InlineData("3.35.0", true)]
