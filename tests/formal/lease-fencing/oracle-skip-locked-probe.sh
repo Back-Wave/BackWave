@@ -144,7 +144,8 @@ run_case() {
   local case="$1" pred="$2" order="$3" change="$4" predict="$5" attempt want
   want=$([[ "$predict" == lock ]] && echo 1 || echo 0)
   for attempt in 1 2 3; do
-    sql >/dev/null <<'SQL'
+    sql >/dev/null <<'SQL' || { echo "$case: reset failed" >&2; exit 2; }
+WHENEVER SQLERROR EXIT 1
 DELETE FROM probe_jobs;
 INSERT INTO probe_jobs VALUES (1, 2, 1, SYSTIMESTAMP - INTERVAL '1' MINUTE, NULL);
 COMMIT;

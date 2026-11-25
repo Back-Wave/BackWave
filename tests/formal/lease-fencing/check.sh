@@ -39,7 +39,7 @@ for cfg in "${cfgs[@]}"; do
   fi
   distinct="$(sed -n 's/.* \([0-9,]*\) distinct states found.*/\1/p' "$log" | tail -n 1)"
   mark=""
-  if [[ "$got" != "$expect" ]]; then
+  if [[ -z "$expect" || -z "$got" || "$got" != "$expect" ]]; then
     mark="  MISMATCH"
     mismatches=$((mismatches + 1))
   fi

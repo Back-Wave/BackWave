@@ -135,7 +135,7 @@ LockRow(s, j, mode, recheckPasses) ==
 LockLevelCols(op, r) ==
     CASE op = "Claim" -> r
       [] op = "Expire" /\ Has("ExpireNoOuterOrder") -> <<r.attempt>>
-      [] op = "Expire" -> <<r.attempt, r.expiry>>
+      [] op = "Expire" /\ ~Has("ExpireNoOuterOrder") -> <<r.attempt, r.expiry>>
 
 Begin(s, op, at, P) ==
     sess' = [sess EXCEPT ![s] = [Idle EXCEPT !.op = op, !.at = at, !.todo = P,
@@ -162,7 +162,7 @@ Finish(s) == /\ lockOf' = Release(s)
      UPDATE j ... FROM @batch c INNER LOOP JOIN backwave.jobs j
      The UPDLOCK read tests each row on its latest committed version when
      it reaches it; Lock makes that test.
-   Oracle  OracleJobStore.cs:581-592, 611-622, 631-636 (ClaimUntracedAsync, from 498)
+   Oracle  OracleJobStore.cs:581-592, 612-623, 631-636 (ClaimUntracedAsync, from 498)
      SELECT ... WHERE state = 0 AND due_time <= :now AND job_id IN (
        SELECT ... WHERE state = 0 AND due_time <= :now ... ROWNUM <= :take)
      FOR UPDATE SKIP LOCKED;  then the C# row checks halt on a locked row
@@ -177,14 +177,14 @@ ClaimMode == IF Has("ClaimNoLock") THEN "wait" ELSE "skip"
 
 ClaimRecheck(s, j, at) ==
     CASE Has("ClaimNoLock") -> TRUE
-      [] Adapter = "Oracle" ->
+      [] ~Has("ClaimNoLock") /\ Adapter = "Oracle" ->
             /\ SnapshotCurrent(s, j)
             /\ row[j].state = Scheduled
             /\ (row[j].due <= at \/ Has("ClaimNoDueRecheck") \/ Has("ClaimNoOuterDue"))
       [] OTHER -> row[j].state = Scheduled /\ row[j].due <= at
 
 \* The Oracle C# checks on the row the locking read returned
-\* (OracleJobStore.cs:611-622).
+\* (OracleJobStore.cs:612-623).
 ClaimHalts(j, at) ==
     /\ Adapter = "Oracle" /\ ~Has("ClaimNoLock")
     /\ \/ row[j].state # Scheduled
@@ -245,7 +245,7 @@ ClaimCommit(s) ==
        MATCHED ... WHERE <fence>.  Lock = the FOR UPDATE read; Commit = the
        MERGE with its fence, on the locked row.
    A retry goes back to Scheduled with due = @now (zero backoff), or to
-   DeadLettered at the ceiling (NodeDriver.cs:154 decides from the run's
+   DeadLettered at the ceiling (NodeDriver.cs:153-155 decides from the run's
    attempt). *)
 
 Kinds == {"Succeeded", "Retry"}
@@ -374,7 +374,7 @@ HeartbeatCommit(s) ==
    SQL Server  SqlServerJobStore.cs:1335-1338, 1401, 1419 (from 1315)
      SELECT TOP (@max) ... WITH (UPDLOCK, READPAST, ROWLOCK)
        WHERE state = 2 AND lease_expiry <= @now;  UPDATE j ... by id
-   Oracle  OracleJobStore.cs:1474-1485, 1544-1557, 1566-1578 (from 1454)
+   Oracle  OracleJobStore.cs:1474-1485, 1548-1557, 1566-1578 (from 1454)
      SELECT job_id, attempt FROM jobs WHERE job_id IN (
        SELECT ... WHERE state = 2 AND lease_expiry <= :now ... ROWNUM <= :max)
      FOR UPDATE SKIP LOCKED;  MERGE ... by id, no fence *)

@@ -15,7 +15,7 @@ Each rule is a TLA+ invariant. The harm is what a user sees when the rule breaks
 |---|---|---|
 | `SingleLease` | A job has at most one live lease. | Two workers run the job at the same time. |
 | `OutcomeFenced` | An outcome write lands only on the reporter's live lease: `Leased`, same owner, same attempt, not expired at the call's `@now`. | A stale or late outcome completes or fails another run of the job. |
-| `ClaimOnlyDue` | A claim leases only rows that are `Scheduled` and due at the claim's `@now`. | A job runs before its due time, for example after a Reschedule moved it. |
+| `ClaimOnlyDue` | A claim leases only rows that are due at the claim's `@now`. A claim of a row that is not `Scheduled` breaks `SingleLease` or `TerminalStays` instead. | A job runs before its due time, for example after a Reschedule moved it. |
 | `ExpireOnce` | An expiry sweep writes only rows that are `Leased` and lapsed at the sweep's `@now`. | A finished run is reset, or a renewed lease is taken from a running worker. |
 | `RelinquishOnlyHeld` | A relinquish writes only leases the calling worker holds. | A finished or foreign job goes back to `Scheduled`. |
 | `TerminalStays` | A job that reached `Succeeded` or `DeadLettered` stays there. | A finished job runs again. |
@@ -30,19 +30,19 @@ The model describes the code at the sync commit `ad5b0ab`. Compare the change wi
 
 | Operation | Postgres `PostgresJobStore.cs` | SQL Server `SqlServerJobStore.cs` | Oracle `OracleJobStore.cs` | Model actions |
 |---|---|---|---|---|
-| Claim | `ClaimUntracedAsync` 430, SQL 508-520 | `ClaimQueueAsync` 492, SQL 564-583 | `ClaimUntracedAsync` 498, SQL 581-592, due check 611-622, write 631-636 | `ClaimBegin`, `ClaimLock`, `ClaimCommit` |
+| Claim | `ClaimUntracedAsync` 430, SQL 508-520 | `ClaimQueueAsync` 492, SQL 564-583 | `ClaimUntracedAsync` 498, SQL 581-592, due check 612-623, write 631-636 | `ClaimBegin`, `ClaimLock`, `ClaimCommit` |
 | ReportOutcome | `ReportOutcomeUntracedAsync` 683, SQL 742-745 | `ReportOutcomeUntracedAsync` 782, SQL 842-845 | `ReportOutcomeUntracedAsync` 850, SQL 909-911 | `ReportUpdate` |
 | ReportOutcomes | `ReportOutcomesUntracedAsync` 806, SQL 879-892 | `ReportOutcomesUntracedAsync` 908, SQL 995-1019 | `ReportOutcomesUntracedAsync` 972, SQL 1043-1047, 1066-1073, 1092-1117 | `ReportUpdate` (Postgres), `ReportLock`, `ReportCommit` |
 | Heartbeat | `HeartbeatAsync` 1130, SQL 1139-1141 | `HeartbeatAsync` 1250, SQL 1266-1272 | `HeartbeatAsync` 1377, SQL 1402-1405, 1421 | `HeartbeatUpdate`, `HeartbeatLock`, `HeartbeatCommit` |
-| ExpireLeases | `ExpireLeasesUntracedAsync` 1184, SQL 1202-1207, 1266-1268, 1281-1283 | `ExpireLeasesUntracedAsync` 1315, SQL 1335-1338, 1401, 1419 | `ExpireLeasesUntracedAsync` 1454, SQL 1474-1485, 1544-1557, 1566-1578 | `ExpireBegin`, `ExpireLock`, `ExpireCommit` |
+| ExpireLeases | `ExpireLeasesUntracedAsync` 1184, SQL 1202-1207, 1266-1268, 1281-1283 | `ExpireLeasesUntracedAsync` 1315, SQL 1335-1338, 1401, 1419 | `ExpireLeasesUntracedAsync` 1454, SQL 1474-1485, 1548-1557, 1566-1578 | `ExpireBegin`, `ExpireLock`, `ExpireCommit` |
 | RelinquishLeases | `RelinquishLeasesUntracedAsync` 1342, SQL 1355-1359, 1421-1423, 1444-1446 | `RelinquishLeasesUntracedAsync` 1486, SQL 1501-1504, 1562-1563, 1578 | `RelinquishLeasesUntracedAsync` 1638, SQL 1651-1655, 1716-1723, 1738-1744 | `RelinquishBegin`, `RelinquishLock`, `RelinquishCommit` |
 | Reschedule | `RescheduleCoreAsync` 1617, SQL 1632-1639 | `RescheduleCoreAsync` 1757, SQL 1767-1769 | `RescheduleCoreAsync` 1921, SQL 1937-1942 | `RescheduleLock`, `RescheduleCommit` |
 
 The model also depends on these facts. A change to any of them touches the model too:
 
 - `src/BackWave.SqlServer/SqlServerMigrator.cs:260` turns on READ_COMMITTED_SNAPSHOT.
-- `src/BackWave/Core/RetryPolicy.cs:166-167` dead-letters when the failed attempt reaches `MaxAttempts`.
-- `src/BackWave/Driver/NodeDriver.cs:154` picks the outcome from the run's attempt.
+- `src/BackWave/Core/RetryPolicy.cs:56-57` (`RetryPolicy.NextAttemptAt`) and `166-167` (`RetryDisposition.NextAttemptAt`) dead-letter when the failed attempt reaches `MaxAttempts`.
+- `src/BackWave/Driver/NodeDriver.cs:153-155` picks the outcome from the run's attempt, through a per-job `[Retry]` override or the Worker Group policy.
 
 To list the commits since the sync commit that touched covered code:
 
@@ -80,7 +80,7 @@ If any step does what the code cannot do, the model is wrong. Fix the action and
 2. Change each action so that each step is again one atomic step of the new code. Update the citation in its comment.
 3. A new guard gets a mutant. Add its name to the `Mutants` `ASSUME`, gate the guard on `Has("<Name>")`, and add a config in `mutants/` that expects the rule the guard protects. When a change removes a guard, find the mutant config that planted the same removal: the real model now ends as that config does.
 4. Run `check.sh --all`. Every row must match.
-5. Update the line numbers in the action comments and in the coverage record. Then move the sync commit, here and in the spec header, to the commit you checked. Move it only after you have confirmed that the model describes the code at that commit.
+5. Update every file and line citation: in the spec comments, in the probe, and in this skill, including the coverage record. Then move the sync commit, here and in the spec header, to the commit you checked. Move it only after you have confirmed that the model describes the code at that commit.
 
 ## Mutants
 
@@ -115,7 +115,7 @@ The Oracle claim (`OracleJobStore.cs:581-592`) and the Oracle expiry sweep (1474
 
 The claim selects every column, so any change makes it skip the row. The sweep selects `job_id, attempt` and orders by `lease_expiry`. It reads `state` only in its subquery. Every write that ends or renews a lease changes `lease_expiry`, so the outer `ORDER BY lease_expiry` is the only thing that keeps the sweep off a row that an outcome, a heartbeat, or another sweep committed after the snapshot. Without it, the sweep locks a row that an outcome wrote after the snapshot and writes it back to `Scheduled`, so a `Succeeded` job can run again. The mutant `expire-no-outer-order-oracle` shows this, and the probe case `noorder` measures the lock.
 
-Evidence: measured on Oracle XE 21.3 (`gvenzl/oracle-xe:21-slim`) and Oracle Free 23.26 (`gvenzl/oracle-free:23-slim`) on 2026-11-25. Inferred for 19c, the oldest version the adapter supports. Measure it again with:
+Evidence: measured on Oracle XE 21.3 (`gvenzl/oracle-xe:21-slim`) and Oracle Free 23.26 (`gvenzl/oracle-free:23-slim`) on 2026-11-25. Inferred for 19c, the oldest version the adapter supports. Each probe container needs about 20 GiB of free disk, so check `df -h /` first. Measure it again with:
 
 ```sh
 tests/formal/lease-fencing/oracle-skip-locked-probe.sh gvenzl/oracle-xe:21-slim
@@ -162,6 +162,6 @@ Run the probe again before you trust the rule in these cases:
 
 ## Not covered
 
-The Core driver loop, Concurrency Limits and the queue locks of a limited queue, slot accounting, AwaitingParent and the fan-in latches, Cancel, Requeue, the transition log, the Commit Horizon, SQLite, and the in-memory store. Retry backoff is zero ticks, and a Reschedule moves the due time by one tick. Liveness is not checked.
+The Core driver loop, Concurrency Limits and the queue locks of a limited queue, slot accounting, AwaitingParent and the fan-in latches, Cancel, Requeue, the transition log, the Commit Horizon, SQLite, and the in-memory store. Each worker has one database session, so the calls of one worker never overlap, as they can on separate connections. Retry backoff is zero ticks, and a Reschedule moves the due time by one tick. Liveness is not checked.
 
 When the code changed without a rerun of this check, use the pstack `/maintain-formal-verification-skill` skill to bring the model back in line.
