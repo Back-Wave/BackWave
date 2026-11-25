@@ -58,19 +58,17 @@ public sealed class PostgresTransitionPruneTests
         Assert.Equal(cap, (int)pastCap[^1].Ordinal);
     }
 
-    [Theory]
-    [InlineData(0, new long[0])]
-    [InlineData(1, new long[] { 0 })]
-    public async Task An_enqueue_under_a_cap_of_zero_or_one_keeps_at_most_cap_entries(int cap, long[] kept)
+    [Fact]
+    public async Task An_enqueue_under_a_cap_of_one_keeps_its_one_entry()
     {
         await using var store = await PostgresTestDatabase.CreateFreshStoreAsync(
-            bounds: StoreBounds.Default with { MaxTransitionsPerJob = cap });
+            bounds: StoreBounds.Default with { MaxTransitionsPerJob = 1 });
         var jobId = Guid.NewGuid();
 
         Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(Job(jobId), T0));
 
         Assert.NotNull(await store.GetJobAsync(jobId));
-        Assert.Equal(kept, (await store.GetJobHistoryAsync(jobId)).Select(t => t.Ordinal).ToArray());
+        Assert.Equal(new long[] { 0 }, (await store.GetJobHistoryAsync(jobId)).Select(t => t.Ordinal).ToArray());
     }
 
     [Fact]

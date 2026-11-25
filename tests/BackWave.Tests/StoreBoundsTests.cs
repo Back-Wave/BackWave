@@ -30,4 +30,18 @@ public class StoreBoundsTests
         Assert.DoesNotContain('�', clamped!);
         Assert.True(Encoding.UTF8.GetByteCount(clamped!) <= bounds.MaxFailureDetailBytes);
     }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void MaxTransitionsPerJob_BelowOne_IsRejected(int cap)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => StoreBounds.Default with { MaxTransitionsPerJob = cap });
+    }
+
+    [Fact]
+    public void MaxTransitionsPerJob_OfOne_IsAccepted()
+    {
+        Assert.Equal(1, (StoreBounds.Default with { MaxTransitionsPerJob = 1 }).MaxTransitionsPerJob);
+    }
 }
