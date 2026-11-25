@@ -1,4 +1,4 @@
--- BackWave SQLite schema v5. Runs once: the migrator skips a step the file already carries.
+-- BackWave SQLite schema v5. Idempotent: safe to run on every deploy.
 -- v4 -> v5: keep the status each Pump's own process last wrote about it, one row per worker id.
 CREATE TABLE IF NOT EXISTS backwave_pumps (
     worker_id          TEXT    NOT NULL PRIMARY KEY,

@@ -134,6 +134,9 @@ public sealed class SqliteMigrationTests
     [InlineData("backwave", "DELETE FROM backwave_schema_version", false)]
     [InlineData("tenant_a", "UPDATE tenant_a_schema_version SET version = 1", true)]
     [InlineData("tenant_a", "DELETE FROM tenant_a_schema_version", true)]
+    [InlineData("tenant_a", "DELETE FROM tenant_a_schema_version", false)]
+    [InlineData("backwave", "DROP TABLE backwave_pumps; DELETE FROM backwave_schema_version", true)]
+    [InlineData("backwave", "DROP TABLE backwave_pumps; DELETE FROM backwave_schema_version", false)]
     public async Task Migration_reruns_cleanly_on_a_schema_whose_stored_version_is_stale(
         string prefix, string corruption, bool coordinate)
     {
@@ -164,6 +167,8 @@ public sealed class SqliteMigrationTests
                     $"SELECT count(*) FROM pragma_table_info('{prefix}_jobs') WHERE name = 'retry_cause'"));
                 Assert.Equal("1", await ScalarText(connection,
                     $"SELECT count(*) FROM pragma_table_info('{prefix}_operator_audit') WHERE name = 'detail'"));
+                Assert.Equal("1", await ScalarText(connection,
+                    $"SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '{prefix}_pumps'"));
             }
         }
         finally
