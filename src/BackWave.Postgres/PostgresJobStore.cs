@@ -396,8 +396,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             cancelledByParent is not null ? now.ToUniversalTime() : DBNull.Value);
         insert.Parameters.AddWithValue("terminalCause",
             cancelledByParent is { } parentState ? ParentFailureCause(parentState) : DBNull.Value);
-        // Workflow membership (ADR 0023): the immutable scalar, stamped once here at enqueue; null for
-        // an ordinary job. The Core never reads it — it lives entirely above the determinism boundary.
+        // Workflow membership: the immutable scalar, stamped once here at enqueue; null for an ordinary
+        // job. The Core never reads it; it lives entirely above the determinism boundary.
         insert.Parameters.AddWithValue("workflowId", (object?)workflowId ?? DBNull.Value);
         insert.Parameters.AddWithValue("now", now.ToUniversalTime());
         insert.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
@@ -543,8 +543,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
         // Concurrency Limit (I3) and Paused flag (§5.8) live in one row: lock it so concurrent
         // claimers of a limited Queue serialize on the slot count and a concurrent Pause is observed
-        // atomically. A Queue recently observed unlimited AND unpaused skips this round-trip and the
-        // lock entirely (issue 0170) — the common case pays nothing; see _unlimitedQueues.
+        // atomically. `readConfig` is false for a Queue recently observed unlimited AND unpaused (issue
+        // 0170), which skips the lock and the read; see _unlimitedQueues.
         var slots = int.MaxValue;
         var paused = false;
         int? configured = null;
@@ -552,11 +552,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         {
             // Serialize claim-vs-first-config on a key that exists BEFORE the row does (issue 0193):
             // the FOR UPDATE below locks nothing when no queue_limits row exists yet, so it does not
-            // serialize against the FIRST pause/limit's INSERT — an in-flight claim could over-claim
+            // serialize against the FIRST pause/limit's INSERT: an in-flight claim could over-claim
             // past a first-ever limit or slip past a first-ever pause. The advisory lock (below) is
             // taken by both this read path and the operator setters, so they serialize with no row
-            // present. Scoped to the read path: a cached unlimited, unpaused Queue (issue 0170) skips
-            // this block entirely and still pays nothing.
+            // present.
             await AcquireQueueConfigLockAsync(connection, transaction, queue, cancellationToken).ConfigureAwait(false);
             // Capture the generation BEFORE the read so a concurrent operator change (which bumps it)
             // is detected when we go to publish the stamp below (issue 0170).
@@ -627,6 +626,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         )
         """;
 
+    // Job Tags ride back with the claim as a correlated aggregate in the same round trip, never a
+    // second SELECT, so the no-tags hot path pays only a PK-indexed empty lookup (NULL) and is never N+1.
+    // ReadClaimedAsync reconstructs the empty-string-key Label discriminator.
     private const string ClaimUpdate =
         """
         UPDATE backwave.jobs j
@@ -637,10 +639,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                   j.lease_owner, j.lease_expiry, j.cancel_requested, j.terminal_at,
                   j.terminal_cause, j.schedule_id, j.parents_remaining, j.mode, j.trace_context,
                   j.sequence, j.workflow_id, j.retry_cause,
-                  -- Job Tags (ADR 0022) ride back with the claim as a correlated aggregate in
-                  -- THIS round-trip — never a second SELECT — so the no-tags hot path pays only a
-                  -- PK-indexed empty lookup (NULL) and is never N+1. The empty-string-key => Label
-                  -- discriminator is reconstructed in ReadClaimedAsync. Always correct, no gating staleness.
                   (SELECT json_agg(json_build_object('k', t.key, 'v', t.value))
                    FROM backwave.job_tags t WHERE t.job_id = j.job_id)::text AS tags
         """;
@@ -1164,7 +1162,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         var (_, applied) = await WriteOutcomesAsync(
             _reportOutcomesInTransaction, connection, transaction, vector, now, cancellationToken).ConfigureAwait(false);
 
-        // Output and Tag deltas land ONLY for applied rows — a fenced-out (StaleLease) row leaves
+        // Output and Tag deltas land ONLY for applied rows: a fenced-out (StaleLease) row leaves
         // nothing a stale node buffered. Output persists only on a Success outcome; Tags union onto
         // the job's existing tags (set semantics, so an identical tag is a no-op). Both ride this
         // same fenced transaction.
