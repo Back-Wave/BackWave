@@ -77,7 +77,8 @@ SQL
 echo "oracle: $(printf '%s\n' "SET HEADING OFF FEEDBACK OFF" \
   "SELECT product || ' ' || version_full FROM product_component_version WHERE ROWNUM = 1;" | sql | grep -m1 .)"
 
-# The ExpireLeases shape (OracleJobStore.cs:1475-1486).
+# The ExpireLeases statement (OracleJobStore.cs:1475-1486), with the outer WHERE
+# and ORDER BY that each case passes. Only outerwhere passes an outer WHERE.
 sweep_sql() {
   local outer_where="$1" outer_order="$2"
   cat <<SQL
