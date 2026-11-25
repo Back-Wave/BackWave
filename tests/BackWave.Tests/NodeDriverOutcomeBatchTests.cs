@@ -191,7 +191,7 @@ public class NodeDriverOutcomeBatchTests
         Claim(driver, b);
         Assert.Empty(driver.Step(new NodeEvent.ExecutionSucceeded(b, T0)));
 
-        Assert.Empty(driver.Step(new NodeEvent.OutcomeBatchReported([], T0)));
+        Assert.Empty(driver.Step(new NodeEvent.OutcomeBatchFaulted(T0)));
         Assert.Equal(1, driver.BufferedOutcomeCount);
 
         Assert.Equal([b.JobId], Rows(Flushed(driver.Step(new NodeEvent.PollDue(T0.AddSeconds(1))))));

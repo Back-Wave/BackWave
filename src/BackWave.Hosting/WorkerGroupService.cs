@@ -430,7 +430,8 @@ internal sealed class WorkerGroupService(
                         reached = nodeEvent switch
                         {
                             NodeEvent.ClaimCompleted => TakeAnswer(_claim),
-                            NodeEvent.OutcomeBatchReported => TakeAnswer(_outcomeWrite),
+                            NodeEvent.OutcomeBatchReported or NodeEvent.OutcomeBatchFaulted
+                                or NodeEvent.OutcomeBatchNotIssued => TakeAnswer(_outcomeWrite),
                             _ => false,
                         };
                         foreach (var command in commands)
@@ -885,7 +886,7 @@ internal sealed class WorkerGroupService(
             }
             else if (commands[index] is Command.ReportOutcomeBatch)
             {
-                events.TryWrite(new NodeEvent.OutcomeBatchReported([], now));
+                events.TryWrite(new NodeEvent.OutcomeBatchNotIssued(now));
             }
         }
     }
@@ -975,7 +976,7 @@ internal sealed class WorkerGroupService(
             case Command.ReportOutcomeBatch batch:
                 _outcomeWrite.Start(
                     cancellationToken => WriteOutcomesAsync(batch, now, cancellationToken),
-                    () => new NodeEvent.OutcomeBatchReported([], _clock.GetUtcNow()),
+                    () => new NodeEvent.OutcomeBatchFaulted(_clock.GetUtcNow()),
                     events);
                 break;
 

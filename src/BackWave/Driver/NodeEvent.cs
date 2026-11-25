@@ -49,6 +49,15 @@ internal abstract record NodeEvent
     /// <summary>The store acknowledged (or rejected as stale) each row of a reported outcome batch.</summary>
     public sealed record OutcomeBatchReported(IReadOnlyList<OutcomeReportResult> Results, DateTimeOffset Now) : NodeEvent;
 
+    /// <summary>A reported outcome batch reached the store and failed, so none of its rows was written.</summary>
+    public sealed record OutcomeBatchFaulted(DateTimeOffset Now) : NodeEvent;
+
+    /// <summary>
+    /// The Shell never issued a reported outcome batch, because a command before it in the same step threw.
+    /// None of its rows was written.
+    /// </summary>
+    public sealed record OutcomeBatchNotIssued(DateTimeOffset Now) : NodeEvent;
+
     /// <summary>The store applied the Core's mint decisions; carries how many instances it minted.</summary>
     public sealed record MintCompleted(int Minted, DateTimeOffset Now) : NodeEvent;
 }

@@ -157,7 +157,9 @@ internal sealed class DeterministicPump(
             }
             else if (commands[index] is Command.ReportOutcomeBatch)
             {
-                _events.Enqueue(new NodeEvent.OutcomeBatchReported([], now));
+                _events.Enqueue(index == from
+                    ? new NodeEvent.OutcomeBatchFaulted(now)
+                    : new NodeEvent.OutcomeBatchNotIssued(now));
             }
         }
     }

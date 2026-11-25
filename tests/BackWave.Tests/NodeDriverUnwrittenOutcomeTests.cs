@@ -145,7 +145,7 @@ public class NodeDriverUnwrittenOutcomeTests
         Finish(driver, second[0]);
         Finish(driver, second[1]);
 
-        driver.Step(new NodeEvent.OutcomeBatchReported([], T0));
+        driver.Step(new NodeEvent.OutcomeBatchFaulted(T0));
         var afterFault = driver.Step(new NodeEvent.PollDue(T0));
         var retry = Assert.Single(afterFault.OfType<Command.ReportOutcomeBatch>());
         Assert.Null(Claim(afterFault));

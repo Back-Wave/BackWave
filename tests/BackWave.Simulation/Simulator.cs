@@ -1608,16 +1608,17 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     break;
                 }
                 writer.OutcomeWrite = null;
-                IReadOnlyList<OutcomeReportResult> written;
+                NodeEvent answer;
                 try
                 {
-                    written = WriteOutcomeBatch(simEvent.Node, simEvent.Batch!);
+                    answer = new NodeEvent.OutcomeBatchReported(
+                        WriteOutcomeBatch(simEvent.Node, simEvent.Batch!), NodeNow(simEvent.Node));
                 }
                 catch (SimTransientFault)
                 {
-                    written = [];
+                    answer = new NodeEvent.OutcomeBatchFaulted(NodeNow(simEvent.Node));
                 }
-                TryDrive(simEvent.Node, new NodeEvent.OutcomeBatchReported(written, NodeNow(simEvent.Node)));
+                TryDrive(simEvent.Node, answer);
                 break;
 
             case EventKind.ClaimLanded:
@@ -2137,7 +2138,9 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 }
                 else if (commands[index] is Command.ReportOutcomeBatch)
                 {
-                    Drive(nodeIndex, new NodeEvent.OutcomeBatchReported([], NodeNow(nodeIndex)));
+                    Drive(nodeIndex, index == issued
+                        ? new NodeEvent.OutcomeBatchFaulted(NodeNow(nodeIndex))
+                        : new NodeEvent.OutcomeBatchNotIssued(NodeNow(nodeIndex)));
                 }
             }
             throw;

@@ -46,8 +46,8 @@ internal sealed class NodeDriver(NodeOptions options)
     private bool _flushDeferred;
 
     /// <summary>
-    /// Whether the last outcome write answered with no rows for a batch that had rows. It closes the
-    /// <see cref="NodeOptions.UnwrittenOutcomeSlots"/> headroom until a write answers with rows again, so a
+    /// Whether the last outcome write faulted. It closes the
+    /// <see cref="NodeOptions.UnwrittenOutcomeSlots"/> headroom until a write lands again, so a
     /// node whose writes fail holds a slot for every Unwritten outcome and claims no more than with no headroom.
     /// </summary>
     private bool _outcomeWriteFaulted;
@@ -197,16 +197,18 @@ internal sealed class NodeDriver(NodeOptions options)
                 }
                 return reactions;
 
+            case NodeEvent.OutcomeBatchFaulted:
+                _outcomeWriteFaulted = true;
+                _reportingSlots = 0;
+                return [];
+
+            case NodeEvent.OutcomeBatchNotIssued:
+                _reportingSlots = 0;
+                return [];
+
             case NodeEvent.OutcomeBatchReported reported:
             {
-                if (reported.Results.Count > 0)
-                {
-                    _outcomeWriteFaulted = false;
-                }
-                else if (_reportingSlots > 0)
-                {
-                    _outcomeWriteFaulted = true;
-                }
+                _outcomeWriteFaulted = false;
                 _reportingSlots = 0;
                 var answered = new List<Command>();
                 // An applied terminal outcome may have released a Dependency due right now:
@@ -220,7 +222,7 @@ internal sealed class NodeDriver(NodeOptions options)
                         answered.Add(new Command.RequestPoll(reported.Now));
                     }
                 }
-                if (reported.Results.Count > 0 && _flushDeferred && FlushOutcomes() is { } deferredFlush)
+                if (_flushDeferred && FlushOutcomes() is { } deferredFlush)
                 {
                     answered.Add(deferredFlush);
                 }
