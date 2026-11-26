@@ -963,7 +963,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
         var vector = OutcomeVector.From(batch, now.ToUniversalTime(), TransitionDetail);
-        var matched = NeedsPerRowWrites(batch)
+        var applied = NeedsPerRowWrites(batch)
             ? await ReportOutcomesInTransactionAsync(batch, vector, now, cancellationToken).ConfigureAwait(false)
             : await TryReportOutcomesInOneRoundTripAsync(vector, now, cancellationToken).ConfigureAwait(false)
               ?? await ReportOutcomesInTransactionAsync(batch, vector, now, cancellationToken).ConfigureAwait(false);
@@ -974,7 +974,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         {
             results[i] = new OutcomeReportResult(
                 batch[i].JobId,
-                matched.Contains(batch[i].JobId) ? OutcomeResult.Applied : OutcomeResult.StaleLease);
+                applied.ContainsKey(batch[i].JobId) ? OutcomeResult.Applied : OutcomeResult.StaleLease);
         }
         return results;
     }
@@ -1051,7 +1051,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     // write happens only when no row it would make terminal parents a Dependency, because the latch
     // cascade (invariant I2) must commit with the terminal write. Otherwise it writes nothing, returns
     // null, and the caller runs the batch in the transaction that cascades.
-    private async ValueTask<HashSet<Guid>?> TryReportOutcomesInOneRoundTripAsync(
+    private async ValueTask<Dictionary<Guid, JobState>?> TryReportOutcomesInOneRoundTripAsync(
         OutcomeVector vector, DateTimeOffset now, CancellationToken cancellationToken)
     {
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -1060,8 +1060,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         return gated ? null : applied;
     }
 
-    // Runs an outcome command and returns whether the gate held the write back, and the ids it applied.
-    private async ValueTask<(bool Gated, HashSet<Guid> Applied)> WriteOutcomesAsync(
+    // Runs an outcome command and returns whether the gate held the write back, and the state it wrote
+    // to each job it applied.
+    private async ValueTask<(bool Gated, Dictionary<Guid, JobState> Applied)> WriteOutcomesAsync(
         string sql, NpgsqlConnection connection, NpgsqlTransaction? transaction, OutcomeVector vector,
         DateTimeOffset now, CancellationToken cancellationToken)
     {
@@ -1070,7 +1071,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         write.Parameters.AddWithValue("now", now.ToUniversalTime());
         write.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
 
-        var applied = new HashSet<Guid>();
+        var applied = new Dictionary<Guid, JobState>();
         var gated = false;
         await using var reader = await write.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         await reader.NextResultAsync(cancellationToken).ConfigureAwait(false); // past LockOutcomeRows
@@ -1079,7 +1080,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             gated = reader.GetBoolean(0);
             if (!reader.IsDBNull(1))
             {
-                applied.Add(reader.GetGuid(1));
+                applied.Add(reader.GetGuid(1), (JobState)reader.GetInt32(2));
             }
         }
         return (gated, applied);
@@ -1090,8 +1091,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     // so no other transaction can still be changing these rows under it: a child enqueue that held a
     // parent's lock has committed its edge into this snapshot, and one that comes later waits on the lock
     // and then sees the parent terminal; and the transition ordinals it reads are the latest. The second
-    // writes the outcomes and their transitions unless `gate` says to hold back, and returns one row per
-    // applied job, or one row with a null job id when it applied none, each carrying the gate.
+    // writes the outcomes and their transitions unless `gate` says to hold back, and returns the job id and
+    // written state of each applied job, or one row with a null job id when it applied none, each
+    // carrying the gate.
     private string OutcomeCommandSql(string gate) =>
         $"""
         {LockOutcomeRows};
@@ -1099,7 +1101,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         gate AS ({gate}),
         {OutcomeWrite}
         {(_historyPolicy == JobHistoryPolicy.Off ? "" : "," + TransitionLogCtes("written"))}
-        SELECT gate.gated, w.job_id FROM gate LEFT JOIN written w ON true
+        SELECT gate.gated, w.job_id, w.state FROM gate LEFT JOIN written w ON true
         """;
 
     // True when a row the batch would make terminal parents a Dependency.
@@ -1159,7 +1161,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         )
         """;
 
-    private async ValueTask<HashSet<Guid>> ReportOutcomesInTransactionAsync(
+    private async ValueTask<Dictionary<Guid, JobState>> ReportOutcomesInTransactionAsync(
         IReadOnlyList<OutcomeReport> batch, OutcomeVector vector, DateTimeOffset now, CancellationToken cancellationToken)
     {
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -1175,7 +1177,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // same fenced transaction.
         foreach (var row in batch)
         {
-            if (!applied.Contains(row.JobId))
+            if (!applied.ContainsKey(row.JobId))
             {
                 continue;
             }
@@ -1197,14 +1199,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // non-terminal and gates nothing). One lookup finds the few terminal parents that actually
         // gate a Dependency; the existing per-parent cascade then resolves each recursively, so a deep
         // dependency graph stays correct. The common no-children batch adds zero per-job statements.
-        var terminal = new Dictionary<Guid, JobState>();
-        for (var i = 0; i < vector.Ids.Length; i++)
-        {
-            if (applied.Contains(vector.Ids[i]) && ((JobState)vector.States[i]).IsTerminal())
-            {
-                terminal[vector.Ids[i]] = (JobState)vector.States[i];
-            }
-        }
+        var terminal = applied.Where(job => job.Value.IsTerminal()).ToDictionary();
         if (terminal.Count > 0)
         {
             // Crash after the terminal write, before the latch cascade: rollback must leave every
