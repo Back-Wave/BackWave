@@ -169,7 +169,7 @@ Finish(s) == /\ lockOf' = Release(s)
    job's rows is also their position order. The enqueue wrote ordinal 0.
    A writer appends MAX(ordinal) + 1 and deletes the rows it sees at or
    below the new ordinal minus TransitionCap (TransitionLogCtes,
-   PostgresJobStore.cs:685-705). The model names a row by its ordinal.
+   PostgresJobStore.cs:683-703). The model names a row by its ordinal.
 
    Every writer except the Postgres one-statement claim reads the log in
    a statement after its row lock, so it reads the latest committed log
@@ -195,25 +195,25 @@ LogAppend(s, r, ord, seen) ==
 Record(s, r) == LogAppend(s, r, MaxOrd(r.log) + 1, LogRange(r.log))
 
 -----------------------------------------------------------------------------
-(* Postgres  PostgresJobStore.cs:648-674 (ClaimCandidates, ClaimUpdate)
+(* Postgres  PostgresJobStore.cs:644-672 (ClaimCandidates, ClaimUpdate)
      WITH candidates AS (SELECT ... WHERE state = 0 AND due_time <= @now
                          ... FOR UPDATE SKIP LOCKED)
      UPDATE ... SET state = 2, attempt = j.attempt + 1, ... FROM candidates
-     ClaimUntracedAsync (from 506) runs it in one of two forms (522-525):
+     ClaimUntracedAsync (from 499) runs it in one of two forms (515-522):
      an autocommit statement whose later CTEs also append and prune the
-     Leased transitions (114-127, TryClaimInOneStatementAsync from 549), or
-     a transaction with the transition insert as a second statement (632,
-     ClaimInTransactionAsync from 573).
-     The one-statement form reads the log from its snapshot. Its gate
-     compares each locked row's xmin with the xmin its snapshot sees, and
-     on any difference the statement writes nothing; the caller then claims
-     in the transaction form, which the model reaches as a new ClaimBegin.
+     Leased transitions (114-120, ClaimInOneStatementAsync from 547), or
+     a transaction with the transition insert as a second statement (628,
+     ClaimInTransactionAsync from 569).
+     The one-statement form reads the log from its snapshot. Its UPDATE
+     writes only a locked row whose xmin its snapshot sees, and skips the
+     others; the caller then claims the rest in the transaction form, which
+     the model reaches as a new ClaimBegin.
      Every transition writer updates the job row, so the model compares
      the row values; a write that leaves the values as they were counts as
-     no change, which only lets the gate pass more often than xmin does.
+     no change, which only lets the filter pass more often than xmin does.
      Begin = the statement snapshot; Lock = SKIP LOCKED with the
-     EvalPlanQual re-check of state and due_time; Commit = the gate, the
-     UPDATE and the log write, and the commit.
+     EvalPlanQual re-check of state and due_time; Commit = the xmin filter,
+     the UPDATE and the log write, and the commit.
    SQL Server  SqlServerJobStore.cs:564-583 (ClaimQueueAsync, from 492)
      INSERT INTO @batch SELECT ... WITH (UPDLOCK, READPAST, ROWLOCK)
        WHERE state = 0 AND due_time <= @now;
@@ -269,18 +269,18 @@ ClaimLock(s) ==
     /\ UNCHANGED <<now, row, unreported, liveLeases, firstTerminal>>
 
 (* The one-statement form under each mutant:
-     OrdinalFromSnapshot  no gate; a collision rolls the statement back,
+     OrdinalFromSnapshot  no filter; a collision rolls the statement back,
                           as the catch before the gate did.
-     NoWindowCheck        no gate; the ordinal comes from the locked row,
+     NoWindowCheck        no filter; the ordinal comes from the locked row,
                           as a per-job counter would give it; the prune
                           still reads the snapshot.
-     LegacyWriterNoBridge the gate and the ordinal use the counter, which
+     LegacyWriterNoBridge the filter and the ordinal use the counter, which
                           the release N-1 node does not move. *)
-OneStatementGated(s, H) ==
+OneStatementSkips(s, j) ==
     /\ ~Has("OrdinalFromSnapshot") /\ ~Has("NoWindowCheck")
-    /\ \E j \in H : IF Has("LegacyWriterNoBridge")
-                    THEN row[j].counter # sess[s].snap[j].counter
-                    ELSE row[j] # sess[s].snap[j]
+    /\ IF Has("LegacyWriterNoBridge")
+       THEN row[j].counter # sess[s].snap[j].counter
+       ELSE row[j] # sess[s].snap[j]
 
 OneStatementOrdinal(s, j) ==
     CASE Has("NoWindowCheck") -> MaxOrd(row[j].log) + 1
@@ -297,37 +297,38 @@ ClaimCommit(s) ==
            w == WorkerOf(s)
            H == me.held
            oneStatement == me.form = "OneStatement"
-           collides == oneStatement /\ \E j \in H : OneStatementOrdinal(s, j) \in LogRange(row[j].log)
-           writes == ~(oneStatement /\ OneStatementGated(s, H)) /\ ~collides
+           W == IF oneStatement THEN {j \in H : ~OneStatementSkips(s, j)} ELSE H
+           collides == oneStatement /\ \E j \in W : OneStatementOrdinal(s, j) \in LogRange(row[j].log)
+           writes == ~collides
        IN /\ row' = [j \in Jobs |->
-                       IF j \in H /\ writes
+                       IF j \in W /\ writes
                        THEN IF oneStatement
                             THEN LogAppend(s, Leases(s, row[j], me.at), OneStatementOrdinal(s, j),
                                         LogRange(me.snap[j].log))
                             ELSE Record(s, Leases(s, row[j], me.at))
                        ELSE row[j]]
           /\ unreported' = IF writes
-                           THEN [unreported EXCEPT ![w] = @ \cup {<<j, row[j].attempt + 1>> : j \in H}]
+                           THEN [unreported EXCEPT ![w] = @ \cup {<<j, row[j].attempt + 1>> : j \in W}]
                            ELSE unreported
           /\ liveLeases' = [j \in Jobs |->
-                        IF j \in H /\ writes THEN liveLeases[j] \cup {<<w, row[j].attempt + 1>>} ELSE liveLeases[j]]
+                        IF j \in W /\ writes THEN liveLeases[j] \cup {<<w, row[j].attempt + 1>>} ELSE liveLeases[j]]
           /\ brokenRules' = brokenRules
-                \cup Check(~writes \/ \A j \in H : row[j].due <= me.at, "ClaimOnlyDue")
+                \cup Check(~writes \/ \A j \in W : row[j].due <= me.at, "ClaimOnlyDue")
                 \cup Check(~collides \/ Has("OrdinalFromSnapshot"), "OrdinalCollision")
     /\ Finish(s)
     /\ UNCHANGED <<now, firstTerminal>>
 
 -----------------------------------------------------------------------------
 (* Single path, all adapters: one fenced UPDATE of one row.
-     Postgres  PostgresJobStore.cs:904-907 (ReportOutcomeUntracedAsync, from 845)
+     Postgres  PostgresJobStore.cs:902-905 (ReportOutcomeUntracedAsync, from 843)
      SQL Server  SqlServerJobStore.cs:842-845 (ReportOutcomeUntracedAsync, from 782)
      Oracle  OracleJobStore.cs:907-909 (ReportOutcomeUntracedAsync, from 848)
      WHERE job_id = @id AND state = 2 AND lease_owner = @worker
        AND attempt = @attempt AND lease_expiry > @now
    Batch path (ReportOutcomesAsync):
-     Postgres  PostgresJobStore.cs:1126-1134, 1148-1152, 1162-1170, 1177-1193
-       (OutcomeCommandSql; ReportOutcomesUntracedAsync from 968 runs it as
-       one implicit transaction, 1083, or inside a transaction, 1195):
+     Postgres  PostgresJobStore.cs:1124-1132, 1146-1150, 1160-1168, 1175-1191
+       (OutcomeCommandSql; ReportOutcomesUntracedAsync from 966 runs it as
+       one implicit transaction, 1081, or inside a transaction, 1193):
        SELECT ... FROM jobs j, unnest(...) d WHERE <fence> ORDER BY j.job_id
          FOR NO KEY UPDATE OF j;
        WITH d AS (unnest(...)), gate AS (...),
@@ -434,7 +435,7 @@ ReportCommit(s) ==
     /\ UNCHANGED now
 
 -----------------------------------------------------------------------------
-(* Postgres  PostgresJobStore.cs:1400-1402 (HeartbeatAsync, from 1391)
+(* Postgres  PostgresJobStore.cs:1398-1400 (HeartbeatAsync, from 1389)
    SQL Server  SqlServerJobStore.cs:1266-1272 (HeartbeatAsync, from 1250)
      One UPDATE: SET lease_expiry = @expiry
        WHERE state = 2 AND lease_owner = @worker AND lease_expiry > @now
@@ -476,7 +477,7 @@ HeartbeatCommit(s) ==
    backoff); at the ceiling it dead-letters.
    The attempt the read returns decides (RetryPolicy.cs:166-167).
 
-   Postgres  PostgresJobStore.cs:1463-1468, 1527-1529, 1542-1544 (from 1445)
+   Postgres  PostgresJobStore.cs:1461-1466, 1525-1527, 1540-1542 (from 1443)
      SELECT job_id, attempt ... WHERE state = 2 AND lease_expiry <= @now
        ... FOR UPDATE SKIP LOCKED;  UPDATE ... by id (retry, dead-letter)
    SQL Server  SqlServerJobStore.cs:1335-1338, 1401, 1419 (from 1315)
@@ -527,7 +528,7 @@ ExpireCommit(s) ==
     /\ UNCHANGED <<now, unreported>>
 
 -----------------------------------------------------------------------------
-(* Postgres  PostgresJobStore.cs:1616-1620, 1682-1684, 1705-1707 (from 1603)
+(* Postgres  PostgresJobStore.cs:1614-1618, 1680-1682, 1703-1705 (from 1601)
      SELECT ... WHERE state = 2 AND lease_owner = @owner ... FOR UPDATE
    SQL Server  SqlServerJobStore.cs:1501-1504, 1562-1563, 1578 (from 1486)
      SELECT ... WITH (UPDLOCK, ROWLOCK) WHERE state = 2 AND lease_owner = @owner
@@ -574,7 +575,7 @@ RelinquishCommit(s) ==
 (* The lock and the guard are one step; the commit can come later, because
    a caller transaction holds the row lock until it commits.
 
-   Postgres  PostgresJobStore.cs:1893-1900 (RescheduleCoreAsync, from 1878)
+   Postgres  PostgresJobStore.cs:1891-1898 (RescheduleCoreAsync, from 1876)
      WITH old AS (SELECT ... WHERE job_id = @id AND state IN (0, 1) FOR UPDATE)
      UPDATE ... SET due_time = @due FROM old
    SQL Server  SqlServerJobStore.cs:1767-1769 (RescheduleCoreAsync, from 1757)

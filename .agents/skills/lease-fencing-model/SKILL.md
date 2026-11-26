@@ -33,14 +33,14 @@ The model describes the code at the sync commit, the last commit that changed `L
 
 | Operation | Postgres `PostgresJobStore.cs` | SQL Server `SqlServerJobStore.cs` | Oracle `OracleJobStore.cs` | Model actions |
 |---|---|---|---|---|
-| Claim | `ClaimUntracedAsync` 506, path choice 522-525; one-statement claim `TryClaimInOneStatementAsync` 549, SQL 114-127; transaction claim `ClaimInTransactionAsync` 573, SQL 632; `ClaimCandidates` 648-657, `ClaimUpdate` 662-674 | `ClaimQueueAsync` 492, SQL 564-583 | `ClaimUntracedAsync` 498, SQL 581-592, due check 610-621, write 629-634 | `ClaimBegin`, `ClaimLock`, `ClaimCommit` |
-| ReportOutcome | `ReportOutcomeUntracedAsync` 845, SQL 904-907 | `ReportOutcomeUntracedAsync` 782, SQL 842-845 | `ReportOutcomeUntracedAsync` 848, SQL 907-909 | `ReportUpdate` |
-| ReportOutcomes | `ReportOutcomesUntracedAsync` 968, path choice 995-998; `TryReportOutcomesInOneRoundTripAsync` 1083; `ReportOutcomesInTransactionAsync` 1195; SQL `OutcomeCommandSql` 1126-1134, `OutcomeFence` 1148-1152, `LockOutcomeRows` 1162-1170, `OutcomeWrite` 1177-1193 | `ReportOutcomesUntracedAsync` 908, SQL 995-1019 | `ReportOutcomesUntracedAsync` 970, SQL 1041-1045, 1064-1071, 1090-1115 | `ReportLock`, `ReportCommit` |
-| Heartbeat | `HeartbeatAsync` 1391, SQL 1400-1402 | `HeartbeatAsync` 1250, SQL 1266-1272 | `HeartbeatAsync` 1375, SQL 1400-1403, 1419 | `HeartbeatUpdate`, `HeartbeatLock`, `HeartbeatCommit` |
-| ExpireLeases | `ExpireLeasesUntracedAsync` 1445, SQL 1463-1468, 1527-1529, 1542-1544 | `ExpireLeasesUntracedAsync` 1315, SQL 1335-1338, 1401, 1419 | `ExpireLeasesUntracedAsync` 1452, SQL 1473-1484, 1547-1556, 1565-1577 | `ExpireBegin`, `ExpireLock`, `ExpireCommit` |
-| RelinquishLeases | `RelinquishLeasesUntracedAsync` 1603, SQL 1616-1620, 1682-1684, 1705-1707 | `RelinquishLeasesUntracedAsync` 1486, SQL 1501-1504, 1562-1563, 1578 | `RelinquishLeasesUntracedAsync` 1637, SQL 1650-1654, 1715-1722, 1737-1743 | `RelinquishBegin`, `RelinquishLock`, `RelinquishCommit` |
-| Reschedule | `RescheduleCoreAsync` 1878, SQL 1893-1900 | `RescheduleCoreAsync` 1757, SQL 1767-1769 | `RescheduleCoreAsync` 1920, SQL 1936-1941 | `RescheduleLock`, `RescheduleCommit` |
-| Transition Log | `TransitionLogCtes` 685-705, `RecordTransitionsBatchAsync` 2091 | `RecordTransitionsBatchAsync` 2015 | `RecordTransitionsBatchAsync` 2177 | `LogAppend`, `Record`, in `ClaimCommit`, `ApplyOutcome`, `ExpireCommit`, `RelinquishCommit` |
+| Claim | `ClaimUntracedAsync` 499, path choice 515-522; one-statement claim `ClaimInOneStatementAsync` 547, SQL 114-120; transaction claim `ClaimInTransactionAsync` 569, SQL 628; `ClaimCandidates` 644-653, `ClaimUpdate` 660-672 | `ClaimQueueAsync` 492, SQL 564-583 | `ClaimUntracedAsync` 498, SQL 581-592, due check 610-621, write 629-634 | `ClaimBegin`, `ClaimLock`, `ClaimCommit` |
+| ReportOutcome | `ReportOutcomeUntracedAsync` 843, SQL 902-905 | `ReportOutcomeUntracedAsync` 782, SQL 842-845 | `ReportOutcomeUntracedAsync` 848, SQL 907-909 | `ReportUpdate` |
+| ReportOutcomes | `ReportOutcomesUntracedAsync` 966, path choice 993-996; `TryReportOutcomesInOneRoundTripAsync` 1081; `ReportOutcomesInTransactionAsync` 1193; SQL `OutcomeCommandSql` 1124-1132, `OutcomeFence` 1146-1150, `LockOutcomeRows` 1160-1168, `OutcomeWrite` 1175-1191 | `ReportOutcomesUntracedAsync` 908, SQL 995-1019 | `ReportOutcomesUntracedAsync` 970, SQL 1041-1045, 1064-1071, 1090-1115 | `ReportLock`, `ReportCommit` |
+| Heartbeat | `HeartbeatAsync` 1389, SQL 1398-1400 | `HeartbeatAsync` 1250, SQL 1266-1272 | `HeartbeatAsync` 1375, SQL 1400-1403, 1419 | `HeartbeatUpdate`, `HeartbeatLock`, `HeartbeatCommit` |
+| ExpireLeases | `ExpireLeasesUntracedAsync` 1443, SQL 1461-1466, 1525-1527, 1540-1542 | `ExpireLeasesUntracedAsync` 1315, SQL 1335-1338, 1401, 1419 | `ExpireLeasesUntracedAsync` 1452, SQL 1473-1484, 1547-1556, 1565-1577 | `ExpireBegin`, `ExpireLock`, `ExpireCommit` |
+| RelinquishLeases | `RelinquishLeasesUntracedAsync` 1601, SQL 1614-1618, 1680-1682, 1703-1705 | `RelinquishLeasesUntracedAsync` 1486, SQL 1501-1504, 1562-1563, 1578 | `RelinquishLeasesUntracedAsync` 1637, SQL 1650-1654, 1715-1722, 1737-1743 | `RelinquishBegin`, `RelinquishLock`, `RelinquishCommit` |
+| Reschedule | `RescheduleCoreAsync` 1876, SQL 1891-1898 | `RescheduleCoreAsync` 1757, SQL 1767-1769 | `RescheduleCoreAsync` 1920, SQL 1936-1941 | `RescheduleLock`, `RescheduleCommit` |
+| Transition Log | `TransitionLogCtes` 683-703, `RecordTransitionsBatchAsync` 2089 | `RecordTransitionsBatchAsync` 2015 | `RecordTransitionsBatchAsync` 2177 | `LogAppend`, `Record`, in `ClaimCommit`, `ApplyOutcome`, `ExpireCommit`, `RelinquishCommit` |
 
 The model also depends on these facts. A change to any of them touches the model too:
 
@@ -115,9 +115,9 @@ Each config in `mutants/` plants one break and must end on the rule named in its
 | `relinquish-no-leased-check-postgres` | RelinquishLeases without `state = 2` | pass |
 | `outcome-keeps-owner-postgres` | A `Succeeded` write that keeps `lease_owner` | pass |
 | `relinquish-no-leased-check-and-outcome-keeps-owner-postgres` | Both of the two above | `RelinquishOnlyHeld` |
-| `ordinal-from-snapshot-postgres` | One-statement claim without the row-version gate; a collision rolls back, as the catch before `c0f2e3c` did | `LogOrdered` |
-| `no-window-check-postgres` | One-statement claim without the gate, with the ordinal read from the locked row (a per-job counter) and the prune from the snapshot | `LogCapped` |
-| `legacy-writer-no-bridge-postgres` | Gate and ordinal on a per-job counter that a release N-1 node (session 2) does not move, with no bridge trigger | `LogOrdered` |
+| `ordinal-from-snapshot-postgres` | One-statement claim without the row-version filter; a collision rolls back, as the catch before `c0f2e3c` did | `LogOrdered` |
+| `no-window-check-postgres` | One-statement claim without the filter, with the ordinal read from the locked row (a per-job counter) and the prune from the snapshot | `LogCapped` |
+| `legacy-writer-no-bridge-postgres` | Filter and ordinal on a per-job counter that a release N-1 node (session 2) does not move, with no bridge trigger | `LogOrdered` |
 
 Some mutant configs leave out a rule that would break first:
 

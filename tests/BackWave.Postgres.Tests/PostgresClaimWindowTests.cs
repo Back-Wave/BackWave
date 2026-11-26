@@ -62,7 +62,7 @@ public sealed class PostgresClaimWindowTests
 
             Assert.Equal(job.JobId, claimed.JobId);
             Assert.Equal(new[] { (3L, JobState.Leased) }, await LogInCommitOrderAsync(admin, job.JobId));
-            Assert.Equal(1, roundTrips!.Commits); // the one-statement claim stood down for the transaction claim
+            Assert.Equal(1, roundTrips!.Commits); // the one-statement claim skipped the job and the transaction claim took it
         }
         finally
         {
