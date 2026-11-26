@@ -179,15 +179,15 @@ SmallestK(S, k) == {p \in S : Cardinality({q \in S : q < p}) < k}
 
 (* The claim's scan: matching rows after the cursor, not resolved, in Position
    order, LIMIT maxRows, cut at the first row still in its backoff window.
-   PG PostgresJobStore.cs:3198-3237, MS SqlServerJobStore.cs:3404-3441,
-   ORA OracleJobStore.cs:3583-3621. *)
+   PG PostgresJobStore.cs:3311-3350, MS SqlServerJobStore.cs:3404-3441,
+   ORA OracleJobStore.cs:3582-3620. *)
 ClaimScan(o) ==
     LET elig == {p \in Pos : p > cursor[o] /\ rows[p] = "committed" /\ Matches(o, p)
                              /\ p \notin resolved[o]}
         page == SmallestK(elig, MaxRows)
     IN {p \in page : \A q \in page \cap backoff[o] : p < q}
 
-(* ClaimObserverDeliveriesAsync (PG PostgresJobStore.cs:3123-3280), then the
+(* ClaimObserverDeliveriesAsync (PG PostgresJobStore.cs:3236-3393), then the
    report when the claim found rows. The claim locks the Observer row and
    reads resolvedAboveCursor (PG :3145-3149), then scans. Only this Observer's
    own transactions touch its row and its observer_deliveries rows, so the
@@ -228,12 +228,12 @@ Decided(r, P, pf, cf) ==
 
 (* Read P, the highest visible Position.
    postgres: the statement snapshot of the one horizon statement
-   (PG PostgresJobStore.cs:3515-3529). The snapshot is taken when the
+   (PG PostgresJobStore.cs:3628-3642). The snapshot is taken when the
    statement starts, before the row lock and the probes, and it also fixes
    h.horizon_pos, the committed horizon the statement returns when the lock is
    skipped.
    lockFirst: its own statement after the lock (MS SqlServerJobStore.cs:3731,
-   ORA OracleJobStore.cs:3921).
+   ORA OracleJobStore.cs:3920).
    pAfterProbes (mutant): P read after both probes, then the decision. *)
 Snap(o) ==
     /\ ob[o].pc = "snap"
@@ -266,7 +266,7 @@ Lock(o) ==
                     [] OTHER -> [ob EXCEPT ![o].pc = "readH"]
     /\ UNCHANGED <<writerVars, hEpoch, hCand, hPos, epochsSeen, cursor, resolved, backoff, delivered, retries, runs>>
 
-\* lockFirst, lock skipped: MS SqlServerJobStore.cs:3728, ORA OracleJobStore.cs:3917.
+\* lockFirst, lock skipped: MS SqlServerJobStore.cs:3728, ORA OracleJobStore.cs:3916.
 ReadH(o) ==
     /\ ob[o].pc = "readH"
     /\ ob' = [ob EXCEPT ![o].hz = hPos, ![o].pc = "sweep"]
@@ -308,8 +308,8 @@ ProbeCur(o) ==
     /\ UNCHANGED <<writerVars, horizonVars, cursor, resolved, backoff, delivered, retries, runs>>
 
 (* The block query: the first matching row after the cursor, at or below the
-   bound, that is not resolved. PG PostgresJobStore.cs:3403-3427,
-   MS SqlServerJobStore.cs:3610-3632, ORA OracleJobStore.cs:3787-3809. *)
+   bound, that is not resolved. PG PostgresJobStore.cs:3516-3540,
+   MS SqlServerJobStore.cs:3610-3632, ORA OracleJobStore.cs:3786-3808. *)
 BlockOf(o, bound) ==
     LET B == {p \in Pos : p > cursor[o] /\ p <= bound /\ rows[p] = "committed"
                          /\ Matches(o, p) /\ p \notin resolved[o]}
