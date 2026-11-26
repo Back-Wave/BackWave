@@ -29,12 +29,13 @@ internal sealed class UnwrittenOutcomes(int maxBatch, int headroom)
 
     public bool IsBufferFull => _buffer.Count >= maxBatch;
 
-    /// <summary>Whether this node is configured with any headroom, open or closed.</summary>
-    public bool HasHeadroom => headroom > 0;
+    public bool IsHeadroomConfigured => headroom > 0;
 
-    public int OpenHeadroom => _lastWriteFaulted ? 0 : headroom;
+    public bool IsHeadroomOpen => OpenHeadroom > 0;
 
     public int SlotsHeld => Math.Max(0, Count - OpenHeadroom);
+
+    private int OpenHeadroom => _lastWriteFaulted ? 0 : headroom;
 
     public void Add(ReportedOutcome outcome) => _buffer.Add(outcome);
 

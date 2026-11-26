@@ -285,7 +285,7 @@ internal sealed class NodeDriver(NodeOptions options)
     /// Each id once, because the store answers one result per requested job.
     /// </summary>
     private IReadOnlyList<Guid> LeasesToRenew() =>
-        _outcomes.HasHeadroom ? [.. _executing.Union(_outcomes.BufferedJobIds)] : [.. _executing];
+        _outcomes.IsHeadroomConfigured ? [.. _executing.Union(_outcomes.BufferedJobIds)] : [.. _executing];
 
     /// <summary>
     /// Drains the next batch of outcomes still buffered, for the Shell to report as this node stops. Returns
@@ -407,7 +407,7 @@ internal sealed class NodeDriver(NodeOptions options)
         {
             return null;
         }
-        if (_outcomes.OpenHeadroom > 0 && landed.Count > 0 && !CanTakeFullClaim)
+        if (_outcomes.IsHeadroomOpen && landed.Count > 0 && !CanTakeFullClaim)
         {
             _pollWaitsOnJobs = landed.Select(job => job.JobId).ToHashSet();
             return null;
