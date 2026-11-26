@@ -179,7 +179,7 @@ SmallestK(S, k) == {p \in S : Cardinality({q \in S : q < p}) < k}
 
 (* The claim's scan: matching rows after the cursor, not resolved, in Position
    order, LIMIT maxRows, cut at the first row still in its backoff window.
-   PG PostgresJobStore.cs:3311-3350, MS SqlServerJobStore.cs:3404-3441,
+   PG PostgresJobStore.cs:3314-3353, MS SqlServerJobStore.cs:3404-3441,
    ORA OracleJobStore.cs:3582-3620. *)
 ClaimScan(o) ==
     LET elig == {p \in Pos : p > cursor[o] /\ rows[p] = "committed" /\ Matches(o, p)
@@ -187,21 +187,21 @@ ClaimScan(o) ==
         page == SmallestK(elig, MaxRows)
     IN {p \in page : \A q \in page \cap backoff[o] : p < q}
 
-(* ClaimObserverDeliveriesAsync (PG PostgresJobStore.cs:3236-3393), then the
+(* ClaimObserverDeliveriesAsync (PG PostgresJobStore.cs:3239-3396), then the
    report when the claim found rows. The claim locks the Observer row and
-   reads resolvedAboveCursor (PG :3145-3149), then scans. Only this Observer's
+   reads resolvedAboveCursor (PG :3261-3265), then scans. Only this Observer's
    own transactions touch its row and its observer_deliveries rows, so the
    lock statement commutes with every other actor's step and the claim is
    atomic up to the scan, its one read of job_transitions.
-   With rows to deliver, it claims them (PG :3253-3280), the subscriber
-   handles them, and TryReportObserverDeliveriesAsync (PG :3289-3383) locks
-   the Observer row, passes the fence, and writes each outcome (PG :3357-3376):
+   With rows to deliver, it claims them (PG :3369-3396), the subscriber
+   handles them, and TryReportObserverDeliveriesAsync (PG :3405-3499) locks
+   the Observer row, passes the fence, and writes each outcome (PG :3473-3492):
    Delivered or DeadLettered sets resolution <> 0, Retry keeps resolution 0
    with a next_attempt_at. Those writes read and touch only this Observer's
    rows, so they commute with every other actor's step and fold into the
    claim. The report then runs the horizon step.
    With no rows and a resolved row above the cursor, the claim's own
-   transaction runs the horizon step and sweep (PG :3239-3250).
+   transaction runs the horizon step and sweep (PG :3355-3366).
    With neither, it commits and changes nothing, which the model leaves out. *)
 Claim(o) ==
     /\ ob[o].pc = "idle"
@@ -219,7 +219,7 @@ Claim(o) ==
     /\ UNCHANGED <<writerVars, horizonVars, cursor, runs>>
 
 \* After the probes: run CommitHorizon.Advance and stage the UPDATE of the row.
-\* The UPDATE (PG :3551-3561) writes a row this transaction has locked, and no
+\* The UPDATE (PG :3667-3677) writes a row this transaction has locked, and no
 \* other actor sees it before commit, so it folds into the step that decides.
 Decided(r, P, pf, cf) ==
     LET n == Advance(r.lk, P, pf, cf)
@@ -228,7 +228,7 @@ Decided(r, P, pf, cf) ==
 
 (* Read P, the highest visible Position.
    postgres: the statement snapshot of the one horizon statement
-   (PG PostgresJobStore.cs:3628-3642). The snapshot is taken when the
+   (PG PostgresJobStore.cs:3631-3645). The snapshot is taken when the
    statement starts, before the row lock and the probes, and it also fixes
    h.horizon_pos, the committed horizon the statement returns when the lock is
    skipped.
@@ -247,10 +247,10 @@ Snap(o) ==
     /\ UNCHANGED <<writerVars, horizonVars, cursor, resolved, backoff, delivered, retries, runs>>
 
 (* Lock the observer_log_horizon row with SKIP LOCKED. A lock reads the newest
-   committed version of the row. PG :3517-3520 (FOR UPDATE SKIP LOCKED in the
-   CTE), MS :3724-3726 (UPDLOCK, READPAST), ORA :3907-3910 (FOR UPDATE SKIP
+   committed version of the row. PG :3633-3636 (FOR UPDATE SKIP LOCKED in the
+   CTE), MS :3724-3726 (UPDLOCK, READPAST), ORA :3906-3909 (FOR UPDATE SKIP
    LOCKED). If another report holds it: postgres returns the snapshot's
-   h.horizon_pos (PG :3539-3542); lockFirst reads the committed horizon in a
+   h.horizon_pos (PG :3655-3658); lockFirst reads the committed horizon in a
    next statement (ReadH). *)
 Lock(o) ==
     /\ ob[o].pc = "lock"
@@ -274,9 +274,9 @@ ReadH(o) ==
 
 (* The two probes, each in one step: a probe takes and gives back its
    exclusive lock, or takes none. The previous epoch is 1 - epoch of the locked
-   row. PG :3523-3524 with observer_log_epoch_free
+   row. PG :3639-3640 with observer_log_epoch_free
    (PG Schema/0005_observer_commit_horizon.sql:43-55), MS :3733-3736
-   (APPLOCK_TEST), ORA :3922-3923 (observer_log_epoch_free,
+   (APPLOCK_TEST), ORA :3921-3922 (observer_log_epoch_free,
    ORA Schema/0005_observer_commit_horizon.sql:52-67).
    The postgres order probes the previous epoch first. MS computes both
    APPLOCK_TEST calls in one SELECT list, and SQL Server does not promise the
@@ -285,7 +285,7 @@ ReadH(o) ==
    orders, so the free order covers it. *)
 EitherProbeFirst == HorizonOrder = "lockFirst"
 
-\* After both probes: decide (PG :3550, MS :3760, ORA :3946), unless the mutant
+\* After both probes: decide (PG :3666, MS :3760, ORA :3945), unless the mutant
 \* still has to read P.
 Probed(r) ==
     IF r.probed # {"prev", "cur"} THEN r
@@ -308,7 +308,7 @@ ProbeCur(o) ==
     /\ UNCHANGED <<writerVars, horizonVars, cursor, resolved, backoff, delivered, retries, runs>>
 
 (* The block query: the first matching row after the cursor, at or below the
-   bound, that is not resolved. PG PostgresJobStore.cs:3516-3540,
+   bound, that is not resolved. PG PostgresJobStore.cs:3519-3543,
    MS SqlServerJobStore.cs:3610-3632, ORA OracleJobStore.cs:3786-3808. *)
 BlockOf(o, bound) ==
     LET B == {p \in Pos : p > cursor[o] /\ p <= bound /\ rows[p] = "committed"
@@ -316,16 +316,16 @@ BlockOf(o, bound) ==
     IN IF B = {} THEN None ELSE Min(B)
 
 (* The target query T: the last visible row after the cursor, at or below the
-   bound, before the block, matching or not. PG :3429-3440, MS :3634-3645,
-   ORA :3811-3822. *)
+   bound, before the block, matching or not. PG :3545-3556, MS :3634-3645,
+   ORA :3810-3821. *)
 TargetOf(o, bound, blk) ==
     LET T == {p \in Pos : p > cursor[o] /\ p <= bound /\ rows[p] = "committed"
                          /\ (blk = None \/ p < blk)}
     IN IF T = {} THEN None ELSE Max(T)
 
 (* Record dead letters, delete observer_deliveries rows at or below the
-   target, move the cursor (PG :3457-3502), then commit (PG :3249 for a claim,
-   :3382 for a report). The commit publishes the staged horizon row and frees
+   target, move the cursor (PG :3573-3618), then commit (PG :3365 for a claim,
+   :3498 for a report). The commit publishes the staged horizon row and frees
    its lock. The writes before the commit read only rows at or below the
    target and no other actor sees them before the commit, so they fold into
    the commit step. *)
@@ -373,7 +373,7 @@ Finish(o) ==
     /\ ob[o].pc = "commit"
     /\ FinishWith(o, ob[o].tgt)
 
-\* A Retry row's next_attempt_at passes (PG :3227 stops holding the claim there).
+\* A Retry row's next_attempt_at passes (PG :3343 stops holding the claim there).
 Elapse(o) ==
     /\ \E p \in backoff[o] : backoff' = [backoff EXCEPT ![o] = @ \ {p}]
     /\ UNCHANGED <<writerVars, horizonVars, cursor, resolved, delivered, retries, runs, ob>>
