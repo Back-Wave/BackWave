@@ -238,6 +238,15 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         NewJob job, DateTimeOffset now, DbTransaction? transaction = null,
         CancellationToken cancellationToken = default)
     {
+        // Inside an ambient TransactionScope the store's own connection would enlist, and the scope could
+        // roll back a job the store already reported Ok and hinted.
+        if (transaction is null && System.Transactions.Transaction.Current is not null)
+        {
+            throw new InvalidOperationException(
+                "The Postgres store does not enqueue inside an ambient TransactionScope. Pass the "
+                + "NpgsqlTransaction to EnqueueAsync for a Transactional Enqueue, or enqueue outside the scope.");
+        }
+
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
 
         // The parent set is a set (§5.1): duplicate ids collapse before any rule applies.
@@ -284,9 +293,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         EnqueueResult result;
         string? hintQueue;
-        // Inside an ambient TransactionScope the connection enlists, so an autocommit insert would join a
-        // scope the store cannot see commit. The transaction path refuses it as it always has.
-        if (IsOneStatementEnqueue(job) && System.Transactions.Transaction.Current is null)
+        if (IsOneStatementEnqueue(job))
         {
             (result, hintQueue) = await EnqueueInOneStatementAsync(connection, job, now, cancellationToken)
                 .ConfigureAwait(false);
