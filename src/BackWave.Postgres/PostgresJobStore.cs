@@ -495,12 +495,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
 
             var take = maxJobs - claimed.Count;
-            var queueClaims = IsCachedUnlimited(queue)
-                ? await TryClaimInOneStatementAsync(connection, request, queue, take, cancellationToken).ConfigureAwait(false)
-                  ?? await ClaimInTransactionAsync(connection, request, queue, take, readConfig: false, cancellationToken)
-                      .ConfigureAwait(false)
-                : await ClaimInTransactionAsync(connection, request, queue, take, readConfig: true, cancellationToken)
-                    .ConfigureAwait(false);
+            var queueClaims = (IsCachedUnlimited(queue)
+                    ? await TryClaimInOneStatementAsync(connection, request, queue, take, cancellationToken).ConfigureAwait(false)
+                    : null)
+                ?? await ClaimInTransactionAsync(connection, request, queue, take, cancellationToken).ConfigureAwait(false);
 
             // RETURNING does not guarantee order; the contract's per-Queue
             // (DueTime, enqueue order) does (§5.2).
@@ -520,8 +518,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     // statement reads the snapshot it started with. A transition committed after that snapshot but
     // before the row lock - another claimer leased the job and handed it back in that window - is
     // missing from the ordinal read, so the insert collides on the primary key and the statement rolls
-    // back whole. Null then, and the caller claims the Queue the two-statement way, whose insert reads
-    // a snapshot taken after the locks.
+    // back whole. Null then, and the caller claims the Queue in a transaction, which reads the Queue's
+    // config again and whose insert reads a snapshot taken after the locks.
     private async ValueTask<List<JobRecord>?> TryClaimInOneStatementAsync(
         NpgsqlConnection connection, ClaimRequest request, string queue, int take, CancellationToken cancellationToken)
     {
@@ -541,46 +539,40 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     private static bool IsTransitionOrdinalCollision(PostgresException exception)
         => exception is { SqlState: PostgresErrorCodes.UniqueViolation, ConstraintName: "job_transitions_pkey" };
 
-    // `readConfig` is false only for a Queue the caller found cached unlimited and unpaused.
     private async ValueTask<List<JobRecord>> ClaimInTransactionAsync(
-        NpgsqlConnection connection, ClaimRequest request, string queue, int take, bool readConfig,
-        CancellationToken cancellationToken)
+        NpgsqlConnection connection, ClaimRequest request, string queue, int take, CancellationToken cancellationToken)
     {
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
         // Concurrency Limit (I3) and Paused flag (§5.8) live in one row: lock it so concurrent
         // claimers of a limited Queue serialize on the slot count and a concurrent Pause is observed
-        // atomically. `readConfig` is false for a Queue recently observed unlimited AND unpaused (issue
-        // 0170), which skips the lock and the read; see _unlimitedQueues.
+        // atomically.
         var slots = int.MaxValue;
         var paused = false;
         int? configured = null;
-        if (readConfig)
+        // Serialize claim-vs-first-config on a key that exists BEFORE the row does (issue 0193):
+        // the FOR UPDATE below locks nothing when no queue_limits row exists yet, so it does not
+        // serialize against the FIRST pause/limit's INSERT: an in-flight claim could over-claim
+        // past a first-ever limit or slip past a first-ever pause. The advisory lock (below) is
+        // taken by both this read path and the operator setters, so they serialize with no row
+        // present.
+        await AcquireQueueConfigLockAsync(connection, transaction, queue, cancellationToken).ConfigureAwait(false);
+        // Capture the generation BEFORE the read so a concurrent operator change (which bumps it)
+        // is detected when we go to publish the stamp below (issue 0170).
+        var generation = Interlocked.Read(ref _queueConfigGeneration);
+        await using (var limit = Cmd(
+            "SELECT max_concurrent, paused FROM backwave.queue_limits WHERE queue = @queue FOR UPDATE",
+            connection, transaction))
         {
-            // Serialize claim-vs-first-config on a key that exists BEFORE the row does (issue 0193):
-            // the FOR UPDATE below locks nothing when no queue_limits row exists yet, so it does not
-            // serialize against the FIRST pause/limit's INSERT: an in-flight claim could over-claim
-            // past a first-ever limit or slip past a first-ever pause. The advisory lock (below) is
-            // taken by both this read path and the operator setters, so they serialize with no row
-            // present.
-            await AcquireQueueConfigLockAsync(connection, transaction, queue, cancellationToken).ConfigureAwait(false);
-            // Capture the generation BEFORE the read so a concurrent operator change (which bumps it)
-            // is detected when we go to publish the stamp below (issue 0170).
-            var generation = Interlocked.Read(ref _queueConfigGeneration);
-            await using (var limit = Cmd(
-                "SELECT max_concurrent, paused FROM backwave.queue_limits WHERE queue = @queue FOR UPDATE",
-                connection, transaction))
+            limit.Parameters.AddWithValue("queue", queue);
+            await using var reader = await limit.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
-                limit.Parameters.AddWithValue("queue", queue);
-                await using var reader = await limit.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
-                if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                {
-                    configured = reader.IsDBNull(0) ? null : reader.GetInt32(0);
-                    paused = reader.GetBoolean(1);
-                }
+                configured = reader.IsDBNull(0) ? null : reader.GetInt32(0);
+                paused = reader.GetBoolean(1);
             }
-            CacheQueueConfig(queue, configured, paused, generation);
         }
+        CacheQueueConfig(queue, configured, paused, generation);
         if (paused)
         {
             await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
