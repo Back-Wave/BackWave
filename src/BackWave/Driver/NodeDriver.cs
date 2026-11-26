@@ -20,6 +20,13 @@ internal sealed class NodeDriver(NodeOptions options)
     /// is installed), so the deterministic harness reads this to observe the buffer-loss-on-crash window.
     /// </summary>
     internal int BufferedOutcomeCount => _outcomes.BufferedCount;
+
+    /// <summary>
+    /// The finished jobs whose outcome write has not answered: the buffered outcomes plus the rows of the write
+    /// in flight. Each still holds its store Lease.
+    /// </summary>
+    internal int UnwrittenOutcomeCount => _outcomes.Count;
+
     private readonly Core.SmoothWeightedRoundRobin? _roundRobin =
         options.Policy is Core.DispatchPolicy.Weighted weighted
             ? new Core.SmoothWeightedRoundRobin(weighted.Weights)
@@ -341,12 +348,6 @@ internal sealed class NodeDriver(NodeOptions options)
         ChargeIssued(first);
         return Issue(first);
     }
-
-    /// <summary>
-    /// The finished jobs whose outcome write has not answered: the buffered outcomes plus the rows of the write
-    /// in flight. Each still holds its store Lease.
-    /// </summary>
-    internal int UnwrittenOutcomeCount => _outcomes.Count;
 
     /// <summary>
     /// The pool slots a claim may fill. The Unwritten outcomes fill the open
