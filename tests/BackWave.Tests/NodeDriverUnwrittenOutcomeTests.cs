@@ -98,6 +98,19 @@ public class NodeDriverUnwrittenOutcomeTests
     }
 
     [Fact]
+    public void WithHeadroom_AShortClaimWithAWaitingPoll_ChainsAPassAtOnce_WhileAFullClaimIsStillFree()
+    {
+        var driver = Driver(unwrittenOutcomeSlots: 4, poolSize: 20);
+        Assert.Equal(10, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
+        driver.Step(new NodeEvent.PollDue(T0));
+
+        var landed = driver.Step(new NodeEvent.ClaimCompleted(Jobs(3), T0));
+
+        // PoolSize 20 - Running 3 still fills a full claim of 10.
+        Assert.Equal(10, Claim(landed)?.MaxJobs);
+    }
+
+    [Fact]
     public void WithHeadroom_TheJobsOfAShortClaim_RepollForTheWholePool_WhenTheyFinish()
     {
         var driver = Driver(unwrittenOutcomeSlots: 4);
@@ -266,12 +279,30 @@ public class NodeDriverUnwrittenOutcomeTests
         Assert.DoesNotContain(driver.Step(new NodeEvent.HeartbeatDue(T0)), command => command is Command.RequestPoll);
     }
 
+    [Fact]
+    public void WithHeadroom_AClaimPassThatStartsFirst_PaysThePollThatWaitsOnAShortClaimsJobs()
+    {
+        var driver = Driver(unwrittenOutcomeSlots: 4);
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.ClaimCompleted(Jobs(1), T0));
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.PollDue(T0));
+        var landed = Jobs(2);
+        Assert.Null(Claim(driver.Step(new NodeEvent.ClaimCompleted(landed, T0))));
+
+        Assert.Equal(1, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
+        driver.Step(new NodeEvent.ClaimCompleted([], T0));
+
+        Assert.DoesNotContain(
+            landed.SelectMany(job => Finish(driver, job)), command => command is Command.RequestPoll);
+    }
+
     /// <summary>
     /// The production pump re-throws a faulted write's store fault before it runs the commands that event yields,
     /// so a re-poll the fault yielded would be lost there and run in the simulator. The poll stays owed instead.
     /// </summary>
     [Fact]
-    public void AFaultedWrite_NeverPaysAPollThatWaitsForASlot_TheNextEventDoes()
+    public void AFaultedWrite_NeverPaysAPollThatWaitsOnJobs_TheNextEventDoes()
     {
         var driver = Driver(unwrittenOutcomeSlots: 1, poolSize: 2, maxOutcomeBatch: 2);
         foreach (var job in Claimed(driver))
@@ -288,6 +319,33 @@ public class NodeDriverUnwrittenOutcomeTests
         Assert.Empty(driver.Step(new NodeEvent.OutcomeBatchFaulted(T0)));
 
         Assert.Contains(driver.Step(new NodeEvent.HeartbeatDue(T0)), command => command is Command.RequestPoll);
+    }
+
+    /// <summary>
+    /// A faulted write closes the headroom, so a short claim's jobs hold their slots as they finish and the rule
+    /// that waits on them does not apply. With the pool full when the claim lands, the waiting poll is dropped as
+    /// with no headroom: a slot those jobs free later pays nothing.
+    /// </summary>
+    [Fact]
+    public void AShortClaimWithAWaitingPoll_WhileAFaultClosesTheHeadroom_DoesNotWaitOnItsJobs()
+    {
+        var driver = Driver(unwrittenOutcomeSlots: 4, maxOutcomeBatch: 2);
+        var first = Claimed(driver);
+        Assert.Single(Finish(driver, first[0]).Concat(Finish(driver, first[1])).OfType<Command.ReportOutcomeBatch>());
+        Finish(driver, first[2]);
+        Assert.Equal(3, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.OutcomeBatchFaulted(T0));
+
+        // The fault closed the headroom: PoolSize 4 - Running 3 - Unwritten 1 leaves no slot.
+        var shortClaim = Jobs(2);
+        Assert.Null(Claim(driver.Step(new NodeEvent.ClaimCompleted(shortClaim, T0))));
+
+        var lost = driver.Step(new NodeEvent.HeartbeatCompleted(
+            [.. shortClaim.Select(job => new HeartbeatResult(job.JobId, Renewed: false, CancelRequested: false))], T0));
+
+        Assert.Equal(2, lost.OfType<Command.AbandonExecution>().Count());
+        Assert.DoesNotContain(lost, command => command is Command.RequestPoll);
     }
 
     [Fact]
@@ -319,6 +377,48 @@ public class NodeDriverUnwrittenOutcomeTests
 
         // The fault closed the headroom: PoolSize 4 - Running 2 - Unwritten 2 leaves no slot for the next batch.
         Assert.Null(Claim(landed));
+    }
+
+    [Fact]
+    public void AWeightedPass_CutToTheFreeSlots_LeavesAWaitingPollWaitingOnTheJobsOfItsLastBatch()
+    {
+        var driver = new NodeDriver(new NodeOptions
+        {
+            WorkerId = "w1",
+            Policy = new DispatchPolicy.Weighted([("q1", 1), ("q2", 1)]),
+            MaxClaimBatch = 10,
+            MaxOutcomeBatch = 2,
+            PoolSize = 4,
+            UnwrittenOutcomeSlots = 4,
+        });
+        var first = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.PollDue(T0))));
+        var cohort = Jobs(first.MaxJobs);
+        var second = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.ClaimCompleted(cohort, T0))));
+        cohort = [.. cohort, .. Jobs(second.MaxJobs)];
+        Assert.Equal(4, cohort.Length);
+        driver.Step(new NodeEvent.ClaimCompleted(cohort[first.MaxJobs..], T0));
+        foreach (var job in cohort)
+        {
+            Finish(driver, job);
+        }
+
+        var nextPass = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.PollDue(T0))));
+        Assert.Equal(2, nextPass.MaxJobs);
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.OutcomeBatchFaulted(T0));
+        var firstBatchJob = Assert.Single(Jobs(1));
+        var cut = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.ClaimCompleted([firstBatchJob], T0))));
+
+        // The fault closed the headroom: PoolSize 4 - Running 1 - Unwritten 2 cuts the batch of 2 to 1.
+        Assert.Equal(1, cut.MaxJobs);
+
+        var retry = Assert.Single(driver.Step(new NodeEvent.HeartbeatDue(T0)).OfType<Command.ReportOutcomeBatch>());
+        driver.Step(new NodeEvent.OutcomeBatchReported(Applied(retry), T0));
+        var lastBatchJob = Assert.Single(Jobs(1));
+        Assert.Null(Claim(driver.Step(new NodeEvent.ClaimCompleted([lastBatchJob], T0))));
+
+        // The first batch's job still runs, so no full claim is free and the finish alone would not re-poll.
+        Assert.Contains(Finish(driver, lastBatchJob), command => command is Command.RequestPoll);
     }
 
     [Fact]
