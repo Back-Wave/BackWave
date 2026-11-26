@@ -1466,13 +1466,14 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
         // FOR UPDATE SKIP LOCKED makes concurrent sweeps dispose disjoint sets: exactly-once disposal.
         // Scoped to the caller's served Queues so each group applies its own policy. Oracle forbids
         // ROWNUM together with FOR UPDATE at one query level, so the top-N candidate set is bounded in an
-        // inner subquery and locked in the outer select.
+        // inner subquery and locked in the outer select. The outer WHERE repeats the lease predicates so
+        // that SKIP LOCKED skips a row whose state or lease_expiry changed after the statement snapshot.
         var queueParams = string.Join(", ", queues.Select((_, i) => $":q{i}"));
         var expired = new List<(Guid JobId, int Attempt)>();
         await using (var select = Cmd(
             $"""
             SELECT job_id, attempt FROM backwave.jobs
-            WHERE job_id IN (
+            WHERE state = {(int)JobState.Leased} AND lease_expiry <= :now AND job_id IN (
                 SELECT job_id FROM (
                     SELECT job_id FROM backwave.jobs
                     WHERE state = 2 AND lease_expiry <= :now AND queue IN ({queueParams})
