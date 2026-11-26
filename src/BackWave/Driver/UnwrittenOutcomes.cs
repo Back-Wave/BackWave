@@ -60,6 +60,7 @@ internal sealed class UnwrittenOutcomes(int maxBatch, int headroom)
         return batch;
     }
 
+    /// <summary>Returns the flush deferred behind this write, or null.</summary>
     public Command.ReportOutcomeBatch? Landed()
     {
         _lastWriteFaulted = false;
@@ -67,12 +68,20 @@ internal sealed class UnwrittenOutcomes(int maxBatch, int headroom)
         return _flushDeferred ? TryFlush() : null;
     }
 
+    /// <summary>
+    /// Leaves a deferred flush to the next poll, heartbeat or finish trigger, so a failing store is not hit
+    /// again at once.
+    /// </summary>
     public void Faulted()
     {
         _lastWriteFaulted = true;
         _rowsInFlight = 0;
     }
 
+    /// <summary>
+    /// Leaves a deferred flush to the next poll, heartbeat or finish trigger, so a failing store is not hit
+    /// again at once.
+    /// </summary>
     public void NotIssued() => _rowsInFlight = 0;
 
     /// <summary>

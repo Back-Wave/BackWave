@@ -52,7 +52,10 @@ internal abstract record NodeEvent
     /// <summary>The store acknowledged (or rejected as stale) each row of a reported outcome batch.</summary>
     public sealed record OutcomeBatchReported(IReadOnlyList<OutcomeReportResult> Results, DateTimeOffset Now) : NodeEvent;
 
-    /// <summary>A reported outcome batch reached the store and failed, so none of its rows was written.</summary>
+    /// <summary>
+    /// A reported outcome batch failed, so the Driver cannot tell which of its rows were written. The Shell
+    /// re-throws the fault after this step and runs none of the commands it yields.
+    /// </summary>
     public sealed record OutcomeBatchFaulted(DateTimeOffset Now) : NodeEvent;
 
     /// <summary>

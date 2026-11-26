@@ -48,8 +48,7 @@ internal sealed class NodeDriver(NodeOptions options)
     /// Reacts to one event. The first event after which none of the jobs a poll waits on runs, and a slot is
     /// free, pays that poll as one re-poll, even below a full claim: a job from an earlier claim can keep the
     /// pool from a full claim for as long as it runs. A claim pass that starts first pays it as well. A faulted
-    /// write never pays it, because the production pump re-throws that write's store fault before it runs any
-    /// command the event yields.
+    /// write never pays it (see <see cref="NodeEvent.OutcomeBatchFaulted"/>).
     /// </summary>
     public IReadOnlyList<Command> Step(NodeEvent nodeEvent)
     {
@@ -258,8 +257,8 @@ internal sealed class NodeDriver(NodeOptions options)
     /// reaches <see cref="NodeOptions.MaxOutcomeBatch"/>, or the node just went idle (the drain-tail, so a lone
     /// outcome never waits a whole poll interval before releasing its dependents). The poll and heartbeat ticks
     /// are the third trigger, handled in their own cases. It re-polls when it makes <see cref="CanTakeFullClaim"/>
-    /// true, so the next claim asks for the whole pool rather than one claim per finish. With no headroom a
-    /// finish never changes the free slots and never re-polls.
+    /// true, so the next claim asks for the whole pool rather than one claim per finish. With the headroom
+    /// closed or not configured, a finish never changes the free slots and never re-polls.
     /// </summary>
     private IReadOnlyList<Command> Finish(JobRecord job, JobOutcome outcome, DateTimeOffset now)
     {
