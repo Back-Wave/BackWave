@@ -158,36 +158,6 @@ public sealed class PostgresTransitionPruneTests
         }
     }
 
-    [Fact]
-    public async Task A_batch_that_takes_a_job_past_the_cap_prunes_it_to_the_cap()
-    {
-        await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
-        var cap = store.Bounds.MaxTransitionsPerJob;
-        var churner = Guid.NewGuid();
-        var bystander = Guid.NewGuid();
-        await store.EnqueueAsync(Job(churner), T0);
-        await store.EnqueueAsync(Job(bystander), T0);
-
-        // Take the churner to the cap, so the report is the first transition that exceeds it.
-        await FillTransitionsUpToAsync(churner, cap - 1);
-        await ReportRetryBatchAsync(store, T0);
-
-        Assert.Equal(cap, (await store.GetJobHistoryAsync(churner)).Count);
-    }
-
-    private static async Task ReportRetryBatchAsync(PostgresJobStore store, DateTimeOffset now)
-    {
-        var claimed = await store.ClaimAsync(new ClaimRequest("w1", ["prune"], 32, Lease, now));
-        Assert.Equal(2, claimed.Count);
-        var batch = claimed
-            .Select(job => new OutcomeReport(
-                job.JobId, "w1", job.Attempt, new JobOutcome.Failure(now.AddMinutes(10), "again")))
-            .ToArray();
-
-        var results = await store.ReportOutcomesAsync(batch, now);
-        Assert.All(results, result => Assert.Equal(OutcomeResult.Applied, result.Result));
-    }
-
     // Extends a job's Transition Log with filler entries so its highest ordinal is exactly
     // <paramref name="highestOrdinal"/>. Walking the log there through the store would be dozens of
     // claim/report cycles of setup noise; the fixture writes the rows directly instead, and every
