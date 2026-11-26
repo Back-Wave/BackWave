@@ -320,7 +320,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     private async ValueTask<(EnqueueResult Result, string? HintQueue)> EnqueueInOneStatementAsync(
         NpgsqlConnection connection, NewJob job, DateTimeOffset now, CancellationToken cancellationToken)
         => await InsertJobAsync(
-                connection, null, job, JobState.Scheduled, 0, null, now, null, cancellationToken).ConfigureAwait(false)
+                connection, transaction: null, job, JobState.Scheduled, parentsRemaining: 0, cancelledByParent: null,
+                now, workflowId: null, cancellationToken).ConfigureAwait(false)
             ? (EnqueueResult.Ok, job.DueTime <= now ? job.Queue : null)
             : (EnqueueResult.Duplicate, null);
 
