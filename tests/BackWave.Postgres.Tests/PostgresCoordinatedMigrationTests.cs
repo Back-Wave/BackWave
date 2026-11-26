@@ -88,28 +88,30 @@ public sealed class PostgresCoordinatedMigrationTests
         Assert.Equal(PostgresMigrator.ExpectedSchemaVersion, await DeployedVersionAsync());
     }
 
-    // SQLSTATEs that prove the first-boot DDL race the coordination lock exists to prevent: two Nodes
-    // concurrently running the unguarded `CREATE ... IF NOT EXISTS` DDL collide on the same catalog
-    // object. 23505 covers the concurrent pg_type / pg_namespace unique-index collision the ADR calls
-    // out — Postgres does not make that DDL concurrency-safe, so a genuine race surfaces as one of these.
-    private static readonly HashSet<string> DuplicateObjectSqlStates = new()
-    {
-        PostgresErrorCodes.DuplicateTable,   // 42P07
-        PostgresErrorCodes.DuplicateObject,  // 42710
-        PostgresErrorCodes.DuplicateSchema,  // 42P06
-        PostgresErrorCodes.UniqueViolation,  // 23505 — e.g. the duplicate pg_type insert
-    };
+    // Concurrent `CREATE OR REPLACE FUNCTION` on one function raises XX000 "tuple concurrently updated".
+    // XX000 is the generic internal-error code, so only the message identifies this race.
+    private static readonly (string SqlState, string? MessageText)[] DdlRaceErrors =
+    [
+        (PostgresErrorCodes.DuplicateTable, null),
+        (PostgresErrorCodes.DuplicateObject, null),
+        (PostgresErrorCodes.DuplicateSchema, null),
+        (PostgresErrorCodes.UniqueViolation, null), // e.g. the duplicate pg_type insert
+        (PostgresErrorCodes.InternalError, "tuple concurrently updated"),
+    ];
+
+    private static bool IsDdlRace(PostgresException pg) =>
+        DdlRaceErrors.Any(race => race.SqlState == pg.SqlState && (race.MessageText is null || race.MessageText == pg.MessageText));
 
     private enum StormOutcome
     {
-        Race,       // The duplicate-object DDL race the coordination lock exists to prevent.
+        Race,       // The DDL race the coordination lock exists to prevent.
         Noise,      // Ambient concurrency/transport blip — neither proves nor disproves the control.
         Unexpected, // A genuinely unexpected error (real defect) — fail regardless of mode.
     }
 
     private static StormOutcome Classify(Exception exception) => exception switch
     {
-        PostgresException pg when DuplicateObjectSqlStates.Contains(pg.SqlState) => StormOutcome.Race,
+        PostgresException pg when IsDdlRace(pg) => StormOutcome.Race,
         // Transient server-side (serialization / deadlock / lock-not-available) and cold-pool transport
         // faults both flow through Npgsql's IsTransient flag; neither is the DDL race we are proving.
         NpgsqlException { IsTransient: true } => StormOutcome.Noise,
@@ -117,9 +119,9 @@ public sealed class PostgresCoordinatedMigrationTests
     };
 
     // Negative control: with coordination OFF, the same first-boot storm races on unguarded
-    // `CREATE ... IF NOT EXISTS` DDL, which Postgres does not make concurrency-safe. The race is
-    // timing-dependent, so this storms a generous attempt budget and passes the moment it observes the
-    // SPECIFIC duplicate-object error the lock exists to prevent — demonstrating the lock is load-bearing.
+    // `CREATE ... IF NOT EXISTS` and `CREATE OR REPLACE` DDL, which Postgres does not make concurrency-safe.
+    // The race is timing-dependent, so this storms a generous attempt budget and passes the moment it
+    // observes one of the SPECIFIC DdlRaceErrors the lock exists to prevent, proving the lock is load-bearing.
     // Even under the race the schema_version INSERT is guarded (WHERE NOT EXISTS), so the failure always
     // surfaces as a thrown error, never a duplicate version row.
     //
@@ -143,10 +145,6 @@ public sealed class PostgresCoordinatedMigrationTests
                 var outcome = Classify(exception);
                 if (outcome == StormOutcome.Race)
                 {
-                    // The load-bearing proof: the storm collided on unguarded CREATE DDL with the exact
-                    // duplicate-object error the coordination lock exists to serialize away.
-                    var postgres = Assert.IsAssignableFrom<PostgresException>(exception);
-                    Assert.Contains(postgres.SqlState, DuplicateObjectSqlStates);
                     return;
                 }
 
@@ -154,7 +152,7 @@ public sealed class PostgresCoordinatedMigrationTests
                 {
                     Assert.Fail(
                         "Uncoordinated first-boot storm threw an unexpected, non-transient error that is " +
-                        $"neither a duplicate-object race nor ambient noise: {exception}");
+                        $"neither a DDL race nor ambient noise: {exception}");
                 }
                 // Noise: ignore and keep storming.
             }
