@@ -51,6 +51,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     private readonly string _reportOutcomesInOneRoundTrip;
     private readonly string _reportOutcomesInTransaction;
 
+    // The batch transition write (RecordTransitionsBatchAsync), fixed the same way.
+    private readonly string _recordTransitions;
+
     // The job insert and its first transition, one statement whose transition exists only for a row it
     // inserted, so a Duplicate writes nothing. Fixed the same way. It inserts ordinal 0 directly, not
     // through the append-and-prune CTEs, which Postgres would plan again on every unprepared enqueue.
@@ -108,15 +111,13 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         _historyPolicy = JobHistoryPolicyResolver.Resolve(options.HistoryPolicy);
         _dataSource = NpgsqlDataSource.Create(options.ConnectionString);
         _postCommitHints = new WakeUpHintCoalescer(SendHintsAsync, _logger);
-        _claimInOneStatement = _historyPolicy == JobHistoryPolicy.Off
-            ? $"WITH {ClaimCandidates} {ClaimUpdate}"
-            : $"""
-              WITH {ClaimCandidates},
-              claimed AS ({ClaimUpdate}),
-              leased AS (SELECT job_id, state, attempt, NULL::text AS detail, sequence AS ord FROM claimed),
-              {TransitionLogCtes("leased")}
-              SELECT * FROM claimed
-              """;
+        _claimInOneStatement = $"""
+            WITH {ClaimCandidates},
+            claimed AS ({ClaimUpdate}),
+            leased AS (SELECT job_id, state, attempt, NULL::text AS detail, sequence AS ord FROM claimed)
+            {TransitionLogCtes("leased")}
+            SELECT * FROM claimed
+            """;
         _enqueueJob = _historyPolicy == JobHistoryPolicy.Off
             ? $"WITH inserted AS ({InsertJob} RETURNING job_id) SELECT count(*) FROM inserted"
             : $"""
@@ -128,7 +129,15 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
               SELECT count(*) FROM inserted
               """;
         _reportOutcomesInOneRoundTrip = OutcomeCommandSql(ChildEdgeGate);
-        _reportOutcomesInTransaction = OutcomeCommandSql("SELECT false AS gated");
+        _reportOutcomesInTransaction = OutcomeCommandSql(NoGate);
+        _recordTransitions = $"""
+            WITH entries AS (
+                SELECT * FROM unnest(@ids::uuid[], @states::int[], @attempts::int[], @details::text[])
+                    WITH ORDINALITY AS u(job_id, state, attempt, detail, ord)
+            )
+            {TransitionLogCtes("entries")}
+            SELECT count(*) FROM entries
+            """;
     }
 
     // The one place a Postgres command is built, so the configured schema is swapped into every query
@@ -648,9 +657,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     // snapshot, so a transaction path runs it after the statement that locks the jobs, and the ordinal
     // read sees every committed transition of a locked job. The prune deletes only rows older than the new
     // one, which that snapshot sees, and its cap filter leaves it nothing to delete until a job reaches
-    // the cap.
-    private static string TransitionLogCtes(string source) =>
-        $"""
+    // the cap. Empty under JobHistoryPolicy.Off, and otherwise starts with the comma that follows the
+    // statement's previous CTE.
+    private string TransitionLogCtes(string source) => _historyPolicy == JobHistoryPolicy.Off
+        ? ""
+        : $"""
+        ,
         logged AS (
             INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
             SELECT s.job_id, COALESCE(t.maxord, -1) + 1, @now, s.state, s.attempt, s.detail
@@ -1093,7 +1105,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         WITH d AS (SELECT * FROM {OutcomeRows}),
         gate AS ({gate}),
         {OutcomeWrite}
-        {(_historyPolicy == JobHistoryPolicy.Off ? "" : "," + TransitionLogCtes("written"))}
+        {TransitionLogCtes("written")}
         SELECT gate.gated, w.job_id, w.state FROM gate LEFT JOIN written w ON true
         """;
 
@@ -1104,6 +1116,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             SELECT 1 FROM backwave.job_parents p JOIN d ON p.parent_id = d.job_id WHERE d.state <> 0
         ) AS gated
         """;
+
+    private const string NoGate = "SELECT false AS gated";
 
     // The fence every outcome write applies to each row independently (Effect-Once): the row is still
     // leased to the reporting worker, at the reported attempt, and the lease is live.
@@ -2072,7 +2086,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             details[i] = TransitionDetail(rows[i].FailureDetail);
         }
 
-        await using var record = Cmd(RecordTransitions, connection, transaction);
+        await using var record = Cmd(_recordTransitions, connection, transaction);
         record.Parameters.AddWithValue("ids", ids);
         record.Parameters.AddWithValue("states", states);
         record.Parameters.AddWithValue("attempts", attempts);
@@ -2081,16 +2095,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         record.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
         await record.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
-
-    private static readonly string RecordTransitions =
-        $"""
-        WITH entries AS (
-            SELECT * FROM unnest(@ids::uuid[], @states::int[], @attempts::int[], @details::text[])
-                WITH ORDINALITY AS u(job_id, state, attempt, detail, ord)
-        ),
-        {TransitionLogCtes("entries")}
-        SELECT count(*) FROM logged
-        """;
 
     // The Failure Detail a transition row stores: Transitions records the row but never the detail; the
     // full rung clamps and keeps it.
