@@ -42,6 +42,9 @@ internal sealed class DeterministicPump(
     // call leaves behind are stepped by the next drive, as the production pump's channel keeps them.
     private readonly Queue<NodeEvent> _events = new();
 
+    // The Driver's Unwritten Outcome count last reported to backwave.worker.outcomes.unwritten.
+    private int _reportedUnwrittenOutcomes;
+
     // The pending settlement of each in-flight Attempt's process telemetry, keyed by (JobId, Attempt):
     // its held-open process span (possibly null) plus the Wire Name and Queue the settling report needs
     // to tag the dead-letter counter, so the settling outcome can land a retry-scheduled / dead-lettered
@@ -80,6 +83,9 @@ internal sealed class DeterministicPump(
             while (_events.TryDequeue(out var nodeEvent))
             {
                 var commands = driver.Step(nodeEvent);
+                BackWaveDiagnostics.RecordUnwrittenOutcomes(
+                    _consumerGroup, driver.UnwrittenOutcomeCount - _reportedUnwrittenOutcomes);
+                _reportedUnwrittenOutcomes = driver.UnwrittenOutcomeCount;
                 for (var issued = 0; issued < commands.Count; issued++)
                 {
                     try
