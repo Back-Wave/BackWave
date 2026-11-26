@@ -250,25 +250,6 @@ internal sealed class WorkerGroupService(
         return false;
     }
 
-    // <summary>Written on the pump loop and then on the hand-back, never at the same time.</summary>
-    private int _reportedUnwrittenOutcomes;
-
-    // <summary>
-    // Every Driver step of this pump goes through here, so the metric sees every change in its count.
-    // </summary>
-    private IReadOnlyList<Command> Step(NodeDriver driver, NodeEvent nodeEvent)
-    {
-        var commands = driver.Step(nodeEvent);
-        ReportUnwrittenOutcomes(driver.UnwrittenOutcomeCount);
-        return commands;
-    }
-
-    private void ReportUnwrittenOutcomes(int unwritten)
-    {
-        BackWaveDiagnostics.RecordUnwrittenOutcomes(options.Name, unwritten - _reportedUnwrittenOutcomes);
-        _reportedUnwrittenOutcomes = unwritten;
-    }
-
     private readonly StoreLane _claim = new();
 
     private readonly StoreLane _outcomeWrite = new();
@@ -294,6 +275,27 @@ internal sealed class WorkerGroupService(
         options.UnclassifiedStoreFaults == UnclassifiedStoreFaultAction.Degrade
         && ReferenceEquals(exception, _storeFault)
         && !(exception is OperationCanceledException && stoppingToken.IsCancellationRequested);
+
+    // <summary>Written on the pump loop and then on the hand-back, never at the same time.</summary>
+    private int _reportedUnwrittenOutcomes;
+
+    // <summary>
+    // Every Driver step of this pump goes through here, so the metric follows the Driver's count while the
+    // pump runs. A clean stop settles the write in flight and drains the buffer without a step, so the metric
+    // can stay high until the hand-back reports 0.
+    // </summary>
+    private IReadOnlyList<Command> Step(NodeDriver driver, NodeEvent nodeEvent)
+    {
+        var commands = driver.Step(nodeEvent);
+        ReportUnwrittenOutcomes(driver.UnwrittenOutcomeCount);
+        return commands;
+    }
+
+    private void ReportUnwrittenOutcomes(int unwritten)
+    {
+        BackWaveDiagnostics.RecordUnwrittenOutcomes(options.Name, unwritten - _reportedUnwrittenOutcomes);
+        _reportedUnwrittenOutcomes = unwritten;
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
