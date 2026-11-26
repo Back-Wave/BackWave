@@ -169,7 +169,7 @@ Finish(s) == /\ lockOf' = Release(s)
    job's rows is also their position order. The enqueue wrote ordinal 0.
    A writer appends MAX(ordinal) + 1 and deletes the rows it sees at or
    below the new ordinal minus TransitionCap (TransitionLogCtes,
-   PostgresJobStore.cs:683-703). The model names a row by its ordinal.
+   PostgresJobStore.cs:669-689). The model names a row by its ordinal.
 
    Every writer except the Postgres one-statement claim reads the log in
    a statement after its row lock, so it reads the latest committed log
@@ -195,15 +195,15 @@ LogAppend(s, r, ord, seen) ==
 Record(s, r) == LogAppend(s, r, MaxOrd(r.log) + 1, LogRange(r.log))
 
 -----------------------------------------------------------------------------
-(* Postgres  PostgresJobStore.cs:644-672 (ClaimCandidates, ClaimUpdate)
+(* Postgres  PostgresJobStore.cs:630-658 (ClaimCandidates, ClaimUpdate)
      WITH candidates AS (SELECT ... WHERE state = 0 AND due_time <= @now
                          ... FOR UPDATE SKIP LOCKED)
      UPDATE ... SET state = 2, attempt = j.attempt + 1, ... FROM candidates
-     ClaimUntracedAsync (from 499) runs it in one of two forms (515-522):
+     ClaimUntracedAsync (from 486) runs it in one of two forms (502-509):
      an autocommit statement whose later CTEs also append and prune the
-     Leased transitions (114-120, ClaimInOneStatementAsync from 547), or
-     a transaction with the transition insert as a second statement (628,
-     ClaimInTransactionAsync from 569).
+     Leased transitions (106-112, ClaimInOneStatementAsync from 534), or
+     a transaction with the transition insert as a second statement (615,
+     ClaimInTransactionAsync from 556).
      The one-statement form reads the log from its snapshot. Its UPDATE
      writes only a locked row whose xmin its snapshot sees, and skips the
      others; the caller then claims the rest in the transaction form, which
@@ -320,15 +320,15 @@ ClaimCommit(s) ==
 
 -----------------------------------------------------------------------------
 (* Single path, all adapters: one fenced UPDATE of one row.
-     Postgres  PostgresJobStore.cs:902-905 (ReportOutcomeUntracedAsync, from 843)
+     Postgres  PostgresJobStore.cs:887-890 (ReportOutcomeUntracedAsync, from 828)
      SQL Server  SqlServerJobStore.cs:842-845 (ReportOutcomeUntracedAsync, from 782)
      Oracle  OracleJobStore.cs:907-909 (ReportOutcomeUntracedAsync, from 848)
      WHERE job_id = @id AND state = 2 AND lease_owner = @worker
        AND attempt = @attempt AND lease_expiry > @now
    Batch path (ReportOutcomesAsync):
-     Postgres  PostgresJobStore.cs:1124-1132, 1146-1150, 1160-1168, 1175-1191
-       (OutcomeCommandSql; ReportOutcomesUntracedAsync from 966 runs it as
-       one implicit transaction, 1081, or inside a transaction, 1193):
+     Postgres  PostgresJobStore.cs:1097-1105, 1117-1121, 1130-1138, 1142-1158
+       (OutcomeCommandSql; ReportOutcomesUntracedAsync from 951 runs it as
+       one implicit transaction, 1058, or inside a transaction, 1160):
        SELECT ... FROM jobs j, unnest(...) d WHERE <fence> ORDER BY j.job_id
          FOR NO KEY UPDATE OF j;
        WITH d AS (unnest(...)), gate AS (...),
@@ -435,7 +435,7 @@ ReportCommit(s) ==
     /\ UNCHANGED now
 
 -----------------------------------------------------------------------------
-(* Postgres  PostgresJobStore.cs:1398-1400 (HeartbeatAsync, from 1389)
+(* Postgres  PostgresJobStore.cs:1364-1366 (HeartbeatAsync, from 1355)
    SQL Server  SqlServerJobStore.cs:1266-1272 (HeartbeatAsync, from 1250)
      One UPDATE: SET lease_expiry = @expiry
        WHERE state = 2 AND lease_owner = @worker AND lease_expiry > @now
@@ -477,7 +477,7 @@ HeartbeatCommit(s) ==
    backoff); at the ceiling it dead-letters.
    The attempt the read returns decides (RetryPolicy.cs:166-167).
 
-   Postgres  PostgresJobStore.cs:1461-1466, 1525-1527, 1540-1542 (from 1443)
+   Postgres  PostgresJobStore.cs:1427-1432, 1491-1493, 1506-1508 (from 1409)
      SELECT job_id, attempt ... WHERE state = 2 AND lease_expiry <= @now
        ... FOR UPDATE SKIP LOCKED;  UPDATE ... by id (retry, dead-letter)
    SQL Server  SqlServerJobStore.cs:1335-1338, 1401, 1419 (from 1315)
@@ -528,7 +528,7 @@ ExpireCommit(s) ==
     /\ UNCHANGED <<now, unreported>>
 
 -----------------------------------------------------------------------------
-(* Postgres  PostgresJobStore.cs:1614-1618, 1680-1682, 1703-1705 (from 1601)
+(* Postgres  PostgresJobStore.cs:1580-1584, 1646-1648, 1669-1671 (from 1567)
      SELECT ... WHERE state = 2 AND lease_owner = @owner ... FOR UPDATE
    SQL Server  SqlServerJobStore.cs:1501-1504, 1562-1563, 1578 (from 1486)
      SELECT ... WITH (UPDLOCK, ROWLOCK) WHERE state = 2 AND lease_owner = @owner
@@ -575,7 +575,7 @@ RelinquishCommit(s) ==
 (* The lock and the guard are one step; the commit can come later, because
    a caller transaction holds the row lock until it commits.
 
-   Postgres  PostgresJobStore.cs:1891-1898 (RescheduleCoreAsync, from 1876)
+   Postgres  PostgresJobStore.cs:1857-1864 (RescheduleCoreAsync, from 1842)
      WITH old AS (SELECT ... WHERE job_id = @id AND state IN (0, 1) FOR UPDATE)
      UPDATE ... SET due_time = @due FROM old
    SQL Server  SqlServerJobStore.cs:1767-1769 (RescheduleCoreAsync, from 1757)
