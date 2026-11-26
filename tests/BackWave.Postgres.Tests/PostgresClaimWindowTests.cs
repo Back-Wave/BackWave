@@ -62,7 +62,10 @@ public sealed class PostgresClaimWindowTests
 
             Assert.Equal(job.JobId, claimed.JobId);
             Assert.Equal(new[] { (3L, JobState.Leased) }, await LogInCommitOrderAsync(admin, job.JobId));
-            Assert.Equal(1, roundTrips!.Commits); // the one-statement claim skipped the job and the transaction claim took it
+            // The window was hit: the one-statement claim (1 command) skipped the job, and the transaction
+            // claim (4 commands and its commit) took it. A claim that went straight to the transaction
+            // path would count (4, 1).
+            Assert.Equal((5, 1), (roundTrips!.Commands, roundTrips.Commits));
         }
         finally
         {
