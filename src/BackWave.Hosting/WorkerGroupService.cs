@@ -1568,6 +1568,9 @@ internal sealed class WorkerGroupService(
         _haltedPump?.Dispose();
         _pollWake.Dispose();
         _hostStopLink.Dispose();
-        _hostStopped.Dispose();
+        // _hostStopped is deliberately not disposed: a host stop token may fire after Dispose, and a
+        // disposed source would throw from that token's Cancel. WebApplicationFactory stops the host
+        // while app.Run() stops it again, so a second stop can overwrite _hostStopLink or arrive after
+        // Dispose. With no timer and no WaitHandle, the source holds nothing that needs releasing.
     }
 }
