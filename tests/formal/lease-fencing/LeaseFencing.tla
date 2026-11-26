@@ -57,7 +57,7 @@
 (* Sync commit: the last commit that changed this file. Line numbers       *)
 (* cite the code at that commit.                                           *)
 (***************************************************************************)
-EXTENDS Integers, FiniteSets, TLC
+EXTENDS Integers, FiniteSets, Sequences, TLC
 
 CONSTANTS
     Adapter,
@@ -68,14 +68,17 @@ CONSTANTS
     LeaseTicks,
     MaxTime,
     MaxNowLag,
-    ReportPaths
+    ReportPaths,
+    TransitionCap
 
 ASSUME Adapter \in {"Postgres", "SqlServer", "Oracle"}
 ASSUME Mutants \subseteq {"OwnerOnlyFence", "ClaimNoDueRecheck", "ClaimNoOuterDue",
                           "RelinquishNoLeasedCheck", "OutcomeKeepsOwner", "ClaimNoLock",
-                          "ExpireNoOuterWhere", "ExpireNoOuterOrder"}
+                          "ExpireNoOuterWhere", "ExpireNoOuterOrder", "OrdinalFromSnapshot",
+                          "NoWindowCheck", "LegacyWriterNoBridge"}
 ASSUME ReportPaths \subseteq {"Single", "Batch"} /\ ReportPaths # {}
 ASSUME LeaseTicks >= 1
+ASSUME TransitionCap >= 1
 
 Scheduled == 0
 Leased == 2
@@ -93,7 +96,7 @@ WorkerOf(s) == IF s % 2 = 1 THEN "w1" ELSE "w2"
 Has(m) == m \in Mutants
 
 Idle == [op |-> "Idle", at |-> 0, todo |-> {}, held |-> {}, job |-> "none", att |-> 0, kind |-> "none",
-         lockLevelSnap |-> [j \in {} |-> NoExpiry]]
+         lockLevelSnap |-> [j \in {} |-> NoExpiry], form |-> "none", snap |-> [j \in {} |-> NoExpiry]]
 
 VARIABLES
     now,
@@ -147,11 +150,12 @@ LockLevelCols(op, r) ==
     CASE op = "Claim" -> r
       [] op = "Expire" -> [c \in ExpireLockCols |-> r[c]]
 
-Begin(s, op, at, P) ==
-    sess' = [sess EXCEPT ![s] = [Idle EXCEPT !.op = op, !.at = at, !.todo = P,
+Begin(s, op, at, P, form) ==
+    sess' = [sess EXCEPT ![s] = [Idle EXCEPT !.op = op, !.at = at, !.todo = P, !.form = form,
                                  !.lockLevelSnap = IF Adapter = "Oracle"
                                           THEN [j \in P |-> LockLevelCols(op, row[j])]
-                                          ELSE @]]
+                                          ELSE @,
+                                 !.snap = IF form = "OneStatement" THEN [j \in P |-> row[j]] ELSE @]]
 
 SnapshotCurrent(s, j) == LockLevelCols(sess[s].op, row[j]) = sess[s].lockLevelSnap[j]
 
@@ -159,20 +163,57 @@ Finish(s) == /\ lockOf' = Release(s)
              /\ sess' = [sess EXCEPT ![s] = Idle]
 
 -----------------------------------------------------------------------------
-(* Postgres  PostgresJobStore.cs:634-660 (ClaimCandidates, ClaimUpdate)
+(* The Transition Log of a job, as row[j].log: the ordinals of its live
+   job_transitions rows in commit order. Every writer of a transition
+   holds the job row lock when it inserts, so the commit order of one
+   job's rows is also their position order. The enqueue wrote ordinal 0.
+   A writer appends MAX(ordinal) + 1 and deletes the rows it sees at or
+   below the new ordinal minus TransitionCap (TransitionLogCtes,
+   PostgresJobStore.cs:685-705). The model names a row by its ordinal.
+
+   Every writer except the Postgres one-statement claim reads the log in
+   a statement after its row lock, so it reads the latest committed log
+   (the transaction claim and RecordTransitionsBatchAsync, the outcome
+   command's second statement, and the SQL Server and Oracle recorders).
+   Record models that writer.
+
+   row[j].counter is a per-job "last ordinal" column that the code does
+   not have. Only LegacyWriterNoBridge uses it, so it stays 0 otherwise. *)
+
+LogRange(log) == {log[i] : i \in DOMAIN log}
+MaxOrd(log) == IF log = <<>> THEN -1
+               ELSE CHOOSE m \in LogRange(log) : \A e \in LogRange(log) : e <= m
+
+\* Session 2 is a node of release N-1 under LegacyWriterNoBridge: it writes
+\* MAX + 1 and leaves the counter as it was.
+Legacy(s) == Has("LegacyWriterNoBridge") /\ s = 2
+
+LogAppend(s, r, ord, seen) ==
+    [r EXCEPT !.log = SelectSeq(@, LAMBDA e : ~(e \in seen /\ e <= ord - TransitionCap)) \o <<ord>>,
+              !.counter = IF Has("LegacyWriterNoBridge") /\ ~Legacy(s) THEN ord ELSE @]
+
+Record(s, r) == LogAppend(s, r, MaxOrd(r.log) + 1, LogRange(r.log))
+
+-----------------------------------------------------------------------------
+(* Postgres  PostgresJobStore.cs:648-674 (ClaimCandidates, ClaimUpdate)
      WITH candidates AS (SELECT ... WHERE state = 0 AND due_time <= @now
                          ... FOR UPDATE SKIP LOCKED)
      UPDATE ... SET state = 2, attempt = j.attempt + 1, ... FROM candidates
-     ClaimUntracedAsync (from 499) runs it in one of two forms (515-518):
+     ClaimUntracedAsync (from 506) runs it in one of two forms (522-525):
      an autocommit statement whose later CTEs also append and prune the
-     Leased transitions (114-120, TryClaimInOneStatementAsync from 540), or
-     a transaction with the transition insert as a second statement (618,
-     ClaimInTransactionAsync from 559). The one-statement form rolls back
-     whole on a transition ordinal collision, and the caller claims again
-     in the transaction form: Rollback, then a new ClaimBegin.
+     Leased transitions (114-127, TryClaimInOneStatementAsync from 549), or
+     a transaction with the transition insert as a second statement (632,
+     ClaimInTransactionAsync from 573).
+     The one-statement form reads the log from its snapshot. Its gate
+     compares each locked row's xmin with the xmin its snapshot sees, and
+     on any difference the statement writes nothing; the caller then claims
+     in the transaction form, which the model reaches as a new ClaimBegin.
+     Every transition writer updates the job row, so the model compares
+     the row values; a write that leaves the values as they were counts as
+     no change, which only lets the gate pass more often than xmin does.
      Begin = the statement snapshot; Lock = SKIP LOCKED with the
-     EvalPlanQual re-check of state and due_time; Commit = the UPDATE and
-     the commit.
+     EvalPlanQual re-check of state and due_time; Commit = the gate, the
+     UPDATE and the log write, and the commit.
    SQL Server  SqlServerJobStore.cs:564-583 (ClaimQueueAsync, from 492)
      INSERT INTO @batch SELECT ... WITH (UPDLOCK, READPAST, ROWLOCK)
        WHERE state = 0 AND due_time <= @now;
@@ -207,11 +248,14 @@ ClaimHalts(j, at) ==
     /\ \/ row[j].state # Scheduled
        \/ ~Has("ClaimNoDueRecheck") /\ row[j].due > at
 
+ClaimForms(s) ==
+    IF Adapter = "Postgres" /\ ~Legacy(s) THEN {"OneStatement", "Transaction"} ELSE {"Transaction"}
+
 ClaimBegin(s) ==
     /\ sess[s].op = "Idle"
-    /\ \E at \in CallTimes :
+    /\ \E at \in CallTimes, form \in ClaimForms(s) :
          /\ ClaimPick(at) # {}
-         /\ Begin(s, "Claim", at, ClaimPick(at))
+         /\ Begin(s, "Claim", at, ClaimPick(at), form)
     /\ UNCHANGED <<now, row, lockOf, unreported, liveLeases, firstTerminal, brokenRules>>
 
 ClaimLock(s) ==
@@ -224,35 +268,66 @@ ClaimLock(s) ==
               /\ UNCHANGED brokenRules
     /\ UNCHANGED <<now, row, unreported, liveLeases, firstTerminal>>
 
+(* The one-statement form under each mutant:
+     OrdinalFromSnapshot  no gate; a collision rolls the statement back,
+                          as the catch before the gate did.
+     NoWindowCheck        no gate; the ordinal comes from the locked row,
+                          as a per-job counter would give it; the prune
+                          still reads the snapshot.
+     LegacyWriterNoBridge the gate and the ordinal use the counter, which
+                          the release N-1 node does not move. *)
+OneStatementGated(s, H) ==
+    /\ ~Has("OrdinalFromSnapshot") /\ ~Has("NoWindowCheck")
+    /\ \E j \in H : IF Has("LegacyWriterNoBridge")
+                    THEN row[j].counter # sess[s].snap[j].counter
+                    ELSE row[j] # sess[s].snap[j]
+
+OneStatementOrdinal(s, j) ==
+    CASE Has("NoWindowCheck") -> MaxOrd(row[j].log) + 1
+      [] Has("LegacyWriterNoBridge") -> row[j].counter + 1
+      [] OTHER -> MaxOrd(sess[s].snap[j].log) + 1
+
+Leases(s, r, at) ==
+    [r EXCEPT !.state = Leased, !.attempt = r.attempt + 1, !.owner = WorkerOf(s), !.expiry = at + LeaseTicks]
+
 ClaimCommit(s) ==
     /\ sess[s].op = "Claim"
     /\ sess[s].todo = {}
     /\ LET me == sess[s]
            w == WorkerOf(s)
            H == me.held
+           oneStatement == me.form = "OneStatement"
+           collides == oneStatement /\ \E j \in H : OneStatementOrdinal(s, j) \in LogRange(row[j].log)
+           writes == ~(oneStatement /\ OneStatementGated(s, H)) /\ ~collides
        IN /\ row' = [j \in Jobs |->
-                       IF j \in H
-                       THEN [row[j] EXCEPT !.state = Leased, !.attempt = row[j].attempt + 1,
-                                           !.owner = w, !.expiry = me.at + LeaseTicks]
+                       IF j \in H /\ writes
+                       THEN IF oneStatement
+                            THEN LogAppend(s, Leases(s, row[j], me.at), OneStatementOrdinal(s, j),
+                                        LogRange(me.snap[j].log))
+                            ELSE Record(s, Leases(s, row[j], me.at))
                        ELSE row[j]]
-          /\ unreported' = [unreported EXCEPT ![w] = @ \cup {<<j, row[j].attempt + 1>> : j \in H}]
+          /\ unreported' = IF writes
+                           THEN [unreported EXCEPT ![w] = @ \cup {<<j, row[j].attempt + 1>> : j \in H}]
+                           ELSE unreported
           /\ liveLeases' = [j \in Jobs |->
-                        IF j \in H THEN liveLeases[j] \cup {<<w, row[j].attempt + 1>>} ELSE liveLeases[j]]
-          /\ brokenRules' = brokenRules \cup Check(\A j \in H : row[j].due <= me.at, "ClaimOnlyDue")
+                        IF j \in H /\ writes THEN liveLeases[j] \cup {<<w, row[j].attempt + 1>>} ELSE liveLeases[j]]
+          /\ brokenRules' = brokenRules
+                \cup Check(~writes \/ \A j \in H : row[j].due <= me.at, "ClaimOnlyDue")
+                \cup Check(~collides \/ Has("OrdinalFromSnapshot"), "OrdinalCollision")
     /\ Finish(s)
     /\ UNCHANGED <<now, firstTerminal>>
 
 -----------------------------------------------------------------------------
 (* Single path, all adapters: one fenced UPDATE of one row.
-     Postgres  PostgresJobStore.cs:888-891 (ReportOutcomeUntracedAsync, from 829)
+     Postgres  PostgresJobStore.cs:904-907 (ReportOutcomeUntracedAsync, from 845)
      SQL Server  SqlServerJobStore.cs:842-845 (ReportOutcomeUntracedAsync, from 782)
      Oracle  OracleJobStore.cs:907-909 (ReportOutcomeUntracedAsync, from 848)
      WHERE job_id = @id AND state = 2 AND lease_owner = @worker
        AND attempt = @attempt AND lease_expiry > @now
    Batch path (ReportOutcomesAsync):
-     Postgres  PostgresJobStore.cs:1110-1118, 1132-1136, 1146-1154, 1161-1177
-       (OutcomeCommandSql; ReportOutcomesUntracedAsync from 952 runs it as
-       one implicit transaction, 1067, or inside a transaction, 1179):
+     Postgres  PostgresJobStore.cs:1126-1134, 1148-1152, 1162-1170, 1177-1193
+       (OutcomeCommandSql; ReportOutcomesUntracedAsync from 968 runs it as
+       one implicit transaction, 1083, or inside a transaction, 1195):
        SELECT ... FROM jobs j, unnest(...) d WHERE <fence> ORDER BY j.job_id
          FOR NO KEY UPDATE OF j;
        WITH d AS (unnest(...)), gate AS (...),
@@ -294,13 +369,13 @@ Fence(r, w, a, at) ==
 ContractFence(r, w, a, at) ==
     r.state = Leased /\ r.owner = w /\ r.attempt = a /\ Unlapsed(r, at)
 
-ApplyOutcome(j, w, a, kind, at) ==
+ApplyOutcome(s, j, w, a, kind, at) ==
     LET st == OutcomeState(kind, a)
         keep == Has("OutcomeKeepsOwner") /\ st = Succeeded
-    IN /\ row' = [row EXCEPT ![j] = [@ EXCEPT !.state = st,
-                                             !.owner = IF keep THEN @ ELSE NoOwner,
-                                             !.expiry = NoExpiry,
-                                             !.due = IF st = Scheduled THEN at ELSE @]]
+    IN /\ row' = [row EXCEPT ![j] = Record(s, [@ EXCEPT !.state = st,
+                                                        !.owner = IF keep THEN @ ELSE NoOwner,
+                                                        !.expiry = NoExpiry,
+                                                        !.due = IF st = Scheduled THEN at ELSE @])]
        /\ liveLeases' = [liveLeases EXCEPT ![j] = EndLease(j)]
        /\ firstTerminal' = [firstTerminal EXCEPT ![j] = NoteTerminal(j, st)]
        /\ brokenRules' = brokenRules \cup Check(ContractFence(row[j], w, a, at), "OutcomeFenced")
@@ -317,7 +392,7 @@ ReportUpdate(s) ==
          IN /\ lockOf[j] = NoSession
             /\ DropRun(w, j, a)
             /\ IF Fence(row[j], w, a, at)
-                 THEN ApplyOutcome(j, w, a, kind, at)
+                 THEN ApplyOutcome(s, j, w, a, kind, at)
                  ELSE UNCHANGED <<row, liveLeases, firstTerminal, brokenRules>>
     /\ UNCHANGED <<now, lockOf, sess>>
 
@@ -353,13 +428,13 @@ ReportCommit(s) ==
                      ELSE Fence(row[j], w, me.att, me.at)
        IN /\ DropRun(w, j, me.att)
           /\ IF writes
-               THEN ApplyOutcome(j, w, me.att, me.kind, me.at)
+               THEN ApplyOutcome(s, j, w, me.att, me.kind, me.at)
                ELSE UNCHANGED <<row, liveLeases, firstTerminal, brokenRules>>
     /\ Finish(s)
     /\ UNCHANGED now
 
 -----------------------------------------------------------------------------
-(* Postgres  PostgresJobStore.cs:1384-1386 (HeartbeatAsync, from 1375)
+(* Postgres  PostgresJobStore.cs:1400-1402 (HeartbeatAsync, from 1391)
    SQL Server  SqlServerJobStore.cs:1266-1272 (HeartbeatAsync, from 1250)
      One UPDATE: SET lease_expiry = @expiry
        WHERE state = 2 AND lease_owner = @worker AND lease_expiry > @now
@@ -401,7 +476,7 @@ HeartbeatCommit(s) ==
    backoff); at the ceiling it dead-letters.
    The attempt the read returns decides (RetryPolicy.cs:166-167).
 
-   Postgres  PostgresJobStore.cs:1447-1452, 1511-1513, 1526-1528 (from 1429)
+   Postgres  PostgresJobStore.cs:1463-1468, 1527-1529, 1542-1544 (from 1445)
      SELECT job_id, attempt ... WHERE state = 2 AND lease_expiry <= @now
        ... FOR UPDATE SKIP LOCKED;  UPDATE ... by id (retry, dead-letter)
    SQL Server  SqlServerJobStore.cs:1335-1338, 1401, 1419 (from 1315)
@@ -424,7 +499,7 @@ ExpireBegin(s) ==
     /\ sess[s].op = "Idle"
     /\ \E at \in CallTimes :
          /\ ExpirePick(at) # {}
-         /\ Begin(s, "Expire", at, ExpirePick(at))
+         /\ Begin(s, "Expire", at, ExpirePick(at), "none")
     /\ UNCHANGED <<now, row, lockOf, unreported, liveLeases, firstTerminal, brokenRules>>
 
 ExpireLock(s) ==
@@ -432,27 +507,27 @@ ExpireLock(s) ==
     /\ \E j \in sess[s].todo : LockRow(s, j, "skip", ExpireRecheck(s, j, sess[s].at))
     /\ UNCHANGED <<now, row, unreported, liveLeases, firstTerminal, brokenRules>>
 
-Disposed(j, at) ==
+Disposed(s, j, at) ==
     LET st == IF row[j].attempt >= MaxAttempts THEN DeadLettered ELSE Scheduled
-    IN [row[j] EXCEPT !.state = st, !.owner = NoOwner, !.expiry = NoExpiry,
-                      !.due = IF st = Scheduled THEN at ELSE row[j].due]
+    IN Record(s, [row[j] EXCEPT !.state = st, !.owner = NoOwner, !.expiry = NoExpiry,
+                                !.due = IF st = Scheduled THEN at ELSE row[j].due])
 
 ExpireCommit(s) ==
     /\ sess[s].op = "Expire"
     /\ sess[s].todo = {}
     /\ LET me == sess[s]
            H == me.held
-       IN /\ row' = [j \in Jobs |-> IF j \in H THEN Disposed(j, me.at) ELSE row[j]]
+       IN /\ row' = [j \in Jobs |-> IF j \in H THEN Disposed(s, j, me.at) ELSE row[j]]
           /\ liveLeases' = [j \in Jobs |-> IF j \in H THEN EndLease(j) ELSE liveLeases[j]]
           /\ firstTerminal' = [j \in Jobs |->
-                            IF j \in H THEN NoteTerminal(j, Disposed(j, me.at).state) ELSE firstTerminal[j]]
+                            IF j \in H THEN NoteTerminal(j, Disposed(s, j, me.at).state) ELSE firstTerminal[j]]
           /\ brokenRules' = brokenRules \cup
                 Check(\A j \in H : row[j].state = Leased /\ Lapsed(row[j], me.at), "ExpireOnce")
     /\ Finish(s)
     /\ UNCHANGED <<now, unreported>>
 
 -----------------------------------------------------------------------------
-(* Postgres  PostgresJobStore.cs:1600-1604, 1666-1668, 1689-1691 (from 1587)
+(* Postgres  PostgresJobStore.cs:1616-1620, 1682-1684, 1705-1707 (from 1603)
      SELECT ... WHERE state = 2 AND lease_owner = @owner ... FOR UPDATE
    SQL Server  SqlServerJobStore.cs:1501-1504, 1562-1563, 1578 (from 1486)
      SELECT ... WITH (UPDLOCK, ROWLOCK) WHERE state = 2 AND lease_owner = @owner
@@ -486,10 +561,10 @@ RelinquishCommit(s) ==
     /\ LET me == sess[s]
            w == WorkerOf(s)
            H == me.held
-       IN /\ row' = [j \in Jobs |-> IF j \in H THEN Disposed(j, me.at) ELSE row[j]]
+       IN /\ row' = [j \in Jobs |-> IF j \in H THEN Disposed(s, j, me.at) ELSE row[j]]
           /\ liveLeases' = [j \in Jobs |-> IF j \in H THEN EndLease(j) ELSE liveLeases[j]]
           /\ firstTerminal' = [j \in Jobs |->
-                            IF j \in H THEN NoteTerminal(j, Disposed(j, me.at).state) ELSE firstTerminal[j]]
+                            IF j \in H THEN NoteTerminal(j, Disposed(s, j, me.at).state) ELSE firstTerminal[j]]
           /\ brokenRules' = brokenRules \cup
                 Check(\A j \in H : row[j].state = Leased /\ row[j].owner = w, "RelinquishOnlyHeld")
     /\ Finish(s)
@@ -499,7 +574,7 @@ RelinquishCommit(s) ==
 (* The lock and the guard are one step; the commit can come later, because
    a caller transaction holds the row lock until it commits.
 
-   Postgres  PostgresJobStore.cs:1877-1884 (RescheduleCoreAsync, from 1862)
+   Postgres  PostgresJobStore.cs:1893-1900 (RescheduleCoreAsync, from 1878)
      WITH old AS (SELECT ... WHERE job_id = @id AND state IN (0, 1) FOR UPDATE)
      UPDATE ... SET due_time = @due FROM old
    SQL Server  SqlServerJobStore.cs:1767-1769 (RescheduleCoreAsync, from 1757)
@@ -546,7 +621,7 @@ Done ==
 Init ==
     /\ now = 0
     /\ row = [j \in Jobs |-> [state |-> Scheduled, attempt |-> 0, owner |-> NoOwner,
-                              expiry |-> NoExpiry, due |-> 0]]
+                              expiry |-> NoExpiry, due |-> 0, log |-> <<0>>, counter |-> 0]]
     /\ lockOf = [j \in Jobs |-> NoSession]
     /\ sess = [s \in Sessions |-> Idle]
     /\ unreported = [w \in Workers |-> {}]
@@ -594,6 +669,12 @@ RelinquishOnlyHeld == "RelinquishOnlyHeld" \notin brokenRules
 TerminalStays == \A j \in Jobs : firstTerminal[j] # NotTerminal => row[j].state = firstTerminal[j]
 
 NoHalt == "NoHalt" \notin brokenRules
+
+LogOrdered == \A j \in Jobs : \A i \in 1..(Len(row[j].log) - 1) : row[j].log[i] < row[j].log[i + 1]
+
+LogCapped == \A j \in Jobs : Len(row[j].log) <= TransitionCap
+
+NoOrdinalCollision == "OrdinalCollision" \notin brokenRules
 
 OwnerOnlyWhileLeased ==
     \A j \in Jobs : (row[j].owner # NoOwner \/ row[j].expiry # NoExpiry) <=> row[j].state = Leased
