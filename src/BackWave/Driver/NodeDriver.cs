@@ -36,9 +36,8 @@ internal sealed class NodeDriver(NodeOptions options)
     private int _pollsFromBeforeClaim;
 
     /// <summary>
-    /// The jobs of a landed claim that the polls which waited on that claim now wait on, or null when no poll
-    /// waits this way. The set never changes: the poll is owed once none of these jobs runs. See
-    /// <see cref="Step"/>.
+    /// The jobs of a landed claim that its waiting polls now wait on, or null. The set never changes: the poll
+    /// is owed once none of these jobs runs. See <see cref="Step"/>.
     /// </summary>
     private IReadOnlySet<Guid>? _pollWaitsOnJobs;
 
@@ -255,12 +254,12 @@ internal sealed class NodeDriver(NodeOptions options)
     }
 
     /// <summary>
-    /// Takes a finished job out of the running set and buffers its terminal outcome, flushing the batch when a
-    /// flush trigger fires: the buffer reaches <see cref="NodeOptions.MaxOutcomeBatch"/>, or the node
-    /// just went idle (the drain-tail, so a lone outcome never waits a whole poll interval before releasing its
-    /// dependents). The poll and heartbeat ticks are the third trigger, handled in their own cases. It re-polls
-    /// when it makes <see cref="CanTakeFullClaim"/> true, so the next claim asks for the whole pool rather than one
-    /// claim per finish. With no headroom a finish never changes the free slots and never re-polls.
+    /// Buffers a finished job's terminal outcome, flushing the batch when a flush trigger fires: the buffer
+    /// reaches <see cref="NodeOptions.MaxOutcomeBatch"/>, or the node just went idle (the drain-tail, so a lone
+    /// outcome never waits a whole poll interval before releasing its dependents). The poll and heartbeat ticks
+    /// are the third trigger, handled in their own cases. It re-polls when it makes <see cref="CanTakeFullClaim"/>
+    /// true, so the next claim asks for the whole pool rather than one claim per finish. With no headroom a
+    /// finish never changes the free slots and never re-polls.
     /// </summary>
     private IReadOnlyList<Command> Finish(JobRecord job, JobOutcome outcome, DateTimeOffset now)
     {
@@ -346,21 +345,19 @@ internal sealed class NodeDriver(NodeOptions options)
 
     /// <summary>
     /// The finished jobs whose outcome write has not answered: the buffered outcomes plus the rows of the write
-    /// in flight. Each still holds its store Lease. The production pump reads it after each step for the
-    /// unwritten-outcomes metric.
+    /// in flight. Each still holds its store Lease.
     /// </summary>
     internal int UnwrittenOutcomeCount => _outcomes.Count;
 
     /// <summary>
-    /// The pool slots a claim may fill. A running job holds one. The Unwritten outcomes fill the
+    /// The pool slots a claim may fill. The Unwritten outcomes fill the open
     /// <see cref="NodeOptions.UnwrittenOutcomeSlots"/> headroom first, and only those beyond it hold a pool
-    /// slot. A faulted write closes the headroom. With no headroom this is the pool minus every Leased job.
+    /// slot. With no headroom this is the pool minus every Leased job.
     /// </summary>
     private int FreeSlots => options.PoolSize - _executing.Count - _outcomes.SlotsHeld;
 
     private int FullClaim => Math.Min(options.MaxClaimBatch, options.PoolSize);
 
-    /// <summary>Whether the free slots fill a full claim.</summary>
     private bool CanTakeFullClaim => FreeSlots >= FullClaim;
 
     /// <summary>

@@ -65,18 +65,16 @@ public sealed record WorkerGroupOptions
 
     /// <summary>
     /// How many jobs per pump whose handlers have returned may wait for their outcome to be written without
-    /// holding a <see cref="PoolSize"/> slot. The group writes outcomes to the store in batches after the
-    /// handlers return. At 0, a job keeps its slot until that write completes, so a pump of short jobs spends
-    /// much of its time waiting on writes. Above 0, up to this many jobs give their slots back as soon as their
-    /// handlers return, and the pump claims and runs new jobs while the write is in flight. Short jobs drain
-    /// faster and a backlog under load shrinks. At most <see cref="PoolSize"/> handlers run at once either way.
+    /// holding a <see cref="PoolSize"/> slot. At 0, a job keeps its slot until that write completes, so a pump
+    /// of short jobs spends much of its time waiting on writes. Above 0, up to this many jobs give their slots
+    /// back as soon as their handlers return, and the pump claims and runs new jobs while the write is in
+    /// flight. At most <see cref="PoolSize"/> handlers run at once either way.
     /// <para>
-    /// The cost is what a crash or a lost store runs again. A job whose outcome is not yet written runs again
-    /// once its Lease lapses, so after a crash or an outage a pump can re-run up to <see cref="PoolSize"/> plus
-    /// this value of jobs, against up to <see cref="PoolSize"/> at 0. Every job stays at-least-once and is done
-    /// only once its outcome is written. While outcome writes fail, the pump stops using these extra slots until
-    /// a write succeeds again. With this above 0, a Wake-Up Hint that arrives during a claim can wait up to one
-    /// <see cref="PollInterval"/> while slots are free, until the jobs of that claim finish.
+    /// The cost is what a crash or an outage runs again. A job whose outcome is not yet written runs again once
+    /// its Lease lapses, so a pump can re-run up to <see cref="PoolSize"/> plus this value of jobs, against up
+    /// to <see cref="PoolSize"/> at 0. While outcome writes fail, the pump stops using these extra slots until
+    /// a write succeeds again. Above 0, a Wake-Up Hint that arrives during a claim can wait up to one
+    /// <see cref="PollInterval"/> while slots are free.
     /// </para>
     /// <para>
     /// For short jobs that are safe to run twice, set this to <see cref="PoolSize"/>. Keep 0 for jobs that are

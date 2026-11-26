@@ -21,7 +21,6 @@ internal sealed class UnwrittenOutcomes(int maxBatch, int headroom)
 
     private bool _lastWriteFaulted;
 
-    /// <summary>The buffered outcomes plus the rows of the write in flight.</summary>
     public int Count => _buffer.Count + _rowsInFlight;
 
     public int BufferedCount => _buffer.Count;
@@ -33,10 +32,8 @@ internal sealed class UnwrittenOutcomes(int maxBatch, int headroom)
     /// <summary>Whether this node is configured with any headroom, open or closed.</summary>
     public bool HasHeadroom => headroom > 0;
 
-    /// <summary>The headroom the Unwritten outcomes may fill now: none after a faulted write.</summary>
     public int OpenHeadroom => _lastWriteFaulted ? 0 : headroom;
 
-    /// <summary>The pool slots the Unwritten outcomes hold: those beyond the open headroom.</summary>
     public int SlotsHeld => Math.Max(0, Count - OpenHeadroom);
 
     public void Add(ReportedOutcome outcome) => _buffer.Add(outcome);
@@ -62,7 +59,6 @@ internal sealed class UnwrittenOutcomes(int maxBatch, int headroom)
         return batch;
     }
 
-    /// <summary>The write in flight landed: it opens the headroom again, and returns the flush it deferred, if any.</summary>
     public Command.ReportOutcomeBatch? Landed()
     {
         _lastWriteFaulted = false;
@@ -70,14 +66,12 @@ internal sealed class UnwrittenOutcomes(int maxBatch, int headroom)
         return _flushDeferred ? TryFlush() : null;
     }
 
-    /// <summary>The write in flight faulted: its rows are dropped, and the headroom closes.</summary>
     public void Faulted()
     {
         _lastWriteFaulted = true;
         _rowsInFlight = 0;
     }
 
-    /// <summary>The Shell never issued the write: its rows are dropped, and the headroom stays as it was.</summary>
     public void NotIssued() => _rowsInFlight = 0;
 
     /// <summary>
@@ -86,7 +80,6 @@ internal sealed class UnwrittenOutcomes(int maxBatch, int headroom)
     /// </summary>
     public Command.ReportOutcomeBatch? DrainBuffered() => _buffer.Count > 0 ? Drain() : null;
 
-    /// <summary>Drains up to the batch bound of buffered outcomes into one write, in completion order.</summary>
     private Command.ReportOutcomeBatch Drain()
     {
         List<ReportedOutcome> rows;

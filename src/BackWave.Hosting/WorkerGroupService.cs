@@ -250,15 +250,11 @@ internal sealed class WorkerGroupService(
         return false;
     }
 
-    // <summary>
-    // The Unwritten outcome count this pump last added to backwave.worker.outcomes.unwritten, so each update
-    // adds only the change. Written on the pump loop and then on the hand-back, never at the same time.
-    // </summary>
-    private int _unwrittenOutcomes;
+    // <summary>Written on the pump loop and then on the hand-back, never at the same time.</summary>
+    private int _reportedUnwrittenOutcomes;
 
     // <summary>
-    // Steps the Driver, then adds the change in its Unwritten outcome count to backwave.worker.outcomes.unwritten.
-    // Every Driver step of this pump goes through here, and the pump takes its count back to zero when it ends.
+    // Every Driver step of this pump goes through here, so the metric sees every change in its count.
     // </summary>
     private IReadOnlyList<Command> Step(NodeDriver driver, NodeEvent nodeEvent)
     {
@@ -269,8 +265,8 @@ internal sealed class WorkerGroupService(
 
     private void ReportUnwrittenOutcomes(int unwritten)
     {
-        BackWaveDiagnostics.RecordUnwrittenOutcomes(options.Name, unwritten - _unwrittenOutcomes);
-        _unwrittenOutcomes = unwritten;
+        BackWaveDiagnostics.RecordUnwrittenOutcomes(options.Name, unwritten - _reportedUnwrittenOutcomes);
+        _reportedUnwrittenOutcomes = unwritten;
     }
 
     private readonly StoreLane _claim = new();
@@ -521,7 +517,6 @@ internal sealed class WorkerGroupService(
             }
             finally
             {
-                // The pump is over, so none of its finished jobs waits on a write of its own any more.
                 ReportUnwrittenOutcomes(0);
 
                 // Its own finally, because the hand-back rethrows a named violation on its way out. Left in
