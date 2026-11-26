@@ -82,21 +82,21 @@ public class OutcomeWriteOverlapTests
         }
         builder.Services.AddSingleton(board);
         builder.Services.AddTransient<IJobHandler<PingJob>, BoardPingHandler>();
-        var group = new WorkerGroupOptions
-        {
-            Name = "workers",
-            Policy = new DispatchPolicy.Strict(["default"]),
-            PollInterval = FastPoll,
-            PoolSize = poolSize,
-            LeaseDuration = TimeSpan.FromMinutes(5),
-            ShutdownBudget = shutdownBudget ?? TimeSpan.FromSeconds(5),
-            MaxOutcomeBatch = maxOutcomeBatch,
-            UnwrittenOutcomeSlots = unwrittenOutcomeSlots,
-        };
         builder.Services.AddBackWave(backwave => backwave
             .UseStore(store)
             .UseRegistry(Registry)
-            .AddWorkerGroup(maintenanceInterval is { } interval ? group with { MaintenanceInterval = interval } : group));
+            .AddWorkerGroup(new WorkerGroupOptions
+            {
+                Name = "workers",
+                Policy = new DispatchPolicy.Strict(["default"]),
+                PollInterval = FastPoll,
+                PoolSize = poolSize,
+                LeaseDuration = TimeSpan.FromMinutes(5),
+                ShutdownBudget = shutdownBudget ?? TimeSpan.FromSeconds(5),
+                MaxOutcomeBatch = maxOutcomeBatch,
+                UnwrittenOutcomeSlots = unwrittenOutcomeSlots,
+                MaintenanceInterval = maintenanceInterval ?? TimeSpan.FromSeconds(5),
+            }));
         return builder.Build();
     }
 
