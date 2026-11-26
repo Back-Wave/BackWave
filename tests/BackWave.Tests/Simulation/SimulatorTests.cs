@@ -1641,7 +1641,7 @@ public class SimulatorTests
     /// <summary>
     /// With unwritten-outcome headroom, a node claims into the slots its finished jobs gave back while their
     /// outcome write is out. Both per-node caps run every step: executions stay at most PoolSize, and
-    /// executions plus Unwritten outcomes at most PoolSize plus the headroom. The run must converge, under the
+    /// executions plus Unwritten Outcomes at most PoolSize plus the headroom. The run must converge, under the
     /// default crash and heartbeat-loss chaos and under isolation too, and replay identically.
     /// </summary>
     [Theory]
@@ -1669,9 +1669,9 @@ public class SimulatorTests
     }
 
     /// <summary>
-    /// A Concurrency Limit counts the Leased rows of its Queue, and an Unwritten row stays Leased until its write
-    /// commits, so the limit holds for any headroom. The I3 oracle checks the limit after every step while the
-    /// nodes claim into their headroom.
+    /// A Concurrency Limit counts the Leased rows of its Queue, and an Unwritten Outcome's row stays Leased until
+    /// its write commits, so the limit holds for any headroom. The I3 oracle checks the limit after every step
+    /// while the nodes claim into their headroom.
     /// </summary>
     [Theory]
     [InlineData(2874UL)]

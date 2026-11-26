@@ -176,6 +176,10 @@ _Avoid_: Rate limit (N-per-minute is a different, unbuilt thing), semaphore
 A node stops claiming when its Worker pool has no free Worker — node-local flow control enforced in the Node Driver (claims never exceed free capacity), not the Shell. Distinct from the Concurrency Limit, which is cluster-wide and per-Queue.
 _Avoid_: Rate limit, throttle (both imply a time-based cap; Backpressure is a capacity cap)
 
+**Unwritten Outcome**:
+A finished job whose outcome write has not answered yet. It still holds its Lease and counts toward its Queue's Concurrency Limit, so it runs again if its Pump crashes. A Worker Group's outcome headroom (`UnwrittenOutcomeSlots`) is extra slots that only Unwritten Outcomes can fill, so its Workers take new jobs while a write is in flight. A failed write closes the headroom until a write lands again.
+_Avoid_: Pending outcome (the job is no longer pending), buffered outcome (the rows of the write in flight count too)
+
 **Dependency**:
 A static edge from a job to a parent set whose terminal states gate the job's due-ness (a countdown latch). The orchestration *mechanism*, living **below** the determinism boundary — simulated and fenced like any Core state. Two reaction modes only: on-success (default) and on-any-terminal. Edges are static, declared at the dependent's enqueue time. This is the Core's *only* dependency vocabulary; the Core never knows what Workflow, if any, a set of dependencies composes.
 _Avoid_: Continuation (retired — was both mechanism and user concept; now split into Dependency + Workflow), child job, callback, Workflow (the user-facing grouping built *from* dependencies, never the edge itself)

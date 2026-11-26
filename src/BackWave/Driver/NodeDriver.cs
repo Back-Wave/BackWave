@@ -7,7 +7,7 @@ namespace BackWave.Driver;
 /// The sans-I/O state machine holding a node's logic: Step(event) → Commands.
 /// It never awaits, times, or threads — the production pump and the Simulator are its
 /// two callers, and both own all I/O and clocks. Its state is the jobs this node is executing, its
-/// Unwritten outcomes, and the claim in flight with the polls that wait on it.
+/// Unwritten Outcomes, and the claim in flight with the polls that wait on it.
 /// </summary>
 internal sealed class NodeDriver(NodeOptions options)
 {
@@ -350,7 +350,7 @@ internal sealed class NodeDriver(NodeOptions options)
     }
 
     /// <summary>
-    /// The pool slots a claim may fill. The Unwritten outcomes fill the open
+    /// The pool slots a claim may fill. The Unwritten Outcomes fill the open
     /// <see cref="NodeOptions.UnwrittenOutcomeSlots"/> headroom first, and only those beyond it hold a pool
     /// slot. With no headroom this is the pool minus every Leased job.
     /// </summary>
@@ -469,10 +469,10 @@ internal sealed record NodeOptions
 
     /// <summary>
     /// Named bound: extra slots that only a finished job whose outcome write has not answered can hold, never
-    /// a running one. The Unwritten outcomes fill them first, so a finished job can free its
+    /// a running one. The Unwritten Outcomes fill them first, so a finished job can free its
     /// <see cref="PoolSize"/> slot before its write lands. The executing jobs stay at most PoolSize, and the
-    /// executing plus the Unwritten at most PoolSize plus this bound. 0 (the default) holds every finished
-    /// job's slot until its write answers.
+    /// executing plus the Unwritten Outcomes at most PoolSize plus this bound. 0 (the default) holds every
+    /// finished job's slot until its write answers.
     /// </summary>
     public int UnwrittenOutcomeSlots { get; init; }
 

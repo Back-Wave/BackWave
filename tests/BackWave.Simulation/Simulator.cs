@@ -98,7 +98,7 @@ internal sealed record SimulationOptions
     /// Driver's UnwrittenOutcomeSlots. 0, the default, holds every finished job's slot until its write answers,
     /// so every existing battery stays byte-identical. A config gate, not a fault stream: it draws no rng, and it
     /// matters only with a finite <see cref="PoolSize"/>. The per-node-cap oracle then checks that a node's
-    /// executions plus its Unwritten outcomes never exceed PoolSize plus this bound.
+    /// executions plus its Unwritten Outcomes never exceed PoolSize plus this bound.
     /// </summary>
     public int UnwrittenOutcomeSlots { get; init; }
 
@@ -3203,11 +3203,11 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     /// the default regime stays byte-identical and pays nothing. The cap-sabotage builds the Driver unbounded,
     /// so it over-admits past the configured PoolSize and Executing.Count exceeds it — tripping this oracle.
     /// <para>
-    /// A second check under the same id bounds the Leases: the executions plus the Unwritten outcomes never
+    /// A second check under the same id bounds the Leases: the executions plus the Unwritten Outcomes never
     /// exceed PoolSize plus <see cref="SimulationOptions.UnwrittenOutcomeSlots"/>. With no headroom that is the
     /// pool itself. Its own sabotage builds the Driver with unbounded headroom. The bound is checked once more as
     /// each claim is issued: after a faulted outcome write closes the headroom, the node claims nothing into it
-    /// until a write lands. The executions plus the Unwritten outcomes may still sit above PoolSize then, since
+    /// until a write lands. The executions plus the Unwritten Outcomes may still sit above PoolSize then, since
     /// the jobs claimed into the headroom before the fault run on. Its sabotage keeps the Driver's headroom open.
     /// </para>
     /// </summary>
@@ -3250,7 +3250,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
             + (node.OutcomeWrite?.Batch!.Outcomes.Count(row => !node.Executing.ContainsKey(row.JobId)) ?? 0);
 
     /// <summary>
-    /// Whether a claim asks for more than the pool leaves when every Unwritten outcome holds a slot, so it fills
+    /// Whether a claim asks for more than the pool leaves when every Unwritten Outcome holds a slot, so it fills
     /// part of the headroom. Never true with no headroom, since the Driver then claims at most that much.
     /// </summary>
     private bool ClaimsIntoHeadroom(SimNode node, Command.ClaimBatch claim)

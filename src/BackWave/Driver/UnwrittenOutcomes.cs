@@ -1,14 +1,14 @@
 namespace BackWave.Driver;
 
 /// <summary>
-/// A node's Unwritten outcomes: the finished jobs whose outcome write has not answered. They are the terminal
+/// A node's Unwritten Outcomes: the finished jobs whose outcome write has not answered. They are the terminal
 /// outcomes buffered for one coalesced write, in completion order, plus the rows of the one write in flight.
 /// Each still holds its store Lease. The pump stays single-writer, so a flush while a write is in flight waits
 /// for that write's answer. A crash discards all of it (a fresh Driver is installed), so those Leases lapse and
 /// the jobs are reclaimed, which is At-Least-Once working as designed.
 /// <para>
 /// The configured headroom is extra slots that only these outcomes can hold. A faulted write closes it until a
-/// write lands again, so a node whose writes fail holds a slot for every Unwritten outcome.
+/// write lands again, so a node whose writes fail holds a slot for every Unwritten Outcome.
 /// </para>
 /// </summary>
 internal sealed class UnwrittenOutcomes(int maxBatch, int headroom)
