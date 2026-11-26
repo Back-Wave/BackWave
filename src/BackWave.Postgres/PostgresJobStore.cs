@@ -52,7 +52,10 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     private readonly string _reportOutcomesInTransaction;
 
     // The job insert and its first transition, one statement whose transition exists only for a row it
-    // inserted, so a Duplicate writes nothing. Fixed the same way.
+    // inserted, so a Duplicate writes nothing. Fixed the same way. It inserts ordinal 0 directly, not
+    // through the append-and-prune CTEs, which Postgres would plan again on every unprepared enqueue.
+    // That is safe for two reasons. The job_transitions foreign key cascades on delete, so a new job id
+    // has no transition rows. MaxTransitionsPerJob is at least 1, so no cap prunes ordinal 0.
     private readonly string _enqueueJob;
 
     // Per-Queue unlimited-Queue cache (issue 0170). The Concurrency Limit (I3) and Paused flag (§5.8)
@@ -114,9 +117,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
               {TransitionLogCtes("leased")}
               SELECT * FROM claimed
               """;
-        // A new job has no transitions, so its first one is ordinal 0 and is below any cap. The shared
-        // append-and-prune CTEs would find nothing to read or prune, but Postgres plans them again on every
-        // unprepared enqueue.
         _enqueueJob = _historyPolicy == JobHistoryPolicy.Off
             ? $"WITH inserted AS ({InsertJob} RETURNING job_id) SELECT count(*) FROM inserted"
             : $"""
@@ -289,7 +289,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 .ConfigureAwait(false);
             await ownTransaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         }
-        // The statement has committed either way, so the hint can never reach a Pump before the job.
+        // The job has committed on both paths, so the hint can never reach a Pump before the job.
         if (hintQueue is not null)
         {
             _postCommitHints.Request(hintQueue);
@@ -651,11 +651,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         """;
 
     // The Transition Log append (§5.12) and its per-job-life prune (§7) as CTEs over `source`, a CTE of
-    // (job_id, state, attempt, detail, ord) rows with each job at most once, appended in `ord` order. The
-    // only SQL that writes a transition. Every CTE reads the statement's one snapshot, so a transaction
-    // path runs it after the statement that locks the jobs, and the ordinal read sees every committed
-    // transition of a locked job. The prune deletes only rows older than the new one, which that
-    // snapshot sees, and its cap filter leaves it nothing to delete until a job reaches the cap.
+    // (job_id, state, attempt, detail, ord) rows with each job at most once, appended in `ord` order. It
+    // writes every transition except the enqueue's ordinal-0 insert. Every CTE reads the statement's one
+    // snapshot, so a transaction path runs it after the statement that locks the jobs, and the ordinal
+    // read sees every committed transition of a locked job. The prune deletes only rows older than the new
+    // one, which that snapshot sees, and its cap filter leaves it nothing to delete until a job reaches
+    // the cap.
     private static string TransitionLogCtes(string source) =>
         $"""
         logged AS (

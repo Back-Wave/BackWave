@@ -4,11 +4,9 @@ using Npgsql;
 namespace BackWave.Postgres.Tests;
 
 /// <summary>
-/// The per-job-life transition cap, on the per-row and the batch write. Every transition write appends
-/// and prunes in one statement, and its prune deletes nothing unless the entry it just wrote reached
-/// <c>MaxTransitionsPerJob</c>. The Conformance Suite's cap clause interleaves the two writers, which
-/// re-prune each other on the very next transition and so hide an off-by-one in either; these pin each
-/// path on its own.
+/// The per-job-life transition cap. Every transition write appends and prunes in one statement, and its
+/// prune deletes nothing unless the entry it just wrote reached <c>MaxTransitionsPerJob</c>. These tests
+/// pin the cap boundary of that statement from a single-row and a multi-job call.
 ///
 /// The batch path needs more than a boundary check. Its prune covers every job in the batch, so jobs
 /// nowhere near the cap are inside that statement's reach - and the lease sweep routes through the batch

@@ -89,8 +89,9 @@ public sealed record PostgresStoreOptions
     /// write, inside the open transaction and before commit. Throwing from the hook aborts that
     /// transaction, which must roll back every step — letting a test prove the store's writes are
     /// all-or-nothing. The argument is the named point reached (for example <c>"claim"</c> or
-    /// <c>"enqueue"</c>). Each name marks one point, reached at most once per operation. A path that
-    /// writes in one statement, such as the enqueue of a job with no parents and no tags, reaches none.
+    /// <c>"enqueue"</c>). Each name marks one point in the code, and an operation that loops reaches it
+    /// once per iteration. A path that writes in one statement, such as the enqueue of a job with no
+    /// parents and no tags, reaches none.
     /// </summary>
     // Internal: this is a test-affordance for the conformance/unit suites (issue 0034), not a
     // consumer API; granted to BackWave.Postgres.Tests via [InternalsVisibleTo].
