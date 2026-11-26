@@ -34,8 +34,8 @@ set it behind PgBouncer in transaction mode unless PgBouncer is 1.21 or later wi
 
 - **`AutoMigrate = true`** applies the embedded, versioned schema on startup. Leave it off and run the
   migration yourself if you manage schema out of band.
-- **`SchemaName`** places BackWave's tables in a schema of your choosing (defaults to `public`).
-- **Transactional Enqueue** lets you enqueue on your own `NpgsqlTransaction` or `DbConnection`, so the
+- **`SchemaName`** places BackWave's tables in a schema of your choosing (defaults to `backwave`).
+- **Transactional Enqueue** lets you enqueue on your own `NpgsqlTransaction`, so the
   job and the rows it depends on commit or roll back together. For EF Core unit-of-work integration,
   add **BackWave.EntityFrameworkCore**.
 

@@ -39,7 +39,7 @@ public sealed class PostgresRoundTripBudgetTests
     private static NewJob Job(string queue = "budget") =>
         new(Guid.NewGuid(), "budget-test", "{}"u8.ToArray(), queue, T0);
 
-    // The recorded budgets: measured 2026-08-28 against Postgres on Npgsql 9.0.3, at schema version 1.
+    // The recorded budgets, measured against Postgres on Npgsql 9.0.3.
     // Each is the cost of ONE call; the arithmetic behind each number is in its test.
 
     private static readonly Budget Claim = new(
