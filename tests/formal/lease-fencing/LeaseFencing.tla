@@ -130,9 +130,10 @@ LockRow(s, j, mode, recheckPasses) ==
                 ELSE /\ sess' = [sess EXCEPT ![s].todo = @ \ {j}]
                      /\ UNCHANGED lockOf
 
-\* The claim selects every column (JobColumns, OracleJobStore.cs:4183-4186).
+\* The claim selects every column but output (JobColumns,
+\* OracleJobStore.cs:4181-4184). output is written only with a Success state.
 \* The sweep selects attempt, filters on state and lease_expiry in its outer
-\* WHERE, and orders by lease_expiry (1477, 1478, 1485).
+\* WHERE, and orders by lease_expiry (1475, 1476, 1483).
 ExpireLockCols ==
     {"attempt"}
     \cup (IF Has("ExpireNoOuterWhere") THEN {} ELSE {"state", "expiry"})
@@ -167,7 +168,7 @@ Finish(s) == /\ lockOf' = Release(s)
      UPDATE j ... FROM @batch c INNER LOOP JOIN backwave.jobs j
      The UPDLOCK read tests each row on its latest committed version when
      it reaches it; Lock makes that test.
-   Oracle  OracleJobStore.cs:581-592, 612-623, 631-636 (ClaimUntracedAsync, from 498)
+   Oracle  OracleJobStore.cs:581-592, 610-621, 629-634 (ClaimUntracedAsync, from 498)
      SELECT ... WHERE state = 0 AND due_time <= :now AND job_id IN (
        SELECT ... WHERE state = 0 AND due_time <= :now ... ROWNUM <= :take)
      FOR UPDATE SKIP LOCKED;  then the C# row checks halt on a locked row
@@ -189,7 +190,7 @@ ClaimRecheck(s, j, at) ==
       [] OTHER -> row[j].state = Scheduled /\ row[j].due <= at
 
 \* The Oracle C# checks on the row the locking read returned
-\* (OracleJobStore.cs:612-623).
+\* (OracleJobStore.cs:610-621).
 ClaimHalts(j, at) ==
     /\ Adapter = "Oracle" /\ ~Has("ClaimNoLock")
     /\ \/ row[j].state # Scheduled
@@ -234,7 +235,7 @@ ClaimCommit(s) ==
 (* Single path, all adapters: one fenced UPDATE of one row.
      Postgres  PostgresJobStore.cs:742-745 (ReportOutcomeUntracedAsync, from 683)
      SQL Server  SqlServerJobStore.cs:842-845 (ReportOutcomeUntracedAsync, from 782)
-     Oracle  OracleJobStore.cs:909-911 (ReportOutcomeUntracedAsync, from 850)
+     Oracle  OracleJobStore.cs:907-909 (ReportOutcomeUntracedAsync, from 848)
      WHERE job_id = @id AND state = 2 AND lease_owner = @worker
        AND attempt = @attempt AND lease_expiry > @now
    Batch path (ReportOutcomesAsync):
@@ -244,7 +245,7 @@ ClaimCommit(s) ==
        INSERT INTO @batch ... INNER LOOP JOIN jobs j WITH (UPDLOCK, ROWLOCK)
          WHERE <fence>;   UPDATE j ... FROM @batch d INNER LOOP JOIN jobs j
        Lock = the U-locked fence read; Commit = the unfenced UPDATE.
-     Oracle  OracleJobStore.cs:1043-1047, 1066-1073, 1092-1117 (from 972):
+     Oracle  OracleJobStore.cs:1041-1045, 1064-1071, 1090-1115 (from 970):
        SELECT ... WHERE job_id IN (...) AND state = 2 AND lease_expiry > :now
        FOR UPDATE;  the C# verdict on owner and attempt;  MERGE ... WHEN
        MATCHED ... WHERE <fence>.  Lock = the FOR UPDATE read; Commit = the
@@ -335,7 +336,7 @@ ReportCommit(s) ==
    SQL Server  SqlServerJobStore.cs:1266-1272 (HeartbeatAsync, from 1250)
      One UPDATE: SET lease_expiry = @expiry
        WHERE state = 2 AND lease_owner = @worker AND lease_expiry > @now
-   Oracle  OracleJobStore.cs:1402-1405, 1421 (HeartbeatAsync, from 1377)
+   Oracle  OracleJobStore.cs:1400-1403, 1419 (HeartbeatAsync, from 1375)
      SELECT ... WHERE job_id IN (...) AND state = 2 AND lease_owner = :worker
        AND lease_expiry > :now FOR UPDATE;  UPDATE ... SET lease_expiry *)
 
@@ -379,7 +380,7 @@ HeartbeatCommit(s) ==
    SQL Server  SqlServerJobStore.cs:1335-1338, 1401, 1419 (from 1315)
      SELECT TOP (@max) ... WITH (UPDLOCK, READPAST, ROWLOCK)
        WHERE state = 2 AND lease_expiry <= @now;  UPDATE j ... by id
-   Oracle  OracleJobStore.cs:1475-1486, 1549-1558, 1567-1579 (from 1454)
+   Oracle  OracleJobStore.cs:1473-1484, 1547-1556, 1565-1577 (from 1452)
      SELECT job_id, attempt FROM jobs
        WHERE state = 2 AND lease_expiry <= :now AND job_id IN (
        SELECT ... WHERE state = 2 AND lease_expiry <= :now ... ROWNUM <= :max)
@@ -428,7 +429,7 @@ ExpireCommit(s) ==
      SELECT ... WHERE state = 2 AND lease_owner = @owner ... FOR UPDATE
    SQL Server  SqlServerJobStore.cs:1501-1504, 1562-1563, 1578 (from 1486)
      SELECT ... WITH (UPDLOCK, ROWLOCK) WHERE state = 2 AND lease_owner = @owner
-   Oracle  OracleJobStore.cs:1652-1656, 1717-1724, 1739-1745 (from 1639)
+   Oracle  OracleJobStore.cs:1650-1654, 1715-1722, 1737-1743 (from 1637)
      SELECT ... WHERE state = 2 AND lease_owner = :owner ... FOR UPDATE
    Each then writes the locked rows by id. The lock waits. *)
 
@@ -476,7 +477,7 @@ RelinquishCommit(s) ==
      UPDATE ... SET due_time = @due FROM old
    SQL Server  SqlServerJobStore.cs:1767-1769 (RescheduleCoreAsync, from 1757)
      UPDATE ... SET due_time = @due WHERE job_id = @id AND state IN (0, 1)
-   Oracle  OracleJobStore.cs:1938-1943 (RescheduleCoreAsync, from 1922)
+   Oracle  OracleJobStore.cs:1936-1941 (RescheduleCoreAsync, from 1920)
      SELECT due_time ... WHERE job_id = :id AND state IN (0, 1) FOR UPDATE;
      UPDATE ... SET due_time = :due WHERE job_id = :id *)
 

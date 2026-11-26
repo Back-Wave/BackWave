@@ -30,13 +30,13 @@ The model describes the code at the sync commit, the last commit that changed `L
 
 | Operation | Postgres `PostgresJobStore.cs` | SQL Server `SqlServerJobStore.cs` | Oracle `OracleJobStore.cs` | Model actions |
 |---|---|---|---|---|
-| Claim | `ClaimUntracedAsync` 430, SQL 508-520 | `ClaimQueueAsync` 492, SQL 564-583 | `ClaimUntracedAsync` 498, SQL 581-592, due check 612-623, write 631-636 | `ClaimBegin`, `ClaimLock`, `ClaimCommit` |
-| ReportOutcome | `ReportOutcomeUntracedAsync` 683, SQL 742-745 | `ReportOutcomeUntracedAsync` 782, SQL 842-845 | `ReportOutcomeUntracedAsync` 850, SQL 909-911 | `ReportUpdate` |
-| ReportOutcomes | `ReportOutcomesUntracedAsync` 806, SQL 879-892 | `ReportOutcomesUntracedAsync` 908, SQL 995-1019 | `ReportOutcomesUntracedAsync` 972, SQL 1043-1047, 1066-1073, 1092-1117 | `ReportUpdate` (Postgres), `ReportLock`, `ReportCommit` |
-| Heartbeat | `HeartbeatAsync` 1130, SQL 1139-1141 | `HeartbeatAsync` 1250, SQL 1266-1272 | `HeartbeatAsync` 1377, SQL 1402-1405, 1421 | `HeartbeatUpdate`, `HeartbeatLock`, `HeartbeatCommit` |
-| ExpireLeases | `ExpireLeasesUntracedAsync` 1184, SQL 1202-1207, 1266-1268, 1281-1283 | `ExpireLeasesUntracedAsync` 1315, SQL 1335-1338, 1401, 1419 | `ExpireLeasesUntracedAsync` 1454, SQL 1475-1486, 1549-1558, 1567-1579 | `ExpireBegin`, `ExpireLock`, `ExpireCommit` |
-| RelinquishLeases | `RelinquishLeasesUntracedAsync` 1342, SQL 1355-1359, 1421-1423, 1444-1446 | `RelinquishLeasesUntracedAsync` 1486, SQL 1501-1504, 1562-1563, 1578 | `RelinquishLeasesUntracedAsync` 1639, SQL 1652-1656, 1717-1724, 1739-1745 | `RelinquishBegin`, `RelinquishLock`, `RelinquishCommit` |
-| Reschedule | `RescheduleCoreAsync` 1617, SQL 1632-1639 | `RescheduleCoreAsync` 1757, SQL 1767-1769 | `RescheduleCoreAsync` 1922, SQL 1938-1943 | `RescheduleLock`, `RescheduleCommit` |
+| Claim | `ClaimUntracedAsync` 430, SQL 508-520 | `ClaimQueueAsync` 492, SQL 564-583 | `ClaimUntracedAsync` 498, SQL 581-592, due check 610-621, write 629-634 | `ClaimBegin`, `ClaimLock`, `ClaimCommit` |
+| ReportOutcome | `ReportOutcomeUntracedAsync` 683, SQL 742-745 | `ReportOutcomeUntracedAsync` 782, SQL 842-845 | `ReportOutcomeUntracedAsync` 848, SQL 907-909 | `ReportUpdate` |
+| ReportOutcomes | `ReportOutcomesUntracedAsync` 806, SQL 879-892 | `ReportOutcomesUntracedAsync` 908, SQL 995-1019 | `ReportOutcomesUntracedAsync` 970, SQL 1041-1045, 1064-1071, 1090-1115 | `ReportUpdate` (Postgres), `ReportLock`, `ReportCommit` |
+| Heartbeat | `HeartbeatAsync` 1130, SQL 1139-1141 | `HeartbeatAsync` 1250, SQL 1266-1272 | `HeartbeatAsync` 1375, SQL 1400-1403, 1419 | `HeartbeatUpdate`, `HeartbeatLock`, `HeartbeatCommit` |
+| ExpireLeases | `ExpireLeasesUntracedAsync` 1184, SQL 1202-1207, 1266-1268, 1281-1283 | `ExpireLeasesUntracedAsync` 1315, SQL 1335-1338, 1401, 1419 | `ExpireLeasesUntracedAsync` 1452, SQL 1473-1484, 1547-1556, 1565-1577 | `ExpireBegin`, `ExpireLock`, `ExpireCommit` |
+| RelinquishLeases | `RelinquishLeasesUntracedAsync` 1342, SQL 1355-1359, 1421-1423, 1444-1446 | `RelinquishLeasesUntracedAsync` 1486, SQL 1501-1504, 1562-1563, 1578 | `RelinquishLeasesUntracedAsync` 1637, SQL 1650-1654, 1715-1722, 1737-1743 | `RelinquishBegin`, `RelinquishLock`, `RelinquishCommit` |
+| Reschedule | `RescheduleCoreAsync` 1617, SQL 1632-1639 | `RescheduleCoreAsync` 1757, SQL 1767-1769 | `RescheduleCoreAsync` 1920, SQL 1936-1941 | `RescheduleLock`, `RescheduleCommit` |
 
 The model also depends on these facts. A change to any of them touches the model too:
 
@@ -104,18 +104,18 @@ Some mutant configs leave out a rule that would break first:
 - `claim-no-lock-*` leave out `ClaimOnlyDue`. With every rule on, it breaks first, when a reschedule commits between the read and the UPDATE. Without it, TLC shows the double lease.
 - `outcome-keeps-owner-postgres` and `relinquish-no-leased-check-and-outcome-keeps-owner-postgres` leave out `OwnerOnlyWhileLeased`, because a set `lease_owner` on a `Succeeded` row is the planted change itself.
 
-A mutant that passes removes a second guard. `relinquish-no-leased-check-postgres` passes because `OwnerOnlyWhileLeased` holds. The two Oracle claim mutants pass because the claim selects every column, so SKIP LOCKED skips any row that changed after the snapshot, and the outer predicates and the C# checks never see a row that is not Scheduled and due. The two single Oracle sweep mutants pass because the outer `WHERE` and the outer `ORDER BY` each read `lease_expiry`, so either one alone makes SKIP LOCKED skip a row that a lease write changed. They are second guards. Keep them: they stop being second guards if the select list or the lock rule changes.
+A mutant that passes removes a second guard. `relinquish-no-leased-check-postgres` passes because `OwnerOnlyWhileLeased` holds. The two Oracle claim mutants pass because the claim selects every column but `output`, which is written only with a Success state, so SKIP LOCKED skips any row that changed after the snapshot, and the outer predicates and the C# checks never see a row that is not Scheduled and due. The two single Oracle sweep mutants pass because the outer `WHERE` and the outer `ORDER BY` each read `lease_expiry`, so either one alone makes SKIP LOCKED skip a row that a lease write changed. They are second guards. Keep them: they stop being second guards if the select list or the lock rule changes.
 
 ## Oracle SKIP LOCKED rule
 
-The Oracle claim (`OracleJobStore.cs:581-592`) and the Oracle expiry sweep (1475-1486) pick their rows in a `ROWNUM` subquery and lock them in an outer `SELECT ... FOR UPDATE SKIP LOCKED`. The model uses this rule for that lock (`LockLevelCols` and `SnapshotCurrent` in the spec):
+The Oracle claim (`OracleJobStore.cs:581-592`) and the Oracle expiry sweep (1473-1484) pick their rows in a `ROWNUM` subquery and lock them in an outer `SELECT ... FOR UPDATE SKIP LOCKED`. The model uses this rule for that lock (`LockLevelCols` and `SnapshotCurrent` in the spec):
 
 - A row that another session holds is skipped.
 - A row is skipped when a column that the locking query level reads changed after the statement snapshot. The locking level is the outer select: its select list, its `WHERE`, and its `ORDER BY`.
 - A row where only other columns changed is locked, and it returns its latest values. This includes a column that only the `ROWNUM` subquery reads.
 - The statement does not restart.
 
-The claim selects every column, so any change makes it skip the row. The sweep selects `job_id, attempt`, repeats `state = 2 AND lease_expiry <= :now` in its outer `WHERE`, and orders by `lease_expiry`. Every write that ends or renews a lease changes `lease_expiry`, so the outer predicates keep the sweep off a row that an outcome, a heartbeat, or another sweep committed after the snapshot. The outer `ORDER BY lease_expiry` does the same on its own. Without both, the sweep locks a row that an outcome wrote after the snapshot and writes it back to `Scheduled`, so a `Succeeded` job can run again. The mutant `expire-no-outer-where-and-order-oracle` shows this, and the probe case `noorder` measures the lock. The probe case `outerwhere` measures that a column read only in the outer `WHERE` also makes SKIP LOCKED skip the row.
+The claim selects every column but `output`, and `output` is written only together with a Success state, so any change makes it skip the row. The sweep selects `job_id, attempt`, repeats `state = 2 AND lease_expiry <= :now` in its outer `WHERE`, and orders by `lease_expiry`. Every write that ends or renews a lease changes `lease_expiry`, so the outer predicates keep the sweep off a row that an outcome, a heartbeat, or another sweep committed after the snapshot. The outer `ORDER BY lease_expiry` does the same on its own. Without both, the sweep locks a row that an outcome wrote after the snapshot and writes it back to `Scheduled`, so a `Succeeded` job can run again. The mutant `expire-no-outer-where-and-order-oracle` shows this, and the probe case `noorder` measures the lock. The probe case `outerwhere` measures that a column read only in the outer `WHERE` also makes SKIP LOCKED skip the row.
 
 Evidence: measured on Oracle XE 21.3 (`gvenzl/oracle-xe:21-slim`) and Oracle Free 23.26 (`gvenzl/oracle-free:23-slim`) on 2026-11-25. Inferred for 19c, the oldest version the adapter supports. Each probe container needs about 20 GiB of free disk, so check `df -h /` first. Measure it again with:
 
