@@ -715,7 +715,8 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         public SimEvent? OutcomeWrite { get; set; }
         public SimEvent? Claim { get; set; }
         // Whether the last outcome write this node's Driver was answered for faulted, which closes its headroom
-        // until a write lands. Read by the per-node-cap oracle at claim time. Cleared with a fresh Driver.
+        // until a write lands. Never set with no headroom configured. Read by the per-node-cap oracle at claim
+        // time. Cleared with a fresh Driver.
         public bool HeadroomClosed { get; set; }
     }
 
@@ -1951,6 +1952,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         {
             _pollsDuringClaim++;
         }
+        nodeEvent = ObserveOutcomeAnswer(node, nodeEvent);
         // An Unroutable ExecuteJob's terminal report is DEFERRED to after the whole command batch
         // (issue 0136), mirroring the production Shell: the pump enqueues the ExecutionUnroutable as a
         // feedback event and only runs its ReportOutcome once every ExecuteJob in the batch has been
@@ -1959,19 +1961,6 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
         // it in the same ClaimCompleted batch — leaving those jobs Leased-but-never-executed, their
         // leases renewed by the Driver's heartbeat forever, so they never converged in the drain window.
         List<JobRecord>? deferredUnroutable = null;
-        switch (nodeEvent)
-        {
-            case NodeEvent.OutcomeBatchFaulted faulted:
-                node.HeadroomClosed = true;
-                if (options.SabotageHeadroomNeverCloses)
-                {
-                    nodeEvent = new NodeEvent.OutcomeBatchNotIssued(faulted.Now);
-                }
-                break;
-            case NodeEvent.OutcomeBatchReported:
-                node.HeadroomClosed = false;
-                break;
-        }
         // The command batch runs inside a try so the deferred Unroutable reports below run even when a later
         // command in the SAME batch faults (a follow-up claim hitting a transient store fault, say). The
         // foreach/switch body keeps its original indentation to stay a surgical diff.
@@ -2020,20 +2009,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                     break;
 
                 case Command.ClaimBatch claim:
-                    if (node.HeadroomClosed && options.UnwrittenOutcomeSlots > 0)
-                    {
-                        _claimsWithHeadroomClosed++;
-                    }
-                    if (ClaimsIntoHeadroom(node, claim))
-                    {
-                        Invariant(
-                            InvariantId.PerNodeCap,
-                            !node.HeadroomClosed,
-                            $"node-{nodeIndex} claimed {claim.MaxJobs} into its unwritten-outcome headroom after a "
-                            + $"faulted outcome write closed it: {node.Executing.Count} in-flight executions and "
-                            + $"{UnwrittenOutcomeCount(node)} unwritten outcomes against a pool of {options.PoolSize}");
-                        _claimsIntoUnwrittenHeadroom++;
-                    }
+                    CheckClaimAgainstHeadroom(nodeIndex, node, claim);
                     if (options.MaxStoreLaneLatency > TimeSpan.Zero && !node.Down)
                     {
                         if (node.Claim is not null)
@@ -3248,6 +3224,50 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     private static int UnwrittenOutcomeCount(SimNode node)
         => node.Driver.BufferedOutcomeCount
             + (node.OutcomeWrite?.Batch!.Outcomes.Count(row => !node.Executing.ContainsKey(row.JobId)) ?? 0);
+
+    /// <summary>
+    /// Tracks whether the node's Driver last answered an outcome write as faulted, which closes its headroom, and
+    /// returns the event to step. The headroom sabotage hands the Driver a write never issued instead, so its
+    /// headroom stays open.
+    /// </summary>
+    private NodeEvent ObserveOutcomeAnswer(SimNode node, NodeEvent nodeEvent)
+    {
+        switch (nodeEvent)
+        {
+            case NodeEvent.OutcomeBatchFaulted faulted:
+                node.HeadroomClosed = options.UnwrittenOutcomeSlots > 0;
+                return options.SabotageHeadroomNeverCloses
+                    ? new NodeEvent.OutcomeBatchNotIssued(faulted.Now)
+                    : nodeEvent;
+            case NodeEvent.OutcomeBatchReported:
+                node.HeadroomClosed = false;
+                return nodeEvent;
+            default:
+                return nodeEvent;
+        }
+    }
+
+    /// <summary>
+    /// Checks a claim as it is issued against the headroom: a claim into it after a faulted write closed it
+    /// breaks the per-node cap (see <see cref="CheckPerNodeCap"/>).
+    /// </summary>
+    private void CheckClaimAgainstHeadroom(int nodeIndex, SimNode node, Command.ClaimBatch claim)
+    {
+        if (node.HeadroomClosed)
+        {
+            _claimsWithHeadroomClosed++;
+        }
+        if (ClaimsIntoHeadroom(node, claim))
+        {
+            Invariant(
+                InvariantId.PerNodeCap,
+                !node.HeadroomClosed,
+                $"node-{nodeIndex} claimed {claim.MaxJobs} into its unwritten-outcome headroom after a "
+                + $"faulted outcome write closed it: {node.Executing.Count} in-flight executions and "
+                + $"{UnwrittenOutcomeCount(node)} unwritten outcomes against a pool of {options.PoolSize}");
+            _claimsIntoUnwrittenHeadroom++;
+        }
+    }
 
     /// <summary>
     /// Whether a claim asks for more than the pool leaves when every Unwritten Outcome holds a slot, so it fills
