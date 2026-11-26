@@ -15,6 +15,8 @@ The Simulator and the in-memory store give a row its Position at commit, so they
 
 ## Does your change touch the model?
 
+TLC reads only the model and never the C#, so a code change is checked only after you copy it into the model's actions.
+
 The model was last confirmed against the code at commit `ad5b0ab` (the sync commit). Run this to list the covered files that differ from it, committed or not:
 
 ```bash
@@ -30,8 +32,9 @@ The three store files are large, so a file in this list may not have changes in 
 | `src/BackWave/Storage/CommitHorizon.cs` `Advance` | `Advance`, transcribed line for line |
 | Postgres `Schema/0005_observer_commit_horizon.sql` `observer_log_register` trigger, SQL Server `SqlServerJobStore.RegisterTransitionWriter` (the prefix of every `INSERT INTO backwave.job_transitions` in `SqlServerJobStore.cs`, today at :1966 and :2098), Oracle `Schema/0005_observer_commit_horizon.sql` trigger | `Register` |
 | `observer_log_position` sequence and the `job_transitions.position` default in each `Schema/0001_initial.sql` | `NextVal` (`Cache` = 1) |
-| The caller's transaction commit or rollback | `Commit`, `Rollback` |
+| The caller's transaction commit or rollback | `EndTxn` (`Commit` and `Rollback` in a trace) |
 | `ClaimObserverDeliveriesAsync` (lock statement with `resolvedAboveCursor`, scan with `LIMIT` and the backoff break, the catch-up branch) and `TryReportObserverDeliveriesAsync` (outcome writes) in each store | `Claim` |
+| A second Observer's report or catch-up claim that calls `AdvanceCommitHorizonAsync` | `ReporterStart`, which starts a stand-in's horizon step at any moment |
 | `AdvanceCommitHorizonAsync` in each store: the row lock with SKIP LOCKED or READPAST, the read of P, the two probes, the skipped-lock fallback, the `UPDATE` | `Snap`, `Lock`, `ReadH`, `ProbePrev`, `ProbeCur`, `Decided` |
 | Postgres `observer_log_epoch_free`, SQL Server `APPLOCK_TEST`, Oracle `observer_log_epoch_free` | `EpochFree` |
 | `AdvanceObserverCursorAsync` in each store: the block query, the target query, dead letters, the `observer_deliveries` delete, the cursor update, the commit | `Sweep` (and `Block`, `Target`, `Finish` for the no-horizon mutant) |
@@ -44,7 +47,13 @@ Each action's comment in the spec cites the file and line it models, and says wh
 tests/formal/commit-horizon/check.sh
 ```
 
-The first run needs network access, and Java 11 or later or mise. `tests/formal/tlc.sh` downloads the pinned tla2tools 1.7.4 and checks its hash, and with no Java it installs a JDK with mise. A run takes 2 to 5 minutes on a 10-core M-series Mac, depending on load. Add `--quick` to skip the two liveness runs, or `--deep` to add `Deep.cfg` (about 2.5 minutes more). Any other argument prints the usage and exits 2.
+The first run needs network access, and Java 11 or later or mise. `tests/formal/tlc.sh` downloads the pinned tla2tools 1.7.4 and checks its hash before it caches it, and with no Java it installs a JDK with mise.
+
+Add `--quick` to skip the two liveness runs, `--deep` to add `Deep.cfg`, or `--config <name>.cfg` to run one config, for example `--config Liveness.cfg`. A horizon mutant given to `--config` runs both of its checks, described below. Any other argument prints the usage and exits 2.
+
+`tlc.sh` runs one TLC process at a time on the machine, from any checkout. A second run prints `Waiting for the TLC run of PID <pid> to finish` and starts when the first ends. The seconds the script prints include that wait. Each run uses half the CPU cores and a 4 GiB heap. Set `TLC_WORKERS` (a number, or `auto` for every core) or `TLC_HEAP` (an `-Xmx` value such as `8g`) to change that.
+
+TLC is CPU-bound, so a run takes longer when other work loads the machine. Run `uptime` first. On a 10-core M-series Mac, a full run with every core as workers took 4 minutes 37 seconds at a load average near 350, and a cold run took 16 minutes 34 seconds at a load near 300. With the default 5 workers, `--deep` took 7 minutes 21 seconds at a load average between 98 and 145 (2026-11-26).
 
 The script prints one line for each run and ends with `check passed` or `check FAILED`. Each line shows the result, the config, the wanted outcome, the exit code, the states, the property TLC named, and the length of its counterexample. A mutant's state count and trace length can change between runs, because TLC runs several workers and stops at the first violation it finds. A good run looks like this:
 
@@ -91,7 +100,7 @@ The counterexamples the mutants produce, in the code's words. A, B are writer se
 
 ## Read a result
 
-When a run fails, `check.sh` keeps its full TLC output in `tests/formal/commit-horizon/.failures/<config>.log`. TLC prints the counterexample there as a numbered list of states, each headed by the action that reached it.
+When a run fails, `check.sh` keeps its full TLC output in `tests/formal/commit-horizon/.failures/<config>.log`. When TLC exits with a code other than 0 or 12, the script also prints the last 20 lines of that output, which name the reason, such as a Java error. TLC prints the counterexample there as a numbered list of states, each headed by the action that reached it.
 
 To read a result as a path through states, use the `/statechart` skill. It finds the shortest path to each broken rule, step by step. The configs here have more than a million states, so give it a copy of the config with smaller bounds and no `SYMMETRY` line, for example two writers. With two writers and Positions up to 4, every mutant above still breaks.
 
