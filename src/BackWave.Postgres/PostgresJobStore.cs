@@ -678,8 +678,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     // one-statement claim runs it only for the job rows whose locked version its snapshot holds.
     // Either way the ordinal read sees every committed transition of a locked job. The prune deletes only
     // rows older than the new one, which that snapshot sees, and its cap filter leaves it nothing to
-    // delete until a job reaches the cap. Empty under JobHistoryPolicy.Off, and otherwise starts with the comma that follows the
-    // statement's previous CTE.
+    // delete until a job reaches the cap. Empty under JobHistoryPolicy.Off, and otherwise starts with the
+    // comma that follows the statement's previous CTE.
     private string TransitionLogCtes(string source) => _historyPolicy == JobHistoryPolicy.Off
         ? ""
         : $"""
