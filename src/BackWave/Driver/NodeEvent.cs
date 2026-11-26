@@ -10,6 +10,9 @@ internal abstract record NodeEvent
 {
     private NodeEvent() { }
 
+    /// <summary>When the Shell observed the event.</summary>
+    public abstract DateTimeOffset Now { get; init; }
+
     /// <summary>The poll tick: time to look for due work.</summary>
     public sealed record PollDue(DateTimeOffset Now) : NodeEvent;
 

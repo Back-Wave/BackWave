@@ -34,7 +34,7 @@ internal sealed class UnwrittenOutcomes(int maxBatch, int headroom)
     public bool HasHeadroom => headroom > 0;
 
     /// <summary>The headroom the Unwritten outcomes may fill now: none after a faulted write.</summary>
-    public int OpenHeadroom => _lastWriteFaulted ? 0 : headroom;
+    private int OpenHeadroom => _lastWriteFaulted ? 0 : headroom;
 
     /// <summary>The pool slots the Unwritten outcomes hold: those beyond the open headroom.</summary>
     public int SlotsHeld => Math.Max(0, Count - OpenHeadroom);
