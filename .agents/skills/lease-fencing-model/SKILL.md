@@ -30,13 +30,13 @@ The model describes the code at the sync commit, the last commit that changed `L
 
 | Operation | Postgres `PostgresJobStore.cs` | SQL Server `SqlServerJobStore.cs` | Oracle `OracleJobStore.cs` | Model actions |
 |---|---|---|---|---|
-| Claim | `ClaimUntracedAsync` 430, SQL 508-520 | `ClaimQueueAsync` 492, SQL 564-583 | `ClaimUntracedAsync` 498, SQL 581-592, due check 610-621, write 629-634 | `ClaimBegin`, `ClaimLock`, `ClaimCommit` |
-| ReportOutcome | `ReportOutcomeUntracedAsync` 683, SQL 742-745 | `ReportOutcomeUntracedAsync` 782, SQL 842-845 | `ReportOutcomeUntracedAsync` 848, SQL 907-909 | `ReportUpdate` |
-| ReportOutcomes | `ReportOutcomesUntracedAsync` 806, SQL 879-892 | `ReportOutcomesUntracedAsync` 908, SQL 995-1019 | `ReportOutcomesUntracedAsync` 970, SQL 1041-1045, 1064-1071, 1090-1115 | `ReportUpdate` (Postgres), `ReportLock`, `ReportCommit` |
-| Heartbeat | `HeartbeatAsync` 1130, SQL 1139-1141 | `HeartbeatAsync` 1250, SQL 1266-1272 | `HeartbeatAsync` 1375, SQL 1400-1403, 1419 | `HeartbeatUpdate`, `HeartbeatLock`, `HeartbeatCommit` |
-| ExpireLeases | `ExpireLeasesUntracedAsync` 1184, SQL 1202-1207, 1266-1268, 1281-1283 | `ExpireLeasesUntracedAsync` 1315, SQL 1335-1338, 1401, 1419 | `ExpireLeasesUntracedAsync` 1452, SQL 1473-1484, 1547-1556, 1565-1577 | `ExpireBegin`, `ExpireLock`, `ExpireCommit` |
-| RelinquishLeases | `RelinquishLeasesUntracedAsync` 1342, SQL 1355-1359, 1421-1423, 1444-1446 | `RelinquishLeasesUntracedAsync` 1486, SQL 1501-1504, 1562-1563, 1578 | `RelinquishLeasesUntracedAsync` 1637, SQL 1650-1654, 1715-1722, 1737-1743 | `RelinquishBegin`, `RelinquishLock`, `RelinquishCommit` |
-| Reschedule | `RescheduleCoreAsync` 1617, SQL 1632-1639 | `RescheduleCoreAsync` 1757, SQL 1767-1769 | `RescheduleCoreAsync` 1920, SQL 1936-1941 | `RescheduleLock`, `RescheduleCommit` |
+| Claim | `ClaimUntracedAsync` 482, path choice 498-503; one-statement claim `TryClaimInOneStatementAsync` 525, SQL 108-116; transaction claim `ClaimInTransactionAsync` 545, SQL 609; `ClaimCandidates` 625-634, `ClaimUpdate` 639-651 | `ClaimQueueAsync` 492, SQL 564-583 | `ClaimUntracedAsync` 498, SQL 581-592, due check 610-621, write 629-634 | `ClaimBegin`, `ClaimLock`, `ClaimCommit` |
+| ReportOutcome | `ReportOutcomeUntracedAsync` 816, SQL 875-878 | `ReportOutcomeUntracedAsync` 782, SQL 842-845 | `ReportOutcomeUntracedAsync` 848, SQL 907-909 | `ReportUpdate` |
+| ReportOutcomes | `ReportOutcomesUntracedAsync` 939, path choice 966-969; `TryReportOutcomesInOneRoundTripAsync` 1054; `ReportOutcomesInTransactionAsync` 1162; SQL `OutcomeCommandSql` 1095-1103, `OutcomeFence` 1115-1119, `LockOutcomeRows` 1129-1137, `OutcomeWrite` 1144-1160 | `ReportOutcomesUntracedAsync` 908, SQL 995-1019 | `ReportOutcomesUntracedAsync` 970, SQL 1041-1045, 1064-1071, 1090-1115 | `ReportLock`, `ReportCommit` |
+| Heartbeat | `HeartbeatAsync` 1365, SQL 1374-1376 | `HeartbeatAsync` 1250, SQL 1266-1272 | `HeartbeatAsync` 1375, SQL 1400-1403, 1419 | `HeartbeatUpdate`, `HeartbeatLock`, `HeartbeatCommit` |
+| ExpireLeases | `ExpireLeasesUntracedAsync` 1419, SQL 1437-1442, 1501-1503, 1516-1518 | `ExpireLeasesUntracedAsync` 1315, SQL 1335-1338, 1401, 1419 | `ExpireLeasesUntracedAsync` 1452, SQL 1473-1484, 1547-1556, 1565-1577 | `ExpireBegin`, `ExpireLock`, `ExpireCommit` |
+| RelinquishLeases | `RelinquishLeasesUntracedAsync` 1577, SQL 1590-1594, 1656-1658, 1679-1681 | `RelinquishLeasesUntracedAsync` 1486, SQL 1501-1504, 1562-1563, 1578 | `RelinquishLeasesUntracedAsync` 1637, SQL 1650-1654, 1715-1722, 1737-1743 | `RelinquishBegin`, `RelinquishLock`, `RelinquishCommit` |
+| Reschedule | `RescheduleCoreAsync` 1852, SQL 1867-1874 | `RescheduleCoreAsync` 1757, SQL 1767-1769 | `RescheduleCoreAsync` 1920, SQL 1936-1941 | `RescheduleLock`, `RescheduleCommit` |
 
 The model also depends on these facts. A change to any of them touches the model too:
 
@@ -50,7 +50,7 @@ To list the commits since the sync commit that touched covered code:
 git log --oneline "$(git log -1 --format=%H -- tests/formal/lease-fencing/LeaseFencing.tla)"..HEAD -- src/BackWave.Postgres/PostgresJobStore.cs src/BackWave.SqlServer/SqlServerJobStore.cs src/BackWave.Oracle/OracleJobStore.cs src/BackWave.SqlServer/SqlServerMigrator.cs src/BackWave/Core/RetryPolicy.cs src/BackWave/Driver/NodeDriver.cs
 ```
 
-A commit touches the model when it changes a cited statement, its `WHERE`, its lock hints, its transaction, or the order of statements inside one transaction. A change elsewhere in these files needs only new line numbers.
+A commit touches the model when it changes a cited statement, its `WHERE`, its lock hints, its transaction, the statements sent as one command, or the order of statements inside one transaction. A change elsewhere in these files needs only new line numbers.
 
 ## Run the check
 
@@ -177,6 +177,6 @@ Run the probe again before you trust the rule in these cases:
 
 ## Not covered
 
-The Core driver loop, Concurrency Limits and the queue locks of a limited queue, slot accounting, AwaitingParent and the fan-in latches, Cancel, Requeue, the transition log, the Commit Horizon, SQLite, and the in-memory store. Each worker has one database session, so the calls of one worker never overlap, as they can on separate connections. Retry backoff is zero ticks, and a Reschedule moves the due time by one tick. Liveness is not checked.
+The Core driver loop, Enqueue, Concurrency Limits and the queue locks of a limited queue, slot accounting, AwaitingParent and the fan-in latches, Cancel, Requeue, the transition log, the Commit Horizon, SQLite, and the in-memory store. The model has no child edges, so the child-edge gate of the Postgres outcome command never holds a write back. A write it holds back ends like a rollback, and the caller runs the batch again in a transaction, which the model reaches as a rollback and a new report. Each worker has one database session, so the calls of one worker never overlap, as they can on separate connections. Retry backoff is zero ticks, and a Reschedule moves the due time by one tick. Liveness is not checked.
 
 When the code changed without a rerun of this check, use the pstack `/maintain-formal-verification-skill` skill to bring the model back in line.

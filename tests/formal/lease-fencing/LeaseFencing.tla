@@ -28,7 +28,11 @@
 (*  - Postgres: each statement has its own snapshot. FOR UPDATE on a row   *)
 (*    that changed after the snapshot re-checks the whole WHERE of that    *)
 (*    query level on the latest version (EvalPlanQual). An UPDATE joined   *)
-(*    to a CTE re-checks only the join.                                    *)
+(*    to a CTE re-checks only the join. Every CTE of one statement reads   *)
+(*    that statement's snapshot. A command of several statements runs as   *)
+(*    one implicit transaction, and each statement takes a new snapshot.   *)
+(*    FOR NO KEY UPDATE conflicts with every row lock and row write in     *)
+(*    the model.                                                           *)
 (*  - SQL Server runs with READ_COMMITTED_SNAPSHOT ON                      *)
 (*    (src/BackWave.SqlServer/SqlServerMigrator.cs:260). A plain SELECT    *)
 (*    reads the row versions of its statement. An UPDLOCK read and the     *)
@@ -155,11 +159,18 @@ Finish(s) == /\ lockOf' = Release(s)
              /\ sess' = [sess EXCEPT ![s] = Idle]
 
 -----------------------------------------------------------------------------
-(* Postgres  PostgresJobStore.cs:508-520 (ClaimUntracedAsync, from 430)
+(* Postgres  PostgresJobStore.cs:625-651 (ClaimCandidates, ClaimUpdate)
      WITH candidates AS (SELECT ... WHERE state = 0 AND due_time <= @now
                          ... FOR UPDATE SKIP LOCKED)
      UPDATE ... SET state = 2, attempt = j.attempt + 1, ... FROM candidates
-     One statement. Begin = its snapshot; Lock = SKIP LOCKED with the
+     ClaimUntracedAsync (from 482) runs it in one of two forms (498-503):
+     an autocommit statement whose later CTEs also append and prune the
+     Leased transitions (108-116, TryClaimInOneStatementAsync from 525), or
+     a transaction with the transition insert as a second statement (609,
+     ClaimInTransactionAsync from 545). The one-statement form rolls back
+     whole on a transition ordinal collision, and the caller claims again
+     in the transaction form: Rollback, then a new ClaimBegin.
+     Begin = the statement snapshot; Lock = SKIP LOCKED with the
      EvalPlanQual re-check of state and due_time; Commit = the UPDATE and
      the commit.
    SQL Server  SqlServerJobStore.cs:564-583 (ClaimQueueAsync, from 492)
@@ -233,14 +244,28 @@ ClaimCommit(s) ==
 
 -----------------------------------------------------------------------------
 (* Single path, all adapters: one fenced UPDATE of one row.
-     Postgres  PostgresJobStore.cs:742-745 (ReportOutcomeUntracedAsync, from 683)
+     Postgres  PostgresJobStore.cs:875-878 (ReportOutcomeUntracedAsync, from 816)
      SQL Server  SqlServerJobStore.cs:842-845 (ReportOutcomeUntracedAsync, from 782)
      Oracle  OracleJobStore.cs:907-909 (ReportOutcomeUntracedAsync, from 848)
      WHERE job_id = @id AND state = 2 AND lease_owner = @worker
        AND attempt = @attempt AND lease_expiry > @now
    Batch path (ReportOutcomesAsync):
-     Postgres  PostgresJobStore.cs:879-892 (from 806): one UPDATE over unnest
-       with the same fence per row. One step, as the single path.
+     Postgres  PostgresJobStore.cs:1095-1103, 1115-1119, 1129-1137, 1144-1160
+       (OutcomeCommandSql; ReportOutcomesUntracedAsync from 939 runs it as
+       one implicit transaction, 1054, or inside a transaction, 1162):
+       SELECT ... FROM jobs j, unnest(...) d WHERE <fence> ORDER BY j.job_id
+         FOR NO KEY UPDATE OF j;
+       WITH d AS (unnest(...)), gate AS (...),
+         written AS (UPDATE jobs j ... FROM d, gate
+                     WHERE NOT gate.gated AND <fence>), <transitions> ...
+       Lock = the waiting lock with the EvalPlanQual re-check of the fence;
+       a row that fails it stays unlocked and the command goes on. The
+       model leaves such a row unlocked, which only allows more orders.
+       Commit = the UPDATE on a snapshot taken after the locks, its fence
+       on the latest row, and the commit. The transaction form commits
+       after the output, tag, and latch statements, which the model does
+       not have. A write the gate holds back is a Rollback; the caller
+       then reports the batch again in the transaction form.
      SQL Server  SqlServerJobStore.cs:995-1019 (from 908):
        INSERT INTO @batch ... INNER LOOP JOIN jobs j WITH (UPDLOCK, ROWLOCK)
          WHERE <fence>;   UPDATE j ... FROM @batch d INNER LOOP JOIN jobs j
@@ -284,7 +309,7 @@ DropRun(w, j, a) == unreported' = [unreported EXCEPT ![w] = @ \ {<<j, a>>}]
 
 ReportUpdate(s) ==
     /\ sess[s].op = "Idle"
-    /\ "Single" \in ReportPaths \/ Adapter = "Postgres"
+    /\ "Single" \in ReportPaths
     /\ LET w == WorkerOf(s) IN
        \E r \in unreported[w], kind \in Kinds, at \in CallTimes :
          LET j == r[1]
@@ -298,19 +323,20 @@ ReportUpdate(s) ==
 
 ReportLock(s) ==
     /\ sess[s].op = "Idle"
-    /\ "Batch" \in ReportPaths /\ Adapter \in {"SqlServer", "Oracle"}
+    /\ "Batch" \in ReportPaths
     /\ LET w == WorkerOf(s) IN
        \E r \in unreported[w], kind \in Kinds, at \in CallTimes :
          LET j == r[1]
              a == r[2]
-             locks == IF Adapter = "SqlServer"
-                      THEN Fence(row[j], w, a, at)
-                      ELSE row[j].state = Leased /\ Unlapsed(row[j], at)
+             locks == IF Adapter = "Oracle"
+                      THEN row[j].state = Leased /\ Unlapsed(row[j], at)
+                      ELSE Fence(row[j], w, a, at)
          IN /\ lockOf[j] = NoSession
-            /\ IF locks
-                 THEN /\ lockOf' = [lockOf EXCEPT ![j] = s]
+            /\ IF locks \/ Adapter = "Postgres"
+                 THEN /\ lockOf' = IF locks THEN [lockOf EXCEPT ![j] = s] ELSE lockOf
                       /\ sess' = [sess EXCEPT ![s] = [Idle EXCEPT !.op = "Report", !.at = at,
-                                     !.held = {j}, !.job = j, !.att = a, !.kind = kind]]
+                                     !.held = IF locks THEN {j} ELSE {}, !.job = j, !.att = a,
+                                     !.kind = kind]]
                       /\ UNCHANGED unreported
                  ELSE /\ DropRun(w, j, a)
                       /\ UNCHANGED <<lockOf, sess>>
@@ -318,6 +344,7 @@ ReportLock(s) ==
 
 ReportCommit(s) ==
     /\ sess[s].op = "Report"
+    /\ Free(sess[s].job, s)
     /\ LET me == sess[s]
            w == WorkerOf(s)
            j == me.job
@@ -332,7 +359,7 @@ ReportCommit(s) ==
     /\ UNCHANGED now
 
 -----------------------------------------------------------------------------
-(* Postgres  PostgresJobStore.cs:1139-1141 (HeartbeatAsync, from 1130)
+(* Postgres  PostgresJobStore.cs:1374-1376 (HeartbeatAsync, from 1365)
    SQL Server  SqlServerJobStore.cs:1266-1272 (HeartbeatAsync, from 1250)
      One UPDATE: SET lease_expiry = @expiry
        WHERE state = 2 AND lease_owner = @worker AND lease_expiry > @now
@@ -374,7 +401,7 @@ HeartbeatCommit(s) ==
    backoff); at the ceiling it dead-letters.
    The attempt the read returns decides (RetryPolicy.cs:166-167).
 
-   Postgres  PostgresJobStore.cs:1202-1207, 1266-1268, 1281-1283 (from 1184)
+   Postgres  PostgresJobStore.cs:1437-1442, 1501-1503, 1516-1518 (from 1419)
      SELECT job_id, attempt ... WHERE state = 2 AND lease_expiry <= @now
        ... FOR UPDATE SKIP LOCKED;  UPDATE ... by id (retry, dead-letter)
    SQL Server  SqlServerJobStore.cs:1335-1338, 1401, 1419 (from 1315)
@@ -425,7 +452,7 @@ ExpireCommit(s) ==
     /\ UNCHANGED <<now, unreported>>
 
 -----------------------------------------------------------------------------
-(* Postgres  PostgresJobStore.cs:1355-1359, 1421-1423, 1444-1446 (from 1342)
+(* Postgres  PostgresJobStore.cs:1590-1594, 1656-1658, 1679-1681 (from 1577)
      SELECT ... WHERE state = 2 AND lease_owner = @owner ... FOR UPDATE
    SQL Server  SqlServerJobStore.cs:1501-1504, 1562-1563, 1578 (from 1486)
      SELECT ... WITH (UPDLOCK, ROWLOCK) WHERE state = 2 AND lease_owner = @owner
@@ -472,7 +499,7 @@ RelinquishCommit(s) ==
 (* The lock and the guard are one step; the commit can come later, because
    a caller transaction holds the row lock until it commits.
 
-   Postgres  PostgresJobStore.cs:1632-1639 (RescheduleCoreAsync, from 1617)
+   Postgres  PostgresJobStore.cs:1867-1874 (RescheduleCoreAsync, from 1852)
      WITH old AS (SELECT ... WHERE job_id = @id AND state IN (0, 1) FOR UPDATE)
      UPDATE ... SET due_time = @due FROM old
    SQL Server  SqlServerJobStore.cs:1767-1769 (RescheduleCoreAsync, from 1757)
