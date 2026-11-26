@@ -36,7 +36,9 @@ public class StoreBoundsTests
     [InlineData(-1)]
     public void MaxTransitionsPerJob_BelowOne_IsRejected(int cap)
     {
-        Assert.Throws<ArgumentOutOfRangeException>(() => StoreBounds.Default with { MaxTransitionsPerJob = cap });
+        var rejected = Assert.Throws<ArgumentOutOfRangeException>(
+            () => StoreBounds.Default with { MaxTransitionsPerJob = cap });
+        Assert.Contains("HistoryPolicy to JobHistoryPolicy.Off", rejected.Message, StringComparison.Ordinal);
     }
 
     [Fact]

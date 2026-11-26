@@ -52,13 +52,20 @@ public sealed record StoreBounds
     /// for a job that churns through many retries. Must be 1 or more: a job always keeps the transition
     /// it just recorded.
     /// </summary>
-    /// <exception cref="ArgumentOutOfRangeException">The value is below 1.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The value is below 1. To record no history, set the
+    /// store options' <c>HistoryPolicy</c> to <see cref="JobHistoryPolicy.Off"/>.</exception>
     public int MaxTransitionsPerJob
     {
         get;
         init
         {
-            ArgumentOutOfRangeException.ThrowIfLessThan(value, 1);
+            if (value < 1)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(MaxTransitionsPerJob), value,
+                    "MaxTransitionsPerJob must be 1 or more. To record no transition history, set the store "
+                    + "options' HistoryPolicy to JobHistoryPolicy.Off.");
+            }
             field = value;
         }
     } = 64;
