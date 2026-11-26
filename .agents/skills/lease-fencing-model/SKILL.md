@@ -64,7 +64,7 @@ tests/formal/lease-fencing/check.sh
 
 The first run needs network access, and Java 11 or later or mise. `tests/formal/tlc.sh` downloads the pinned tla2tools.jar and checks its hash, and with no Java it installs a JDK with mise.
 
-It runs TLC on every config in `tests/formal/lease-fencing/` and prints one row per config: the expected result, the result, the distinct states, and the seconds. Each config's first line, `\* expect: pass` or `\* expect: <Rule>`, says what it must end with. The script exits 0 only when every row matches. Add `--mutants` for the planted breaks in `mutants/` or `--all` for both. Run `--all` after you change the model. Each config that passes on Oracle takes about 2 to 5 minutes, and every other config takes under a minute. With the default 5 workers on a 10-core Mac, `--all` took 17 minutes 26 seconds at a load average that fell from about 510 to 145 (2026-11-26). Run `uptime` first, because load slows every config. Add `--config <name>` to run one config, for example `--config oracle.cfg` or `--config mutants/claim-no-lock-oracle.cfg`.
+It runs TLC on every config in `tests/formal/lease-fencing/` and prints one row per config: the expected result, the result, the distinct states, and the seconds. Each config's first line, `\* expect: pass` or `\* expect: <Rule>`, says what it must end with. The script exits 0 only when every row matches. Add `--mutants` for the planted breaks in `mutants/` or `--all` for both. Run `--all` after you change the model. Each config that passes takes about 2 to 3 minutes on Oracle and SQL Server and about 3 to 13 minutes on Postgres, and every other config takes a few seconds. With the default 5 workers on a 10-core Mac, `--all` took 31 minutes 28 seconds at a load average of about 7 to 12 (2026-11-26), and `postgres.cfg` alone took 12 minutes 43 seconds of that. Run `uptime` first, because load slows every config. Add `--config <name>` to run one config, for example `--config oracle.cfg` or `--config mutants/claim-no-lock-oracle.cfg`.
 
 `tlc.sh` runs one TLC process at a time on the machine, from any checkout. A second run prints `Waiting for the TLC run of PID <pid> to finish` and starts when the first ends. The seconds the script prints include that wait. Each run uses half the CPU cores and a 4 GiB heap. Set `TLC_WORKERS` (a number, or `auto` for every core) or `TLC_HEAP` (an `-Xmx` value such as `8g`) to change that.
 
@@ -75,7 +75,7 @@ The baseline at the sync commit: every row matches, and the three adapter config
 | Config | Distinct states |
 |---|---|
 | `oracle.cfg` | 14,110,656 |
-| `postgres.cfg` | 1,947,808 |
+| `postgres.cfg` | 19,599,230 |
 | `sqlserver.cfg` | 2,698,212 |
 
 Read every result with the pstack `/statechart` skill. A violation comes back as its shortest path in plain steps, and a pass comes back as a chart of the states. The raw TLC output of each config is in the folder that `check.sh` prints last.
