@@ -58,9 +58,21 @@ A commit touches the model when it changes a cited statement, its `WHERE`, its l
 tests/formal/lease-fencing/check.sh
 ```
 
-It runs TLC (pinned by `tests/formal/tlc.sh`) on every config in `tests/formal/lease-fencing/` and prints one row per config: the expected result, the result, the distinct states, and the seconds. Each config's first line, `\* expect: pass` or `\* expect: <Rule>`, says what it must end with. The script exits 0 only when every row matches. It takes about 2 minutes. Add `--mutants` for the planted breaks in `mutants/` (about 3.5 minutes) or `--all` for both (about 5.5 minutes on 2026-11-25; times vary about 2x with machine load). Run `--all` after you change the model.
+The first run needs network access, and Java 11 or later or mise. `tests/formal/tlc.sh` downloads the pinned tla2tools.jar and checks its hash, and with no Java it installs a JDK with mise.
 
-The baseline at the sync commit: every row matches, and `postgres.cfg`, `sqlserver.cfg`, and `oracle.cfg` pass.
+It runs TLC on every config in `tests/formal/lease-fencing/` and prints one row per config: the expected result, the result, the distinct states, and the seconds. Each config's first line, `\* expect: pass` or `\* expect: <Rule>`, says what it must end with. The script exits 0 only when every row matches. Add `--mutants` for the planted breaks in `mutants/` or `--all` for both. Run `--all` after you change the model. Each config that passes on Oracle takes about 2 to 5 minutes, and every other config takes under a minute. With the default 5 workers on a 10-core Mac, `--all` took 17 minutes 26 seconds at a load average that fell from about 510 to 145 (2026-11-26). Run `uptime` first, because load slows every config. Add `--config <name>` to run one config, for example `--config oracle.cfg` or `--config mutants/claim-no-lock-oracle.cfg`.
+
+`tlc.sh` runs one TLC process at a time on the machine, from any checkout. A second run prints `Waiting for the TLC run of PID <pid> to finish` and starts when the first ends. Each run uses half the CPU cores and a 4 GiB heap. Set `TLC_WORKERS` (a number, or `auto` for every core) or `TLC_HEAP` (an `-Xmx` value such as `8g`) to change that.
+
+When TLC exits with a code other than 0 or 12, the row reads `error:<code>` and the script prints the last 20 lines of TLC's output under it, which name the reason, such as a Java error.
+
+The baseline at the sync commit: every row matches, and the three adapter configs pass with these distinct-state counts. A count that changes without a model change means the bounds or the TLC version changed.
+
+| Config | Distinct states |
+|---|---|
+| `oracle.cfg` | 14,110,656 |
+| `postgres.cfg` | 1,947,808 |
+| `sqlserver.cfg` | 2,698,212 |
 
 Read every result with the pstack `/statechart` skill. A violation comes back as its shortest path in plain steps, and a pass comes back as a chart of the states. The raw TLC output of each config is in the folder that `check.sh` prints last.
 
@@ -78,9 +90,10 @@ If any step does what the code cannot do, the model is wrong. Fix the action and
 
 1. Find the actions of the changed statements in the coverage record.
 2. Change each action so that each step is again one atomic step of the new code. Update the citation in its comment.
-3. A new guard gets a mutant. Add its name to the `Mutants` `ASSUME`, gate the guard on `Has("<Name>")`, and add a config in `mutants/` that expects the rule the guard protects. When a change removes a guard, find the mutant config that planted the same removal: the real model now ends as that config does.
-4. Run `check.sh --all`. Every row must match.
-5. Update every file and line citation: in the spec comments, in the probe, and in this skill, including the coverage record. Then move the sync commit, here and in the spec header, to the commit you checked. Move it only after you have confirmed that the model describes the code at that commit.
+3. Definitions such as `Fence` serve every adapter, and the config's `Adapter` constant picks the adapter. When a change alters a guard in one adapter only, gate the guard on that adapter, so the other adapters' configs keep it. For example, an Oracle outcome that drops `attempt = :attempt` becomes `(r.attempt = a \/ Has("OwnerOnlyFence") \/ Adapter = "Oracle")` in `Fence`.
+4. A new guard gets a mutant. Add its name to the `Mutants` `ASSUME`, gate the guard on `Has("<Name>")`, and add a config in `mutants/` that expects the rule the guard protects. When a change removes a guard, find the mutant config that planted the same removal: the real model now ends as that config does.
+5. Run `check.sh --all`. Every row must match.
+6. Update every file and line citation: in the spec comments, in the probe, and in this skill, including the coverage record. Then move the sync commit, here and in the spec header, to the commit you checked. Move it only after you have confirmed that the model describes the code at that commit.
 
 ## Mutants
 
