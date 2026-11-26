@@ -8,15 +8,17 @@ public class NodeDriverUnwrittenOutcomeTests
 {
     private static readonly DateTimeOffset T0 = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
-    private static NodeDriver Driver(int unwrittenOutcomeSlots, int poolSize = 4, int maxOutcomeBatch = 10) => new(new NodeOptions
-    {
-        WorkerId = "w1",
-        Policy = new DispatchPolicy.Strict(["default"]),
-        MaxClaimBatch = 10,
-        MaxOutcomeBatch = maxOutcomeBatch,
-        PoolSize = poolSize,
-        UnwrittenOutcomeSlots = unwrittenOutcomeSlots,
-    });
+    private static NodeDriver Driver(
+        int unwrittenOutcomeSlots, int poolSize = 4, int maxOutcomeBatch = 10, DispatchPolicy? policy = null) =>
+        new(new NodeOptions
+        {
+            WorkerId = "w1",
+            Policy = policy ?? new DispatchPolicy.Strict(["default"]),
+            MaxClaimBatch = 10,
+            MaxOutcomeBatch = maxOutcomeBatch,
+            PoolSize = poolSize,
+            UnwrittenOutcomeSlots = unwrittenOutcomeSlots,
+        });
 
     private static JobRecord[] Jobs(int count) => [.. Enumerable.Range(0, count).Select(_ => new JobRecord
     {
@@ -45,6 +47,36 @@ public class NodeDriverUnwrittenOutcomeTests
 
     private static OutcomeReportResult[] Applied(Command.ReportOutcomeBatch write)
         => [.. write.Outcomes.Select(row => new OutcomeReportResult(row.JobId, OutcomeResult.Applied))];
+
+    /// <summary>
+    /// One long job runs, two polls wait on the next claim, and that claim lands short with <paramref name="count"/>
+    /// jobs, so the polls wait on them. Returns those jobs.
+    /// </summary>
+    private static JobRecord[] AShortClaimWithAWaitingPoll(NodeDriver driver, int count)
+    {
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.ClaimCompleted(Jobs(1), T0));
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.PollDue(T0));
+        var landed = Jobs(count);
+        Assert.Null(Claim(driver.Step(new NodeEvent.ClaimCompleted(landed, T0))));
+        return landed;
+    }
+
+    /// <summary>A Weighted pass claims the whole pool of 4 over its two batches, and every job finishes.</summary>
+    private static void FourFinishedJobs(NodeDriver driver)
+    {
+        var first = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.PollDue(T0))));
+        var cohort = Jobs(first.MaxJobs);
+        var second = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.ClaimCompleted(cohort, T0))));
+        cohort = [.. cohort, .. Jobs(second.MaxJobs)];
+        Assert.Equal(4, cohort.Length);
+        driver.Step(new NodeEvent.ClaimCompleted(cohort[first.MaxJobs..], T0));
+        foreach (var job in cohort)
+        {
+            Finish(driver, job);
+        }
+    }
 
     [Fact]
     public void WithNoHeadroom_AFinishedJobHoldsItsSlot_UntilItsWriteAnswers()
@@ -235,12 +267,7 @@ public class NodeDriverUnwrittenOutcomeTests
     public void WithHeadroom_TheJobsOfAShortClaim_RepollWhenTheyFinish_EvenBelowAFullClaim()
     {
         var driver = Driver(unwrittenOutcomeSlots: 4);
-        driver.Step(new NodeEvent.PollDue(T0));
-        driver.Step(new NodeEvent.ClaimCompleted(Jobs(1), T0));
-        driver.Step(new NodeEvent.PollDue(T0));
-        driver.Step(new NodeEvent.PollDue(T0));
-        var shortJob = Assert.Single(Jobs(1));
-        Assert.Null(Claim(driver.Step(new NodeEvent.ClaimCompleted([shortJob], T0))));
+        var shortJob = Assert.Single(AShortClaimWithAWaitingPoll(driver, 1));
 
         Assert.Contains(Finish(driver, shortJob), command => command is Command.RequestPoll);
         Assert.Equal(3, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
@@ -250,12 +277,7 @@ public class NodeDriverUnwrittenOutcomeTests
     public void WithHeadroom_TheJobsOfAShortClaim_RepollWhenTheirLeasesAreLost_EvenBelowAFullClaim()
     {
         var driver = Driver(unwrittenOutcomeSlots: 4);
-        driver.Step(new NodeEvent.PollDue(T0));
-        driver.Step(new NodeEvent.ClaimCompleted(Jobs(1), T0));
-        driver.Step(new NodeEvent.PollDue(T0));
-        driver.Step(new NodeEvent.PollDue(T0));
-        var lostJob = Assert.Single(Jobs(1));
-        driver.Step(new NodeEvent.ClaimCompleted([lostJob], T0));
+        var lostJob = Assert.Single(AShortClaimWithAWaitingPoll(driver, 1));
 
         var heartbeat = driver.Step(new NodeEvent.HeartbeatCompleted([new HeartbeatResult(lostJob.JobId, Renewed: false, CancelRequested: false)], T0));
 
@@ -267,12 +289,7 @@ public class NodeDriverUnwrittenOutcomeTests
     public void WithHeadroom_TheJobsOfAShortClaim_RepollOnce_AfterTheLastOfThemFinishes()
     {
         var driver = Driver(unwrittenOutcomeSlots: 4);
-        driver.Step(new NodeEvent.PollDue(T0));
-        driver.Step(new NodeEvent.ClaimCompleted(Jobs(1), T0));
-        driver.Step(new NodeEvent.PollDue(T0));
-        driver.Step(new NodeEvent.PollDue(T0));
-        var landed = Jobs(2);
-        driver.Step(new NodeEvent.ClaimCompleted(landed, T0));
+        var landed = AShortClaimWithAWaitingPoll(driver, 2);
 
         Assert.DoesNotContain(Finish(driver, landed[0]), command => command is Command.RequestPoll);
         Assert.Contains(Finish(driver, landed[1]), command => command is Command.RequestPoll);
@@ -283,12 +300,7 @@ public class NodeDriverUnwrittenOutcomeTests
     public void WithHeadroom_AClaimPassThatStartsFirst_PaysThePollThatWaitsOnAShortClaimsJobs()
     {
         var driver = Driver(unwrittenOutcomeSlots: 4);
-        driver.Step(new NodeEvent.PollDue(T0));
-        driver.Step(new NodeEvent.ClaimCompleted(Jobs(1), T0));
-        driver.Step(new NodeEvent.PollDue(T0));
-        driver.Step(new NodeEvent.PollDue(T0));
-        var landed = Jobs(2);
-        Assert.Null(Claim(driver.Step(new NodeEvent.ClaimCompleted(landed, T0))));
+        var landed = AShortClaimWithAWaitingPoll(driver, 2);
 
         Assert.Equal(1, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
         driver.Step(new NodeEvent.ClaimCompleted([], T0));
@@ -351,25 +363,9 @@ public class NodeDriverUnwrittenOutcomeTests
     [Fact]
     public void AWeightedPass_ClaimsNothingIntoTheHeadroom_AfterAFaultBetweenItsBatches()
     {
-        var driver = new NodeDriver(new NodeOptions
-        {
-            WorkerId = "w1",
-            Policy = new DispatchPolicy.Weighted([("q1", 1), ("q2", 1)]),
-            MaxClaimBatch = 10,
-            MaxOutcomeBatch = 2,
-            PoolSize = 4,
-            UnwrittenOutcomeSlots = 4,
-        });
-        var first = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.PollDue(T0))));
-        var cohort = Jobs(first.MaxJobs);
-        var second = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.ClaimCompleted(cohort, T0))));
-        cohort = [.. cohort, .. Jobs(second.MaxJobs)];
-        Assert.Equal(4, cohort.Length);
-        driver.Step(new NodeEvent.ClaimCompleted(cohort[first.MaxJobs..], T0));
-        foreach (var job in cohort)
-        {
-            Finish(driver, job);
-        }
+        var driver = Driver(
+            unwrittenOutcomeSlots: 4, maxOutcomeBatch: 2, policy: new DispatchPolicy.Weighted([("q1", 1), ("q2", 1)]));
+        FourFinishedJobs(driver);
 
         var nextPass = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.PollDue(T0))));
         driver.Step(new NodeEvent.OutcomeBatchFaulted(T0));
@@ -382,25 +378,9 @@ public class NodeDriverUnwrittenOutcomeTests
     [Fact]
     public void AWeightedPass_CutToTheFreeSlots_LeavesAWaitingPollWaitingOnTheJobsOfItsLastBatch()
     {
-        var driver = new NodeDriver(new NodeOptions
-        {
-            WorkerId = "w1",
-            Policy = new DispatchPolicy.Weighted([("q1", 1), ("q2", 1)]),
-            MaxClaimBatch = 10,
-            MaxOutcomeBatch = 2,
-            PoolSize = 4,
-            UnwrittenOutcomeSlots = 4,
-        });
-        var first = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.PollDue(T0))));
-        var cohort = Jobs(first.MaxJobs);
-        var second = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.ClaimCompleted(cohort, T0))));
-        cohort = [.. cohort, .. Jobs(second.MaxJobs)];
-        Assert.Equal(4, cohort.Length);
-        driver.Step(new NodeEvent.ClaimCompleted(cohort[first.MaxJobs..], T0));
-        foreach (var job in cohort)
-        {
-            Finish(driver, job);
-        }
+        var driver = Driver(
+            unwrittenOutcomeSlots: 4, maxOutcomeBatch: 2, policy: new DispatchPolicy.Weighted([("q1", 1), ("q2", 1)]));
+        FourFinishedJobs(driver);
 
         var nextPass = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.PollDue(T0))));
         Assert.Equal(2, nextPass.MaxJobs);
