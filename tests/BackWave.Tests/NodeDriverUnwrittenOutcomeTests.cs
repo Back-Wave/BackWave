@@ -224,6 +224,37 @@ public class NodeDriverUnwrittenOutcomeTests
     }
 
     [Fact]
+    public void AWeightedPass_ClaimsNothingIntoTheHeadroom_AfterAFaultBetweenItsBatches()
+    {
+        var driver = new NodeDriver(new NodeOptions
+        {
+            WorkerId = "w1",
+            Policy = new DispatchPolicy.Weighted([("q1", 1), ("q2", 1)]),
+            MaxClaimBatch = 10,
+            MaxOutcomeBatch = 2,
+            PoolSize = 4,
+            UnwrittenOutcomeSlots = 4,
+        });
+        var first = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.PollDue(T0))));
+        var cohort = Jobs(first.MaxJobs);
+        var second = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.ClaimCompleted(cohort, T0))));
+        cohort = [.. cohort, .. Jobs(second.MaxJobs)];
+        Assert.Equal(4, cohort.Length);
+        driver.Step(new NodeEvent.ClaimCompleted(cohort[first.MaxJobs..], T0));
+        foreach (var job in cohort)
+        {
+            Finish(driver, job);
+        }
+
+        var nextPass = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.PollDue(T0))));
+        driver.Step(new NodeEvent.OutcomeBatchFaulted(T0));
+        var landed = driver.Step(new NodeEvent.ClaimCompleted(Jobs(nextPass.MaxJobs), T0));
+
+        // The fault closed the headroom: PoolSize 4 - Running 2 - Unwritten 2 leaves no slot for the next batch.
+        Assert.Null(Claim(landed));
+    }
+
+    [Fact]
     public void AHeartbeatResult_ForAJobThatNoLongerRuns_IsNotActedOn()
     {
         var driver = Driver(unwrittenOutcomeSlots: 4);

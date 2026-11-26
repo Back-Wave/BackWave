@@ -124,7 +124,7 @@ internal sealed class NodeDriver(NodeOptions options)
                 // so a pass interrupted before it drains strands none — advance for this batch now. A
                 // batch that returns work means the pass continues; an empty claim ends the pass and
                 // leaves the rest of the plan un-issued (uncharged).
-                if (claim.Jobs.Count > 0 && _weightedPlan.TryDequeue(out var nextBatch))
+                if (claim.Jobs.Count > 0 && NextWeightedBatch() is { } nextBatch)
                 {
                     ChargeIssued(nextBatch);
                     executions.Add(Issue(nextBatch));
@@ -377,6 +377,25 @@ internal sealed class NodeDriver(NodeOptions options)
         }
         _passWaitsOn = null;
         return true;
+    }
+
+    /// <summary>
+    /// The next batch of the Weighted pass, cut to the free slots, or null when the plan is done or no slot is
+    /// free. The pass sized its batches from the free slots when it started, and a faulted write since then
+    /// closes the headroom, so a later batch can ask for more than the pool now has. Null ends the pass.
+    /// </summary>
+    private Command.ClaimBatch? NextWeightedBatch()
+    {
+        if (!_weightedPlan.TryDequeue(out var batch))
+        {
+            return null;
+        }
+        if (FreeSlots <= 0)
+        {
+            _weightedPlan.Clear();
+            return null;
+        }
+        return batch with { MaxJobs = Math.Min(batch.MaxJobs, FreeSlots) };
     }
 
     private Command.ClaimBatch Issue(Command.ClaimBatch batch)

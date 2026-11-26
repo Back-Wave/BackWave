@@ -1751,6 +1751,27 @@ public class SimulatorTests
     }
 
     /// <summary>
+    /// A Weighted pass issues one claim per Queue, and a faulted write can close the headroom between two of them.
+    /// Every node runs Weighted here, so the per-node-cap oracle checks the later batches of a pass as well.
+    /// </summary>
+    [Theory]
+    [InlineData(2896UL)]
+    [InlineData(2897UL)]
+    [InlineData(2898UL)]
+    public void UnwrittenOutcomeSlots_UnderStoreFaults_AWeightedPassClaimsNothingIntoAClosedHeadroom(ulong seed)
+    {
+        var result = new Simulator(HeadroomUnderStoreFaults(seed) with
+        {
+            TopologyQueues = 3,
+            ForceWeightedDispatch = true,
+        }).Run();
+
+        Assert.True(result.WeightedNodeCount > 0, $"seed {seed}: no Weighted node");
+        Assert.True(result.ClaimsWithHeadroomClosed > 0, $"seed {seed}: no claim ran while the headroom was closed");
+        Assert.Equal(200, result.Succeeded + result.DeadLettered + result.Cancelled + result.Quarantined);
+    }
+
+    /// <summary>
     /// Oracle self-test for the closed headroom: the Driver hears a faulted write as one never issued, so it keeps
     /// claiming into its headroom after the fault. A working oracle must fail the run and print the replay seed.
     /// </summary>
