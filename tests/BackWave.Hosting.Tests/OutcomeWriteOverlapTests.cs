@@ -100,14 +100,24 @@ public class OutcomeWriteOverlapTests
         return builder.Build();
     }
 
-    private static async Task WaitForStateAsync(BackWaveMonitor monitor, Guid jobId, JobState state)
+    private static Task WaitForStateAsync(BackWaveMonitor monitor, Guid jobId, JobState state) =>
+        WaitUntilAsync(async () => (await monitor.GetJobAsync(jobId))?.State == state, $"job {jobId} to reach {state}");
+
+    private static Task WaitUntilAsync(Func<bool> condition, string description) =>
+        WaitUntilAsync(() => ValueTask.FromResult(condition()), description);
+
+    private static async Task WaitUntilAsync(Func<ValueTask<bool>> condition, string description)
     {
         var deadline = DateTimeOffset.UtcNow + TestTimeout;
-        while ((await monitor.GetJobAsync(jobId))?.State != state)
+        while (DateTimeOffset.UtcNow < deadline)
         {
-            Assert.True(DateTimeOffset.UtcNow < deadline, $"job {jobId} never reached {state}");
-            await Task.Delay(25);
+            if (await condition())
+            {
+                return;
+            }
+            await Task.Delay(10);
         }
+        Assert.Fail($"Timed out waiting for {description}.");
     }
 
     [Fact]
@@ -159,16 +169,6 @@ public class OutcomeWriteOverlapTests
         await app.StopAsync();
     }
 
-    private static async Task WaitForSweepsAsync(FaultableStore store, int sweeps)
-    {
-        var deadline = DateTimeOffset.UtcNow + TestTimeout;
-        while (store.ExpireLeasesCalls < sweeps)
-        {
-            Assert.True(DateTimeOffset.UtcNow < deadline, $"the pump swept {store.ExpireLeasesCalls} times, never {sweeps}");
-            await Task.Delay(10);
-        }
-    }
-
     [Fact]
     public async Task ARowBeingWritten_KeepsItsPoolSlot_UntilTheWriteAnswers()
     {
@@ -211,11 +211,12 @@ public class OutcomeWriteOverlapTests
 
         await board.Ran("second").WaitAsync(TestTimeout);
         Assert.Equal(JobState.Leased, (await monitor.GetJobAsync(first))!.State);
-        await unwritten.WaitForAsync(2, TestTimeout);
+        await WaitUntilAsync(() => unwritten.Current == 2, "two unwritten outcomes");
 
         var lastClaim = store.LastClaimAt;
         var third = await client.EnqueueAsync(new PingJob("third"), dueTime: DateTimeOffset.UtcNow);
-        await WaitForSweepsAsync(store, store.ExpireLeasesCalls + 2);
+        var sweeps = store.ExpireLeasesCalls + 2;
+        await WaitUntilAsync(() => store.ExpireLeasesCalls >= sweeps, $"{sweeps} lease sweeps");
         Assert.Equal(lastClaim, store.LastClaimAt);
         Assert.False(board.HasRun("third"), "the third job ran while two finished jobs filled the pool and its one extra slot");
         Assert.Equal(JobState.Scheduled, (await monitor.GetJobAsync(third))!.State);
@@ -402,16 +403,6 @@ internal sealed class UnwrittenOutcomesRecorder : IDisposable
     }
 
     public long Current => Interlocked.Read(ref _current);
-
-    public async Task WaitForAsync(long count, TimeSpan timeout)
-    {
-        var deadline = DateTimeOffset.UtcNow + timeout;
-        while (Current != count)
-        {
-            Assert.True(DateTimeOffset.UtcNow < deadline, $"the unwritten count stayed at {Current}, never {count}");
-            await Task.Delay(10);
-        }
-    }
 
     public void Dispose() => _listener.Dispose();
 }
