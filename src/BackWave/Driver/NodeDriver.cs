@@ -75,10 +75,9 @@ internal sealed class NodeDriver(NodeOptions options)
                 // default) runs maintenance every poll: the historical behaviour, byte-for-byte.
                 var maintenanceDue =
                     _lastMaintenance is not { } last || poll.Now - last >= options.MaintenanceInterval;
-                // Compute the claim pass BEFORE draining the buffer: a buffered-but-unreported outcome still
-                // holds its store Lease, so it must keep counting against the pool (StartClaimPass subtracts
-                // it). The buffered slots re-open only when the imminent flush's applied outcomes re-poll, so
-                // claiming them here too would over-admit past PoolSize (ADR 0035).
+                // Compute the claim pass BEFORE draining the buffer. A buffered outcome still holds its store
+                // Lease, so FreeSlots counts it the same way buffered or in flight: inside the open headroom it
+                // holds no pool slot, and past it, one slot until its write answers.
                 Command.ClaimBatch? firstClaim = null;
                 if (_claimInFlight is null)
                 {

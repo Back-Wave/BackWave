@@ -72,15 +72,15 @@ public sealed record WorkerGroupOptions
     /// faster and a backlog under load shrinks. At most <see cref="PoolSize"/> handlers run at once either way.
     /// <para>
     /// The cost is what a crash or a lost store runs again. A job whose outcome is not yet written runs again
-    /// once its lease lapses, so after a crash or an outage a pump can re-run up to <see cref="PoolSize"/> plus
+    /// once its Lease lapses, so after a crash or an outage a pump can re-run up to <see cref="PoolSize"/> plus
     /// this value of jobs, against up to <see cref="PoolSize"/> at 0. Every job stays at-least-once and is done
     /// only once its outcome is written. While outcome writes fail, the pump stops using these extra slots until
     /// a write succeeds again.
     /// </para>
     /// <para>
     /// For short jobs that are safe to run twice, set this to <see cref="PoolSize"/>. Keep 0 for jobs that are
-    /// costly or unsafe to run twice. Concurrency limits still hold, because a job keeps its lease, and counts
-    /// toward its queue's limit, until its outcome is written. The <c>backwave.worker.outcomes.unwritten</c>
+    /// costly or unsafe to run twice. A Concurrency Limit still holds, because a job keeps its Lease, and counts
+    /// toward its Queue's Concurrency Limit, until its outcome is written. The <c>backwave.worker.outcomes.unwritten</c>
     /// metric counts the jobs that wait. Must not be negative. Defaults to 0.
     /// </para>
     /// </summary>
