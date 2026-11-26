@@ -113,10 +113,17 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         _postCommitHints = new WakeUpHintCoalescer(SendHintsAsync, _logger);
         _claimInOneStatement = $"""
             WITH {ClaimCandidates},
-            claimed AS ({ClaimUpdate}),
+            gate AS (
+                SELECT EXISTS (
+                    SELECT 1 FROM candidates c LEFT JOIN backwave.jobs seen ON seen.job_id = c.job_id
+                    WHERE seen.xmin IS DISTINCT FROM c.locked_version
+                ) AS gated
+            ),
+            admitted AS (SELECT c.job_id FROM candidates c, gate WHERE NOT gate.gated),
+            claimed AS ({ClaimUpdate("admitted")}),
             leased AS (SELECT job_id, state, attempt, NULL::text AS detail, sequence AS ord FROM claimed)
             {TransitionLogCtes("leased")}
-            SELECT * FROM claimed
+            SELECT claimed.*, gate.gated FROM gate LEFT JOIN claimed ON true
             """;
         _enqueueJob = _historyPolicy == JobHistoryPolicy.Off
             ? $"WITH inserted AS ({InsertJob} RETURNING job_id) SELECT count(*) FROM inserted"
@@ -532,29 +539,36 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
     // The claim of a Queue recently seen unlimited and unpaused: one autocommit statement, so the lease
     // write, its Leased transitions and any prune commit together in one round trip. Every CTE of the
-    // statement reads the snapshot it started with. A transition committed after that snapshot but
-    // before the row lock - another claimer leased the job and handed it back in that window - is
-    // missing from the ordinal read, so the insert collides on the primary key and the statement rolls
-    // back whole. Null then, and the caller claims the Queue in a transaction, which reads the Queue's
-    // config again and whose insert reads a snapshot taken after the locks.
+    // statement reads the snapshot it started with, but FOR UPDATE locks the newest version of each row,
+    // which can be newer: another claimer leased the job and handed it back after that snapshot. The
+    // ordinal read and the prune would then miss that claimer's transitions. Every transition writer
+    // also updates the job row in its transaction, so the gate compares the version the snapshot sees
+    // with the locked one. On any difference the statement writes nothing and this returns null, and the
+    // caller claims the Queue in a transaction, which reads the Queue's config again and whose log write
+    // reads a snapshot taken after the locks.
     private async ValueTask<List<JobRecord>?> TryClaimInOneStatementAsync(
         NpgsqlConnection connection, ClaimRequest request, string queue, int take, CancellationToken cancellationToken)
     {
         await using var claim = Cmd(_claimInOneStatement, connection);
         AddClaimParameters(claim, request, queue, take);
         claim.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
-        try
+        var queueClaims = new List<JobRecord>();
+        await using var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        var tags = reader.GetOrdinal("tags");
+        var gated = reader.GetOrdinal("gated");
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            return await ReadClaimedAsync(claim, request, cancellationToken).ConfigureAwait(false);
+            if (reader.GetBoolean(gated))
+            {
+                return null;
+            }
+            if (!reader.IsDBNull(0))
+            {
+                queueClaims.Add(ReadClaimedJob(reader, request, tags));
+            }
         }
-        catch (PostgresException exception) when (IsTransitionOrdinalCollision(exception))
-        {
-            return null;
-        }
+        return queueClaims;
     }
-
-    private static bool IsTransitionOrdinalCollision(PostgresException exception)
-        => exception is { SqlState: PostgresErrorCodes.UniqueViolation, ConstraintName: "job_transitions_pkey" };
 
     private async ValueTask<List<JobRecord>> ClaimInTransactionAsync(
         NpgsqlConnection connection, ClaimRequest request, string queue, int take, CancellationToken cancellationToken)
@@ -615,7 +629,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             return [];
         }
 
-        await using var claim = Cmd($"WITH {ClaimCandidates} {ClaimUpdate}", connection, transaction);
+        await using var claim = Cmd($"WITH {ClaimCandidates} {ClaimUpdate("candidates")}", connection, transaction);
         AddClaimParameters(claim, request, queue, Math.Min(take, slots));
         var queueClaims = await ReadClaimedAsync(claim, request, cancellationToken).ConfigureAwait(false);
         // Crash after the lease write, before commit: rollback must un-lease every row (issue 0034).
@@ -634,7 +648,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     private const string ClaimCandidates =
         """
         candidates AS (
-            SELECT job_id FROM backwave.jobs
+            SELECT job_id, xmin AS locked_version FROM backwave.jobs
             WHERE queue = @queue AND state = 0 AND due_time <= @now
             ORDER BY due_time, sequence
             LIMIT @take
@@ -644,12 +658,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
     // Job Tags ride back with the claim as a correlated aggregate in the same round trip, never a
     // second SELECT, so the no-tags hot path pays only a PK-indexed empty lookup (NULL) and is never N+1.
-    // ReadClaimedAsync reconstructs the empty-string-key Label discriminator.
-    private const string ClaimUpdate =
-        """
+    // ReadClaimedJob reconstructs the empty-string-key Label discriminator.
+    private static string ClaimUpdate(string source) =>
+        $"""
         UPDATE backwave.jobs j
         SET state = 2, attempt = j.attempt + 1, lease_owner = @worker, lease_expiry = @expiry
-        FROM candidates c
+        FROM {source} c
         WHERE j.job_id = c.job_id
         RETURNING j.job_id, j.wire_name, j.payload, j.queue, j.state, j.due_time, j.attempt,
                   j.lease_owner, j.lease_expiry, j.cancel_requested, j.terminal_at,
@@ -662,10 +676,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     // The Transition Log append (§5.12) and its per-job-life prune (§7) as CTEs over `source`, a CTE of
     // (job_id, state, attempt, detail, ord) rows with each job at most once, appended in `ord` order. It
     // writes every transition except the enqueue's ordinal-0 insert. Every CTE reads the statement's one
-    // snapshot, so a transaction path runs it after the statement that locks the jobs, and the ordinal
-    // read sees every committed transition of a locked job. The prune deletes only rows older than the new
-    // one, which that snapshot sees, and its cap filter leaves it nothing to delete until a job reaches
-    // the cap. Empty under JobHistoryPolicy.Off, and otherwise starts with the comma that follows the
+    // snapshot, so a transaction path runs it after the statement that locks the jobs, and the
+    // one-statement claim runs it only when its snapshot holds the version of each job row it locked.
+    // Either way the ordinal read sees every committed transition of a locked job. The prune deletes only
+    // rows older than the new one, which that snapshot sees, and its cap filter leaves it nothing to
+    // delete until a job reaches the cap. Empty under JobHistoryPolicy.Off, and otherwise starts with the comma that follows the
     // statement's previous CTE.
     private string TransitionLogCtes(string source) => _historyPolicy == JobHistoryPolicy.Off
         ? ""
@@ -706,21 +721,22 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         var tags = reader.GetOrdinal("tags");
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            var job = ReadJob(reader);
-            if (job.State != JobState.Leased || !string.Equals(job.LeaseOwner, request.WorkerId, StringComparison.Ordinal))
-            {
-                throw Invariant.Halt(
-                    InvariantTrigger.ClaimedRowNotLeasedToWorker,
-                    $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
-            }
-            // The correlated tag aggregate: json, or NULL when the job has none.
-            if (!reader.IsDBNull(tags))
-            {
-                job = job with { Tags = ParseTagsJson(reader.GetString(tags)) };
-            }
-            queueClaims.Add(job);
+            queueClaims.Add(ReadClaimedJob(reader, request, tags));
         }
         return queueClaims;
+    }
+
+    private static JobRecord ReadClaimedJob(NpgsqlDataReader reader, ClaimRequest request, int tags)
+    {
+        var job = ReadJob(reader);
+        if (job.State != JobState.Leased || !string.Equals(job.LeaseOwner, request.WorkerId, StringComparison.Ordinal))
+        {
+            throw Invariant.Halt(
+                InvariantTrigger.ClaimedRowNotLeasedToWorker,
+                $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
+        }
+        // The correlated tag aggregate: json, or NULL when the job has none.
+        return reader.IsDBNull(tags) ? job : job with { Tags = ParseTagsJson(reader.GetString(tags)) };
     }
 
     // The earliest future instant a currently-empty claim could begin returning work through time alone,
