@@ -167,6 +167,27 @@ public class ShutdownHandBackTests
         Assert.Equal(JobState.Leased, (await monitor.GetJobAsync(jobId))!.State); // degraded to today's lapse
     }
 
+    // WebApplicationFactory stops the host while app.Run() stops it again, so a group can see a second
+    // stop, before or after its disposal, whose token outlives it. That token firing must not throw.
+    [Fact]
+    public async Task StopTokensThatFireAfterDisposal_DoNotThrow_WhenTheGroupIsStoppedTwice()
+    {
+        await using var app = BuildHost(new InMemoryJobStore(), new RecoveryGate());
+        await app.StartAsync();
+        var group = app.Services.GetServices<Microsoft.Extensions.Hosting.IHostedService>()
+            .OfType<WorkerGroupService>().Single();
+        using var stoppedBefore = new CancellationTokenSource();
+        using var stoppedAfter = new CancellationTokenSource();
+
+        await group.StopAsync(stoppedBefore.Token).WaitAsync(TestTimeout);
+        await app.StopAsync().WaitAsync(TestTimeout);
+        await app.DisposeAsync();
+        await group.StopAsync(stoppedAfter.Token).WaitAsync(TestTimeout);
+
+        stoppedBefore.Cancel();
+        stoppedAfter.Cancel();
+    }
+
     [Fact]
     public async Task ZeroShutdownBudget_SkipsTheHandBack_LeavingTheLeaseToLapse()
     {
