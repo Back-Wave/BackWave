@@ -542,7 +542,9 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
         var tags = reader.GetOrdinal("tags");
         var candidatesColumn = reader.GetOrdinal("candidates");
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        // The Lease commits with the statement, so a cancelled read would leave these jobs leased to this
+        // worker, unseen, until the Lease expires. Stopping the read saves nothing.
+        while (await reader.ReadAsync(CancellationToken.None).ConfigureAwait(false))
         {
             candidates = reader.GetInt64(candidatesColumn);
             if (!reader.IsDBNull(0))
