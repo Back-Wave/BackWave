@@ -51,7 +51,7 @@ The first run needs network access, and Java 11 or later or mise. `tests/formal/
 
 Add `--quick` to skip the two liveness runs, `--deep` to add `Deep.cfg`, or `--config <name>.cfg` to run one config, for example `--config Liveness.cfg`. A horizon mutant given to `--config` runs both of its checks, described below. Any other argument prints the usage and exits 2.
 
-`tlc.sh` runs one TLC process at a time on the machine, from any checkout. A second run prints `Waiting for the TLC run of PID <pid> to finish` and starts when the first ends. Each run uses half the CPU cores and a 4 GiB heap. Set `TLC_WORKERS` (a number, or `auto` for every core) or `TLC_HEAP` (an `-Xmx` value such as `8g`) to change that.
+`tlc.sh` runs one TLC process at a time on the machine, from any checkout. A second run prints `Waiting for the TLC run of PID <pid> to finish` and starts when the first ends. The seconds the script prints include that wait. Each run uses half the CPU cores and a 4 GiB heap. Set `TLC_WORKERS` (a number, or `auto` for every core) or `TLC_HEAP` (an `-Xmx` value such as `8g`) to change that.
 
 TLC is CPU-bound, so a run takes longer when other work loads the machine. Run `uptime` first. On a 10-core M-series Mac, a full run with every core as workers took 4 minutes 37 seconds at a load average near 350, and a cold run took 16 minutes 34 seconds at a load near 300. With the default 5 workers, `--deep` took 7 minutes 21 seconds at a load average between 98 and 145 (2026-11-26).
 

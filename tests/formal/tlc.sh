@@ -84,4 +84,10 @@ states="$(mktemp -d)"
 
 cd "$spec_dir"
 "${java[@]}" "-Xmx$heap" -XX:+UseParallelGC -cp "$jar" tlc2.TLC \
-  -workers "$workers" -cleanup -metadir "$states" "$spec_file" "$@"
+  -workers "$workers" -cleanup -metadir "$states" "$spec_file" "$@" &
+child=$!
+trap 'kill "$child" 2>/dev/null' INT TERM HUP
+status=0
+wait "$child" || status=$?
+while kill -0 "$child" 2>/dev/null; do wait "$child" || status=$?; done
+exit "$status"

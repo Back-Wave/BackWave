@@ -13,7 +13,7 @@ mode="${1:-}"
 only=""
 case "$#:$mode" in
   0: | 1:--quick | 1:--deep) ;;
-  2:--config) only="$(basename "$2")" ;;
+  2:--config) [[ -n "$2" ]] || usage; only="$(basename "$2")" ;;
   *) usage ;;
 esac
 
