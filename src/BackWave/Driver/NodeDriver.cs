@@ -48,12 +48,13 @@ internal sealed class NodeDriver(NodeOptions options)
     /// <summary>
     /// Reacts to one event. The first event after which a slot is free pays a poll that waited for one, as one
     /// re-poll, even below a full claim: a job from an earlier claim can keep the pool from a full claim for as
-    /// long as it runs. A claim pass that starts first pays it as well.
+    /// long as it runs. A claim pass that starts first pays it as well. A faulted write never pays it, because the
+    /// production pump re-throws that write's store fault before it runs any command the event yields.
     /// </summary>
     public IReadOnlyList<Command> Step(NodeEvent nodeEvent)
     {
         var commands = React(nodeEvent);
-        if (!_pollWaitsForASlot || FreeSlots <= 0)
+        if (!_pollWaitsForASlot || FreeSlots <= 0 || nodeEvent is NodeEvent.OutcomeBatchFaulted)
         {
             return commands;
         }

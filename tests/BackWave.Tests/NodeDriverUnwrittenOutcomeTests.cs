@@ -245,6 +245,30 @@ public class NodeDriverUnwrittenOutcomeTests
         Assert.DoesNotContain(Finish(driver, landed[1]), command => command is Command.RequestPoll);
     }
 
+    /// <summary>
+    /// The production pump re-throws a faulted write's store fault before it runs the commands that event yields,
+    /// so a re-poll the fault yielded would be lost there and run in the simulator. The poll stays owed instead.
+    /// </summary>
+    [Fact]
+    public void AFaultedWrite_NeverPaysAPollThatWaitsForASlot_TheNextEventDoes()
+    {
+        var driver = Driver(unwrittenOutcomeSlots: 1, poolSize: 2, maxOutcomeBatch: 2);
+        foreach (var job in Claimed(driver))
+        {
+            Finish(driver, job);
+        }
+        Assert.Equal(1, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
+        driver.Step(new NodeEvent.PollDue(T0));
+        var last = Jobs(1);
+        Assert.Null(Claim(driver.Step(new NodeEvent.ClaimCompleted(last, T0))));
+        Assert.DoesNotContain(Finish(driver, last[0]), command => command is Command.RequestPoll);
+
+        // Dropping the 2 rows in flight frees the slot the second of them held past the headroom of 1.
+        Assert.Empty(driver.Step(new NodeEvent.OutcomeBatchFaulted(T0)));
+
+        Assert.Contains(driver.Step(new NodeEvent.HeartbeatDue(T0)), command => command is Command.RequestPoll);
+    }
+
     [Fact]
     public void AWeightedPass_ClaimsNothingIntoTheHeadroom_AfterAFaultBetweenItsBatches()
     {
