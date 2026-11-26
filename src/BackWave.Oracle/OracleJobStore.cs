@@ -602,9 +602,9 @@ public sealed class OracleJobStore(OracleStoreOptions options) : IJobStore, ISto
                     // Oracle has no multi-row RETURNING, so the claim reads the row BEFORE it leases it and
                     // synthesizes the post-lease state in memory. SKIP LOCKED does not re-evaluate a row that
                     // changed after the statement snapshot: it skips the row, but only when the change touches
-                    // a column this query level reads. This level reads state and due_time, so a job that a
-                    // claim or reschedule changed after the subquery picked it is skipped (measured on Oracle
-                    // 21 and 23, not on 19c). The checks below guard any version that behaves otherwise. The
+                    // a column this query level reads. This level selects every column, so a job that any
+                    // write changed after the subquery picked it is skipped (the rule is measured on Oracle 21
+                    // and 23, not on 19c). The checks below guard any version that behaves otherwise. The
                     // reschedule race conformance fact and the Torture claim checks cover the invariant end to end.
                     if (job.State != JobState.Scheduled)
                     {
