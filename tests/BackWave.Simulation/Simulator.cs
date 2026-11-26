@@ -2031,7 +2031,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                             !node.HeadroomClosed,
                             $"node-{nodeIndex} claimed {claim.MaxJobs} into its unwritten-outcome headroom after a "
                             + $"faulted outcome write closed it: {node.Executing.Count} in-flight executions and "
-                            + $"{UnwrittenOutcomes(node)} unwritten outcomes against a pool of {options.PoolSize}");
+                            + $"{UnwrittenOutcomeCount(node)} unwritten outcomes against a pool of {options.PoolSize}");
                         _claimsIntoUnwrittenHeadroom++;
                     }
                     if (options.MaxStoreLaneLatency > TimeSpan.Zero && !node.Down)
@@ -3224,7 +3224,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
                 InvariantId.PerNodeCap,
                 node.Executing.Count <= options.PoolSize,
                 $"per-node cap {options.PoolSize} exceeded: node-{n} has {node.Executing.Count} in-flight executions");
-            var unwritten = UnwrittenOutcomes(node);
+            var unwritten = UnwrittenOutcomeCount(node);
             Invariant(
                 InvariantId.PerNodeCap,
                 node.Executing.Count + unwritten <= (long)options.PoolSize + options.UnwrittenOutcomeSlots,
@@ -3245,7 +3245,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     /// rows of its write in flight whose job it is not running again. The Driver counts those rows as well, so
     /// this count is at most the Driver's.
     /// </summary>
-    private static int UnwrittenOutcomes(SimNode node)
+    private static int UnwrittenOutcomeCount(SimNode node)
         => node.Driver.BufferedOutcomeCount
             + (node.OutcomeWrite?.Batch!.Outcomes.Count(row => !node.Executing.ContainsKey(row.JobId)) ?? 0);
 
@@ -3255,7 +3255,7 @@ internal sealed class Simulator(SimulationOptions options, FaultPlan? faultPlan 
     /// </summary>
     private bool ClaimsIntoHeadroom(SimNode node, Command.ClaimBatch claim)
     {
-        var unwritten = UnwrittenOutcomes(node);
+        var unwritten = UnwrittenOutcomeCount(node);
         return unwritten > 0 && claim.MaxJobs > options.PoolSize - node.Executing.Count - unwritten;
     }
 
