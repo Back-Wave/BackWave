@@ -103,6 +103,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         _historyPolicy = JobHistoryPolicyResolver.Resolve(options.HistoryPolicy);
         _dataSource = NpgsqlDataSource.Create(options.ConnectionString);
         _postCommitHints = new WakeUpHintCoalescer(SendHintsAsync, _logger);
+        // An empty claim still fires observer_log_register on its 0-row log insert (about 50 us of server CPU).
         _claimInOneStatement = $"""
             WITH {ClaimCandidates},
             claimed AS ({ClaimUpdate(lockedVersionOnly: true)}),
