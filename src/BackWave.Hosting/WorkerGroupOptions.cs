@@ -75,7 +75,8 @@ public sealed record WorkerGroupOptions
     /// once its Lease lapses, so after a crash or an outage a pump can re-run up to <see cref="PoolSize"/> plus
     /// this value of jobs, against up to <see cref="PoolSize"/> at 0. Every job stays at-least-once and is done
     /// only once its outcome is written. While outcome writes fail, the pump stops using these extra slots until
-    /// a write succeeds again.
+    /// a write succeeds again. With this above 0, a Wake-Up Hint that arrives during a claim can wait up to one
+    /// <see cref="PollInterval"/> while slots are free, until the jobs of that claim finish.
     /// </para>
     /// <para>
     /// For short jobs that are safe to run twice, set this to <see cref="PoolSize"/>. Keep 0 for jobs that are

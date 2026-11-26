@@ -77,13 +77,15 @@ public class NodeDriverUnwrittenOutcomeTests
     }
 
     /// <summary>
-    /// A poll that waited on a claim can be a Wake-Up Hint for work due now, so the slots the claim left serve it at
-    /// once, with or without headroom. A pass that waited for the claimed jobs instead left the hint for the poll tick.
+    /// With headroom the jobs of a short claim give their slots back as they finish, so a pass chained at once would
+    /// claim only the slots they leave and split the pool into two cohorts. The poll waits on those jobs instead, at
+    /// the cost of a Wake-Up Hint that can wait for them while slots are free. With no headroom a finish frees no
+    /// slot, so the pass chains at once.
     /// </summary>
     [Theory]
-    [InlineData(0)]
-    [InlineData(4)]
-    public void AShortClaimWithAWaitingPoll_ChainsAPassForTheSlotsItLeft(int unwrittenOutcomeSlots)
+    [InlineData(0, 2)]
+    [InlineData(4, null)]
+    public void AShortClaimWithAWaitingPoll_ChainsAPartialPass_OnlyWithNoHeadroom(int unwrittenOutcomeSlots, int? chained)
     {
         var driver = Driver(unwrittenOutcomeSlots);
         var claim = Assert.IsType<Command.ClaimBatch>(Claim(driver.Step(new NodeEvent.PollDue(T0))));
@@ -92,7 +94,7 @@ public class NodeDriverUnwrittenOutcomeTests
 
         var landed = driver.Step(new NodeEvent.ClaimCompleted(Jobs(2), T0));
 
-        Assert.Equal(2, Claim(landed)?.MaxJobs);
+        Assert.Equal(chained, Claim(landed)?.MaxJobs);
     }
 
     [Fact]
@@ -103,7 +105,6 @@ public class NodeDriverUnwrittenOutcomeTests
         driver.Step(new NodeEvent.PollDue(T0));
         var jobs = Jobs(2);
         driver.Step(new NodeEvent.ClaimCompleted(jobs, T0));
-        driver.Step(new NodeEvent.ClaimCompleted([], T0));
 
         Assert.DoesNotContain(Finish(driver, jobs[0]), command => command is Command.RequestPoll);
         Assert.Contains(Finish(driver, jobs[1]), command => command is Command.RequestPoll);
@@ -217,53 +218,52 @@ public class NodeDriverUnwrittenOutcomeTests
         Assert.Equal(3, Claim(landed)?.MaxJobs);
     }
 
-    /// <summary>
-    /// Fills the pool of 4 with one long job and then a claim of 3 that a Wake-Up Hint waited on, so the hint finds
-    /// no free slot when that claim lands.
-    /// </summary>
-    private static JobRecord[] FillThePoolUnderAWaitingPoll(NodeDriver driver)
+    [Fact]
+    public void WithHeadroom_TheJobsOfAShortClaim_RepollWhenTheyFinish_EvenBelowAFullClaim()
     {
+        var driver = Driver(unwrittenOutcomeSlots: 4);
         driver.Step(new NodeEvent.PollDue(T0));
         driver.Step(new NodeEvent.ClaimCompleted(Jobs(1), T0));
-        Assert.Equal(3, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
         driver.Step(new NodeEvent.PollDue(T0));
-        var landed = Jobs(3);
-        Assert.Null(Claim(driver.Step(new NodeEvent.ClaimCompleted(landed, T0))));
-        return landed;
+        driver.Step(new NodeEvent.PollDue(T0));
+        var shortJob = Assert.Single(Jobs(1));
+        Assert.Null(Claim(driver.Step(new NodeEvent.ClaimCompleted([shortJob], T0))));
+
+        Assert.Contains(Finish(driver, shortJob), command => command is Command.RequestPoll);
+        Assert.Equal(3, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
     }
 
     [Fact]
-    public void WithHeadroom_APollThatFoundThePoolFull_RepollsOnTheFirstFinish_EvenBelowAFullClaim()
+    public void WithHeadroom_TheJobsOfAShortClaim_RepollWhenTheirLeasesAreLost_EvenBelowAFullClaim()
     {
         var driver = Driver(unwrittenOutcomeSlots: 4);
-        var landed = FillThePoolUnderAWaitingPoll(driver);
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.ClaimCompleted(Jobs(1), T0));
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.PollDue(T0));
+        var lostJob = Assert.Single(Jobs(1));
+        driver.Step(new NodeEvent.ClaimCompleted([lostJob], T0));
 
-        Assert.Contains(Finish(driver, landed[0]), command => command is Command.RequestPoll);
-        Assert.Equal(1, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
-    }
-
-    [Fact]
-    public void WithHeadroom_APollThatFoundThePoolFull_RepollsOnTheFirstLostLease_EvenBelowAFullClaim()
-    {
-        var driver = Driver(unwrittenOutcomeSlots: 4);
-        var landed = FillThePoolUnderAWaitingPoll(driver);
-
-        var heartbeat = driver.Step(new NodeEvent.HeartbeatCompleted(
-            [new HeartbeatResult(landed[0].JobId, Renewed: false, CancelRequested: false)], T0));
+        var heartbeat = driver.Step(new NodeEvent.HeartbeatCompleted([new HeartbeatResult(lostJob.JobId, Renewed: false, CancelRequested: false)], T0));
 
         Assert.Contains(heartbeat, command => command is Command.RequestPoll);
-        Assert.Equal(1, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
+        Assert.Equal(3, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
     }
 
     [Fact]
-    public void WithHeadroom_APollThatFoundThePoolFull_RepollsOnce()
+    public void WithHeadroom_TheJobsOfAShortClaim_RepollOnce_AfterTheLastOfThemFinishes()
     {
         var driver = Driver(unwrittenOutcomeSlots: 4);
-        var landed = FillThePoolUnderAWaitingPoll(driver);
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.ClaimCompleted(Jobs(1), T0));
+        driver.Step(new NodeEvent.PollDue(T0));
+        driver.Step(new NodeEvent.PollDue(T0));
+        var landed = Jobs(2);
+        driver.Step(new NodeEvent.ClaimCompleted(landed, T0));
 
-        Finish(driver, landed[0]);
-
-        Assert.DoesNotContain(Finish(driver, landed[1]), command => command is Command.RequestPoll);
+        Assert.DoesNotContain(Finish(driver, landed[0]), command => command is Command.RequestPoll);
+        Assert.Contains(Finish(driver, landed[1]), command => command is Command.RequestPoll);
+        Assert.DoesNotContain(driver.Step(new NodeEvent.HeartbeatDue(T0)), command => command is Command.RequestPoll);
     }
 
     /// <summary>
