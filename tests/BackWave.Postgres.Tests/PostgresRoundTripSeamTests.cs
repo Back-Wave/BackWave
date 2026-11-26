@@ -65,9 +65,9 @@ public sealed class PostgresRoundTripSeamTests
              {string.Join(Environment.NewLine, offenders)}
 
              Call ExecuteNonQueryCountedAsync / ExecuteReaderCountedAsync / ExecuteScalarCountedAsync /
-             CommitCountedAsync instead. If the statement genuinely belongs to no store operation - it runs on its own
-             session, outside every operation the budgets measure - put a comment directly above the
-             call that starts with "{ExemptionMarker}" and says why.
+             CommitCountedAsync instead. If the statement genuinely belongs to no store operation - it
+             runs on its own session, outside every operation the budgets measure - put a comment
+             directly above the call that starts with "{ExemptionMarker}" and says why.
              """);
     }
 

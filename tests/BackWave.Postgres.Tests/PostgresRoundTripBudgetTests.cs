@@ -19,8 +19,9 @@ namespace BackWave.Postgres.Tests;
 /// regression that would otherwise reach production as nothing but a slightly slower job rate.
 ///
 /// What the count covers: commands executed and COMMITs sent, per operation; their sum is the
-/// operation's round trips. A command that holds two statements is one round trip. What it does not: opening a pooled connection, BEGIN (Npgsql prepends it to
-/// the first statement, so it never waits on its own), and the one-time schema-version check.
+/// operation's round trips. A command that holds two statements is one round trip. What it does not:
+/// opening a pooled connection, BEGIN (Npgsql prepends it to the first statement, so it never waits on
+/// its own), and the one-time schema-version check.
 ///
 /// Unlike the Oracle budgets there is no LOB-read column and no fetch window here, because Postgres has
 /// no LOB locator on these paths: bytea and text values arrive inside the row like every other column,

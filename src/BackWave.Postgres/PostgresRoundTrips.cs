@@ -78,8 +78,9 @@ internal static class PostgresRoundTrips
     // The adapter's execution entry points. Every ExecuteXxxAsync in the adapter goes through one of
     // these, and so does every COMMIT, and that is enforced rather than trusted: PostgresRoundTripSeamTests
     // fails the build's test pass on any bare driver call in src/BackWave.Postgres that is neither a
-    // wrapper body below nor marked "uncounted round trip:" at the call site with a reason. The marked ones are statements
-    // belonging to no operation - the Wake-Up Hint subscription's parked LISTEN session, and migration.
+    // wrapper body below nor marked "uncounted round trip:" at the call site with a reason. The marked
+    // ones are statements belonging to no operation - the Wake-Up Hint subscription's parked LISTEN
+    // session, and migration.
     internal static Task<int> ExecuteNonQueryCountedAsync(
         this NpgsqlCommand command, CancellationToken cancellationToken)
     {
