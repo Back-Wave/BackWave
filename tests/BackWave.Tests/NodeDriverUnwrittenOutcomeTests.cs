@@ -138,7 +138,7 @@ public class NodeDriverUnwrittenOutcomeTests
     }
 
     [Fact]
-    public void AFaultedWrite_ClosesTheHeadroom_UntilAWriteAppliesRowsAgain()
+    public void AFaultedWrite_ClosesTheHeadroom_UntilAWriteLands()
     {
         var driver = Driver(unwrittenOutcomeSlots: 4);
         var first = Claimed(driver);
@@ -160,6 +160,27 @@ public class NodeDriverUnwrittenOutcomeTests
 
         // Headroom open again: PoolSize 4 - Running 1 - max(0, Unwritten 1 - 4).
         Assert.Equal(3, Claim(driver.Step(new NodeEvent.PollDue(T0)))!.MaxJobs);
+    }
+
+    [Fact]
+    public void AWriteNeverIssued_KeepsTheHeadroomOpen()
+    {
+        var driver = Driver(unwrittenOutcomeSlots: 4);
+        var first = Claimed(driver);
+        foreach (var job in first)
+        {
+            Finish(driver, job);
+        }
+        var second = Claimed(driver);
+        Finish(driver, second[0]);
+        Finish(driver, second[1]);
+
+        driver.Step(new NodeEvent.OutcomeBatchNotIssued(T0));
+        var afterNotIssued = driver.Step(new NodeEvent.PollDue(T0));
+
+        Assert.Single(afterNotIssued.OfType<Command.ReportOutcomeBatch>());
+        // PoolSize 4 - Running 2 - max(0, Unwritten 2 - 4).
+        Assert.Equal(2, Claim(afterNotIssued)!.MaxJobs);
     }
 
     [Theory]
