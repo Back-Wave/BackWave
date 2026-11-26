@@ -682,8 +682,7 @@ internal sealed class WorkerGroupService(
             {
                 continue;
             }
-            var commands = Step(driver, nodeEvent);
-            foreach (var command in commands)
+            foreach (var command in Step(driver, nodeEvent))
             {
                 await ExecuteToCompletionAsync(command, events.Writer, budget).ConfigureAwait(false);
             }
