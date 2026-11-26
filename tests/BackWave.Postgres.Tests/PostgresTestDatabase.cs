@@ -71,8 +71,8 @@ public static class PostgresTestDatabase
     }
 
     /// <summary>
-    /// Waits until a backend of the store created with <paramref name="applicationName"/> waits on a lock,
-    /// of <paramref name="waitEvent"/> when given. Fails the test after five seconds.
+    /// Waits until a backend whose application name is <paramref name="applicationName"/> waits on a
+    /// lock (on <paramref name="waitEvent"/>, when given). Fails the test after five seconds.
     /// </summary>
     public static async Task WaitForLockWaitAsync(string applicationName, string? waitEvent = null)
     {

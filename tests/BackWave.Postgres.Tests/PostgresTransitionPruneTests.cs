@@ -175,7 +175,6 @@ public sealed class PostgresTransitionPruneTests
         Assert.Equal(cap, (await store.GetJobHistoryAsync(churner)).Count);
     }
 
-    // Claims both jobs and batch-reports both as retries.
     private static async Task ReportRetryBatchAsync(PostgresJobStore store, DateTimeOffset now)
     {
         var claimed = await store.ClaimAsync(new ClaimRequest("w1", ["prune"], 32, Lease, now));

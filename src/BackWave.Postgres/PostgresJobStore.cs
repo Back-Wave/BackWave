@@ -43,22 +43,14 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
     private readonly WakeUpHintCoalescer _postCommitHints;
 
-    // The one-statement claim (ClaimInOneStatementAsync), fixed by the history policy at construction.
     private readonly string _claimInOneStatement;
-
-    // The outcome write, fixed the same way: gated on the child-edge check for the one-round-trip path
-    // (TryReportOutcomesInOneRoundTripAsync), ungated inside the transaction that cascades.
     private readonly string _reportOutcomesInOneRoundTrip;
     private readonly string _reportOutcomesInTransaction;
-
-    // The batch transition write (RecordTransitionsBatchAsync), fixed the same way.
     private readonly string _recordTransitions;
 
-    // The job insert and its first transition, one statement whose transition exists only for a row it
-    // inserted, so a Duplicate writes nothing. Fixed the same way. It inserts ordinal 0 directly, not
-    // through the append-and-prune CTEs, which Postgres would plan again on every unprepared enqueue.
-    // That is safe for two reasons. The job_transitions foreign key cascades on delete, so a new job id
-    // has no transition rows. MaxTransitionsPerJob is at least 1, so no cap prunes ordinal 0.
+    // Inserts ordinal 0 directly, not through TransitionLogCtes, which Postgres would plan again on every
+    // unprepared enqueue. It needs no prune: a new job id has no transition rows (the job_transitions
+    // foreign key cascades on delete), and MaxTransitionsPerJob is at least 1.
     private readonly string _enqueueJob;
 
     // Per-Queue unlimited-Queue cache (issue 0170). The Concurrency Limit (I3) and Paused flag (§5.8)
@@ -198,8 +190,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
     // Test-only failpoint (issue 0034): a no-op in production (hook null), but a test arms
     // PostgresStoreOptions.FaultHook to throw at a named point between the effects of a
-    // multi-effect operation, proving the surrounding transaction makes them all-or-nothing. A path
-    // that writes in one statement has no point between effects, so it reaches no failpoint.
+    // multi-effect operation, proving the surrounding transaction makes them all-or-nothing.
     private Task FailpointAsync(string name, CancellationToken cancellationToken)
         => _options.FaultHook?.Invoke(name, cancellationToken) ?? Task.CompletedTask;
 
@@ -305,7 +296,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 .ConfigureAwait(false);
             await ownTransaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         }
-        // The job has committed on both paths, so the hint can never reach a Pump before the job.
         if (hintQueue is not null)
         {
             _postCommitHints.Request(hintQueue);
@@ -313,8 +303,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         return result;
     }
 
-    // A job with no parents and no tags is the job row and its first transition, one statement. Run as
-    // autocommit it costs one round trip instead of two.
     private static bool IsOneStatementEnqueue(NewJob job) => job.Parents.Count == 0 && job.Tags.Count == 0;
 
     private async ValueTask<(EnqueueResult Result, string? HintQueue)> EnqueueInOneStatementAsync(
@@ -400,8 +388,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         return (EnqueueResult.Ok, state == JobState.Scheduled && job.DueTime <= now ? job.Queue : null);
     }
 
-    // The job row and its first transition, in one statement on the caller's transaction or, with none,
-    // as autocommit. False when the job id already exists (a Duplicate), which writes nothing.
+    // False when the job id already exists (a Duplicate).
     private async ValueTask<bool> InsertJobAsync(
         NpgsqlConnection connection, NpgsqlTransaction? transaction, NewJob job, JobState state,
         int parentsRemaining, JobState? cancelledByParent, DateTimeOffset now, Guid? workflowId,
@@ -640,7 +627,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         return queueClaims;
     }
 
-    // The claim's candidate pick, the single contended operation: set-based FOR UPDATE SKIP LOCKED.
     private const string ClaimCandidates =
         """
         candidates AS (
@@ -733,7 +719,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 InvariantTrigger.ClaimedRowNotLeasedToWorker,
                 $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
         }
-        // The correlated tag aggregate: json, or NULL when the job has none.
         return reader.IsDBNull(tags) ? job : job with { Tags = ParseTagsJson(reader.GetString(tags)) };
     }
 
@@ -995,7 +980,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             : await TryReportOutcomesInOneRoundTripAsync(vector, now, cancellationToken).ConfigureAwait(false)
               ?? await ReportOutcomesInTransactionAsync(batch, vector, now, cancellationToken).ConfigureAwait(false);
 
-        // One result per input row, in input order, keyed by job id: Applied when matched, else StaleLease.
         var results = new OutcomeReportResult[batch.Count];
         for (var i = 0; i < batch.Count; i++)
         {
@@ -1006,10 +990,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         return results;
     }
 
-    // The set-valued payload of a batched outcome write, one entry per batch row in batch order: each
-    // row's fence keys (worker, attempt) plus its COMPUTED target state, the per-state columns (terminal
-    // instant, cause, retry due-time) and the detail its transition records. Output blobs and Tag deltas
-    // stay out of it: the few rows carrying them get a per-row write inside the transaction.
+    // Output blobs and Tag deltas stay out of the vector: the few rows carrying them get a per-row write
+    // inside the transaction.
     private sealed record OutcomeVector(
         Guid[] Ids, string[] Workers, int[] Attempts, int[] States, string?[] Causes,
         DateTimeOffset?[] Dues, DateTimeOffset?[] TerminalAts, string?[] Details)
@@ -1027,20 +1009,17 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 vector.Ids[i] = row.JobId;
                 vector.Workers[i] = row.WorkerId;
                 vector.Attempts[i] = row.Attempt;
-                // Success -> Succeeded (3, terminal now); Failure with a retry instant -> Scheduled (0, due
-                // then, NOT terminal); Failure at the ceiling -> Dead-Lettered (5); Cancelled -> 4;
-                // Unroutable -> Quarantined (6). The cause rides terminal failures/cancel/unroutable; due
-                // rides retry. Failure Detail rides only a failing transition.
-                (int State, string? Cause, DateTimeOffset? Due, DateTimeOffset? TerminalAt) target = row.Outcome switch
+                (JobState State, string? Cause, DateTimeOffset? Due, DateTimeOffset? TerminalAt) target = row.Outcome switch
                 {
-                    JobOutcome.Success => (3, null, null, nowUtc),
-                    JobOutcome.Failure { NextDueTime: { } retryAt } => (0, null, retryAt.ToUniversalTime(), null),
-                    JobOutcome.Failure failure => (5, failure.Error, null, nowUtc),
-                    JobOutcome.Cancelled cancelled => (4, cancelled.Cause, null, nowUtc),
-                    JobOutcome.Unroutable unroutable => (6, unroutable.Reason, null, nowUtc),
+                    JobOutcome.Success => (JobState.Succeeded, null, null, nowUtc),
+                    JobOutcome.Failure { NextDueTime: { } retryAt } => (JobState.Scheduled, null, retryAt.ToUniversalTime(), null),
+                    JobOutcome.Failure failure => (JobState.DeadLettered, failure.Error, null, nowUtc),
+                    JobOutcome.Cancelled cancelled => (JobState.Cancelled, cancelled.Cause, null, nowUtc),
+                    JobOutcome.Unroutable unroutable => (JobState.Quarantined, unroutable.Reason, null, nowUtc),
                     _ => throw new ArgumentOutOfRangeException(nameof(batch)),
                 };
-                (vector.States[i], vector.Causes[i], vector.Dues[i], vector.TerminalAts[i]) = target;
+                (var state, vector.Causes[i], vector.Dues[i], vector.TerminalAts[i]) = target;
+                vector.States[i] = (int)state;
                 vector.Details[i] = row.Outcome is JobOutcome.Failure ? transitionDetail(row.FailureDetail) : null;
             }
             return vector;
@@ -1059,8 +1038,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         }
     }
 
-    // Output blobs and Tag deltas are per-row statements, so a batch carrying any of them takes the
-    // transaction.
     private static bool NeedsPerRowWrites(IReadOnlyList<OutcomeReport> batch)
     {
         foreach (var row in batch)
@@ -1087,8 +1064,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         return gated ? null : applied;
     }
 
-    // Runs an outcome command and returns whether the gate held the write back, and the state it wrote
-    // to each job it applied.
     private async ValueTask<(bool Gated, Dictionary<Guid, JobState> Applied)> WriteOutcomesAsync(
         string sql, NpgsqlConnection connection, NpgsqlTransaction? transaction, OutcomeVector vector,
         DateTimeOffset now, CancellationToken cancellationToken)
@@ -1117,10 +1092,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
     // row the fence will match, in id order. The second then reads a snapshot taken after those locks,
     // so no other transaction can still be changing these rows under it: a child enqueue that held a
     // parent's lock has committed its edge into this snapshot, and one that comes later waits on the lock
-    // and then sees the parent terminal; and the transition ordinals it reads are the latest. The second
-    // writes the outcomes and their transitions unless `gate` says to hold back, and returns the job id and
-    // written state of each applied job, or one row with a null job id when it applied none, each
-    // carrying the gate.
+    // and then sees the parent terminal; and the transition ordinals it reads are the latest. A gated or
+    // empty write returns one row with a null job id.
     private string OutcomeCommandSql(string gate) =>
         $"""
         {LockOutcomeRows};
@@ -1141,8 +1114,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
     private const string NoGate = "SELECT false AS gated";
 
-    // The fence every outcome write applies to each row independently (Effect-Once): the row is still
-    // leased to the reporting worker, at the reported attempt, and the lease is live.
     private const string OutcomeFence =
         """
         j.job_id = d.job_id AND j.state = 2 AND j.lease_owner = d.worker AND j.attempt = d.attempt
@@ -1156,7 +1127,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             WITH ORDINALITY AS d(job_id, worker, attempt, state, cause, due, terminal_at, detail, ord)
         """;
 
-    // Takes the locks only. Its one row, the count of rows locked, is not read.
     private const string LockOutcomeRows =
         $"""
         SELECT count(*) FROM (
@@ -1167,11 +1137,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         ) locked
         """;
 
-    // One fenced multi-row UPDATE: the fence applies to every row INDEPENDENTLY. A row whose lease is no
-    // longer live fails to join and changes nothing (StaleLease). due_time moves only for a retry row
-    // (COALESCE keeps it for everyone else); cancel_requested clears only for a Cancelled row.
-    // terminal_at/terminal_cause carry per-row (null for retry). retry_cause records a handler-failure
-    // retry and is left alone on every terminal row.
+    // One fenced multi-row UPDATE: a row whose lease is no longer live fails to join (StaleLease). State 0
+    // is a retry and 4 Cancelled; retry_cause 1 marks a handler-failure retry.
     private const string OutcomeWrite =
         $"""
         written AS (
@@ -1196,7 +1163,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-        // The outcome write and its transitions, the same command as the one-round-trip path without the gate.
         var (_, applied) = await WriteOutcomesAsync(
             _reportOutcomesInTransaction, connection, transaction, vector, now, cancellationToken).ConfigureAwait(false);
 
@@ -2072,9 +2038,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await audit.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    // Appends one Transition Log entry (§5.12) for a job's resulting state, inside the SAME transaction
-    // as the state change it records. `failureDetail` is the Shell-captured exception text, written only
-    // on a failing transition (§5.12); null on every other transition.
+    // Appends one Transition Log entry (§5.12) inside the transaction of the state change it records.
     private Task RecordTransitionAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction, Guid jobId, JobState state,
         int attempt, DateTimeOffset now, CancellationToken cancellationToken, string? failureDetail = null)
@@ -2082,10 +2046,8 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             connection, transaction, [(jobId, state, attempt, failureDetail)], now, cancellationToken);
 
     // Appends a batch of Transition Log entries (§5.12) and prunes each job to MaxTransitionsPerJob (§7)
-    // in one statement, inside the caller's transaction and after the statement that locked the jobs.
-    // Each job appears at most once per batch. Honors the history policy: Off writes nothing;
-    // Transitions writes the rows but never the detail; the full rung keeps the clamped detail. `now` is
-    // always the caller's clock.
+    // in one statement. Each job appears at most once. Run it after the statement that locked the jobs,
+    // so its snapshot holds their latest transitions. `now` is always the caller's clock.
     private async Task RecordTransitionsBatchAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction,
         IReadOnlyList<(Guid JobId, JobState State, int Attempt, string? FailureDetail)> rows,
@@ -2118,8 +2080,6 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await record.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    // The Failure Detail a transition row stores: Transitions records the row but never the detail; the
-    // full rung clamps and keeps it.
     private string? TransitionDetail(string? failureDetail) => _historyPolicy == JobHistoryPolicy.Transitions
         ? null
         : _options.Bounds.ClampFailureDetail(failureDetail);
