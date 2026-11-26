@@ -49,7 +49,7 @@ tests/formal/commit-horizon/check.sh
 
 The first run needs network access, and Java 11 or later or mise. `tests/formal/tlc.sh` downloads the pinned tla2tools 1.7.4 and checks its hash before it caches it, and with no Java it installs a JDK with mise.
 
-Add `--quick` to skip the two liveness runs, `--deep` to add `Deep.cfg`, or `--config <name>.cfg` to run one config, for example `--config Liveness.cfg`. A mutant config given to `--config` runs both of its checks. Any other argument prints the usage and exits 2.
+Add `--quick` to skip the two liveness runs, `--deep` to add `Deep.cfg`, or `--config <name>.cfg` to run one config, for example `--config Liveness.cfg`. A horizon mutant given to `--config` runs both of its checks, described below. Any other argument prints the usage and exits 2.
 
 `tlc.sh` runs one TLC process at a time on the machine, from any checkout. A second run prints `Waiting for the TLC run of PID <pid> to finish` and starts when the first ends. Each run uses half the CPU cores and a 4 GiB heap. Set `TLC_WORKERS` (a number, or `auto` for every core) or `TLC_HEAP` (an `-Xmx` value such as `8g`) to change that.
 

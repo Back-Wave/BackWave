@@ -3,7 +3,7 @@
 # Usage: tests/formal/tlc.sh <Spec.tla> [extra TLC args]   (the .cfg beside the spec is used)
 #   TLC_WORKERS  worker threads (default: half the CPU cores; "auto" uses every core)
 #   TLC_HEAP     JVM maximum heap, as for -Xmx (default: 4g)
-#   TLC_LOG      file for TLC's output (default: stdout); this script's own messages stay on stderr
+#   TLC_LOG      file for all output once the lock is taken (default: stdout and stderr)
 # A run waits while another holds /tmp/backwave-tlc.lock, a symlink to the holder's PID and
 # start time. A lock whose holder has exited is removed.
 set -euo pipefail
@@ -25,7 +25,7 @@ if [[ $# -lt 1 ]]; then
   exit 2
 fi
 
-started() { ps -p "$1" -o lstart= 2>/dev/null; }
+started() { LC_ALL=C TZ=UTC ps -p "$1" -o lstart= 2>/dev/null; }
 me="$$ $(started $$)"
 
 release_lock() {
@@ -49,6 +49,7 @@ until ln -s "$me" "$lock" 2>/dev/null; do
   fi
   sleep 2
 done
+[[ -z "${TLC_LOG:-}" ]] || exec >"$TLC_LOG" 2>&1
 
 sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
 if [[ ! -f "$jar" || "$(sha256 "$jar")" != "$TLA_SHA256" ]]; then
@@ -82,6 +83,5 @@ spec_file="$(basename "$spec")"
 states="$(mktemp -d)"
 
 cd "$spec_dir"
-[[ -z "${TLC_LOG:-}" ]] || exec >"$TLC_LOG" 2>&1
 "${java[@]}" "-Xmx$heap" -XX:+UseParallelGC -cp "$jar" tlc2.TLC \
   -workers "$workers" -cleanup -metadir "$states" "$spec_file" "$@"
