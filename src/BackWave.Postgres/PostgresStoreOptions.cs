@@ -13,6 +13,12 @@ public sealed record PostgresStoreOptions
     /// The Npgsql connection string the store opens its own connection pool from. Required —
     /// it must point at a database the store has rights to read, write, and (if
     /// <see cref="AutoMigrate"/> is on) create its schema in.
+    /// <para>
+    /// On a direct connection, add <c>Max Auto Prepare=64</c> to make the store's statements
+    /// server-side prepared statements, so the server skips parse and plan on each call. 64 is how many
+    /// statements Npgsql keeps prepared on each connection. Do not set it behind PgBouncer in
+    /// transaction mode unless PgBouncer is 1.21 or later with <c>max_prepared_statements</c> above 0.
+    /// </para>
     /// </summary>
     public required string ConnectionString { get; init; }
 
@@ -83,7 +89,9 @@ public sealed record PostgresStoreOptions
     /// write, inside the open transaction and before commit. Throwing from the hook aborts that
     /// transaction, which must roll back every step — letting a test prove the store's writes are
     /// all-or-nothing. The argument is the named point reached (for example <c>"claim"</c> or
-    /// <c>"enqueue"</c>).
+    /// <c>"enqueue"</c>). Each name marks one point in the code, and an operation that loops reaches it
+    /// once per iteration. A path that writes in one statement, such as the enqueue of a job with no
+    /// parents and no tags, reaches none.
     /// </summary>
     // Internal: this is a test-affordance for the conformance/unit suites (issue 0034), not a
     // consumer API; granted to BackWave.Postgres.Tests via [InternalsVisibleTo].

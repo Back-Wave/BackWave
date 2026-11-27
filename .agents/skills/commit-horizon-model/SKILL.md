@@ -17,10 +17,10 @@ The Simulator and the in-memory store give a row its Position at commit, so they
 
 TLC reads only the model and never the C#, so a code change is checked only after you copy it into the model's actions.
 
-The model was last confirmed against the code at commit `ad5b0ab` (the sync commit). Run this to list the covered files that differ from it, committed or not:
+The model describes the code at the sync commit, the last commit that changed `CommitHorizon.tla`. Line numbers are at the sync commit. Run this to list the covered files that differ from it, committed or not:
 
 ```bash
-git diff --stat ad5b0ab -- src/BackWave/Storage/CommitHorizon.cs \
+git diff --stat "$(git log -1 --format=%h -- tests/formal/commit-horizon/CommitHorizon.tla)" -- src/BackWave/Storage/CommitHorizon.cs \
   src/BackWave.Postgres/PostgresJobStore.cs src/BackWave.SqlServer/SqlServerJobStore.cs src/BackWave.Oracle/OracleJobStore.cs \
   'src/BackWave.Postgres/Schema/*' 'src/BackWave.SqlServer/Schema/*' 'src/BackWave.Oracle/Schema/*'
 ```
@@ -124,7 +124,7 @@ A deadlock (exit 11) means some actor has no step out of a state that is not the
 3. If the change adds a step that a property depends on, add a mutant config that removes or reorders it, and add it to `check.sh`.
 4. Every other config is a copy of `CommitHorizon.cfg` with a few constants changed. If you change a bound or an invariant list in `CommitHorizon.cfg`, make the same change in each of them.
 5. Run `tests/formal/commit-horizon/check.sh`. The real configs must pass, and each mutant must fail with the property the script expects.
-6. Move the sync commit in this file forward only after you confirm that the model describes the code at the new commit. Update the coverage record in the same edit.
+6. Commit the spec change only after you confirm that the model describes the code at that commit. That commit becomes the sync commit. Update the coverage record in the same commit.
 
 To bring the model back in line after changes that skipped this skill, use `/maintain-formal-verification-skill`.
 
@@ -139,7 +139,7 @@ What the model assumes:
 - A writer can register on either epoch. That covers a stale read of `epoch`, for example by a REPEATABLE READ, SERIALIZABLE, or SNAPSHOT caller transaction, so the read folds into the lock step.
 - A commit becomes visible no later than it releases the transaction's locks, as in each engine.
 - Every SQL Server Transition Log insert registers. SQL Server has no trigger (`src/BackWave.SqlServer/Schema/0006_observer_commit_horizon.sql:5`), so each `INSERT INTO backwave.job_transitions` in `SqlServerJobStore.cs` must start with the `{RegisterTransitionWriter}` prefix, today at :1966 and :2098. `MutantDrawBeforeRegister.cfg` shows what one insert without it breaks.
-- Claim and report transactions run at READ COMMITTED, so each statement takes a fresh snapshot. No adapter passes an isolation level when it begins them, so each takes the default. Postgres: `BeginTransactionAsync` at `PostgresJobStore.cs:3129` (claim) and `:3295` (report) uses the Npgsql default, which sends `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED`. SQL Server: `BeginTransactionAsync` at `SqlServerJobStore.cs:3332-3333` and `:3500-3501` uses the SqlClient default READ COMMITTED, and the migrator turns on `READ_COMMITTED_SNAPSHOT` (`SqlServerMigrator.cs:260`), so each statement reads its own snapshot. Oracle: `BeginAsync` (`OracleJobStore.cs:211-213`) at `:3503` and `:3681` uses the Oracle default READ COMMITTED.
+- Claim and report transactions run at READ COMMITTED, so each statement takes a fresh snapshot. No adapter passes an isolation level when it begins them, so each takes the default. Postgres: `BeginTransactionAsync` at `PostgresJobStore.cs:3245` (claim) and `:3411` (report) uses the Npgsql default, which sends `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED`. SQL Server: `BeginTransactionAsync` at `SqlServerJobStore.cs:3332-3333` and `:3500-3501` uses the SqlClient default READ COMMITTED, and the migrator turns on `READ_COMMITTED_SNAPSHOT` (`SqlServerMigrator.cs:260`), so each statement reads its own snapshot. Oracle: `BeginAsync` (`OracleJobStore.cs:211-213`) at `:3502` and `:3680` uses the Oracle default READ COMMITTED.
 - Each Observer has one claim and report worker, so the lease fence is not modeled. A second Observer's report is a stand-in (`Reporters`) that runs the horizon step at any time, up to `ReporterRuns` times.
 - Dead-lettered is the same as delivered for the cursor. A Retry holds the cursor until its backoff passes.
 

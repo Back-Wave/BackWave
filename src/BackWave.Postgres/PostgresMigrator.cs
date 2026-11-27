@@ -114,6 +114,8 @@ public static class PostgresMigrator
             await ApplyScriptsAsync(connection, transaction, rewriter, cancellationToken).ConfigureAwait(false);
         }
 
+        // uncounted round trip: the commit that ends the migration transaction, uncounted for the same
+        // reason as the statements inside it.
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 

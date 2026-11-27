@@ -4,16 +4,14 @@ using Npgsql;
 namespace BackWave.Postgres.Tests;
 
 /// <summary>
-/// The per-job-life transition cap, on both write paths. Each recorder skips its prune DELETE unless the
-/// entry it just wrote reached <c>MaxTransitionsPerJob</c>, so the cap is enforced by a statement that
-/// usually does not run. The Conformance Suite's cap clause interleaves the two recorders, which re-prune
-/// each other on the very next transition and so hide an off-by-one in either skip; these pin each path
-/// on its own.
+/// The per-job-life transition cap. Every transition write appends and prunes in one statement, and its
+/// prune deletes nothing unless the entry it just wrote reached <c>MaxTransitionsPerJob</c>. These tests
+/// pin the cap boundary of that statement from a single-row and a multi-job call.
 ///
-/// The batch path needs more than a boundary check. Its single DELETE covers every job id in the batch,
-/// so jobs nowhere near the cap are inside that statement's reach - and since the lease sweep now routes
-/// through the batch recorder, a wide sweep puts hundreds of untouched jobs inside one prune's WHERE at
-/// a time. They must come through with their whole history intact.
+/// The batch path needs more than a boundary check. Its prune covers every job in the batch, so jobs
+/// nowhere near the cap are inside that statement's reach - and the lease sweep routes through the batch
+/// writer, so a wide sweep puts hundreds of untouched jobs inside one prune at a time. They must come
+/// through with their whole history intact.
 /// </summary>
 [Collection("postgres")]
 public sealed class PostgresTransitionPruneTests
@@ -58,19 +56,17 @@ public sealed class PostgresTransitionPruneTests
         Assert.Equal(cap, (int)pastCap[^1].Ordinal);
     }
 
-    [Theory]
-    [InlineData(0, new long[0])]
-    [InlineData(1, new long[] { 0 })]
-    public async Task An_enqueue_under_a_cap_of_zero_or_one_keeps_at_most_cap_entries(int cap, long[] kept)
+    [Fact]
+    public async Task An_enqueue_under_a_cap_of_one_keeps_its_one_entry()
     {
         await using var store = await PostgresTestDatabase.CreateFreshStoreAsync(
-            bounds: StoreBounds.Default with { MaxTransitionsPerJob = cap });
+            bounds: StoreBounds.Default with { MaxTransitionsPerJob = 1 });
         var jobId = Guid.NewGuid();
 
         Assert.Equal(EnqueueResult.Ok, await store.EnqueueAsync(Job(jobId), T0));
 
         Assert.NotNull(await store.GetJobAsync(jobId));
-        Assert.Equal(kept, (await store.GetJobHistoryAsync(jobId)).Select(t => t.Ordinal).ToArray());
+        Assert.Equal(new long[] { 0 }, (await store.GetJobHistoryAsync(jobId)).Select(t => t.Ordinal).ToArray());
     }
 
     [Fact]
@@ -160,50 +156,6 @@ public sealed class PostgresTransitionPruneTests
             var history = await store.GetJobHistoryAsync(bystander);
             Assert.Equal([0L, 1, 2, 3, 4, 5, 6], history.Select(t => t.Ordinal).ToList());
         }
-    }
-
-    [Fact]
-    public async Task A_batch_pays_for_the_prune_only_when_a_job_reaches_the_cap()
-    {
-        // The round-trip half of the claim, measured against itself: two batched reports of the SAME
-        // shape - two jobs, both retried, no output and no tags - where the only difference is that one
-        // job crossed the cap in the second. The gap between them is the whole cost of the prune, and it
-        // has to be exactly one statement.
-        await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
-        var cap = store.Bounds.MaxTransitionsPerJob;
-        var churner = Guid.NewGuid();
-        var bystander = Guid.NewGuid();
-        await store.EnqueueAsync(Job(churner), T0);
-        await store.EnqueueAsync(Job(bystander), T0);
-
-        var underCap = await ReportRetryBatchAsync(store, T0);
-        var next = T0.AddMinutes(10);
-
-        // Take the churner to the cap, so the next report is the first transition that exceeds it. The
-        // bystander is left where it is, so the batch's shape does not change.
-        await FillTransitionsUpToAsync(churner, cap - 1);
-        var atCap = await ReportRetryBatchAsync(store, next);
-
-        Assert.Equal(underCap + 1, atCap);
-        Assert.Equal(cap, (await store.GetJobHistoryAsync(churner)).Count);
-    }
-
-    // Claims both jobs, batch-reports both as retries, and returns the statements the REPORT cost. The
-    // claim runs outside the measured scope: it writes transitions of its own, and only the report is
-    // under test here.
-    private static async Task<int> ReportRetryBatchAsync(PostgresJobStore store, DateTimeOffset now)
-    {
-        var claimed = await store.ClaimAsync(new ClaimRequest("w1", ["prune"], 32, Lease, now));
-        Assert.Equal(2, claimed.Count);
-        var batch = claimed
-            .Select(job => new OutcomeReport(
-                job.JobId, "w1", job.Attempt, new JobOutcome.Failure(now.AddMinutes(10), "again")))
-            .ToArray();
-
-        using var scope = PostgresRoundTrips.Observe();
-        var results = await store.ReportOutcomesAsync(batch, now);
-        Assert.All(results, result => Assert.Equal(OutcomeResult.Applied, result.Result));
-        return scope.Statements;
     }
 
     // Extends a job's Transition Log with filler entries so its highest ordinal is exactly

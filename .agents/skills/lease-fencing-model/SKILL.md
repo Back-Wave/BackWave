@@ -1,6 +1,6 @@
 ---
 name: lease-fencing-model
-description: TLA+ model of lease fencing in the Postgres, SQL Server, and Oracle job stores (Claim, Heartbeat, ExpireLeases, RelinquishLeases, ReportOutcome(s), Reschedule), checked with TLC at the level of SQL statements and row locks. Use when a change touches the SQL, locking, or transaction shape of those methods, to check a lease race, or to read a model result.
+description: TLA+ model of lease fencing in the Postgres, SQL Server, and Oracle job stores (Claim, Heartbeat, ExpireLeases, RelinquishLeases, ReportOutcome(s), Reschedule) and the Transition Log ordinals and cap they write, checked with TLC at the level of SQL statements and row locks. Use when a change touches the SQL, locking, or transaction shape of those methods, to check a lease race, or to read a model result.
 ---
 
 # Lease fencing model
@@ -21,8 +21,11 @@ Each rule is a TLA+ invariant. The harm is what a user sees when the rule breaks
 | `TerminalStays` | A job that reached `Succeeded` or `DeadLettered` stays there. | A finished job runs again. |
 | `NoHalt` | The Oracle claim's C# due check (`Invariant.Halt`) never fires. | The node fail-stops. |
 | `OwnerOnlyWhileLeased` | `lease_owner` and `lease_expiry` are set exactly when the state is `Leased`. | None by itself. It makes `lease_owner = @owner` imply `Leased`, so the `state = 2` guard in RelinquishLeases is a second guard. |
+| `LogOrdered` | A job's Transition Log ordinals rise in commit order. | Job history and the Transition Observer show a job's transitions out of order. |
+| `LogCapped` | A job keeps at most `MaxTransitionsPerJob` log rows. | The log grows past its storage bound. |
+| `NoOrdinalCollision` | The Postgres one-statement claim never inserts an ordinal that the log already holds. | The claim fails with a primary-key error, because it no longer catches one. |
 
-Bounds: 2 jobs (symmetric), 2 sessions for workers `w1` and `w2`, `MaxAttempts` 2, a lease of 2 ticks, a clock from 0 to 2, a call `@now` that can lag the clock by 1 tick, and both outcome paths. A pass covers these bounds and the abstractions in the spec header, not the whole system.
+Bounds: 2 jobs (symmetric), 2 sessions for workers `w1` and `w2`, `MaxAttempts` 2, a lease of 2 ticks, a clock from 0 to 2, a call `@now` that can lag the clock by 1 tick, both outcome paths, and a `MaxTransitionsPerJob` (`TransitionCap`) of 1. A pass covers these bounds and the abstractions in the spec header, not the whole system.
 
 ## Does the change touch the model
 
@@ -30,13 +33,14 @@ The model describes the code at the sync commit, the last commit that changed `L
 
 | Operation | Postgres `PostgresJobStore.cs` | SQL Server `SqlServerJobStore.cs` | Oracle `OracleJobStore.cs` | Model actions |
 |---|---|---|---|---|
-| Claim | `ClaimUntracedAsync` 430, SQL 508-520 | `ClaimQueueAsync` 492, SQL 564-583 | `ClaimUntracedAsync` 498, SQL 581-592, due check 610-621, write 629-634 | `ClaimBegin`, `ClaimLock`, `ClaimCommit` |
-| ReportOutcome | `ReportOutcomeUntracedAsync` 683, SQL 742-745 | `ReportOutcomeUntracedAsync` 782, SQL 842-845 | `ReportOutcomeUntracedAsync` 848, SQL 907-909 | `ReportUpdate` |
-| ReportOutcomes | `ReportOutcomesUntracedAsync` 806, SQL 879-892 | `ReportOutcomesUntracedAsync` 908, SQL 995-1019 | `ReportOutcomesUntracedAsync` 970, SQL 1041-1045, 1064-1071, 1090-1115 | `ReportUpdate` (Postgres), `ReportLock`, `ReportCommit` |
-| Heartbeat | `HeartbeatAsync` 1130, SQL 1139-1141 | `HeartbeatAsync` 1250, SQL 1266-1272 | `HeartbeatAsync` 1375, SQL 1400-1403, 1419 | `HeartbeatUpdate`, `HeartbeatLock`, `HeartbeatCommit` |
-| ExpireLeases | `ExpireLeasesUntracedAsync` 1184, SQL 1202-1207, 1266-1268, 1281-1283 | `ExpireLeasesUntracedAsync` 1315, SQL 1335-1338, 1401, 1419 | `ExpireLeasesUntracedAsync` 1452, SQL 1473-1484, 1547-1556, 1565-1577 | `ExpireBegin`, `ExpireLock`, `ExpireCommit` |
-| RelinquishLeases | `RelinquishLeasesUntracedAsync` 1342, SQL 1355-1359, 1421-1423, 1444-1446 | `RelinquishLeasesUntracedAsync` 1486, SQL 1501-1504, 1562-1563, 1578 | `RelinquishLeasesUntracedAsync` 1637, SQL 1650-1654, 1715-1722, 1737-1743 | `RelinquishBegin`, `RelinquishLock`, `RelinquishCommit` |
-| Reschedule | `RescheduleCoreAsync` 1617, SQL 1632-1639 | `RescheduleCoreAsync` 1757, SQL 1767-1769 | `RescheduleCoreAsync` 1920, SQL 1936-1941 | `RescheduleLock`, `RescheduleCommit` |
+| Claim | `ClaimUntracedAsync` 487, path choice 503-510; one-statement claim `ClaimInOneStatementAsync` 535, SQL 107-113; transaction claim `ClaimInTransactionAsync` 559, SQL 618, transition insert 625-628; `ClaimCandidates` 633-642, `ClaimUpdate` 649-661 | `ClaimQueueAsync` 492, SQL 564-583 | `ClaimUntracedAsync` 498, SQL 581-592, due check 610-621, write 629-634 | `ClaimBegin`, `ClaimLock`, `ClaimCommit` |
+| ReportOutcome | `ReportOutcomeUntracedAsync` 831, SQL 890-893 | `ReportOutcomeUntracedAsync` 782, SQL 842-845 | `ReportOutcomeUntracedAsync` 848, SQL 907-909 | `ReportUpdate` |
+| ReportOutcomes | `ReportOutcomesUntracedAsync` 954, path choice 981-984; `TryReportOutcomesInOneRoundTripAsync` 1061; `ReportOutcomesInTransactionAsync` 1163; SQL `OutcomeCommandSql` 1100-1108, `OutcomeFence` 1120-1124, `LockOutcomeRows` 1133-1141, `OutcomeWrite` 1145-1161 | `ReportOutcomesUntracedAsync` 908, SQL 995-1019 | `ReportOutcomesUntracedAsync` 970, SQL 1041-1045, 1064-1071, 1090-1115 | `ReportLock`, `ReportCommit` |
+| Heartbeat | `HeartbeatAsync` 1358, SQL 1367-1369 | `HeartbeatAsync` 1250, SQL 1266-1272 | `HeartbeatAsync` 1375, SQL 1400-1403, 1419 | `HeartbeatUpdate`, `HeartbeatLock`, `HeartbeatCommit` |
+| ExpireLeases | `ExpireLeasesUntracedAsync` 1412, SQL 1430-1435, 1494-1496, 1509-1511 | `ExpireLeasesUntracedAsync` 1315, SQL 1335-1338, 1401, 1419 | `ExpireLeasesUntracedAsync` 1452, SQL 1473-1484, 1547-1556, 1565-1577 | `ExpireBegin`, `ExpireLock`, `ExpireCommit` |
+| RelinquishLeases | `RelinquishLeasesUntracedAsync` 1570, SQL 1583-1587, 1649-1651, 1672-1674 | `RelinquishLeasesUntracedAsync` 1486, SQL 1501-1504, 1562-1563, 1578 | `RelinquishLeasesUntracedAsync` 1637, SQL 1650-1654, 1715-1722, 1737-1743 | `RelinquishBegin`, `RelinquishLock`, `RelinquishCommit` |
+| Reschedule | `RescheduleCoreAsync` 1845, SQL 1860-1867 | `RescheduleCoreAsync` 1757, SQL 1767-1769 | `RescheduleCoreAsync` 1920, SQL 1936-1941 | `RescheduleLock`, `RescheduleCommit` |
+| Transition Log | `TransitionLogCtes` 672-692, `RecordTransitionsBatchAsync` 2054 | `RecordTransitionsBatchAsync` 2015 | `RecordTransitionsBatchAsync` 2177 | `LogAppend`, `Record`, in `ClaimCommit`, `ApplyOutcome`, `ExpireCommit`, `RelinquishCommit` |
 
 The model also depends on these facts. A change to any of them touches the model too:
 
@@ -50,7 +54,7 @@ To list the commits since the sync commit that touched covered code:
 git log --oneline "$(git log -1 --format=%H -- tests/formal/lease-fencing/LeaseFencing.tla)"..HEAD -- src/BackWave.Postgres/PostgresJobStore.cs src/BackWave.SqlServer/SqlServerJobStore.cs src/BackWave.Oracle/OracleJobStore.cs src/BackWave.SqlServer/SqlServerMigrator.cs src/BackWave/Core/RetryPolicy.cs src/BackWave/Driver/NodeDriver.cs
 ```
 
-A commit touches the model when it changes a cited statement, its `WHERE`, its lock hints, its transaction, or the order of statements inside one transaction. A change elsewhere in these files needs only new line numbers.
+A commit touches the model when it changes a cited statement, its `WHERE`, its lock hints, its transaction, the statements sent as one command, or the order of statements inside one transaction. A change elsewhere in these files needs only new line numbers.
 
 ## Run the check
 
@@ -60,7 +64,7 @@ tests/formal/lease-fencing/check.sh
 
 The first run needs network access, and Java 11 or later or mise. `tests/formal/tlc.sh` downloads the pinned tla2tools.jar and checks its hash, and with no Java it installs a JDK with mise.
 
-It runs TLC on every config in `tests/formal/lease-fencing/` and prints one row per config: the expected result, the result, the distinct states, and the seconds. Each config's first line, `\* expect: pass` or `\* expect: <Rule>`, says what it must end with. The script exits 0 only when every row matches. Add `--mutants` for the planted breaks in `mutants/` or `--all` for both. Run `--all` after you change the model. Each config that passes on Oracle takes about 2 to 5 minutes, and every other config takes under a minute. With the default 5 workers on a 10-core Mac, `--all` took 17 minutes 26 seconds at a load average that fell from about 510 to 145 (2026-11-26). Run `uptime` first, because load slows every config. Add `--config <name>` to run one config, for example `--config oracle.cfg` or `--config mutants/claim-no-lock-oracle.cfg`.
+It runs TLC on every config in `tests/formal/lease-fencing/` and prints one row per config: the expected result, the result, the distinct states, and the seconds. Each config's first line, `\* expect: pass` or `\* expect: <Rule>`, says what it must end with. The script exits 0 only when every row matches. Add `--mutants` for the planted breaks in `mutants/` or `--all` for both. Run `--all` after you change the model. Each config that passes takes about 2 to 3 minutes on Oracle and SQL Server and about 3 to 13 minutes on Postgres, and every other config takes a few seconds. With the default 5 workers on a 10-core Mac, `--all` took 31 minutes 28 seconds at a load average of about 7 to 12 (2026-11-26), and `postgres.cfg` alone took 12 minutes 43 seconds of that. Run `uptime` first, because load slows every config. Add `--config <name>` to run one config, for example `--config oracle.cfg` or `--config mutants/claim-no-lock-oracle.cfg`.
 
 `tlc.sh` runs one TLC process at a time on the machine, from any checkout. A second run prints `Waiting for the TLC run of PID <pid> to finish` and starts when the first ends. The seconds the script prints include that wait. Each run uses half the CPU cores and a 4 GiB heap. Set `TLC_WORKERS` (a number, or `auto` for every core) or `TLC_HEAP` (an `-Xmx` value such as `8g`) to change that.
 
@@ -71,7 +75,7 @@ The baseline at the sync commit: every row matches, and the three adapter config
 | Config | Distinct states |
 |---|---|
 | `oracle.cfg` | 14,110,656 |
-| `postgres.cfg` | 1,947,808 |
+| `postgres.cfg` | 19,599,230 |
 | `sqlserver.cfg` | 2,698,212 |
 
 Read every result with the pstack `/statechart` skill. A violation comes back as its shortest path in plain steps, and a pass comes back as a chart of the states. The raw TLC output of each config is in the folder that `check.sh` prints last.
@@ -111,6 +115,9 @@ Each config in `mutants/` plants one break and must end on the rule named in its
 | `relinquish-no-leased-check-postgres` | RelinquishLeases without `state = 2` | pass |
 | `outcome-keeps-owner-postgres` | A `Succeeded` write that keeps `lease_owner` | pass |
 | `relinquish-no-leased-check-and-outcome-keeps-owner-postgres` | Both of the two above | `RelinquishOnlyHeld` |
+| `ordinal-from-snapshot-postgres` | One-statement claim without the row-version filter; a collision rolls back, as the catch before `c0f2e3c` did | `LogOrdered` |
+| `no-window-check-postgres` | One-statement claim without the filter, with the ordinal read from the locked row (a per-job counter) and the prune from the snapshot | `LogCapped` |
+| `legacy-writer-no-bridge-postgres` | Filter and ordinal on a per-job counter that a release N-1 node (session 2) does not move, with no bridge trigger | `LogOrdered` |
 
 Some mutant configs leave out a rule that would break first:
 
@@ -177,6 +184,6 @@ Run the probe again before you trust the rule in these cases:
 
 ## Not covered
 
-The Core driver loop, Concurrency Limits and the queue locks of a limited queue, slot accounting, AwaitingParent and the fan-in latches, Cancel, Requeue, the transition log, the Commit Horizon, SQLite, and the in-memory store. Each worker has one database session, so the calls of one worker never overlap, as they can on separate connections. Retry backoff is zero ticks, and a Reschedule moves the due time by one tick. Liveness is not checked.
+The Core driver loop, Enqueue, Concurrency Limits and the queue locks of a limited queue, slot accounting, AwaitingParent and the fan-in latches, Cancel, Requeue, the transition writes of the child latches, Mint and the trigger schedule, the Commit Horizon, SQLite, and the in-memory store. The model has no child edges, so the child-edge gate of the Postgres outcome command never holds a write back. A write it holds back ends like a rollback, and the caller runs the batch again in a transaction, which the model reaches as a rollback and a new report. Each worker has one database session, so the calls of one worker never overlap, as they can on separate connections. Retry backoff is zero ticks, and a Reschedule moves the due time by one tick. Liveness is not checked.
 
 When the code changed without a rerun of this check, use the pstack `/maintain-formal-verification-skill` skill to bring the model back in line.

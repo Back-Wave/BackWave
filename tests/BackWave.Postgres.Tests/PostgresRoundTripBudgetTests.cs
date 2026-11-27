@@ -5,7 +5,7 @@ using Npgsql;
 namespace BackWave.Postgres.Tests;
 
 /// <summary>
-/// The Postgres adapter's round-trip budget: the statements hot operations cost today, pinned so a
+/// The Postgres adapter's round-trip budget: the round trips hot operations cost today, pinned so a
 /// change has to move them on purpose.
 ///
 /// These numbers are the point. A per-row round trip on this adapter is invisible to every other test in
@@ -18,14 +18,14 @@ namespace BackWave.Postgres.Tests;
 /// after, and it should be recorded here in the same commit that earns it; a number that rises is a
 /// regression that would otherwise reach production as nothing but a slightly slower job rate.
 ///
-/// What the count covers: statements executed, per operation. What it does not: opening a pooled
-/// connection, BEGIN, COMMIT, and the one-time schema-version check. Those are round trips too, but they
-/// are a small constant per operation rather than a cost per row - and per row is the shape of the
-/// problem these budgets exist to watch.
+/// What the count covers: commands executed and COMMITs sent, per operation; their sum is the
+/// operation's round trips. A command that holds two statements is one round trip. What it does not:
+/// opening a pooled connection, BEGIN (Npgsql prepends it to the first statement, so it never waits on
+/// its own), and the one-time schema-version check.
 ///
 /// Unlike the Oracle budgets there is no LOB-read column and no fetch window here, because Postgres has
 /// no LOB locator on these paths: bytea and text values arrive inside the row like every other column,
-/// so a statement count is the whole cost. Every number below is therefore a plain statement count.
+/// so commands and commits are the whole cost.
 /// </summary>
 [Collection("postgres")]
 public sealed class PostgresRoundTripBudgetTests
@@ -39,40 +39,44 @@ public sealed class PostgresRoundTripBudgetTests
     private static NewJob Job(string queue = "budget") =>
         new(Guid.NewGuid(), "budget-test", "{}"u8.ToArray(), queue, T0);
 
-    // The recorded budgets: measured 2026-08-28 against Postgres on Npgsql 9.0.3, at schema version 1.
+    // The recorded budgets, measured against Postgres on Npgsql 9.0.3.
     // Each is the cost of ONE call; the arithmetic behind each number is in its test.
 
     private static readonly Budget Claim = new(
         "ClaimBatchAsync of 32 jobs (one queue, cold caches)",
-        Statements: 5);
+        Commands: 5, Commits: 1);
+
+    private static readonly Budget WarmClaim = new(
+        "ClaimAsync of 32 jobs (one queue already seen unlimited)",
+        Commands: 1, Commits: 0);
 
     private static readonly Budget ReportOutcomes = new(
         "ReportOutcomesAsync of 32 succeeded rows",
-        Statements: 3);
+        Commands: 1, Commits: 0);
 
     private static readonly Budget ReportOutcomesWithOutput = new(
         "ReportOutcomesAsync of 32 succeeded rows, every one carrying job output",
-        Statements: 35);
+        Commands: 34, Commits: 1);
 
     private static readonly Budget ExpireLeases = new(
         "ExpireLeasesAsync over 32 expired leases, all rescheduled",
-        Statements: 3);
+        Commands: 3, Commits: 1);
 
     private static readonly Budget ListJobs = new(
         "ListJobsAsync over a 200-job page of terminal jobs",
-        Statements: 2);
+        Commands: 2, Commits: 0);
 
     private static readonly Budget Enqueue = new(
         "EnqueueAsync of one untagged job",
-        Statements: 1);
+        Commands: 1, Commits: 0);
 
     private static readonly Budget EnqueueTagged = new(
         "EnqueueAsync of one job carrying three tags",
-        Statements: 4);
+        Commands: 4, Commits: 1);
 
     private static readonly Budget WritePumpStatuses = new(
         "WritePumpStatusesAsync of 8 Pumps that also reaps 8 old rows",
-        Statements: 1);
+        Commands: 1, Commits: 0);
 
     [Fact]
     public async Task Claim_of_a_full_batch_stays_within_its_round_trip_budget()
@@ -93,12 +97,9 @@ public sealed class PostgresRoundTripBudgetTests
         // No per-row anything. The claim is a single set-based FOR UPDATE SKIP LOCKED whose RETURNING
         // hands back the whole job row, so 32 jobs cost the same statement as 1. Tags ride back inside
         // that same statement as a correlated json_agg, which is why there is no tag-hydration trip
-        // here the way there is in the job listing below. The transition insert is set-based over
-        // unnest(), and its own RETURNING hands back the assigned ordinals, so - unlike Oracle, which
-        // rejects RETURNING on an INSERT ... SELECT and has to read the highest ordinal back - there is
-        // no second statement to learn them. No prune DELETE either: the batch recorder issues one only
-        // when some job in the batch reached MaxTransitionsPerJob, and a freshly claimed job is on its
-        // second transition.
+        // here the way there is in the job listing below. The transition write is one set-based
+        // statement over unnest() that appends and prunes together, so - unlike Oracle, which has to
+        // read the highest ordinal back - there is no second statement for the ordinals or the prune.
         //
         // The concurrency-limit count is absent because this queue has no queue_limits row: `configured`
         // comes back null, so the "count leased rows" statement never runs. A limited queue costs 6.
@@ -116,6 +117,35 @@ public sealed class PostgresRoundTripBudgetTests
     }
 
     [Fact]
+    public async Task Claim_on_a_queue_already_seen_unlimited_stays_within_its_round_trip_budget()
+    {
+        // The claim a running Pump makes: the queue was stamped unlimited by an earlier claim less than
+        // five seconds ago, so the config lock and read are skipped. ClaimAsync rather than
+        // ClaimBatchAsync because that is what a Worker Group without adaptive poll backoff calls, so no
+        // next-due read either.
+        await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
+        for (var i = 0; i < 2 * ClaimBatch; i++)
+        {
+            await store.EnqueueAsync(Job(), T0);
+        }
+        Assert.Equal(ClaimBatch, (await store.ClaimAsync(
+            new ClaimRequest("budget-worker", ["budget"], ClaimBatch, Lease, T0))).Count);
+
+        // 1 autocommit statement, so no COMMIT: the claim UPDATE ... RETURNING, the batched transition
+        // insert and the capped prune are CTEs of one statement.
+        IReadOnlyList<JobRecord> claimed;
+        Measured measured;
+        using (var scope = PostgresRoundTrips.Observe())
+        {
+            claimed = await store.ClaimAsync(new ClaimRequest("budget-worker", ["budget"], ClaimBatch, Lease, T0));
+            measured = Measured.From(scope);
+        }
+
+        Assert.Equal(ClaimBatch, claimed.Count);
+        AssertBudget(WarmClaim, measured);
+    }
+
+    [Fact]
     public async Task ReportOutcomes_of_a_full_batch_stays_within_its_round_trip_budget()
     {
         await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
@@ -129,17 +159,14 @@ public sealed class PostgresRoundTripBudgetTests
         // The plain drain: every row succeeded, none carries output or a tag delta, so nothing but the
         // fenced state write and the transition log runs.
         //
-        // 1 fenced batch UPDATE ... RETURNING + 1 batched transition insert + 1 child-latch probe = 3,
-        // independent of batch size. The UPDATE joins the outcome vector in through unnest() and applies
-        // the per-(worker, attempt) Effect-Once fence to every row independently, and its RETURNING
-        // reports which rows matched - so unlike Oracle, which has no set-valued RETURNING and pays an
-        // extra FOR UPDATE read to recover the same verdict, there is nothing to read back.
-        //
-        // The third statement is the child-latch probe: every row here is Succeeded, hence terminal,
-        // so the adapter asks once - SELECT DISTINCT parent_id ... = ANY(@ids) - whether any of these
-        // 32 ids parents a dependency. It finds none, and the per-parent cascade never runs. A batch
-        // of pure retries would not pay it at all: a retry row stays non-terminal and gates nothing.
-        // As above, no job in this batch is near the cap, so the batch recorder issues no prune DELETE.
+        // 1 command and no COMMIT, independent of batch size: two statements that Npgsql runs as one
+        // implicit transaction. The first locks the 32 fenced rows. The second, in a snapshot taken
+        // after those locks, checks once whether any row it makes terminal parents a Dependency, and
+        // since none does, writes the outcomes and their transitions as CTEs of one statement. The
+        // UPDATE joins the outcome vector in through unnest() and applies the per-(worker, attempt)
+        // Effect-Once fence to every row independently, and its RETURNING reports which rows matched -
+        // so unlike Oracle, which has no set-valued RETURNING and pays an extra FOR UPDATE read to
+        // recover the same verdict, there is nothing to read back.
         var batch = claimed
             .Select(job => new OutcomeReport(job.JobId, "budget-worker", job.Attempt, new JobOutcome.Success()))
             .ToArray();
@@ -167,8 +194,10 @@ public sealed class PostgresRoundTripBudgetTests
         var claimed = await store.ClaimAsync(new ClaimRequest("budget-worker", ["budget"], ClaimBatch, Lease, T0));
         Assert.Equal(ClaimBatch, claimed.Count);
 
-        // The drain budget above plus ONE STATEMENT PER BLOB: 3 + 32 = 35. This is the one honest
-        // per-row cost left on the Postgres outcome path, and pinning it is how it stays visible.
+        // A batch carrying output takes the transaction: 1 outcome command (the write and its
+        // transitions, as on the drain path) + ONE STATEMENT PER BLOB + 1 child-latch lookup = 34, and
+        // the COMMIT. The blobs are the one honest per-row cost left on the Postgres outcome path, and
+        // pinning it is how it stays visible.
         //
         // Output is deliberately kept out of the fenced batch vector: the vector carries only the
         // columns every row in a drain has, so the common pure-drain row (the budget above) rides one
@@ -177,8 +206,8 @@ public sealed class PostgresRoundTripBudgetTests
         //
         // Postgres can do better than this - unnest(@ids::uuid[], @outputs::bytea[]) would fold all 32
         // into the batch the same way the state vector already folds - and when someone does that work,
-        // this number should fall to 4 and be recorded here in the same commit. Until then 35 is the
-        // truth, and a budget that quietly said 4 would be a number nobody could trust.
+        // this number should fall to 2 and be recorded here in the same commit. Until then 34 is the
+        // truth, and a budget that quietly said 2 would be a number nobody could trust.
         var payload = new byte[4_096];
         Random.Shared.NextBytes(payload);
         var batch = claimed
@@ -287,11 +316,10 @@ public sealed class PostgresRoundTripBudgetTests
         await using var store = await PostgresTestDatabase.CreateFreshStoreAsync();
         await store.EnqueueAsync(Job(), T0); // warms the one-time schema check, off the measured path
 
-        // One is NOT the number the wire charges. This counter deliberately excludes acquiring a
-        // pooled connection, BEGIN and COMMIT (see the class remarks), and enqueue pays all of them on
-        // every call because it opens and commits its own transaction per job. That fixed per-call cost
-        // is why enqueue barely moves when the claim and outcome paths get faster, and only a bulk
-        // enqueue on the Storage Contract can amortize it.
+        // 1 autocommit insert (the job row and its Scheduled transition in one CTE), and no COMMIT: a
+        // job with no parents and no tags is that one statement, so it needs no transaction of its own.
+        // This is still one round trip per job; only a bulk enqueue on the Storage Contract can
+        // amortize it.
         Measured measured;
         using (var scope = PostgresRoundTrips.Observe())
         {
@@ -363,13 +391,13 @@ public sealed class PostgresRoundTripBudgetTests
         // must allocate exactly zero bytes no matter how many statements it runs.
         for (var i = 0; i < 1_000; i++)
         {
-            PostgresRoundTrips.CountStatement(); // let the JIT tier up before the measurement
+            PostgresRoundTrips.CountCommand(); // let the JIT tier up before the measurement
         }
 
         var before = GC.GetAllocatedBytesForCurrentThread();
         for (var i = 0; i < 1_000_000; i++)
         {
-            PostgresRoundTrips.CountStatement();
+            PostgresRoundTrips.CountCommand();
         }
         var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
 
@@ -380,17 +408,17 @@ public sealed class PostgresRoundTripBudgetTests
     public void A_scope_counts_only_what_happens_inside_it()
     {
         // The instrument's own correctness check: without this, a budget of zero would pass forever.
-        PostgresRoundTrips.CountStatement(); // outside any scope - must not be seen by the scope below
+        PostgresRoundTrips.CountCommand(); // outside any scope - must not be seen by the scope below
 
         using var scope = PostgresRoundTrips.Observe();
-        PostgresRoundTrips.CountStatement();
-        PostgresRoundTrips.CountStatement();
+        PostgresRoundTrips.CountCommand();
+        PostgresRoundTrips.CountCommand();
 
-        Assert.Equal(2, scope.Statements);
+        Assert.Equal(2, scope.Commands);
 
         scope.Dispose();
-        PostgresRoundTrips.CountStatement(); // after the scope closed - the counts are frozen
-        Assert.Equal(2, scope.Statements);
+        PostgresRoundTrips.CountCommand(); // after the scope closed - the counts are frozen
+        Assert.Equal(2, scope.Commands);
     }
 
     // Sets every job's row to the Dead-Lettered shape in one statement: terminal state, terminal
@@ -406,23 +434,24 @@ public sealed class PostgresRoundTripBudgetTests
         await update.ExecuteNonQueryAsync();
     }
 
-    private sealed record Budget(string Operation, int Statements);
+    private sealed record Budget(string Operation, int Commands, int Commits);
 
-    private sealed record Measured(int Statements)
+    private sealed record Measured(int Commands, int Commits)
     {
-        public static Measured From(PostgresRoundTripScope scope) => new(scope.Statements);
+        public static Measured From(PostgresRoundTripScope scope) => new(scope.Commands, scope.Commits);
     }
 
     private static void AssertBudget(Budget budget, Measured measured)
     {
-        if (measured.Statements == budget.Statements)
+        if (measured.Commands == budget.Commands && measured.Commits == budget.Commits)
         {
             return;
         }
         Assert.Fail(
             $"""
             Postgres round-trip budget moved: {budget.Operation}
-              statements: budgeted {budget.Statements}, measured {measured.Statements} ({Delta(budget.Statements, measured.Statements)})
+              commands: budgeted {budget.Commands}, measured {measured.Commands} ({Delta(budget.Commands, measured.Commands)})
+              commits:  budgeted {budget.Commits}, measured {measured.Commits} ({Delta(budget.Commits, measured.Commits)})
 
             A budget moves in either direction only deliberately. If a change was meant to move this,
             record the new number in PostgresRoundTripBudgetTests in the same commit. If it was not, the

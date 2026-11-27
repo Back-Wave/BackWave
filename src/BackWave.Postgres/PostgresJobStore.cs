@@ -43,6 +43,16 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
     private readonly WakeUpHintCoalescer _postCommitHints;
 
+    private readonly string _claimInOneStatement;
+    private readonly string _reportOutcomesInOneRoundTrip;
+    private readonly string _reportOutcomesInTransaction;
+    private readonly string _recordTransitions;
+
+    // Inserts ordinal 0 directly, not through TransitionLogCtes, which Postgres would plan again on every
+    // unprepared enqueue. It needs no prune: a new job id has no transition rows (the job_transitions
+    // foreign key cascades on delete), and MaxTransitionsPerJob is at least 1.
+    private readonly string _enqueueJob;
+
     // Per-Queue unlimited-Queue cache (issue 0170). The Concurrency Limit (I3) and Paused flag (§5.8)
     // share one queue_limits row, mutated only by rare operator actions; a claim on a limited or paused
     // Queue must lock and read that row, but the common unlimited, unpaused Queue need not pay the
@@ -93,6 +103,34 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         _historyPolicy = JobHistoryPolicyResolver.Resolve(options.HistoryPolicy);
         _dataSource = NpgsqlDataSource.Create(options.ConnectionString);
         _postCommitHints = new WakeUpHintCoalescer(SendHintsAsync, _logger);
+        // An empty claim still fires observer_log_register on its 0-row log insert (about 50 us of server CPU).
+        _claimInOneStatement = $"""
+            WITH {ClaimCandidates},
+            claimed AS ({ClaimUpdate(lockedVersionOnly: true)}),
+            leased AS (SELECT job_id, state, attempt, NULL::text AS detail, sequence AS ord FROM claimed)
+            {TransitionLogCtes("leased")}
+            SELECT claimed.*, n.candidates FROM (SELECT count(*) AS candidates FROM candidates) n LEFT JOIN claimed ON true
+            """;
+        _enqueueJob = _historyPolicy == JobHistoryPolicy.Off
+            ? $"WITH inserted AS ({InsertJob} RETURNING job_id) SELECT count(*) FROM inserted"
+            : $"""
+              WITH inserted AS ({InsertJob} RETURNING job_id, state),
+              logged AS (
+                  INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
+                  SELECT job_id, 0, @now, state, 0, NULL FROM inserted
+              )
+              SELECT count(*) FROM inserted
+              """;
+        _reportOutcomesInOneRoundTrip = OutcomeCommandSql(ChildEdgeGate);
+        _reportOutcomesInTransaction = OutcomeCommandSql(NoGate);
+        _recordTransitions = $"""
+            WITH entries AS (
+                SELECT * FROM unnest(@ids::uuid[], @states::int[], @attempts::int[], @details::text[])
+                    WITH ORDINALITY AS u(job_id, state, attempt, detail, ord)
+            )
+            {TransitionLogCtes("entries")}
+            SELECT count(*) FROM entries
+            """;
     }
 
     // The one place a Postgres command is built, so the configured schema is swapped into every query
@@ -192,6 +230,15 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         NewJob job, DateTimeOffset now, DbTransaction? transaction = null,
         CancellationToken cancellationToken = default)
     {
+        // Inside an ambient TransactionScope the store's own connection would enlist, and the scope could
+        // roll back a job the store already reported Ok and hinted.
+        if (transaction is null && System.Transactions.Transaction.Current is not null)
+        {
+            throw new InvalidOperationException(
+                "The Postgres store does not enqueue inside an ambient TransactionScope. Pass the "
+                + "NpgsqlTransaction to EnqueueAsync for a Transactional Enqueue, or enqueue outside the scope.");
+        }
+
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
 
         // The parent set is a set (§5.1): duplicate ids collapse before any rule applies.
@@ -236,16 +283,36 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         }
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await using var ownTransaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-        var (result, hintQueue) = await EnqueueCoreAsync(connection, ownTransaction, job, now, cancellationToken)
-            .ConfigureAwait(false);
-        await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        EnqueueResult result;
+        string? hintQueue;
+        if (IsOneStatementEnqueue(job))
+        {
+            (result, hintQueue) = await EnqueueInOneStatementAsync(connection, job, now, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            await using var ownTransaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            (result, hintQueue) = await EnqueueCoreAsync(connection, ownTransaction, job, now, cancellationToken)
+                .ConfigureAwait(false);
+            await ownTransaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
+        }
         if (hintQueue is not null)
         {
             _postCommitHints.Request(hintQueue);
         }
         return result;
     }
+
+    private static bool IsOneStatementEnqueue(NewJob job) => job.Parents.Count == 0 && job.Tags.Count == 0;
+
+    private async ValueTask<(EnqueueResult Result, string? HintQueue)> EnqueueInOneStatementAsync(
+        NpgsqlConnection connection, NewJob job, DateTimeOffset now, CancellationToken cancellationToken)
+        => await InsertJobAsync(
+                connection, transaction: null, job, JobState.Scheduled, parentsRemaining: 0, cancelledByParent: null,
+                now, workflowId: null, cancellationToken).ConfigureAwait(false)
+            ? (EnqueueResult.Ok, job.DueTime <= now ? job.Queue : null)
+            : (EnqueueResult.Duplicate, null);
 
     private async ValueTask<(EnqueueResult Result, string? HintQueue)> EnqueueCoreAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction, NewJob job, DateTimeOffset now,
@@ -295,58 +362,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             : pendingParents.Count > 0 ? JobState.AwaitingParent
             : JobState.Scheduled;
 
-        const string insertJob =
-            """
-            INSERT INTO backwave.jobs
-                (job_id, wire_name, payload, trace_context, queue, state, due_time, parents_remaining, mode,
-                 terminal_at, terminal_cause, workflow_id)
-            VALUES (@id, @wire, @payload, @trace::text, @queue, @state, @due, @remaining, @mode, @terminalAt, @terminalCause, @workflowId)
-            ON CONFLICT (job_id) DO NOTHING
-            """;
-        // The transition row exists only for a job row this statement inserted, so a Duplicate writes nothing.
-        var recordsHistory = _historyPolicy != JobHistoryPolicy.Off;
-        await using var insert = Cmd(
-            recordsHistory
-                ? $"""
-                  WITH inserted AS ({insertJob} RETURNING job_id)
-                  INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
-                  SELECT job_id, 0, @now, @state, 0, NULL FROM inserted
-                  RETURNING ordinal
-                  """
-                : insertJob,
-            connection, transaction);
-        insert.Parameters.AddWithValue("id", job.JobId);
-        insert.Parameters.AddWithValue("wire", job.WireName);
-        insert.Parameters.AddWithValue("payload", job.Payload.ToArray());
-        insert.Parameters.AddWithValue("trace", (object?)job.TraceContext ?? DBNull.Value);
-        insert.Parameters.AddWithValue("queue", job.Queue);
-        insert.Parameters.AddWithValue("state", (int)state);
-        insert.Parameters.AddWithValue("due", job.DueTime.ToUniversalTime());
-        insert.Parameters.AddWithValue("remaining", pendingParents.Count);
-        insert.Parameters.AddWithValue("mode", (int)job.Mode);
-        insert.Parameters.AddWithValue("terminalAt",
-            cancelledByParent is not null ? now.ToUniversalTime() : DBNull.Value);
-        insert.Parameters.AddWithValue("terminalCause",
-            cancelledByParent is not null ? ParentFailureCause(cancelledByParent.Value) : DBNull.Value);
-        // Workflow membership (ADR 0023): the immutable scalar, stamped once here at enqueue; null for
-        // an ordinary job. The Core never reads it — it lives entirely above the determinism boundary.
-        insert.Parameters.AddWithValue("workflowId", (object?)workflowId ?? DBNull.Value);
-        if (!recordsHistory)
+        if (!await InsertJobAsync(
+                connection, transaction, job, state, pendingParents.Count, cancelledByParent, now, workflowId,
+                cancellationToken).ConfigureAwait(false))
         {
-            if (await insert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false) == 0)
-            {
-                return (EnqueueResult.Duplicate, null);
-            }
-        }
-        else
-        {
-            insert.Parameters.AddWithValue("now", now.ToUniversalTime());
-            if (await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not long ordinal)
-            {
-                return (EnqueueResult.Duplicate, null);
-            }
-            await PruneTransitionsAsync(connection, transaction, job.JobId, ordinal, cancellationToken)
-                .ConfigureAwait(false);
+            return (EnqueueResult.Duplicate, null);
         }
 
         // Crash between the job row and its parent edges: rollback must leave neither (issue 0034).
@@ -368,6 +388,43 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
         return (EnqueueResult.Ok, state == JobState.Scheduled && job.DueTime <= now ? job.Queue : null);
     }
+
+    // False when the job id already exists (a Duplicate).
+    private async ValueTask<bool> InsertJobAsync(
+        NpgsqlConnection connection, NpgsqlTransaction? transaction, NewJob job, JobState state,
+        int parentsRemaining, JobState? cancelledByParent, DateTimeOffset now, Guid? workflowId,
+        CancellationToken cancellationToken)
+    {
+        await using var insert = Cmd(_enqueueJob, connection, transaction);
+        insert.Parameters.AddWithValue("id", job.JobId);
+        insert.Parameters.AddWithValue("wire", job.WireName);
+        insert.Parameters.AddWithValue("payload", job.Payload.ToArray());
+        insert.Parameters.AddWithValue("trace", (object?)job.TraceContext ?? DBNull.Value);
+        insert.Parameters.AddWithValue("queue", job.Queue);
+        insert.Parameters.AddWithValue("state", (int)state);
+        insert.Parameters.AddWithValue("due", job.DueTime.ToUniversalTime());
+        insert.Parameters.AddWithValue("remaining", parentsRemaining);
+        insert.Parameters.AddWithValue("mode", (int)job.Mode);
+        insert.Parameters.AddWithValue("terminalAt",
+            cancelledByParent is not null ? now.ToUniversalTime() : DBNull.Value);
+        insert.Parameters.AddWithValue("terminalCause",
+            cancelledByParent is { } parentState ? ParentFailureCause(parentState) : DBNull.Value);
+        // Workflow membership: the immutable scalar, stamped once here at enqueue; null for an ordinary
+        // job. The Core never reads it; it lives entirely above the determinism boundary.
+        insert.Parameters.AddWithValue("workflowId", (object?)workflowId ?? DBNull.Value);
+        insert.Parameters.AddWithValue("now", now.ToUniversalTime());
+        return await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is 1L;
+    }
+
+    private const string InsertJob =
+        """
+        INSERT INTO backwave.jobs
+            (job_id, wire_name, payload, trace_context, queue, state, due_time, parents_remaining, mode,
+             terminal_at, terminal_cause, workflow_id)
+        VALUES (@id, @wire, @payload, @trace::text, @queue, @state, @due, @remaining, @mode, @terminalAt,
+                @terminalCause, @workflowId)
+        ON CONFLICT (job_id) DO NOTHING
+        """;
 
     private async Task SendHintsAsync(IReadOnlyCollection<string> queues, CancellationToken cancellationToken)
     {
@@ -442,127 +499,15 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 break;
             }
 
-            await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-
-            // Concurrency Limit (I3) and Paused flag (§5.8) live in one row: lock it so concurrent
-            // claimers of a limited Queue serialize on the slot count and a concurrent Pause is observed
-            // atomically. A Queue recently observed unlimited AND unpaused skips this round-trip and the
-            // lock entirely (issue 0170) — the common case pays nothing; see _unlimitedQueues.
-            var slots = int.MaxValue;
-            var paused = false;
-            int? configured = null;
-            if (!IsCachedUnlimited(queue))
+            var take = maxJobs - claimed.Count;
+            var (queueClaims, claimRestInTransaction) = IsCachedUnlimited(queue)
+                ? await ClaimInOneStatementAsync(connection, request, queue, take, cancellationToken).ConfigureAwait(false)
+                : ([], true);
+            if (claimRestInTransaction)
             {
-                // Serialize claim-vs-first-config on a key that exists BEFORE the row does (issue 0193):
-                // the FOR UPDATE below locks nothing when no queue_limits row exists yet, so it does not
-                // serialize against the FIRST pause/limit's INSERT — an in-flight claim could over-claim
-                // past a first-ever limit or slip past a first-ever pause. The advisory lock (below) is
-                // taken by both this read path and the operator setters, so they serialize with no row
-                // present. Scoped to the read path: a cached unlimited, unpaused Queue (issue 0170) skips
-                // this block entirely and still pays nothing.
-                await AcquireQueueConfigLockAsync(connection, transaction, queue, cancellationToken).ConfigureAwait(false);
-                // Capture the generation BEFORE the read so a concurrent operator change (which bumps it)
-                // is detected when we go to publish the stamp below (issue 0170).
-                var generation = Interlocked.Read(ref _queueConfigGeneration);
-                await using (var limit = Cmd(
-                    "SELECT max_concurrent, paused FROM backwave.queue_limits WHERE queue = @queue FOR UPDATE",
-                    connection, transaction))
-                {
-                    limit.Parameters.AddWithValue("queue", queue);
-                    await using var reader = await limit.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
-                    if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                    {
-                        configured = reader.IsDBNull(0) ? null : reader.GetInt32(0);
-                        paused = reader.GetBoolean(1);
-                    }
-                }
-                CacheQueueConfig(queue, configured, paused, generation);
+                queueClaims.AddRange(await ClaimInTransactionAsync(
+                    connection, request, queue, take - queueClaims.Count, cancellationToken).ConfigureAwait(false));
             }
-            if (paused)
-            {
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                continue; // a Paused Queue yields nothing to Claim (§5.8)
-            }
-            if (configured is { } limitValue)
-            {
-                await using var leased = Cmd(
-                    "SELECT count(*) FROM backwave.jobs WHERE queue = @queue AND state = 2",
-                    connection, transaction);
-                leased.Parameters.AddWithValue("queue", queue);
-                if (await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not long inUse)
-                {
-                    throw Invariant.Halt(
-                        InvariantTrigger.LeasedCountAggregateNull,
-                        $"The leased-count aggregate for queue '{queue}' returned no value; COUNT(*) always returns one.");
-                }
-                slots = limitValue - (int)inUse;
-            }
-            if (slots <= 0)
-            {
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                continue;
-            }
-
-            // The single contended operation: set-based FOR UPDATE SKIP LOCKED.
-            await using var claim = Cmd(
-                """
-                WITH candidates AS (
-                    SELECT job_id FROM backwave.jobs
-                    WHERE queue = @queue AND state = 0 AND due_time <= @now
-                    ORDER BY due_time, sequence
-                    LIMIT @take
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE backwave.jobs j
-                SET state = 2, attempt = j.attempt + 1, lease_owner = @worker, lease_expiry = @expiry
-                FROM candidates c
-                WHERE j.job_id = c.job_id
-                RETURNING j.job_id, j.wire_name, j.payload, j.queue, j.state, j.due_time, j.attempt,
-                          j.lease_owner, j.lease_expiry, j.cancel_requested, j.terminal_at,
-                          j.terminal_cause, j.schedule_id, j.parents_remaining, j.mode, j.trace_context,
-                          j.sequence, j.workflow_id, j.retry_cause,
-                          -- Job Tags (ADR 0022) ride back with the claim as a correlated aggregate in
-                          -- THIS round-trip — never a second SELECT — so the no-tags hot path pays only a
-                          -- PK-indexed empty lookup (NULL) and is never N+1. The empty-string-key => Label
-                          -- discriminator is reconstructed below. Always correct, no gating staleness.
-                          (SELECT json_agg(json_build_object('k', t.key, 'v', t.value))
-                           FROM backwave.job_tags t WHERE t.job_id = j.job_id)::text
-                """,
-                connection, transaction);
-            claim.Parameters.AddWithValue("queue", queue);
-            claim.Parameters.AddWithValue("now", request.Now.ToUniversalTime());
-            claim.Parameters.AddWithValue("take", Math.Min(maxJobs - claimed.Count, slots));
-            claim.Parameters.AddWithValue("worker", request.WorkerId);
-            claim.Parameters.AddWithValue("expiry", (request.Now + request.LeaseDuration).ToUniversalTime());
-            var queueClaims = new List<JobRecord>();
-            await using (var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false))
-            {
-                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                {
-                    var job = ReadJob(reader);
-                    if (job.State != JobState.Leased || !string.Equals(job.LeaseOwner, request.WorkerId, StringComparison.Ordinal))
-                    {
-                        throw Invariant.Halt(
-                            InvariantTrigger.ClaimedRowNotLeasedToWorker,
-                            $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
-                    }
-                    // Column 19 is the correlated tag aggregate (json or NULL when the job has none).
-                    if (!reader.IsDBNull(19))
-                    {
-                        job = job with { Tags = ParseTagsJson(reader.GetString(19)) };
-                    }
-                    queueClaims.Add(job);
-                }
-            }
-            // Crash after the lease write, before commit: rollback must un-lease every row (issue 0034).
-            await FailpointAsync("claim", cancellationToken).ConfigureAwait(false);
-            // Transition Log (§5.12): one Leased entry per claimed job at its post-claim Attempt, in
-            // ONE set-based INSERT in this same transaction (atomic with the lease write).
-            await RecordTransitionsBatchAsync(
-                connection, transaction,
-                [.. queueClaims.Select(j => (j.JobId, JobState.Leased, j.Attempt, (string?)null))],
-                request.Now, cancellationToken).ConfigureAwait(false);
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
             // RETURNING does not guarantee order; the contract's per-Queue
             // (DueTime, enqueue order) does (§5.2).
@@ -575,6 +520,209 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             ? await NextDueAsync(connection, request, cancellationToken).ConfigureAwait(false)
             : null;
         return (claimed, nextDue);
+    }
+
+    // The claim of a Queue recently seen unlimited and unpaused: one autocommit statement, so the lease
+    // write, its Leased transitions and any prune commit together in one round trip. Every CTE of the
+    // statement reads the snapshot it started with, but FOR UPDATE locks the newest version of each row,
+    // which can be newer: another claimer leased the job and handed it back after that snapshot. The
+    // ordinal read and the prune would then miss that claimer's transitions. Every transition writer
+    // also updates the job row in its transaction, so the UPDATE writes only a row whose snapshot
+    // version is the one FOR UPDATE locked (same xmin); its scan reads the snapshot version and drops a
+    // changed row before any write, so no EvalPlanQual re-check substitutes the newer one. Skipped is
+    // true when it dropped a candidate, and the caller claims the rest in a transaction, which reads the
+    // Queue's config again and whose log write reads a snapshot taken after the locks.
+    private async ValueTask<(List<JobRecord> Claimed, bool Skipped)> ClaimInOneStatementAsync(
+        NpgsqlConnection connection, ClaimRequest request, string queue, int take, CancellationToken cancellationToken)
+    {
+        await using var claim = Cmd(_claimInOneStatement, connection);
+        AddClaimParameters(claim, request, queue, take);
+        claim.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
+        var queueClaims = new List<JobRecord>();
+        long candidates = 0;
+        await using var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        var tags = reader.GetOrdinal("tags");
+        var candidatesColumn = reader.GetOrdinal("candidates");
+        // The Lease commits with the statement, so a cancelled read would leave these jobs leased to this
+        // worker, unseen, until the Lease expires. Stopping the read saves nothing.
+        while (await reader.ReadAsync(CancellationToken.None).ConfigureAwait(false))
+        {
+            candidates = reader.GetInt64(candidatesColumn);
+            if (!reader.IsDBNull(0))
+            {
+                queueClaims.Add(ReadClaimedJob(reader, request, tags));
+            }
+        }
+        return (queueClaims, queueClaims.Count < candidates);
+    }
+
+    private async ValueTask<List<JobRecord>> ClaimInTransactionAsync(
+        NpgsqlConnection connection, ClaimRequest request, string queue, int take, CancellationToken cancellationToken)
+    {
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+        // Concurrency Limit (I3) and Paused flag (§5.8) live in one row: lock it so concurrent
+        // claimers of a limited Queue serialize on the slot count and a concurrent Pause is observed
+        // atomically.
+        var slots = int.MaxValue;
+        var paused = false;
+        int? configured = null;
+        // Serialize claim-vs-first-config on a key that exists BEFORE the row does (issue 0193):
+        // the FOR UPDATE below locks nothing when no queue_limits row exists yet, so it does not
+        // serialize against the FIRST pause/limit's INSERT: an in-flight claim could over-claim
+        // past a first-ever limit or slip past a first-ever pause. The advisory lock (below) is
+        // taken by both this read path and the operator setters, so they serialize with no row
+        // present.
+        await AcquireQueueConfigLockAsync(connection, transaction, queue, cancellationToken).ConfigureAwait(false);
+        // Capture the generation BEFORE the read so a concurrent operator change (which bumps it)
+        // is detected when we go to publish the stamp below (issue 0170).
+        var generation = Interlocked.Read(ref _queueConfigGeneration);
+        await using (var limit = Cmd(
+            "SELECT max_concurrent, paused FROM backwave.queue_limits WHERE queue = @queue FOR UPDATE",
+            connection, transaction))
+        {
+            limit.Parameters.AddWithValue("queue", queue);
+            await using var reader = await limit.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+            if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                configured = reader.IsDBNull(0) ? null : reader.GetInt32(0);
+                paused = reader.GetBoolean(1);
+            }
+        }
+        CacheQueueConfig(queue, configured, paused, generation);
+        if (paused)
+        {
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
+            return []; // a Paused Queue yields nothing to Claim (§5.8)
+        }
+        if (configured is { } limitValue)
+        {
+            await using var leased = Cmd(
+                "SELECT count(*) FROM backwave.jobs WHERE queue = @queue AND state = 2",
+                connection, transaction);
+            leased.Parameters.AddWithValue("queue", queue);
+            if (await leased.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not long inUse)
+            {
+                throw Invariant.Halt(
+                    InvariantTrigger.LeasedCountAggregateNull,
+                    $"The leased-count aggregate for queue '{queue}' returned no value; COUNT(*) always returns one.");
+            }
+            slots = limitValue - (int)inUse;
+        }
+        if (slots <= 0)
+        {
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
+            return [];
+        }
+
+        await using var claim = Cmd($"WITH {ClaimCandidates} {ClaimUpdate(lockedVersionOnly: false)}", connection, transaction);
+        AddClaimParameters(claim, request, queue, Math.Min(take, slots));
+        var queueClaims = await ReadClaimedAsync(claim, request, cancellationToken).ConfigureAwait(false);
+        // Crash after the lease write, before commit: rollback must un-lease every row (issue 0034).
+        await FailpointAsync("claim", cancellationToken).ConfigureAwait(false);
+        // Transition Log (§5.12): one Leased entry per claimed job at its post-claim Attempt, in
+        // ONE set-based INSERT in this same transaction (atomic with the lease write).
+        await RecordTransitionsBatchAsync(
+            connection, transaction,
+            [.. queueClaims.Select(j => (j.JobId, JobState.Leased, j.Attempt, (string?)null))],
+            request.Now, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
+        return queueClaims;
+    }
+
+    private const string ClaimCandidates =
+        """
+        candidates AS (
+            SELECT job_id, xmin AS locked_version FROM backwave.jobs
+            WHERE queue = @queue AND state = 0 AND due_time <= @now
+            ORDER BY due_time, sequence
+            LIMIT @take
+            FOR UPDATE SKIP LOCKED
+        )
+        """;
+
+    // Job Tags ride back with the claim as a correlated aggregate in the same round trip, never a
+    // second SELECT, so the no-tags hot path pays only a PK-indexed empty lookup (NULL) and is never N+1.
+    // ReadClaimedJob reconstructs the empty-string-key Label discriminator. The CASE around the xmin
+    // filter keeps the planner's half-rows guess for an opaque boolean instead of its 0.5% guess for an
+    // equality on a column with no statistics, which would plan the Transition Log CTEs for one row.
+    private static string ClaimUpdate(bool lockedVersionOnly) =>
+        $"""
+        UPDATE backwave.jobs j
+        SET state = 2, attempt = j.attempt + 1, lease_owner = @worker, lease_expiry = @expiry
+        FROM candidates c
+        WHERE j.job_id = c.job_id{(lockedVersionOnly ? " AND CASE WHEN j.xmin = c.locked_version THEN true END" : "")}
+        RETURNING j.job_id, j.wire_name, j.payload, j.queue, j.state, j.due_time, j.attempt,
+                  j.lease_owner, j.lease_expiry, j.cancel_requested, j.terminal_at,
+                  j.terminal_cause, j.schedule_id, j.parents_remaining, j.mode, j.trace_context,
+                  j.sequence, j.workflow_id, j.retry_cause,
+                  (SELECT json_agg(json_build_object('k', t.key, 'v', t.value))
+                   FROM backwave.job_tags t WHERE t.job_id = j.job_id)::text AS tags
+        """;
+
+    // The Transition Log append (§5.12) and its per-job-life prune (§7) as CTEs over `source`, a CTE of
+    // (job_id, state, attempt, detail, ord) rows with each job at most once, appended in `ord` order. It
+    // writes every transition except the enqueue's ordinal-0 insert. Every CTE reads the statement's one
+    // snapshot, so a transaction path runs it after the statement that locks the jobs, and the
+    // one-statement claim runs it only for the job rows whose locked version its snapshot holds.
+    // Either way the ordinal read sees every committed transition of a locked job. The prune deletes only
+    // rows older than the new one, which that snapshot sees, and its cap filter leaves it nothing to
+    // delete until a job reaches the cap. Empty under JobHistoryPolicy.Off, and otherwise starts with the
+    // comma that follows the statement's previous CTE.
+    private string TransitionLogCtes(string source) => _historyPolicy == JobHistoryPolicy.Off
+        ? ""
+        : $"""
+        ,
+        logged AS (
+            INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
+            SELECT s.job_id, COALESCE(t.maxord, -1) + 1, @now, s.state, s.attempt, s.detail
+            FROM {source} s
+            LEFT JOIN (
+                SELECT job_id, MAX(ordinal) AS maxord FROM backwave.job_transitions
+                WHERE job_id IN (SELECT job_id FROM {source}) GROUP BY job_id
+            ) t ON t.job_id = s.job_id
+            ORDER BY s.ord
+            RETURNING job_id, ordinal
+        ),
+        pruned AS (
+            DELETE FROM backwave.job_transitions jt
+            USING logged l
+            WHERE l.ordinal >= @transitionCap AND jt.job_id = l.job_id AND jt.ordinal <= l.ordinal - @transitionCap
+        )
+        """;
+
+    private static void AddClaimParameters(NpgsqlCommand claim, ClaimRequest request, string queue, int take)
+    {
+        claim.Parameters.AddWithValue("queue", queue);
+        claim.Parameters.AddWithValue("now", request.Now.ToUniversalTime());
+        claim.Parameters.AddWithValue("take", take);
+        claim.Parameters.AddWithValue("worker", request.WorkerId);
+        claim.Parameters.AddWithValue("expiry", (request.Now + request.LeaseDuration).ToUniversalTime());
+    }
+
+    private static async ValueTask<List<JobRecord>> ReadClaimedAsync(
+        NpgsqlCommand claim, ClaimRequest request, CancellationToken cancellationToken)
+    {
+        var queueClaims = new List<JobRecord>();
+        await using var reader = await claim.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        var tags = reader.GetOrdinal("tags");
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            queueClaims.Add(ReadClaimedJob(reader, request, tags));
+        }
+        return queueClaims;
+    }
+
+    private static JobRecord ReadClaimedJob(NpgsqlDataReader reader, ClaimRequest request, int tags)
+    {
+        var job = ReadJob(reader);
+        if (job.State != JobState.Leased || !string.Equals(job.LeaseOwner, request.WorkerId, StringComparison.Ordinal))
+        {
+            throw Invariant.Halt(
+                InvariantTrigger.ClaimedRowNotLeasedToWorker,
+                $"Claim returned job {job.JobId} in state {job.State} leased to '{job.LeaseOwner}'; the same statement had just set Leased to '{request.WorkerId}'.");
+        }
+        return reader.IsDBNull(tags) ? job : job with { Tags = ParseTagsJson(reader.GetString(tags)) };
     }
 
     // The earliest future instant a currently-empty claim could begin returning work through time alone,
@@ -753,7 +901,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
         if (await update.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is not int newState)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return OutcomeResult.StaleLease; // the (workerId, attempt) fence
         }
 
@@ -781,7 +929,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             await ResolveChildLatchesAsync(connection, transaction, jobId, (JobState)newState, now, cancellationToken)
                 .ConfigureAwait(false);
         }
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return OutcomeResult.Applied;
     }
 
@@ -829,53 +977,174 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         }
 
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
-        var nowUtc = now.ToUniversalTime();
+        var vector = OutcomeVector.From(batch, now.ToUniversalTime(), TransitionDetail);
+        var applied = NeedsPerRowWrites(batch)
+            ? await ReportOutcomesInTransactionAsync(batch, vector, now, cancellationToken).ConfigureAwait(false)
+            : await TryReportOutcomesInOneRoundTripAsync(vector, now, cancellationToken).ConfigureAwait(false)
+              ?? await ReportOutcomesInTransactionAsync(batch, vector, now, cancellationToken).ConfigureAwait(false);
 
-        // The set-valued payload: each row's fence keys (worker, attempt) plus its COMPUTED target
-        // state and the per-state columns (terminal instant, cause, retry due-time). Output blobs and
-        // Tag deltas stay OUT of this vector — the few rows carrying them get a per-row write below,
-        // inside this same transaction, so the common pure-drain row rides the batch UPDATE alone.
-        var count = batch.Count;
-        var ids = new Guid[count];
-        var workers = new string[count];
-        var attempts = new int[count];
-        var states = new int[count];
-        var causes = new string?[count];
-        var dues = new DateTimeOffset?[count];
-        var terminalAts = new DateTimeOffset?[count];
-        for (var i = 0; i < count; i++)
+        var results = new OutcomeReportResult[batch.Count];
+        for (var i = 0; i < batch.Count; i++)
         {
-            var row = batch[i];
-            ids[i] = row.JobId;
-            workers[i] = row.WorkerId;
-            attempts[i] = row.Attempt;
-            // Success → Succeeded (3, terminal now); Failure with a retry instant → Scheduled (0, due
-            // then, NOT terminal); Failure at the ceiling → Dead-Lettered (5); Cancelled → 4; Unroutable
-            // → Quarantined (6). The cause rides terminal failures/cancel/unroutable; due rides retry.
-            (int State, string? Cause, DateTimeOffset? Due, DateTimeOffset? TerminalAt) target = row.Outcome switch
+            results[i] = new OutcomeReportResult(
+                batch[i].JobId,
+                applied.ContainsKey(batch[i].JobId) ? OutcomeResult.Applied : OutcomeResult.StaleLease);
+        }
+        return results;
+    }
+
+    // Output blobs and Tag deltas stay out of the vector: the few rows carrying them get a per-row write
+    // inside the transaction.
+    private sealed record OutcomeVector(
+        Guid[] Ids, string[] Workers, int[] Attempts, int[] States, string?[] Causes,
+        DateTimeOffset?[] Dues, DateTimeOffset?[] TerminalAts, string?[] Details)
+    {
+        public static OutcomeVector From(
+            IReadOnlyList<OutcomeReport> batch, DateTimeOffset nowUtc, Func<string?, string?> transitionDetail)
+        {
+            var count = batch.Count;
+            var vector = new OutcomeVector(
+                new Guid[count], new string[count], new int[count], new int[count], new string?[count],
+                new DateTimeOffset?[count], new DateTimeOffset?[count], new string?[count]);
+            for (var i = 0; i < count; i++)
             {
-                JobOutcome.Success => (3, null, null, nowUtc),
-                JobOutcome.Failure { NextDueTime: { } retryAt } => (0, null, retryAt.ToUniversalTime(), null),
-                JobOutcome.Failure failure => (5, failure.Error, null, nowUtc),
-                JobOutcome.Cancelled cancelled => (4, cancelled.Cause, null, nowUtc),
-                JobOutcome.Unroutable unroutable => (6, unroutable.Reason, null, nowUtc),
-                _ => throw new ArgumentOutOfRangeException(nameof(batch)),
-            };
-            (states[i], causes[i], dues[i], terminalAts[i]) = target;
+                var row = batch[i];
+                vector.Ids[i] = row.JobId;
+                vector.Workers[i] = row.WorkerId;
+                vector.Attempts[i] = row.Attempt;
+                (JobState State, string? Cause, DateTimeOffset? Due, DateTimeOffset? TerminalAt) target = row.Outcome switch
+                {
+                    JobOutcome.Success => (JobState.Succeeded, null, null, nowUtc),
+                    JobOutcome.Failure { NextDueTime: { } retryAt } => (JobState.Scheduled, null, retryAt.ToUniversalTime(), null),
+                    JobOutcome.Failure failure => (JobState.DeadLettered, failure.Error, null, nowUtc),
+                    JobOutcome.Cancelled cancelled => (JobState.Cancelled, cancelled.Cause, null, nowUtc),
+                    JobOutcome.Unroutable unroutable => (JobState.Quarantined, unroutable.Reason, null, nowUtc),
+                    _ => throw new ArgumentOutOfRangeException(nameof(batch)),
+                };
+                (var state, vector.Causes[i], vector.Dues[i], vector.TerminalAts[i]) = target;
+                vector.States[i] = (int)state;
+                vector.Details[i] = row.Outcome is JobOutcome.Failure ? transitionDetail(row.FailureDetail) : null;
+            }
+            return vector;
         }
 
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        public void AddTo(NpgsqlCommand command)
+        {
+            command.Parameters.AddWithValue("ids", Ids);
+            command.Parameters.AddWithValue("workers", Workers);
+            command.Parameters.AddWithValue("attempts", Attempts);
+            command.Parameters.AddWithValue("states", States);
+            command.Parameters.AddWithValue("causes", Causes);
+            command.Parameters.AddWithValue("dues", Dues);
+            command.Parameters.AddWithValue("terminalAts", TerminalAts);
+            command.Parameters.AddWithValue("details", Details);
+        }
+    }
 
-        // One fenced multi-row UPDATE: the WHERE applies the per-(worker, attempt) Effect-Once fence to
-        // every row INDEPENDENTLY. A row whose lease is no longer live simply fails to join and changes
-        // nothing (StaleLease); a matched row applies and is returned via RETURNING, keyed by job id.
-        // due_time moves only for a retry row (COALESCE keeps it for everyone else); cancel_requested
-        // clears only for a Cancelled row. terminal_at/terminal_cause carry per-row (null for retry).
-        // retry_cause records a handler-failure retry and is left alone on every terminal row.
-        var matched = new Dictionary<Guid, int>();
-        await using (var update = Cmd(
-            """
+    private static bool NeedsPerRowWrites(IReadOnlyList<OutcomeReport> batch)
+    {
+        foreach (var row in batch)
+        {
+            if ((row.Outcome is JobOutcome.Success && row.Output is not null) || row.AddedTags is { Count: > 0 })
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The outcome write in one round trip: the outcome command with the child-edge gate, which Npgsql
+    // runs as one implicit transaction that commits when the server reaches the end of the command. The
+    // write happens only when no row it would make terminal parents a Dependency, because the latch
+    // cascade (invariant I2) must commit with the terminal write. Otherwise it writes nothing, returns
+    // null, and the caller runs the batch in the transaction that cascades.
+    private async ValueTask<Dictionary<Guid, JobState>?> TryReportOutcomesInOneRoundTripAsync(
+        OutcomeVector vector, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        var (gated, applied) = await WriteOutcomesAsync(
+            _reportOutcomesInOneRoundTrip, connection, null, vector, now, cancellationToken).ConfigureAwait(false);
+        return gated ? null : applied;
+    }
+
+    private async ValueTask<(bool Gated, Dictionary<Guid, JobState> Applied)> WriteOutcomesAsync(
+        string sql, NpgsqlConnection connection, NpgsqlTransaction? transaction, OutcomeVector vector,
+        DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        await using var write = Cmd(sql, connection, transaction);
+        vector.AddTo(write);
+        write.Parameters.AddWithValue("now", now.ToUniversalTime());
+        write.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
+
+        var applied = new Dictionary<Guid, JobState>();
+        var gated = false;
+        await using var reader = await write.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
+        await reader.NextResultAsync(cancellationToken).ConfigureAwait(false); // past LockOutcomeRows
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            gated = reader.GetBoolean(0);
+            if (!reader.IsDBNull(1))
+            {
+                applied.Add(reader.GetGuid(1), (JobState)reader.GetInt32(2));
+            }
+        }
+        return (gated, applied);
+    }
+
+    // The outcome command: two statements, sent as one round trip. The first takes the row lock of every
+    // row the fence will match, in id order. The second then reads a snapshot taken after those locks,
+    // so no other transaction can still be changing these rows under it: a child enqueue that held a
+    // parent's lock has committed its edge into this snapshot, and one that comes later waits on the lock
+    // and then sees the parent terminal; and the transition ordinals it reads are the latest. A gated or
+    // empty write returns one row with a null job id.
+    private string OutcomeCommandSql(string gate) =>
+        $"""
+        {LockOutcomeRows};
+        WITH d AS (SELECT * FROM {OutcomeRows}),
+        gate AS ({gate}),
+        {OutcomeWrite}
+        {TransitionLogCtes("written")}
+        SELECT gate.gated, w.job_id, w.state FROM gate LEFT JOIN written w ON true
+        """;
+
+    // True when a row the batch would make terminal parents a Dependency.
+    private const string ChildEdgeGate =
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM backwave.job_parents p JOIN d ON p.parent_id = d.job_id WHERE d.state <> 0
+        ) AS gated
+        """;
+
+    private const string NoGate = "SELECT false AS gated";
+
+    private const string OutcomeFence =
+        """
+        j.job_id = d.job_id AND j.state = 2 AND j.lease_owner = d.worker AND j.attempt = d.attempt
+          AND j.lease_expiry > @now
+        """;
+
+    private const string OutcomeRows =
+        """
+        unnest(@ids::uuid[], @workers::text[], @attempts::int[], @states::int[], @causes::text[],
+               @dues::timestamptz[], @terminalAts::timestamptz[], @details::text[])
+            WITH ORDINALITY AS d(job_id, worker, attempt, state, cause, due, terminal_at, detail, ord)
+        """;
+
+    private const string LockOutcomeRows =
+        $"""
+        SELECT count(*) FROM (
+            SELECT 1 FROM backwave.jobs j, {OutcomeRows}
+            WHERE {OutcomeFence}
+            ORDER BY j.job_id
+            FOR NO KEY UPDATE OF j
+        ) locked
+        """;
+
+    // One fenced multi-row UPDATE: a row whose lease is no longer live fails to join (StaleLease). State 0
+    // is a retry and 4 Cancelled; retry_cause 1 marks a handler-failure retry.
+    private const string OutcomeWrite =
+        $"""
+        written AS (
             UPDATE backwave.jobs j
             SET state = d.state,
                 lease_owner = NULL,
@@ -885,37 +1154,28 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 due_time = COALESCE(d.due, j.due_time),
                 cancel_requested = CASE WHEN d.state = 4 THEN false ELSE j.cancel_requested END,
                 retry_cause = CASE WHEN d.state = 0 THEN 1 ELSE j.retry_cause END
-            FROM unnest(@ids::uuid[], @workers::text[], @attempts::int[], @states::int[],
-                        @causes::text[], @dues::timestamptz[], @terminalAts::timestamptz[])
-                 AS d(job_id, worker, attempt, state, cause, due, terminal_at)
-            WHERE j.job_id = d.job_id AND j.state = 2 AND j.lease_owner = d.worker
-              AND j.attempt = d.attempt AND j.lease_expiry > @now
-            RETURNING j.job_id, j.state
-            """,
-            connection, transaction))
-        {
-            update.Parameters.AddWithValue("ids", ids);
-            update.Parameters.AddWithValue("workers", workers);
-            update.Parameters.AddWithValue("attempts", attempts);
-            update.Parameters.AddWithValue("states", states);
-            update.Parameters.AddWithValue("causes", causes);
-            update.Parameters.AddWithValue("dues", dues);
-            update.Parameters.AddWithValue("terminalAts", terminalAts);
-            update.Parameters.AddWithValue("now", nowUtc);
-            await using var reader = await update.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            {
-                matched[reader.GetGuid(0)] = reader.GetInt32(1);
-            }
-        }
+            FROM d, gate
+            WHERE NOT gate.gated AND {OutcomeFence}
+            RETURNING j.job_id, j.state, j.attempt, d.detail, d.ord
+        )
+        """;
 
-        // Output and Tag deltas land ONLY for matched rows — a fenced-out (StaleLease) row leaves
+    private async ValueTask<Dictionary<Guid, JobState>> ReportOutcomesInTransactionAsync(
+        IReadOnlyList<OutcomeReport> batch, OutcomeVector vector, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+        var (_, applied) = await WriteOutcomesAsync(
+            _reportOutcomesInTransaction, connection, transaction, vector, now, cancellationToken).ConfigureAwait(false);
+
+        // Output and Tag deltas land ONLY for applied rows: a fenced-out (StaleLease) row leaves
         // nothing a stale node buffered. Output persists only on a Success outcome; Tags union onto
         // the job's existing tags (set semantics, so an identical tag is a no-op). Both ride this
-        // same fenced transaction, keeping the common drain row a pure batch UPDATE.
+        // same fenced transaction.
         foreach (var row in batch)
         {
-            if (!matched.ContainsKey(row.JobId))
+            if (!applied.ContainsKey(row.JobId))
             {
                 continue;
             }
@@ -933,35 +1193,12 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
         }
 
-        // Transition Log (§5.12): one entry per matched row for its resulting state at this Attempt,
-        // in ONE set-based INSERT atomic with the outcome write. Failure Detail rides only a failing
-        // transition; every other outcome records null. The batch honors the history policy (Off
-        // appends nothing), so the noop-drain hot path adds no transition statements at all.
-        var transitionRows = new List<(Guid JobId, JobState State, int Attempt, string? FailureDetail)>(matched.Count);
-        foreach (var row in batch)
-        {
-            if (matched.TryGetValue(row.JobId, out var newState))
-            {
-                transitionRows.Add((row.JobId, (JobState)newState, row.Attempt,
-                    row.Outcome is JobOutcome.Failure ? row.FailureDetail : null));
-            }
-        }
-        await RecordTransitionsBatchAsync(connection, transaction, transitionRows, now, cancellationToken)
-            .ConfigureAwait(false);
-
         // First-level child-latch resolution for the matched TERMINAL ids only (a retry row stays
         // non-terminal and gates nothing). One lookup finds the few terminal parents that actually
         // gate a Dependency; the existing per-parent cascade then resolves each recursively, so a deep
         // dependency graph stays correct. The common no-children batch adds zero per-job statements.
-        var terminalIds = new List<Guid>();
-        foreach (var (jobId, state) in matched)
-        {
-            if (((JobState)state).IsTerminal())
-            {
-                terminalIds.Add(jobId);
-            }
-        }
-        if (terminalIds.Count > 0)
+        var terminal = applied.Where(job => job.Value.IsTerminal()).ToDictionary();
+        if (terminal.Count > 0)
         {
             // Crash after the terminal write, before the latch cascade: rollback must leave every
             // parent non-terminal and every child latch un-resolved (issue 0034, invariant I2). Kept a
@@ -973,7 +1210,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 "SELECT DISTINCT parent_id FROM backwave.job_parents WHERE parent_id = ANY(@ids)",
                 connection, transaction))
             {
-                withChildren.Parameters.AddWithValue("ids", terminalIds.ToArray());
+                withChildren.Parameters.AddWithValue("ids", terminal.Keys.ToArray());
                 await using var reader = await withChildren.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
@@ -983,29 +1220,20 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             parents.Sort(); // deterministic lock order, as everywhere else (issue 0032)
             foreach (var parentId in parents)
             {
-                if (!matched.TryGetValue(parentId, out var parentState))
+                if (!terminal.TryGetValue(parentId, out var parentState))
                 {
                     throw Invariant.Halt(
                         InvariantTrigger.ParentJobMissingFromBatch,
                         $"Parent job {parentId} came back from a lookup restricted to this batch's own terminal ids, yet it is absent from that batch.");
                 }
                 await ResolveChildLatchesAsync(
-                    connection, transaction, parentId, (JobState)parentState, now, cancellationToken)
+                    connection, transaction, parentId, parentState, now, cancellationToken)
                     .ConfigureAwait(false);
             }
         }
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-
-        // One result per input row, in input order, keyed by job id: matched ⇒ Applied, else StaleLease.
-        var results = new OutcomeReportResult[count];
-        for (var i = 0; i < count; i++)
-        {
-            results[i] = new OutcomeReportResult(
-                batch[i].JobId,
-                matched.ContainsKey(batch[i].JobId) ? OutcomeResult.Applied : OutcomeResult.StaleLease);
-        }
-        return results;
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
+        return applied;
     }
 
     /// <summary>
@@ -1317,7 +1545,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
         }
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return expired.Count;
     }
 
@@ -1370,7 +1598,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
 
         if (held.Count == 0)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return 0;
         }
 
@@ -1480,7 +1708,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
         }
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return held.Count;
     }
 
@@ -1527,7 +1755,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     .ConfigureAwait(false);
                 await AppendAuditAsync(connection, transaction, actor, OperatorAction.Cancel, jobId.ToString(), now, cancellationToken)
                     .ConfigureAwait(false);
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
                 return CancelResult.CancelledImmediately;
 
             case JobState.Leased:
@@ -1539,11 +1767,11 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                 }
                 await AppendAuditAsync(connection, transaction, actor, OperatorAction.Cancel, jobId.ToString(), now, cancellationToken)
                     .ConfigureAwait(false);
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
                 return CancelResult.CancellationRequested;
 
             default:
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
                 return CancelResult.NotCancellable;
         }
     }
@@ -1574,7 +1802,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         update.Parameters.AddWithValue("now", now.ToUniversalTime());
         if (await update.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false) is null)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return RequeueResult.NotRequeueable;
         }
 
@@ -1583,7 +1811,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             .ConfigureAwait(false);
         await AppendAuditAsync(connection, transaction, actor, OperatorAction.Requeue, jobId.ToString(), now, cancellationToken)
             .ConfigureAwait(false);
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return RequeueResult.Requeued;
     }
 
@@ -1610,7 +1838,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await using var ownTransaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         var result = await RescheduleCoreAsync(connection, ownTransaction, jobId, dueTime, actor, now, cancellationToken)
             .ConfigureAwait(false);
-        await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await ownTransaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return result;
     }
 
@@ -1704,7 +1932,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             await upsert.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
         await AppendAuditAsync(connection, transaction, actor, action, queue, now, cancellationToken).ConfigureAwait(false);
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         InvalidateQueueConfig(); // pause/resume on this process is honored on the next claim (0170)
     }
 
@@ -1730,7 +1958,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         }
         if (schedule is null)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return TriggerScheduleResult.ScheduleNotFound;
         }
 
@@ -1759,7 +1987,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         }
         await AppendAuditAsync(connection, transaction, actor, OperatorAction.TriggerScheduleNow, scheduleId, now, cancellationToken)
             .ConfigureAwait(false);
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return TriggerScheduleResult.Triggered;
     }
 
@@ -1813,85 +2041,16 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         await audit.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    // Appends one Transition Log entry (spec §5.12) for a job's resulting state, inside the SAME
-    // transaction as the state change it records — a crash leaves neither or both (§4). The
-    // ordinal is the per-job max + 1 (a sub-select against the same table), so it climbs even as
-    // oldest rows age out. The trailing bounded delete enforces MaxTransitionsPerJob (§7): once the
-    // cap is exceeded, the oldest entry is dropped, and it runs only when this entry put the cap in
-    // play. `now` is always the caller's clock - the database clock is never consulted (Virtual
-    // Time stays meaningful in the Conformance Suite).
-    // `failureDetail` is the Shell-captured exception text, written only on a failing transition
-    // (§5.12) and clamped to MaxFailureDetailBytes; null on every other transition.
-    private async Task RecordTransitionAsync(
+    // Appends one Transition Log entry (§5.12) inside the transaction of the state change it records.
+    private Task RecordTransitionAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction, Guid jobId, JobState state,
         int attempt, DateTimeOffset now, CancellationToken cancellationToken, string? failureDetail = null)
-    {
-        // Job History Policy (§5.12, ADR 0011) gates writes, not schema. Off appends no row at all;
-        // Transitions appends the row but never the detail; the full rung keeps the clamped detail.
-        // The table always exists — flipping the policy is config, never a migration.
-        if (_historyPolicy == JobHistoryPolicy.Off)
-        {
-            return;
-        }
-        if (_historyPolicy == JobHistoryPolicy.Transitions)
-        {
-            failureDetail = null; // record the transition, but never the detail it would have carried
-        }
+        => RecordTransitionsBatchAsync(
+            connection, transaction, [(jobId, state, attempt, failureDetail)], now, cancellationToken);
 
-        // RETURNING the assigned ordinal lets PruneTransitionsAsync skip the DELETE when the entry
-        // just written has not reached the cap - the common 2-transition job pays no DELETE round-trip.
-        long ordinal;
-        await using (var insert = Cmd(
-            """
-            INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
-            SELECT @id, COALESCE(MAX(ordinal) + 1, 0), @now, @state, @attempt, @detail
-            FROM backwave.job_transitions WHERE job_id = @id
-            RETURNING ordinal
-            """,
-            connection, transaction))
-        {
-            insert.Parameters.AddWithValue("id", jobId);
-            insert.Parameters.AddWithValue("now", now.ToUniversalTime());
-            insert.Parameters.AddWithValue("state", (int)state);
-            insert.Parameters.AddWithValue("attempt", attempt);
-            insert.Parameters.AddWithValue(
-                "detail", (object?)_options.Bounds.ClampFailureDetail(failureDetail) ?? DBNull.Value);
-            ordinal = (long)(await insert.ExecuteScalarCountedAsync(cancellationToken).ConfigureAwait(false))!;
-        }
-
-        await PruneTransitionsAsync(connection, transaction, jobId, ordinal, cancellationToken).ConfigureAwait(false);
-    }
-
-    private async Task PruneTransitionsAsync(
-        NpgsqlConnection connection, NpgsqlTransaction transaction, Guid jobId, long newestOrdinal,
-        CancellationToken cancellationToken)
-    {
-        if (newestOrdinal < _options.Bounds.MaxTransitionsPerJob)
-        {
-            return;
-        }
-        await using var prune = Cmd(
-            """
-            DELETE FROM backwave.job_transitions
-            WHERE job_id = @id AND ordinal <= (
-                SELECT MAX(ordinal) FROM backwave.job_transitions WHERE job_id = @id
-            ) - @cap
-            """,
-            connection, transaction);
-        prune.Parameters.AddWithValue("id", jobId);
-        prune.Parameters.AddWithValue("cap", _options.Bounds.MaxTransitionsPerJob);
-        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
-    }
-
-    // Appends a BATCH of Transition Log entries (§5.12) in ONE set-based INSERT — the per-row
-    // recorder amortized for the claim, batched-report, and lease-sweep paths, where each job
-    // appears exactly once per batch so its ordinal (the per-job MAX(ordinal)+1) is well-defined.
-    // Runs inside the caller's transaction, so the whole batch is atomic with the lease/outcome
-    // write, exactly as the per-row calls were. The global Position rides the job_transitions
-    // SEQUENCE default, one nextval per row. One set-based DELETE prunes the batch to
-    // MaxTransitionsPerJob (§7). Honors the history policy: Off writes nothing; Transitions writes
-    // the rows but never the detail; the full rung keeps the clamped detail. `now` is always the
-    // caller's clock.
+    // Appends a batch of Transition Log entries (§5.12) and prunes each job to MaxTransitionsPerJob (§7)
+    // in one statement. Each job appears at most once. Run it after the statement that locked the jobs,
+    // so its snapshot holds their latest transitions. `now` is always the caller's clock.
     private async Task RecordTransitionsBatchAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction,
         IReadOnlyList<(Guid JobId, JobState State, int Attempt, string? FailureDetail)> rows,
@@ -1911,65 +2070,22 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             ids[i] = rows[i].JobId;
             states[i] = (int)rows[i].State;
             attempts[i] = rows[i].Attempt;
-            // Transitions records the row but never the detail; the full rung clamps and keeps it.
-            details[i] = _historyPolicy == JobHistoryPolicy.Transitions
-                ? null
-                : _options.Bounds.ClampFailureDetail(rows[i].FailureDetail);
+            details[i] = TransitionDetail(rows[i].FailureDetail);
         }
 
-        // RETURNING the assigned ordinals lets the prune be skipped entirely (below) when no job in
-        // the batch has reached the cap — the common 2-transition job pays no DELETE round-trip.
-        var maxNewOrdinal = -1L;
-        await using (var insert = Cmd(
-            """
-            INSERT INTO backwave.job_transitions (job_id, ordinal, recorded_at, state, attempt, failure_detail)
-            SELECT u.id, COALESCE(t.maxord, -1) + 1, @now, u.state, u.attempt, u.detail
-            FROM unnest(@ids::uuid[], @states::int[], @attempts::int[], @details::text[])
-                 WITH ORDINALITY AS u(id, state, attempt, detail, ord)
-            LEFT JOIN (
-                SELECT job_id, MAX(ordinal) AS maxord FROM backwave.job_transitions
-                WHERE job_id = ANY(@ids) GROUP BY job_id
-            ) t ON t.job_id = u.id
-            ORDER BY u.ord
-            RETURNING ordinal
-            """,
-            connection, transaction))
-        {
-            insert.Parameters.AddWithValue("ids", ids);
-            insert.Parameters.AddWithValue("states", states);
-            insert.Parameters.AddWithValue("attempts", attempts);
-            insert.Parameters.AddWithValue("details", details);
-            insert.Parameters.AddWithValue("now", now.ToUniversalTime());
-            await using var reader = await insert.ExecuteReaderCountedAsync(cancellationToken).ConfigureAwait(false);
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            {
-                var ordinal = reader.GetInt64(0);
-                if (ordinal > maxNewOrdinal)
-                {
-                    maxNewOrdinal = ordinal;
-                }
-            }
-        }
-
-        // Per-job-life cap (§7): skip the prune entirely unless some job's new ordinal reached the
-        // cap — a job nowhere near MaxTransitionsPerJob never pays the DELETE. When some job did
-        // reach it, one set-based DELETE keeps only the newest MaxTransitionsPerJob per job (the
-        // correlated MAX no-ops for the jobs still under the cap).
-        if (maxNewOrdinal < _options.Bounds.MaxTransitionsPerJob)
-        {
-            return;
-        }
-        await using var prune = Cmd(
-            """
-            DELETE FROM backwave.job_transitions jt
-            WHERE jt.job_id = ANY(@ids)
-              AND jt.ordinal <= (SELECT MAX(ordinal) FROM backwave.job_transitions x WHERE x.job_id = jt.job_id) - @cap
-            """,
-            connection, transaction);
-        prune.Parameters.AddWithValue("ids", ids);
-        prune.Parameters.AddWithValue("cap", _options.Bounds.MaxTransitionsPerJob);
-        await prune.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
+        await using var record = Cmd(_recordTransitions, connection, transaction);
+        record.Parameters.AddWithValue("ids", ids);
+        record.Parameters.AddWithValue("states", states);
+        record.Parameters.AddWithValue("attempts", attempts);
+        record.Parameters.AddWithValue("details", details);
+        record.Parameters.AddWithValue("now", now.ToUniversalTime());
+        record.Parameters.AddWithValue("transitionCap", _options.Bounds.MaxTransitionsPerJob);
+        await record.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    private string? TransitionDetail(string? failureDetail) => _historyPolicy == JobHistoryPolicy.Transitions
+        ? null
+        : _options.Bounds.ClampFailureDetail(failureDetail);
 
     // ── §5.7 Schedules & minting ────────────────────────────────────────────────
 
@@ -2092,7 +2208,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             }
             if (schedule is null)
             {
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
                 continue; // another node already minted these ticks
             }
 
@@ -2147,7 +2263,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     .ConfigureAwait(false);
             }
             minted += mintedForDecision;
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
         return minted;
@@ -2180,7 +2296,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         }
         await AppendAuditAsync(
             connection, transaction, actor, OperatorAction.SetConcurrencyLimit, queue, now, cancellationToken).ConfigureAwait(false);
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         InvalidateQueueConfig(); // a limit set/cleared on this process is honored on the next claim (0170)
     }
 
@@ -2579,7 +2695,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // All-or-nothing: a non-Ok validation leaves nothing inserted, so only Ok commits.
         if (result == WorkflowEnqueueResult.Ok)
         {
-            await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await ownTransaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             foreach (var queue in hintQueues)
             {
                 _postCommitHints.Request(queue);
@@ -3188,7 +3304,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             && !string.Equals(held, request.WorkerId, StringComparison.Ordinal)
             && leaseExpiry > request.Now)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return ObserverClaim.None(request.ObserverId);
         }
 
@@ -3246,7 +3362,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
                     connection, transaction, request.ObserverId, cursor, states, request.WireName, request.Queue,
                     request.Now, cancellationToken).ConfigureAwait(false);
             }
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return ObserverClaim.None(request.ObserverId);
         }
 
@@ -3276,7 +3392,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             await lease.ExecuteNonQueryCountedAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return new ObserverClaim(request.ObserverId, Acquired: true, candidates);
     }
 
@@ -3324,7 +3440,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // same connection.
         if (!found)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             return ObserverReportOutcome.UnknownObserver; // nothing claimed, nothing to resolve
         }
 
@@ -3344,7 +3460,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
         // lapse leaves ITS future expiry here for the old owner's late report to read.
         if (!string.Equals(leaseOwner, report.WorkerId, StringComparison.Ordinal) || leaseExpiry <= report.Now)
         {
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
             if (ObserverFence.IsContradiction(report))
             {
                 Invariant.Degrade(
@@ -3379,7 +3495,7 @@ public sealed class PostgresJobStore : IJobStore, IWakeUpHintSource, IAsyncDispo
             connection, transaction, report.ObserverId, cursor, states, wireName, queue, report.Now, cancellationToken)
             .ConfigureAwait(false);
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitCountedAsync(cancellationToken).ConfigureAwait(false);
         return ObserverReportOutcome.Applied;
     }
 

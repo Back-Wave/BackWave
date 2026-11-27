@@ -49,9 +49,26 @@ public sealed record StoreBounds
     /// <summary>
     /// How many transition-log entries a single job retains over its life, newest kept. When a state
     /// change would exceed this cap, the oldest transition is dropped — keeping the history bounded
-    /// for a job that churns through many retries.
+    /// for a job that churns through many retries. Must be 1 or more: a job always keeps the transition
+    /// it just recorded.
     /// </summary>
-    public int MaxTransitionsPerJob { get; init; } = 64;
+    /// <exception cref="ArgumentOutOfRangeException">The value is below 1. To record no history, set the
+    /// store options' <c>HistoryPolicy</c> to <see cref="JobHistoryPolicy.Off"/>.</exception>
+    public int MaxTransitionsPerJob
+    {
+        get;
+        init
+        {
+            if (value < 1)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(MaxTransitionsPerJob), value,
+                    "MaxTransitionsPerJob must be 1 or more. To record no transition history, set the store "
+                    + "options' HistoryPolicy to JobHistoryPolicy.Off.");
+            }
+            field = value;
+        }
+    } = 64;
 
     /// <summary>
     /// The cap on a stored failure-detail string (the exception type, message, and stack captured on a
