@@ -25,6 +25,7 @@ using BackWave.Benchmarks.Workload;
 //   --producers N                  concurrent producer tasks            (default: 1; raise for sustained)
 //   --pool-size N                  per-node max concurrent jobs         (default: target's built-in tuning)
 //   --worker-groups N              in-process pumps on the same queue   (default: 1)
+//   --unwritten-outcome-slots N    BackWave UnwrittenOutcomeSlots       (default: 0)
 //   --payload-bytes B              fixed payload size band              (default: 128)
 //   --warmup  W                    warmup runs discarded                (default: 1)
 //   --runs    N                    measured runs reported as min/median/max distribution (default: 3)
@@ -72,6 +73,7 @@ var spec = new WorkloadSpec
     ProducerCount = options.Producers,
     PumpPoolSize = options.PoolSize,
     WorkerGroupCount = options.WorkerGroups,
+    PumpUnwrittenOutcomeSlots = options.UnwrittenOutcomeSlots,
     PayloadSizeBytes = options.PayloadBytes,
 };
 

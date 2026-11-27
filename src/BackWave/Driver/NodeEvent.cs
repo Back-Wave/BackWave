@@ -10,6 +10,9 @@ internal abstract record NodeEvent
 {
     private NodeEvent() { }
 
+    /// <summary>When the Shell observed the event.</summary>
+    public abstract DateTimeOffset Now { get; init; }
+
     /// <summary>The poll tick: time to look for due work.</summary>
     public sealed record PollDue(DateTimeOffset Now) : NodeEvent;
 
@@ -48,6 +51,18 @@ internal abstract record NodeEvent
 
     /// <summary>The store acknowledged (or rejected as stale) each row of a reported outcome batch.</summary>
     public sealed record OutcomeBatchReported(IReadOnlyList<OutcomeReportResult> Results, DateTimeOffset Now) : NodeEvent;
+
+    /// <summary>
+    /// A reported outcome batch failed, so the Driver cannot tell which of its rows were written. The Shell
+    /// re-throws the fault after this step and runs none of the commands it yields.
+    /// </summary>
+    public sealed record OutcomeBatchFaulted(DateTimeOffset Now) : NodeEvent;
+
+    /// <summary>
+    /// The Shell never issued a reported outcome batch, because a command before it in the same step threw.
+    /// None of its rows was written.
+    /// </summary>
+    public sealed record OutcomeBatchNotIssued(DateTimeOffset Now) : NodeEvent;
 
     /// <summary>The store applied the Core's mint decisions; carries how many instances it minted.</summary>
     public sealed record MintCompleted(int Minted, DateTimeOffset Now) : NodeEvent;

@@ -1638,6 +1638,156 @@ public class SimulatorTests
         Assert.Equal(200, isolated.Succeeded + isolated.DeadLettered + isolated.Cancelled);
     }
 
+    /// <summary>
+    /// With unwritten-outcome headroom, a node claims into the slots its finished jobs gave back while their
+    /// outcome write is out. Both per-node caps run every step: executions stay at most PoolSize, and
+    /// executions plus Unwritten Outcomes at most PoolSize plus the headroom. The run must converge, under the
+    /// default crash and heartbeat-loss chaos and under isolation too, and replay identically.
+    /// </summary>
+    [Theory]
+    [InlineData(2871UL)]
+    [InlineData(2872UL)]
+    [InlineData(2873UL)]
+    public void UnwrittenOutcomeSlots_ClaimIntoTheHeadroom_AndBothPerNodeCapsHold(ulong seed)
+    {
+        var options = new SimulationOptions
+        {
+            Seed = seed,
+            PoolSize = 2,
+            UnwrittenOutcomeSlots = 2,
+            WorkloadDuration = TimeSpan.FromMinutes(10),
+            MaxStoreLaneLatency = TimeSpan.FromSeconds(3),
+        };
+        var result = new Simulator(options).Run();
+        Assert.True(result.ClaimsIntoUnwrittenHeadroom > 0, $"seed {seed}: no claim used the headroom");
+        Assert.Equal(200, result.Succeeded + result.DeadLettered + result.Cancelled);
+        Assert.Equal(result.FinalJobs, new Simulator(options).Run().FinalJobs);
+
+        var isolated = new Simulator(options with { IsolationCount = 30 }).Run();
+        Assert.True(isolated.Isolations > 0, $"seed {seed}: isolation injected nothing");
+        Assert.Equal(200, isolated.Succeeded + isolated.DeadLettered + isolated.Cancelled);
+    }
+
+    /// <summary>
+    /// A Concurrency Limit counts the Leased rows of its Queue, and an Unwritten Outcome's row stays Leased until
+    /// its write commits, so the limit holds for any headroom. The I3 oracle checks the limit after every step
+    /// while the nodes claim into their headroom.
+    /// </summary>
+    [Theory]
+    [InlineData(2874UL)]
+    [InlineData(2875UL)]
+    [InlineData(2876UL)]
+    public void UnwrittenOutcomeSlots_NeverPushAQueuePastItsConcurrencyLimit(ulong seed)
+    {
+        var result = new Simulator(new SimulationOptions
+        {
+            Seed = seed,
+            PoolSize = 4,
+            UnwrittenOutcomeSlots = 4,
+            ConcurrencyLimit = 3,
+            WorkloadDuration = TimeSpan.FromMinutes(10),
+            MaxStoreLaneLatency = TimeSpan.FromSeconds(3),
+        }).Run();
+
+        Assert.True(result.ClaimsIntoUnwrittenHeadroom > 0, $"seed {seed}: no claim used the headroom");
+        Assert.True(result.LimitSaturations > 0, $"seed {seed}: the limit never bound");
+        Assert.Equal(200, result.Succeeded + result.DeadLettered + result.Cancelled);
+    }
+
+    /// <summary>
+    /// Oracle self-test for the lease cap: the Driver is built with unbounded headroom while the oracle checks the
+    /// configured one, so the Driver keeps claiming while outcomes wait for their write. A working oracle must
+    /// fail the run and print the replay seed.
+    /// </summary>
+    [Theory]
+    [InlineData(2877UL)]
+    [InlineData(2878UL)]
+    public void UnwrittenOutcomeSlotsSelfTest_ClaimingPastTheBound_FailsTheRun_AndPrintsTheSeed(ulong seed)
+    {
+        var exception = Assert.Throws<SimulationInvariantException>(() => new Simulator(new SimulationOptions
+        {
+            Seed = seed,
+            PoolSize = 2,
+            UnwrittenOutcomeSlots = 1,
+            SabotageUnwrittenOutcomeSlots = true,
+            WorkloadDuration = TimeSpan.FromMinutes(10),
+            MaxExecutionDuration = TimeSpan.FromSeconds(5),
+            MaxStoreLaneLatency = TimeSpan.FromSeconds(3),
+        }).Run());
+
+        Assert.Contains($"seed {seed}", exception.Message);
+        Assert.Contains("unwritten outcomes", exception.Message);
+        Assert.Equal(InvariantId.PerNodeCap, exception.InvariantId);
+    }
+
+    private static SimulationOptions HeadroomUnderStoreFaults(ulong seed) => new()
+    {
+        Seed = seed,
+        PoolSize = 4,
+        UnwrittenOutcomeSlots = 4,
+        StoreFaultProbability = 0.1,
+        WorkloadDuration = TimeSpan.FromMinutes(10),
+        MaxExecutionDuration = TimeSpan.FromSeconds(5),
+        MaxStoreLaneLatency = TimeSpan.FromSeconds(3),
+    };
+
+    /// <summary>
+    /// A faulted outcome write closes the headroom until a write lands. Under store faults the nodes claim into
+    /// their headroom between faults, and the per-node-cap oracle checks every claim issued while it is closed.
+    /// </summary>
+    [Theory]
+    [InlineData(2896UL)]
+    [InlineData(2897UL)]
+    [InlineData(2898UL)]
+    public void UnwrittenOutcomeSlots_UnderStoreFaults_ClaimNothingIntoAClosedHeadroom(ulong seed)
+    {
+        var options = HeadroomUnderStoreFaults(seed);
+        var result = new Simulator(options).Run();
+
+        Assert.True(result.ClaimsIntoUnwrittenHeadroom > 0, $"seed {seed}: no claim used the headroom");
+        Assert.True(result.ClaimsWithHeadroomClosed > 0, $"seed {seed}: no claim ran while the headroom was closed");
+        Assert.Equal(200, result.Succeeded + result.DeadLettered + result.Cancelled + result.Quarantined);
+        Assert.Equal(result.FinalJobs, new Simulator(options).Run().FinalJobs);
+    }
+
+    /// <summary>
+    /// A Weighted pass issues one claim per Queue, and a faulted write can close the headroom between two of them.
+    /// Every node runs Weighted here, so the per-node-cap oracle checks the later batches of a pass as well.
+    /// </summary>
+    [Theory]
+    [InlineData(2896UL)]
+    [InlineData(2897UL)]
+    [InlineData(2898UL)]
+    public void UnwrittenOutcomeSlots_UnderStoreFaults_AWeightedPassClaimsNothingIntoAClosedHeadroom(ulong seed)
+    {
+        var result = new Simulator(HeadroomUnderStoreFaults(seed) with
+        {
+            TopologyQueues = 3,
+            ForceWeightedDispatch = true,
+        }).Run();
+
+        Assert.True(result.WeightedNodeCount > 0, $"seed {seed}: no Weighted node");
+        Assert.True(result.ClaimsWithHeadroomClosed > 0, $"seed {seed}: no claim ran while the headroom was closed");
+        Assert.Equal(200, result.Succeeded + result.DeadLettered + result.Cancelled + result.Quarantined);
+    }
+
+    /// <summary>
+    /// Oracle self-test for the closed headroom: the Driver hears a faulted write as one never issued, so it keeps
+    /// claiming into its headroom after the fault. A working oracle must fail the run and print the replay seed.
+    /// </summary>
+    [Theory]
+    [InlineData(2896UL)]
+    [InlineData(2897UL)]
+    public void HeadroomNeverClosesSelfTest_ClaimingAfterAFaultedWrite_FailsTheRun_AndPrintsTheSeed(ulong seed)
+    {
+        var exception = Assert.Throws<SimulationInvariantException>(
+            () => new Simulator(HeadroomUnderStoreFaults(seed) with { SabotageHeadroomNeverCloses = true }).Run());
+
+        Assert.Contains($"seed {seed}", exception.Message);
+        Assert.Contains("after a faulted outcome write closed it", exception.Message);
+        Assert.Equal(InvariantId.PerNodeCap, exception.InvariantId);
+    }
+
     [Theory]
     [InlineData(1UL)]
     [InlineData(2UL)]

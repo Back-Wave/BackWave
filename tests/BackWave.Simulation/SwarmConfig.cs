@@ -42,6 +42,7 @@ internal static class SwarmConfig
     // with an ASCII constant ("SWARMCFG") to keep an independent stream by convention with the rest of the
     // harness — it does not collide with any in-Simulator stream.
     private const ulong SwarmStreamSalt = 0x5357_4152_4D43_4647UL; // "SWARMCFG"
+    private const ulong UnwrittenSlotsSalt = 0x554E_5752_4954_544EUL; // "UNWRITTN"
 
     /// <summary>The per-axis probability a fault axis is active at all — biased toward OFF.</summary>
     private const double AxisActiveProbability = 0.30;
@@ -156,6 +157,13 @@ internal static class SwarmConfig
         var poolSize = poolBounded ? 1 + rng.Next(4) : int.MaxValue; // 1..4 or unbounded
         var maxExecution = poolBounded ? TimeSpan.FromSeconds(40) : TimeSpan.FromSeconds(90); // <= 60s Lease when pooled
 
+        // How many finished jobs per node may wait for their outcome write without holding a pool slot: 0..pool,
+        // with 0 kept so a share of pooled runs still holds every slot until its write answers. A finite pool
+        // only, since an unbounded pool has no slot to free. Its own stream, so no other draw moves.
+        var unwrittenOutcomeSlots = poolBounded
+            ? new DeterministicRandom(seed ^ UnwrittenSlotsSalt).Next(poolSize + 1)
+            : 0;
+
         // A modest job count keeps the swarm suite fast while still giving the faults something to chew on. Drawn
         // here — its historical stream position, the first draw after the pool block — so the two new coins below
         // stay strictly last and this draw is unshifted (see the byte-identical note on those coins).
@@ -242,6 +250,7 @@ internal static class SwarmConfig
             TopologyQueues = topologyQueues,
             ConcurrencyLimits = concurrencyLimits,
             PoolSize = poolSize,
+            UnwrittenOutcomeSlots = unwrittenOutcomeSlots,
             MaxExecutionDuration = maxExecution,
             Schedules = schedules,
             Observers = observers,

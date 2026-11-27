@@ -6,26 +6,27 @@ namespace BackWave.Driver;
 /// <summary>
 /// The sans-I/O state machine holding a node's logic: Step(event) → Commands.
 /// It never awaits, times, or threads — the production pump and the Simulator are its
-/// two callers, and both own all I/O and clocks. Its only state is the set of jobs this
-/// node is currently executing.
+/// two callers, and both own all I/O and clocks. Its state is the jobs this node is executing, its
+/// Unwritten Outcomes, and the claim in flight with the polls that wait on it.
 /// </summary>
 internal sealed class NodeDriver(NodeOptions options)
 {
     private readonly HashSet<Guid> _executing = [];
 
-    /// <summary>
-    /// Terminal outcomes buffered for a coalesced report (ADR 0035), in completion order. The pump stays
-    /// single-writer: outcomes flush together as one <see cref="Command.ReportOutcomeBatch"/> instead of one
-    /// write each. A crash discards this buffer (a fresh Driver is installed), so those leases lapse and the
-    /// jobs are reclaimed — At-Least-Once working as designed.
-    /// </summary>
-    private List<ReportedOutcome> _outcomeBuffer = [];
+    private readonly UnwrittenOutcomes _outcomes = new(options.MaxOutcomeBatch, options.UnwrittenOutcomeSlots);
 
     /// <summary>
     /// How many terminal outcomes are buffered but not yet flushed. A crash discards them (a fresh Driver
     /// is installed), so the deterministic harness reads this to observe the buffer-loss-on-crash window.
     /// </summary>
-    internal int BufferedOutcomeCount => _outcomeBuffer.Count;
+    internal int BufferedOutcomeCount => _outcomes.BufferedCount;
+
+    /// <summary>
+    /// The finished jobs whose outcome write has not answered: the buffered outcomes plus the rows of the write
+    /// in flight. Each still holds its store Lease.
+    /// </summary>
+    internal int UnwrittenOutcomeCount => _outcomes.Count;
+
     private readonly Core.SmoothWeightedRoundRobin? _roundRobin =
         options.Policy is Core.DispatchPolicy.Weighted weighted
             ? new Core.SmoothWeightedRoundRobin(weighted.Weights)
@@ -41,14 +42,38 @@ internal sealed class NodeDriver(NodeOptions options)
 
     private int _pollsFromBeforeClaim;
 
-    private int _reportingSlots;
-
-    private bool _flushDeferred;
+    /// <summary>
+    /// The jobs of a landed claim that its waiting polls now wait on, or null. The set never changes: the poll
+    /// is owed once none of these jobs runs. See <see cref="Step"/>.
+    /// </summary>
+    private IReadOnlySet<Guid>? _pollWaitsOnJobs;
 
     /// <summary>When maintenance last ran; null until the first poll. Throttles the sweep.</summary>
     private DateTimeOffset? _lastMaintenance;
 
+    /// <summary>
+    /// Reacts to one event. The first event after which none of the jobs a poll waits on runs, and a slot is
+    /// free, pays that poll as one re-poll, even below a full claim: a job from an earlier claim can keep the
+    /// pool from a full claim for as long as it runs. A claim pass that starts first pays it as well. A faulted
+    /// write never pays it (see <see cref="NodeEvent.OutcomeBatchFaulted"/>).
+    /// </summary>
     public IReadOnlyList<Command> Step(NodeEvent nodeEvent)
+    {
+        var commands = React(nodeEvent);
+        if (_pollWaitsOnJobs is not { } jobs
+            || _executing.Overlaps(jobs)
+            || FreeSlots <= 0
+            || nodeEvent is NodeEvent.OutcomeBatchFaulted)
+        {
+            return commands;
+        }
+        _pollWaitsOnJobs = null;
+        return commands.Any(command => command is Command.RequestPoll)
+            ? commands
+            : [.. commands, new Command.RequestPoll(nodeEvent.Now)];
+    }
+
+    private IReadOnlyList<Command> React(NodeEvent nodeEvent)
     {
         switch (nodeEvent)
         {
@@ -59,10 +84,9 @@ internal sealed class NodeDriver(NodeOptions options)
                 // default) runs maintenance every poll: the historical behaviour, byte-for-byte.
                 var maintenanceDue =
                     _lastMaintenance is not { } last || poll.Now - last >= options.MaintenanceInterval;
-                // Compute the claim pass BEFORE draining the buffer: a buffered-but-unreported outcome still
-                // holds its store Lease, so it must keep counting against the pool (StartClaimPass subtracts
-                // it). The buffered slots re-open only when the imminent flush's applied outcomes re-poll, so
-                // claiming them here too would over-admit past PoolSize (ADR 0035).
+                // Compute the claim pass BEFORE draining the buffer. A buffered outcome still holds its store
+                // Lease, so FreeSlots counts it the same way buffered or in flight: inside the open headroom it
+                // holds no pool slot, and past it, one slot until its write answers.
                 Command.ClaimBatch? firstClaim = null;
                 if (_claimInFlight is null)
                 {
@@ -75,7 +99,7 @@ internal sealed class NodeDriver(NodeOptions options)
                 var commands = new List<Command>();
                 // A poll tick is a flush trigger (ADR 0035): land any partial batch first, so released
                 // Dependencies are claimable on the flush's own re-poll.
-                if (FlushOutcomes() is { } pollFlush)
+                if (_outcomes.TryFlush() is { } pollFlush)
                 {
                     commands.Add(pollFlush);
                 }
@@ -128,60 +152,49 @@ internal sealed class NodeDriver(NodeOptions options)
                 // so a pass interrupted before it drains strands none — advance for this batch now. A
                 // batch that returns work means the pass continues; an empty claim ends the pass and
                 // leaves the rest of the plan un-issued (uncharged).
-                if (claim.Jobs.Count > 0 && _weightedPlan.TryDequeue(out var nextBatch))
+                if (claim.Jobs.Count > 0 && NextWeightedBatch() is { } nextBatch)
                 {
                     ChargeIssued(nextBatch);
                     executions.Add(Issue(nextBatch));
                 }
-                else if (RunWaitingClaimPass(cameBackFull: claim.Jobs.Count == bound) is { } waitingPass)
+                else if (RunWaitingClaimPass(claim.Jobs, cameBackFull: claim.Jobs.Count == bound) is { } waitingPass)
                 {
                     executions.Add(waitingPass);
                 }
                 return executions;
 
             case NodeEvent.ExecutionSucceeded success:
-                _executing.Remove(success.Job.JobId);
-                return BufferOutcome(new ReportedOutcome(
-                    success.Job.JobId, options.WorkerId, success.Job.Attempt, new JobOutcome.Success()));
+                return Finish(success.Job, new JobOutcome.Success(), success.Now);
 
             case NodeEvent.ExecutionFailed failure:
             {
-                _executing.Remove(failure.Job.JobId);
                 // Loud-failure path (ADR 0051): the node that ran the job holds its type, so a per-job-type
                 // [Retry] override resolves here, above the storage boundary. Absent an override, the job
                 // inherits the Worker Group policy. The lease-expiry sweep keeps the group policy.
                 var nextAttemptAt = options.RetryOverrides.TryGetValue(failure.Job.WireName, out var disposition)
                     ? disposition.NextAttemptAt(failure.Job.Attempt, failure.Now)
                     : options.RetryPolicy.NextAttemptAt(failure.Job.Attempt, failure.Now);
-                return BufferOutcome(new ReportedOutcome(
-                    failure.Job.JobId,
-                    options.WorkerId,
-                    failure.Job.Attempt,
-                    new JobOutcome.Failure(nextAttemptAt, failure.Error)));
+                return Finish(failure.Job, new JobOutcome.Failure(nextAttemptAt, failure.Error), failure.Now);
             }
 
             case NodeEvent.ExecutionCancelled cancelled:
-                _executing.Remove(cancelled.Job.JobId);
-                return BufferOutcome(new ReportedOutcome(
-                    cancelled.Job.JobId, options.WorkerId, cancelled.Job.Attempt, new JobOutcome.Cancelled(cancelled.Cause)));
+                return Finish(cancelled.Job, new JobOutcome.Cancelled(cancelled.Cause), cancelled.Now);
 
             case NodeEvent.ExecutionUnroutable unroutable:
-                _executing.Remove(unroutable.Job.JobId);
-                return BufferOutcome(new ReportedOutcome(
-                    unroutable.Job.JobId, options.WorkerId, unroutable.Job.Attempt, new JobOutcome.Unroutable(unroutable.Reason)));
+                return Finish(unroutable.Job, new JobOutcome.Unroutable(unroutable.Reason), unroutable.Now);
 
             case NodeEvent.HeartbeatDue:
                 // A heartbeat tick is a flush trigger (ADR 0035): drain any partial buffer, then renew the
                 // leases of whatever is still executing. An idle node with a non-empty buffer would already
                 // have flushed on the drain-tail, so this mainly catches a partial batch under sustained load.
                 var heartbeatCommands = new List<Command>();
-                if (FlushOutcomes() is { } heartbeatFlush)
+                if (_outcomes.TryFlush() is { } heartbeatFlush)
                 {
                     heartbeatCommands.Add(heartbeatFlush);
                 }
-                if (_executing.Count > 0)
+                if (LeasesToRenew() is { Count: > 0 } renewing)
                 {
-                    heartbeatCommands.Add(new Command.Heartbeat(options.WorkerId, [.. _executing], options.LeaseDuration));
+                    heartbeatCommands.Add(new Command.Heartbeat(options.WorkerId, renewing, options.LeaseDuration));
                 }
                 return heartbeatCommands;
 
@@ -189,6 +202,12 @@ internal sealed class NodeDriver(NodeOptions options)
                 var reactions = new List<Command>();
                 foreach (var result in heartbeat.Results)
                 {
+                    // A buffered outcome, or a job that finished after the heartbeat went out, runs no more:
+                    // there is nothing to abandon or cancel, and its outcome write answers for its Lease.
+                    if (!_executing.Contains(result.JobId))
+                    {
+                        continue;
+                    }
                     if (!result.Renewed)
                     {
                         _executing.Remove(result.JobId);
@@ -201,9 +220,17 @@ internal sealed class NodeDriver(NodeOptions options)
                 }
                 return reactions;
 
+            case NodeEvent.OutcomeBatchFaulted:
+                _outcomes.Faulted();
+                return [];
+
+            case NodeEvent.OutcomeBatchNotIssued:
+                _outcomes.NotIssued();
+                return [];
+
             case NodeEvent.OutcomeBatchReported reported:
             {
-                _reportingSlots = 0;
+                var deferredFlush = _outcomes.Landed();
                 var answered = new List<Command>();
                 // An applied terminal outcome may have released a Dependency due right now:
                 // re-poll so it is claimed promptly, not on the next timer tick. This decision
@@ -216,7 +243,7 @@ internal sealed class NodeDriver(NodeOptions options)
                         answered.Add(new Command.RequestPoll(reported.Now));
                     }
                 }
-                if (reported.Results.Count > 0 && _flushDeferred && FlushOutcomes() is { } deferredFlush)
+                if (deferredFlush is not null)
                 {
                     answered.Add(deferredFlush);
                 }
@@ -233,60 +260,44 @@ internal sealed class NodeDriver(NodeOptions options)
     }
 
     /// <summary>
-    /// Buffers one terminal outcome and flushes the batch when a flush trigger fires (ADR 0035): the buffer
-    /// reaches <see cref="NodeOptions.MaxOutcomeBatch"/>, or the node just went idle (the drain-tail, so a
-    /// lone outcome never waits a whole poll interval before releasing its dependents). The poll and
-    /// heartbeat ticks are the third trigger, handled in their own cases.
+    /// Buffers a finished job's terminal outcome, flushing the batch when a flush trigger fires: the buffer
+    /// reaches <see cref="NodeOptions.MaxOutcomeBatch"/>, or the node just went idle (the drain-tail, so a lone
+    /// outcome never waits a whole poll interval before releasing its dependents). The poll and heartbeat ticks
+    /// are the third trigger, handled in their own cases. It re-polls when it makes <see cref="CanTakeFullClaim"/>
+    /// true, so the next claim asks for the whole pool rather than one claim per finish. With the headroom
+    /// closed or not configured, a finish never changes the free slots and never re-polls.
     /// </summary>
-    private IReadOnlyList<Command> BufferOutcome(ReportedOutcome outcome)
+    private IReadOnlyList<Command> Finish(JobRecord job, JobOutcome outcome, DateTimeOffset now)
     {
-        _outcomeBuffer.Add(outcome);
-        return (_outcomeBuffer.Count >= options.MaxOutcomeBatch || _executing.Count == 0)
-            && FlushOutcomes() is { } flush
-                ? [flush]
-                : [];
+        var couldTakeFullClaim = CanTakeFullClaim;
+        _executing.Remove(job.JobId);
+        _outcomes.Add(new ReportedOutcome(job.JobId, options.WorkerId, job.Attempt, outcome));
+        var commands = new List<Command>(2);
+        if ((_outcomes.IsBufferFull || _executing.Count == 0) && _outcomes.TryFlush() is { } flush)
+        {
+            commands.Add(flush);
+        }
+        if (!couldTakeFullClaim && CanTakeFullClaim)
+        {
+            commands.Add(new Command.RequestPoll(now));
+        }
+        return commands;
     }
 
-    private Command.ReportOutcomeBatch? FlushOutcomes()
-    {
-        if (_outcomeBuffer.Count == 0)
-        {
-            return null;
-        }
-        if (_reportingSlots > 0)
-        {
-            _flushDeferred = true;
-            return null;
-        }
-        var batch = DrainOutcomeBatch();
-        _reportingSlots = batch.Outcomes.Count;
-        _flushDeferred = _outcomeBuffer.Count > 0;
-        return batch;
-    }
-
-    /// <summary>Drains up to <see cref="NodeOptions.MaxOutcomeBatch"/> buffered outcomes into one batch command, in completion order.</summary>
-    private Command.ReportOutcomeBatch DrainOutcomeBatch()
-    {
-        List<ReportedOutcome> rows;
-        if (_outcomeBuffer.Count <= options.MaxOutcomeBatch)
-        {
-            rows = _outcomeBuffer;
-            _outcomeBuffer = [];
-        }
-        else
-        {
-            rows = _outcomeBuffer.GetRange(0, options.MaxOutcomeBatch);
-            _outcomeBuffer.RemoveRange(0, options.MaxOutcomeBatch);
-        }
-        return new Command.ReportOutcomeBatch(rows);
-    }
+    /// <summary>
+    /// The Leases a heartbeat renews: every running job, and with a headroom the buffered outcomes as well,
+    /// since the node now runs more work while they wait. Never the rows of the write in flight: that write
+    /// either commits them or drops them, and a renewal would take the row locks it holds in another order.
+    /// Each id once, because the store answers one result per requested job.
+    /// </summary>
+    private IReadOnlyList<Guid> LeasesToRenew() =>
+        _outcomes.IsHeadroomConfigured ? [.. _executing.Union(_outcomes.BufferedJobIds)] : [.. _executing];
 
     /// <summary>
     /// Drains the next batch of outcomes still buffered, for the Shell to report as this node stops. Returns
     /// null when the buffer is empty, so a clean stop with nothing pending issues no write.
     /// </summary>
-    internal Command.ReportOutcomeBatch? DrainBufferedOutcomes()
-        => _outcomeBuffer.Count > 0 ? DrainOutcomeBatch() : null;
+    internal Command.ReportOutcomeBatch? DrainBufferedOutcomes() => _outcomes.DrainBuffered();
 
     /// <summary>
     /// Starts a claim pass and returns its first claim, or null when the pool is full.
@@ -305,11 +316,12 @@ internal sealed class NodeDriver(NodeOptions options)
     private Command.ClaimBatch? StartClaimPass()
     {
         _weightedPlan.Clear();
-        var available = Math.Min(options.MaxClaimBatch, options.PoolSize - LeasedSlots);
+        var available = Math.Min(options.MaxClaimBatch, FreeSlots);
         if (available <= 0)
         {
             return null;
         }
+        _pollWaitsOnJobs = null;
         if (_roundRobin is null)
         {
             return Issue(new Command.ClaimBatch(options.WorkerId, options.Policy.Queues, available, options.LeaseDuration));
@@ -337,7 +349,35 @@ internal sealed class NodeDriver(NodeOptions options)
         return Issue(first);
     }
 
-    private int LeasedSlots => _executing.Count + _outcomeBuffer.Count + _reportingSlots;
+    /// <summary>
+    /// The pool slots a claim may fill. The Unwritten Outcomes fill the open
+    /// <see cref="NodeOptions.UnwrittenOutcomeSlots"/> headroom first, and only those beyond it hold a pool
+    /// slot. With no headroom this is the pool minus every Leased job.
+    /// </summary>
+    private int FreeSlots => options.PoolSize - _executing.Count - _outcomes.SlotsHeld;
+
+    private int FullClaim => Math.Min(options.MaxClaimBatch, options.PoolSize);
+
+    private bool CanTakeFullClaim => FreeSlots >= FullClaim;
+
+    /// <summary>
+    /// The next batch of the Weighted pass, cut to the free slots, or null when the plan is done or no slot is
+    /// free. The pass sized its batches from the free slots when it started, and a faulted write since then
+    /// closes the headroom, so a later batch can ask for more than the pool now has. Null ends the pass.
+    /// </summary>
+    private Command.ClaimBatch? NextWeightedBatch()
+    {
+        if (!_weightedPlan.TryDequeue(out var batch))
+        {
+            return null;
+        }
+        if (FreeSlots <= 0)
+        {
+            _weightedPlan.Clear();
+            return null;
+        }
+        return batch with { MaxJobs = Math.Min(batch.MaxJobs, FreeSlots) };
+    }
 
     private Command.ClaimBatch Issue(Command.ClaimBatch batch)
     {
@@ -352,12 +392,27 @@ internal sealed class NodeDriver(NodeOptions options)
         return bound;
     }
 
-    private Command.ClaimBatch? RunWaitingClaimPass(bool cameBackFull)
+    /// <summary>
+    /// Serves the polls that waited on the claim that just landed. With the headroom open, a claim that returned
+    /// jobs while the pool cannot take a full claim leaves those polls waiting on its jobs instead: they give
+    /// their slots back when they finish, so a pass chained now would claim only the slots they leave and split
+    /// the pool into two cohorts. Any other landed claim chains a pass at once.
+    /// </summary>
+    private Command.ClaimBatch? RunWaitingClaimPass(IReadOnlyList<JobRecord> landed, bool cameBackFull)
     {
         var waiting = _pollsDuringClaim + (cameBackFull ? _pollsFromBeforeClaim : 0);
         _pollsDuringClaim = 0;
         _pollsFromBeforeClaim = 0;
-        if (waiting == 0 || StartClaimPass() is not { } pass)
+        if (waiting == 0)
+        {
+            return null;
+        }
+        if (_outcomes.IsHeadroomOpen && landed.Count > 0 && !CanTakeFullClaim)
+        {
+            _pollWaitsOnJobs = landed.Select(job => job.JobId).ToHashSet();
+            return null;
+        }
+        if (StartClaimPass() is not { } pass)
         {
             return null;
         }
@@ -411,6 +466,15 @@ internal sealed record NodeOptions
     /// work, so the pool can never overshoot. Unbounded unless the Shell sets it.
     /// </summary>
     public int PoolSize { get; init; } = int.MaxValue;
+
+    /// <summary>
+    /// Named bound: extra slots that only a finished job whose outcome write has not answered can hold, never
+    /// a running one. The Unwritten Outcomes fill them first, so a finished job can free its
+    /// <see cref="PoolSize"/> slot before its write lands. The executing jobs stay at most PoolSize, and the
+    /// executing plus the Unwritten Outcomes at most PoolSize plus this bound. 0 (the default) holds every
+    /// finished job's slot until its write answers.
+    /// </summary>
+    public int UnwrittenOutcomeSlots { get; init; }
 
     public TimeSpan LeaseDuration { get; init; } = TimeSpan.FromSeconds(60);
     public Core.RetryPolicy RetryPolicy { get; init; } = Core.RetryPolicy.Default;

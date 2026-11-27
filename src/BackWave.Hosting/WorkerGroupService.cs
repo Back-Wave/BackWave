@@ -276,6 +276,27 @@ internal sealed class WorkerGroupService(
         && ReferenceEquals(exception, _storeFault)
         && !(exception is OperationCanceledException && stoppingToken.IsCancellationRequested);
 
+    // <summary>Written on the pump loop and then on the hand-back, never at the same time.</summary>
+    private int _reportedUnwrittenOutcomes;
+
+    // <summary>
+    // Every Driver step of this pump goes through here, so the metric follows the Driver's count while the
+    // pump runs. A clean stop settles the write in flight and drains the buffer without a step, so the metric
+    // can stay high until the hand-back reports 0.
+    // </summary>
+    private IReadOnlyList<Command> Step(NodeDriver driver, NodeEvent nodeEvent)
+    {
+        var commands = driver.Step(nodeEvent);
+        ReportUnwrittenOutcomes(driver.UnwrittenOutcomeCount);
+        return commands;
+    }
+
+    private void ReportUnwrittenOutcomes(int unwritten)
+    {
+        BackWaveDiagnostics.RecordUnwrittenOutcomes(options.Name, unwritten - _reportedUnwrittenOutcomes);
+        _reportedUnwrittenOutcomes = unwritten;
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try
@@ -331,6 +352,7 @@ internal sealed class WorkerGroupService(
             // A value below 1 has always meant one outcome per write, and the Driver's batches need at least one row.
             MaxOutcomeBatch = Math.Max(1, options.MaxOutcomeBatch ?? options.MaxClaimBatch), // coalesce a claim batch's worth of outcomes
             PoolSize = options.PoolSize, // the Driver subtracts in-flight work from claims
+            UnwrittenOutcomeSlots = options.UnwrittenOutcomeSlots,
             LeaseDuration = options.LeaseDuration,
             RetryPolicy = options.RetryPolicy,
             RetryOverrides = registry.RetryOverrides, // per-job-type [Retry] overrides, loud-failure path (0051)
@@ -408,7 +430,7 @@ internal sealed class WorkerGroupService(
                 }
                 try
                 {
-                    var commands = driver.Step(nodeEvent);
+                    var commands = Step(driver, nodeEvent);
                     var issued = 0;
                     var reached = false;
                     try
@@ -416,7 +438,8 @@ internal sealed class WorkerGroupService(
                         reached = nodeEvent switch
                         {
                             NodeEvent.ClaimCompleted => TakeAnswer(_claim),
-                            NodeEvent.OutcomeBatchReported => TakeAnswer(_outcomeWrite),
+                            NodeEvent.OutcomeBatchReported or NodeEvent.OutcomeBatchFaulted
+                                or NodeEvent.OutcomeBatchNotIssued => TakeAnswer(_outcomeWrite),
                             _ => false,
                         };
                         foreach (var command in commands)
@@ -496,6 +519,8 @@ internal sealed class WorkerGroupService(
             }
             finally
             {
+                ReportUnwrittenOutcomes(0);
+
                 // Its own finally, because the hand-back rethrows a named violation on its way out. Left in
                 // the same block, that throw would skip the lines below: the channel would stay open for
                 // the tickers to fill until host shutdown, and the Wake-Up Hint subscription would leak on
@@ -654,7 +679,7 @@ internal sealed class WorkerGroupService(
             {
                 continue;
             }
-            foreach (var command in driver.Step(nodeEvent))
+            foreach (var command in Step(driver, nodeEvent))
             {
                 await ExecuteToCompletionAsync(command, events.Writer, budget).ConfigureAwait(false);
             }
@@ -866,7 +891,7 @@ internal sealed class WorkerGroupService(
             }
             else if (commands[index] is Command.ReportOutcomeBatch)
             {
-                events.TryWrite(new NodeEvent.OutcomeBatchReported([], now));
+                events.TryWrite(new NodeEvent.OutcomeBatchNotIssued(now));
             }
         }
     }
@@ -956,7 +981,7 @@ internal sealed class WorkerGroupService(
             case Command.ReportOutcomeBatch batch:
                 _outcomeWrite.Start(
                     cancellationToken => WriteOutcomesAsync(batch, now, cancellationToken),
-                    () => new NodeEvent.OutcomeBatchReported([], _clock.GetUtcNow()),
+                    () => new NodeEvent.OutcomeBatchFaulted(_clock.GetUtcNow()),
                     events);
                 break;
 

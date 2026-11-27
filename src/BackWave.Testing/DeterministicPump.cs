@@ -42,6 +42,9 @@ internal sealed class DeterministicPump(
     // call leaves behind are stepped by the next drive, as the production pump's channel keeps them.
     private readonly Queue<NodeEvent> _events = new();
 
+    // The Driver's Unwritten Outcome count last reported to backwave.worker.outcomes.unwritten.
+    private int _reportedUnwrittenOutcomes;
+
     // The pending settlement of each in-flight Attempt's process telemetry, keyed by (JobId, Attempt):
     // its held-open process span (possibly null) plus the Wire Name and Queue the settling report needs
     // to tag the dead-letter counter, so the settling outcome can land a retry-scheduled / dead-lettered
@@ -80,6 +83,9 @@ internal sealed class DeterministicPump(
             while (_events.TryDequeue(out var nodeEvent))
             {
                 var commands = driver.Step(nodeEvent);
+                BackWaveDiagnostics.RecordUnwrittenOutcomes(
+                    _consumerGroup, driver.UnwrittenOutcomeCount - _reportedUnwrittenOutcomes);
+                _reportedUnwrittenOutcomes = driver.UnwrittenOutcomeCount;
                 for (var issued = 0; issued < commands.Count; issued++)
                 {
                     try
@@ -144,9 +150,10 @@ internal sealed class DeterministicPump(
         }
     }
 
-    // The Driver frees its claim or its outcome write only when that batch's completion lands, and a store
-    // call that throws lands none. Land an empty one for the batch that threw and for each batch behind it
-    // that never ran, so one failed call cannot stop the node from claiming or writing again.
+    // The Driver frees its claim or its outcome write only when that batch's answer lands, and a store call
+    // that throws lands none. Answer the batch that threw as an empty claim or a faulted write, and each batch
+    // behind it that never ran as an empty claim or a write never issued, so one failed call cannot stop the
+    // node from claiming or writing again.
     private void ReleaseUnansweredBatches(IReadOnlyList<Command> commands, int from, DateTimeOffset now)
     {
         for (var index = from; index < commands.Count; index++)
@@ -157,7 +164,9 @@ internal sealed class DeterministicPump(
             }
             else if (commands[index] is Command.ReportOutcomeBatch)
             {
-                _events.Enqueue(new NodeEvent.OutcomeBatchReported([], now));
+                _events.Enqueue(index == from
+                    ? new NodeEvent.OutcomeBatchFaulted(now)
+                    : new NodeEvent.OutcomeBatchNotIssued(now));
             }
         }
     }

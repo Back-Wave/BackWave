@@ -180,8 +180,10 @@ public class NodeDriverOutcomeBatchTests
         Assert.Equal(1, driver.BufferedOutcomeCount);
     }
 
-    [Fact]
-    public void AnEmptyAnswer_FreesTheWrite_WithoutStartingAnother()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void AFaultedOrUnissuedWrite_FreesTheWriteLane_WithoutStartingAnother(bool faulted)
     {
         var driver = Driver();
         var a = Job();
@@ -191,7 +193,8 @@ public class NodeDriverOutcomeBatchTests
         Claim(driver, b);
         Assert.Empty(driver.Step(new NodeEvent.ExecutionSucceeded(b, T0)));
 
-        Assert.Empty(driver.Step(new NodeEvent.OutcomeBatchReported([], T0)));
+        NodeEvent answer = faulted ? new NodeEvent.OutcomeBatchFaulted(T0) : new NodeEvent.OutcomeBatchNotIssued(T0);
+        Assert.Empty(driver.Step(answer));
         Assert.Equal(1, driver.BufferedOutcomeCount);
 
         Assert.Equal([b.JobId], Rows(Flushed(driver.Step(new NodeEvent.PollDue(T0.AddSeconds(1))))));

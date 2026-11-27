@@ -39,6 +39,7 @@ internal sealed record Scenario
     public int? ConcurrencyLimit { get; init; }
     public IReadOnlyDictionary<string, int> ConcurrencyLimits { get; init; } = new Dictionary<string, int>();
     public int PoolSize { get; init; } = int.MaxValue;
+    public int UnwrittenOutcomeSlots { get; init; }
     public double HintDeliveryProbability { get; init; }
     public TimeSpan MaxHintLatency { get; init; } = TimeSpan.FromMilliseconds(250);
     public double StoreFaultProbability { get; init; }
@@ -66,6 +67,8 @@ internal sealed record Scenario
     public bool Sabotage { get; init; }
     public bool SabotageSlotDoubleRelease { get; init; }
     public bool SabotagePoolSize { get; init; }
+    public bool SabotageUnwrittenOutcomeSlots { get; init; }
+    public bool SabotageHeadroomNeverCloses { get; init; }
     public bool SabotageOutcomeFence { get; init; }
     public bool SabotageBatchFence { get; init; }
     public bool SabotageMigrationSweep { get; init; }
@@ -108,6 +111,7 @@ internal sealed record Scenario
         ConcurrencyLimit = o.ConcurrencyLimit,
         ConcurrencyLimits = o.ConcurrencyLimits,
         PoolSize = o.PoolSize,
+        UnwrittenOutcomeSlots = o.UnwrittenOutcomeSlots,
         HintDeliveryProbability = o.HintDeliveryProbability,
         MaxHintLatency = o.MaxHintLatency,
         StoreFaultProbability = o.StoreFaultProbability,
@@ -126,6 +130,8 @@ internal sealed record Scenario
         Sabotage = o.Sabotage,
         SabotageSlotDoubleRelease = o.SabotageSlotDoubleRelease,
         SabotagePoolSize = o.SabotagePoolSize,
+        SabotageUnwrittenOutcomeSlots = o.SabotageUnwrittenOutcomeSlots,
+        SabotageHeadroomNeverCloses = o.SabotageHeadroomNeverCloses,
         SabotageOutcomeFence = o.SabotageOutcomeFence,
         SabotageBatchFence = o.SabotageBatchFence,
         SabotageMigrationSweep = o.SabotageMigrationSweep,
@@ -165,6 +171,7 @@ internal sealed record Scenario
         ConcurrencyLimit = ConcurrencyLimit,
         ConcurrencyLimits = ConcurrencyLimits,
         PoolSize = PoolSize,
+        UnwrittenOutcomeSlots = UnwrittenOutcomeSlots,
         HintDeliveryProbability = HintDeliveryProbability,
         MaxHintLatency = MaxHintLatency,
         StoreFaultProbability = StoreFaultProbability,
@@ -183,6 +190,8 @@ internal sealed record Scenario
         Sabotage = Sabotage,
         SabotageSlotDoubleRelease = SabotageSlotDoubleRelease,
         SabotagePoolSize = SabotagePoolSize,
+        SabotageUnwrittenOutcomeSlots = SabotageUnwrittenOutcomeSlots,
+        SabotageHeadroomNeverCloses = SabotageHeadroomNeverCloses,
         SabotageOutcomeFence = SabotageOutcomeFence,
         SabotageBatchFence = SabotageBatchFence,
         SabotageMigrationSweep = SabotageMigrationSweep,

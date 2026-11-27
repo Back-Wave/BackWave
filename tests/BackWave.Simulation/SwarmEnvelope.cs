@@ -53,7 +53,8 @@ internal static class SwarmEnvelope
     /// <item><b>Finite pool</b> ⟹ the clean-execution single-Queue regime: no lease-loss axes (crash / heartbeat /
     /// store / ack-loss, each of which can leave a node executing a zombie past its Lease), no Recurring Schedule
     /// (a mid-run mint injects out-of-band work), and a sub-Lease execution, so real in-flight == leases ≤ pool
-    /// and the per-node cap holds.</item>
+    /// and the per-node cap holds. Its unwritten-outcome headroom stays within 0..PoolSize, and is 0 for an
+    /// unbounded pool.</item>
     /// <item><b>Per-Queue limits</b> ⟹ a multi-Queue topology (≥2); limits over a single Queue are dropped.</item>
     /// </list>
     /// </summary>
@@ -138,11 +139,14 @@ internal static class SwarmEnvelope
             TopologyQueues = topologyQueues,
             ConcurrencyLimits = limits,
             PoolSize = poolSize,
+            UnwrittenOutcomeSlots = poolSize == int.MaxValue ? 0 : Math.Clamp(scenario.UnwrittenOutcomeSlots, 0, poolSize),
             Schedules = schedules,
             // The Swarm never manufactures failures (ADR 0018): clear every Sabotage flag.
             Sabotage = false,
             SabotageSlotDoubleRelease = false,
             SabotagePoolSize = false,
+            SabotageUnwrittenOutcomeSlots = false,
+            SabotageHeadroomNeverCloses = false,
             SabotageOutcomeFence = false,
             SabotageBatchFence = false,
             SabotageMigrationSweep = false,

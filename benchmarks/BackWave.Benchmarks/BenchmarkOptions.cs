@@ -44,6 +44,12 @@ public sealed record BenchmarkOptions
     /// </summary>
     public int WorkerGroups { get; init; } = 1;
 
+    /// <summary>
+    /// The BackWave pump's UnwrittenOutcomeSlots: how many finished jobs may give back their slot before
+    /// their outcome write answers. Defaults to 0, the product default.
+    /// </summary>
+    public int UnwrittenOutcomeSlots { get; init; }
+
     /// <summary>Fixed payload size band, in bytes.</summary>
     public int PayloadBytes { get; init; } = 128;
 
@@ -88,6 +94,7 @@ public sealed record BenchmarkOptions
                 "--producers" => result with { Producers = int.Parse(value) },
                 "--pool-size" => result with { PoolSize = int.Parse(value) },
                 "--worker-groups" => result with { WorkerGroups = int.Parse(value) },
+                "--unwritten-outcome-slots" => result with { UnwrittenOutcomeSlots = int.Parse(value) },
                 "--payload-bytes" => result with { PayloadBytes = int.Parse(value) },
                 "--warmup" => result with { WarmupRuns = int.Parse(value) },
                 "--runs" => result with { MeasuredRuns = int.Parse(value) },

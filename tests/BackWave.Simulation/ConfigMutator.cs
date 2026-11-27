@@ -9,8 +9,8 @@ namespace BackWave.Tests.Simulation;
 /// so the mutant is in-envelope by construction and can be evaluated by <b>generate</b> (a fresh run through the
 /// budget guards) with no risk of a false bug. Each call nudges one to three knobs from the search RNG — toggling
 /// a fault axis on/off, redrawing an active intensity within its band, or flipping a structural knob (multi-Queue
-/// topology, per-Queue limits, finite pool, a clean-stop count, or a registered Transition Observer) - and stamps
-/// a fresh Seed so generate regenerates a fresh world.
+/// topology, per-Queue limits, finite pool, the unwritten-outcome headroom, a clean-stop count, or a registered
+/// Transition Observer) - and stamps a fresh Seed so generate regenerates a fresh world.
 /// </summary>
 internal static class ConfigMutator
 {
@@ -32,7 +32,7 @@ internal static class ConfigMutator
         return SwarmEnvelope.Confine(s);
     }
 
-    private const int OpCount = 14;
+    private const int OpCount = 15;
 
     private static Scenario ApplyOne(Scenario s, DeterministicRandom rng) => rng.Next(OpCount) switch
     {
@@ -49,6 +49,7 @@ internal static class ConfigMutator
         10 => s with { ConcurrencyLimits = ToggleLimits(s, rng) },
         11 => s with { PoolSize = TogglePool(s.PoolSize, rng) },
         12 => s with { StopCount = ToggleCount(s.StopCount, 1, SwarmEnvelope.StopMax, rng) },
+        13 => s with { UnwrittenOutcomeSlots = ToggleCount(s.UnwrittenOutcomeSlots, 1, SwarmEnvelope.PoolMax, rng) },
         _ => s with { Observers = ToggleObservers(s.Observers) },
     };
 

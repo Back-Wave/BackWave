@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.Metrics;
 using BackWave.Core;
+using BackWave.Diagnostics;
 using BackWave.Jobs;
 using BackWave.Monitor;
 using BackWave.Storage;
@@ -70,7 +72,7 @@ public class OutcomeWriteOverlapTests
 
     private static WebApplication BuildHost(
         IJobStore store, PingBoard board, int poolSize, ILoggerProvider? logs = null, TimeSpan? shutdownBudget = null,
-        int? maxOutcomeBatch = null)
+        int? maxOutcomeBatch = null, int unwrittenOutcomeSlots = 0, TimeSpan? maintenanceInterval = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
@@ -92,18 +94,30 @@ public class OutcomeWriteOverlapTests
                 LeaseDuration = TimeSpan.FromMinutes(5),
                 ShutdownBudget = shutdownBudget ?? TimeSpan.FromSeconds(5),
                 MaxOutcomeBatch = maxOutcomeBatch,
+                UnwrittenOutcomeSlots = unwrittenOutcomeSlots,
+                MaintenanceInterval = maintenanceInterval ?? TimeSpan.FromSeconds(5),
             }));
         return builder.Build();
     }
 
-    private static async Task WaitForStateAsync(BackWaveMonitor monitor, Guid jobId, JobState state)
+    private static Task WaitForStateAsync(BackWaveMonitor monitor, Guid jobId, JobState state) =>
+        WaitUntilAsync(async () => (await monitor.GetJobAsync(jobId))?.State == state, $"job {jobId} to reach {state}");
+
+    private static Task WaitUntilAsync(Func<bool> condition, string description) =>
+        WaitUntilAsync(() => ValueTask.FromResult(condition()), description);
+
+    private static async Task WaitUntilAsync(Func<ValueTask<bool>> condition, string description)
     {
         var deadline = DateTimeOffset.UtcNow + TestTimeout;
-        while ((await monitor.GetJobAsync(jobId))?.State != state)
+        while (DateTimeOffset.UtcNow < deadline)
         {
-            Assert.True(DateTimeOffset.UtcNow < deadline, $"job {jobId} never reached {state}");
-            await Task.Delay(25);
+            if (await condition())
+            {
+                return;
+            }
+            await Task.Delay(10);
         }
+        Assert.Fail($"Timed out waiting for {description}.");
     }
 
     [Fact]
@@ -177,6 +191,42 @@ public class OutcomeWriteOverlapTests
         await WaitForStateAsync(monitor, first, JobState.Succeeded);
         await WaitForStateAsync(monitor, second, JobState.Succeeded);
         await app.StopAsync();
+    }
+
+    [Fact]
+    public async Task ARowBeingWritten_FreesItsPoolSlot_WithinTheUnwrittenOutcomeSlots_AndNoFurther()
+    {
+        using var unwritten = new UnwrittenOutcomesRecorder("workers");
+        var store = new FaultableStore(new InMemoryJobStore()) { HoldOutcomeWrites = true };
+        var board = new PingBoard();
+        await using var app = BuildHost(
+            store, board, poolSize: 1, unwrittenOutcomeSlots: 1, maintenanceInterval: TimeSpan.Zero);
+        await app.StartAsync();
+        var client = app.Services.GetRequiredService<BackWaveClient>();
+        var monitor = app.Services.GetRequiredService<BackWaveMonitor>();
+
+        var first = await client.EnqueueAsync(new PingJob("first"), dueTime: DateTimeOffset.UtcNow);
+        await store.HeldOutcomeWriteEntered.WaitAsync(TestTimeout);
+        var second = await client.EnqueueAsync(new PingJob("second"), dueTime: DateTimeOffset.UtcNow);
+
+        await board.Ran("second").WaitAsync(TestTimeout);
+        Assert.Equal(JobState.Leased, (await monitor.GetJobAsync(first))!.State);
+        await WaitUntilAsync(() => unwritten.Current == 2, "two unwritten outcomes");
+
+        var lastClaim = store.LastClaimAt;
+        var third = await client.EnqueueAsync(new PingJob("third"), dueTime: DateTimeOffset.UtcNow);
+        var sweeps = store.ExpireLeasesCalls + 2;
+        await WaitUntilAsync(() => store.ExpireLeasesCalls >= sweeps, $"{sweeps} lease sweeps");
+        Assert.Equal(lastClaim, store.LastClaimAt);
+        Assert.False(board.HasRun("third"), "the third job ran while two finished jobs filled the pool and its one extra slot");
+        Assert.Equal(JobState.Scheduled, (await monitor.GetJobAsync(third))!.State);
+
+        store.ReleaseOutcomeWrites();
+        await WaitForStateAsync(monitor, first, JobState.Succeeded);
+        await WaitForStateAsync(monitor, second, JobState.Succeeded);
+        await WaitForStateAsync(monitor, third, JobState.Succeeded);
+        await app.StopAsync();
+        Assert.Equal(0, unwritten.Current);
     }
 
     [Fact]
@@ -321,4 +371,38 @@ public class OutcomeWriteOverlapTests
         }
         await app.StopAsync();
     }
+}
+
+/// <summary>Sums one group's <c>backwave.worker.outcomes.unwritten</c> deltas into its current count.</summary>
+internal sealed class UnwrittenOutcomesRecorder : IDisposable
+{
+    private readonly MeterListener _listener = new();
+    private long _current;
+
+    public UnwrittenOutcomesRecorder(string group)
+    {
+        _listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == BackWaveDiagnostics.SourceName
+                && instrument.Name == "backwave.worker.outcomes.unwritten")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        _listener.SetMeasurementEventCallback<long>((_, value, tags, _) =>
+        {
+            foreach (var tag in tags)
+            {
+                if (tag.Key == "messaging.consumer.group.name" && tag.Value as string == group)
+                {
+                    Interlocked.Add(ref _current, value);
+                }
+            }
+        });
+        _listener.Start();
+    }
+
+    public long Current => Interlocked.Read(ref _current);
+
+    public void Dispose() => _listener.Dispose();
 }

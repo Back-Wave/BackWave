@@ -63,6 +63,28 @@ public sealed record WorkerGroupOptions
     /// </summary>
     public int? MaxOutcomeBatch { get; init; }
 
+    /// <summary>
+    /// How many jobs per pump whose handlers have returned may wait for their outcome to be written without
+    /// holding a <see cref="PoolSize"/> slot. At 0, a job keeps its slot until that write completes, so a pump
+    /// of short jobs spends much of its time waiting on writes. Above 0, up to this many jobs give their slots
+    /// back as soon as their handlers return, and the pump claims and runs new jobs while the write is in
+    /// flight. At most <see cref="PoolSize"/> handlers run at once either way.
+    /// <para>
+    /// The cost is what a crash or an outage runs again. A job whose outcome is not yet written runs again once
+    /// its Lease lapses, so a pump can re-run up to <see cref="PoolSize"/> plus this value of jobs, against up
+    /// to <see cref="PoolSize"/> at 0. While outcome writes fail, the pump stops using these extra slots until
+    /// a write succeeds again. Above 0, a Wake-Up Hint that arrives during a claim can wait up to one
+    /// <see cref="PollInterval"/> while slots are free.
+    /// </para>
+    /// <para>
+    /// For short jobs that are safe to run twice, set this to <see cref="PoolSize"/>. Keep 0 for jobs that are
+    /// costly or unsafe to run twice. A Concurrency Limit still holds, because a job keeps its Lease, and counts
+    /// toward its Queue's Concurrency Limit, until its outcome is written. The <c>backwave.worker.outcomes.unwritten</c>
+    /// metric counts the jobs that wait. Must not be negative. Defaults to 0.
+    /// </para>
+    /// </summary>
+    public int UnwrittenOutcomeSlots { get; init; }
+
     // Batched, bounded polling is the sole correctness mechanism (ADR-0005); a wake-up hint only ever
     // brings a poll forward, never replaces it.
     /// <summary>
