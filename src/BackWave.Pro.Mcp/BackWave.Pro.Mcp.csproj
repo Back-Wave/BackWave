@@ -18,10 +18,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- The official MCP SDK's ASP.NET Core transport (streamable HTTP). 1.4.x is the GA line; the
-         tool layer is kept decoupled from transport specifics so the eventual 2.0 move touches only
-         the hosting seam. -->
-    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="1.4.1" />
+    <!-- The official MCP SDK's ASP.NET Core transport (streamable HTTP). -->
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.4.0" />
   </ItemGroup>
 
   <ItemGroup>

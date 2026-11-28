@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using ModelContextProtocol.AspNetCore;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
@@ -65,7 +66,7 @@ public sealed class HostMcpServerIsolationTests
         builder.WebHost.UseTestServer();
 
         builder.Services.AddMcpServer(server => server.ServerInfo = new Implementation { Name = "Host", Version = "1.0" })
-            .WithHttpTransport(transport => transport.Stateless = true)
+            .WithHttpTransport(transport => transport.SessionMode = HttpServerSessionMode.Stateless)
             .WithTools<HostTools>()
             .WithRequestFilters(filters => filters.AddCallToolFilter(next => async (context, cancellationToken) =>
                 context.Params?.Name == "host_ping"
